@@ -10,9 +10,6 @@ This module is the single home for mutable global state and the C-track seam:
 
 This module must NOT import gdb or any higher layer (arch/*, commands/*).
 """
-import importlib
-
-
 class CommandRegistry:
     """Holds registered command classes and instantiated commands.
 
@@ -51,9 +48,9 @@ class ArchRegistry:
 
     @staticmethod
     def _walk(base):
-        """Breadth-first walk of base and all transitive subclasses."""
+        """Breadth-first walk of all transitive subclasses of base (base excluded)."""
         seen = []
-        queue = [base]
+        queue = list(base.__subclasses__())
         while queue:
             cls = queue.pop(0)
             seen.append(cls)

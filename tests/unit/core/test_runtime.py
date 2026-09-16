@@ -1,7 +1,5 @@
 """Unit tests for gef.core.runtime (no gdb import required)."""
-import builtins
 import sys
-import types
 
 import pytest
 
@@ -58,7 +56,7 @@ def test_arch_registry_find_walks_subclasses_recursively():
     # Monkeypatch Architecture.__subclasses__ on the module-level base used by find.
     # ArchRegistry.find references the base via a late lookup; we inject FakeArch.
     rt.ArchRegistry._base = FakeArch  # test injection hook
-    assert FakeArch in rt.ArchRegistry.all()
+    assert FakeArch not in rt.ArchRegistry.all()
     assert Child in rt.ArchRegistry.all()
     assert Grandchild in rt.ArchRegistry.all()
     assert rt.ArchRegistry.find("GRAND") is Grandchild
