@@ -5,3 +5,7 @@ chrome_dev
 chrome_stable
 linux-*
 download
+.*
+
+# superpowers: local agent design specs & implementation-status files (never tracked)
+docs/superpowers/
