@@ -92,6 +92,98 @@ def hexdump(source, length=0x10, separator=".", color=True, show_symbol=True, ba
         ))
     return "\n".join(result)
 
+def write_memory(addr, data):
+    """Write `data` at address `addr`."""
+
+    from gef.core.process import Pid, ProcessMap, is_32bit, is_pin, is_qemu_user
+
+    def write_memory_qemu_user(pid, addr, data, length):
+        """Write `data` at address `addr` for qemu-user or Intel Pin."""
+
+        def read_memory_via_proc_mem(pid, addr, length):
+            with open("/proc/{:d}/mem".format(pid), "rb") as fd:
+                try:
+                    fd.seek(addr)
+                    return fd.read(length)
+                except OSError:
+                    return None
+
+        def write_memory_via_proc_mem(pid, addr, data, length):
+            with open("/proc/{:d}/mem".format(pid), "wb") as fd:
+                try:
+                    fd.seek(addr)
+                    ret = fd.write(data[:length])
+                    fd.flush()
+                    gdb.execute("maintenance flush dcache", to_string=True)
+                    return ret
+                except (OSError, gdb.error):
+                    return None
+
+        def write_with_check(pid, addr, data, length, offset=0):
+            before = read_memory_via_proc_mem(pid, addr + offset, length)
+            if before is None:
+                return None
+
+            ret = write_memory_via_proc_mem(pid, addr + offset, data, length)
+            after = read_memory(addr, length)
+
+            if ret:
+                if after == data[:length]:
+                    return ret
+                else:
+                    # fail, revert
+                    write_memory_via_proc_mem(pid, addr + offset, before, length)
+                    return None
+            return None
+
+        # 1. qemu-user (32bit) maps the memory at +0x10000 (fast path)
+        if is_qemu_user() and is_32bit(): # not Intel Pin
+            ret = write_with_check(pid, addr, data, length, offset=0x10000)
+            if ret:
+                return ret
+
+        # 2. we assume addr is same
+        ret = write_with_check(pid, addr, data, length)
+        if ret:
+            return ret
+
+        # 3. heuristic addr search and try use it
+        if is_qemu_user(): # not Intel Pin
+            inner_section = ProcessMap.lookup_address(addr).section
+            target_path = inner_section.path
+
+            outer_maps = ProcessMap.get_process_maps(outer=True)
+            for m in outer_maps:
+                if m.path != target_path:
+                    continue
+                offset = m.page_start - inner_section.page_start
+                ret = write_with_check(pid, addr, data, length, offset=offset)
+                if ret:
+                    return ret
+
+        raise Exception("Memory write error for qemu-user or Intel Pin")
+
+    # ----
+
+    length = len(data)
+    if length == 0:
+        return 0
+
+    try:
+        gdb.selected_inferior().write_memory(addr, data, length)
+        return length
+    except gdb.MemoryError:
+        pass
+
+    # Under qemu-user/pin, you can not patch to `code` areas,
+    # so you have to patch via /proc/pid/mem
+    if is_qemu_user() or is_pin():
+        pid = Pid.get_pid()
+        if pid:
+            return write_memory_qemu_user(pid, addr, data, length)
+
+    raise Exception("Memory write error")
+
 def read_memory(addr, length):
     """Return a `length` long byte array with the copy of the process memory at `addr`."""
     from gef.core.process import Pid, is_arm64, is_pin, is_qemu_system
