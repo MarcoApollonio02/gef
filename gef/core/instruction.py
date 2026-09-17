@@ -9,9 +9,9 @@ Reads of the mutable global `current_arch` go through `runtime.current_arch`
 (never a by-name import) to avoid the stale-binding pitfall documented in
 runtime.py. References to modules that are not yet extracted (symbols,
 process, utils, gef.commands) are imported lazily inside the method that
-needs them. `gef.core.utils` is referenced through a late-bound
+needs them. `gef.core.symbols` is referenced through a late-bound
 `ModuleLoader` trampoline inside the `Disasm` class body, so this module
-stays importable before `gef.core.utils` exists.
+stays importable before `gef.core.symbols` exists.
 """
 import functools
 import gdb
@@ -361,13 +361,13 @@ class Disasm:
 
     __gef_prev_arch__ = None # previous valid result of gdb.selected_frame().architecture()
 
-    # Late-bound trampoline: resolves to gef.core.utils.ModuleLoader at call
-    # time, keeping this module importable before gef.core.utils exists.
+    # Late-bound trampoline: resolves to gef.core.symbols.ModuleLoader at call
+    # time, keeping this module importable before gef.core.symbols exists.
     class ModuleLoader:
         def load_capstone(f):
             @functools.wraps(f)
             def wrapper(*args, **kwargs):
-                from gef.core.utils import ModuleLoader
+                from gef.core.symbols import ModuleLoader
                 return ModuleLoader.load_capstone(f)(*args, **kwargs)
             return wrapper
 
