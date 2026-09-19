@@ -507,7 +507,7 @@ class GefUtil:
             env_path = os.getenv("PATH", env_path_default)
             env_path = env_path.split(os.pathsep)
 
-            from gef import Gef
+            from gef.bootstrap import Gef
             if hasattr(Gef, "GEF_VENV_BIN_PATH"):
                 env_path.insert(0, Gef.GEF_VENV_BIN_PATH)
 
