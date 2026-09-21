@@ -19,6 +19,7 @@ needs it.
 import datetime
 import functools
 import io
+import itertools
 import math
 import os
 import re
