@@ -3,6 +3,7 @@
 import abc
 import ctypes
 import enum
+import re
 import struct
 
 import gdb

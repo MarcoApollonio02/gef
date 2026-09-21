@@ -13,9 +13,11 @@ from gef.core.address import AddressUtil
 from gef.core.color import Color
 from gef.core.elf import Elf
 from gef.core.memory import (read_int_from_memory, read_cstring_from_memory,
+                             read_int32_from_memory,
                              read_memory, write_memory, is_valid_addr,
                              u8, u16, u32, u64)
-from gef.core.process import is_alive
+from gef.core.process import (is_alive, is_in_kernel, is_in_secure, is_rr,
+                              is_support_secure_world)
 from gef.core.registers import get_register
 from gef.core.utils import GefUtil
 

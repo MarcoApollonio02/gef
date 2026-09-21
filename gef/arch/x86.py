@@ -14,10 +14,11 @@ from gef.core.color import Color
 from gef.core.elf import Elf
 from gef.core.memory import (read_int_from_memory, read_cstring_from_memory,
                              read_memory, write_memory, is_valid_addr,
-                             u8, u16, u32, u64)
-from gef.core.process import is_alive
-from gef.core.registers import get_register
-from gef.core.utils import GefUtil
+                             p32, p64, u8, u16, u32, u64)
+from gef.core.process import (is_alive, is_in_kernel, is_kvm_enabled, is_qiling,
+                              is_remote_debug, is_rr)
+from gef.core.registers import get_register, to_unsigned_long
+from gef.core.utils import GefUtil, rol, ror
 
 
 class X86(Architecture):
