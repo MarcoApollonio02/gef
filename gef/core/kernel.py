@@ -17,7 +17,7 @@ import gdb
 from gef.core import runtime
 from gef.core.address import AddressUtil
 from gef.core.cache import Cache
-from gef.core.color import Color, warn
+from gef.core.color import Color, err, gef_print, info, warn
 from gef.core.memory import is_valid_addr, read_cstring_from_memory, read_int_from_memory, read_memory
 from gef.core.pagewalk import KernelAddressHeuristicFinder, PageMap
 from gef.core.process import (get_pagesize, get_pagesize_mask_low, is_32bit, is_arm32, is_arm64,
@@ -25,7 +25,7 @@ from gef.core.process import (get_pagesize, get_pagesize_mask_low, is_32bit, is_
                               is_vmware, is_x86)
 from gef.core.registers import get_register, to_unsigned_long
 from gef.core.symbols import Symbol
-from gef.core.utils import slice_unpack
+from gef.core.utils import GefUtil, align_to_ptrsize, slice_unpack
 
 class KernelConstsBase:
     """A class that manages constants by version."""
@@ -2147,7 +2147,7 @@ class KernelConstsArm64(KernelConstsBase):
 
         # Prevent recursion:
         #   read_physmem -> kgdb_use_physmap -> get_ksymaddr -> pagewalk -> read_physmem -> ...
-        if not __gef_command_instances__["ksymaddr-remote"].kallsyms:
+        if not runtime.CommandRegistry.instances["ksymaddr-remote"].kallsyms:
             # None does not cache, because kallsyms may be resolved later
             return None
 
