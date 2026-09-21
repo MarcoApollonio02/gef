@@ -112,13 +112,16 @@ class EventHandler:
     def new_objfile_handler(_event):
         """GDB event handler for new object file cases."""
         from gef.core.process import ProcessMap, is_alive, is_kgdb, is_qemu_system, is_vmware, get_arch, set_arch
-        from gef.commands.break_relative_virtual_address import BreakRelativeVirtualAddressCommand
         Cache.reset_gef_caches(all=True)
         if runtime.current_arch is None:
             set_arch(get_arch())
 
-        # delayed breakpoint for brva
-        if BreakRelativeVirtualAddressCommand.delayed_bp_set is False and is_alive():
+        # delayed breakpoint for brva (command not extracted until Phase 2)
+        try:
+            from gef.commands.break_relative_virtual_address import BreakRelativeVirtualAddressCommand
+        except ModuleNotFoundError:
+            BreakRelativeVirtualAddressCommand = None
+        if BreakRelativeVirtualAddressCommand and BreakRelativeVirtualAddressCommand.delayed_bp_set is False and is_alive():
             if not (is_qemu_system() or is_kgdb() or is_vmware()):
                 codebase = ProcessMap.get_codebase()
                 if codebase:
