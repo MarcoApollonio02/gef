@@ -10,7 +10,6 @@ to call time, so importing this module does not require them. They will be
 wired up when the data blobs and arch classes are extracted.
 """
 import collections
-import collections
 import re
 
 from gef.core import runtime
