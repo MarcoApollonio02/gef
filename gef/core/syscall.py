@@ -9,6 +9,8 @@ gef.py at this stage of the modularization work. Those references are deferred
 to call time, so importing this module does not require them. They will be
 wired up when the data blobs and arch classes are extracted.
 """
+import collections
+import collections
 import re
 
 from gef.core import runtime
@@ -2241,3 +2243,4 @@ class SyscallCSKY(Syscall):
                 raise
             syscall_list.append([nr, name, sc_def[func]])
         return syscall_list
+#
