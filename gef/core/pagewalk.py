@@ -13,6 +13,7 @@ gef.commands `TlsCommand` / `XSecureMemAddrCommand`) are late-imported inside
 the referencing method.
 """
 import gdb
+import itertools
 import re
 
 from gef.core import runtime
