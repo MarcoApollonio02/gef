@@ -80,6 +80,7 @@ class ArchRegistry:
 
 current_arch = None
 missing_modules: dict = {}
+alias_instances: dict = {}
 
 
 def get_current_arch():

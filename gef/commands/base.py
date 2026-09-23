@@ -648,3 +648,55 @@ class BufferingOutput:
 
         gef_print("\n".join(self.out), less=less, skip_color=skip_color)
         return
+
+
+class GefAlias(gdb.Command):
+    """Simple aliasing wrapper because GDB doesn't do what it should."""
+
+    _category_ = "99. GEF Maintenance Command"
+
+    def __init__(self, alias, command, force_repeat=None, pre_defined=False):
+        p = command.split()
+        if not p:
+            return
+
+        # initialize
+        self._alias_ = alias
+        self._command_ = command
+        if force_repeat is None:
+            self._repeat_ = False
+        else:
+            self._repeat_ = force_repeat
+        self._pre_defined_ = pre_defined # default alias settings of GEF
+        self.__doc__ = "Alias for '{:s}'".format(Color.greenify(command))
+
+        # Inherit settings from the aliased command
+        instance = runtime.CommandRegistry.instances.get(command, None)
+        if instance:
+            # repeat settings
+            if force_repeat is None:
+                self._repeat_ = instance._repeat_
+
+            # doc
+            self.__doc__ += ": {:s}".format(instance.__doc__)
+
+            # complete settings
+            if hasattr(instance, "complete"):
+                self.complete = instance.complete
+
+        # define aliased command
+        if hasattr(instance, "complete"):
+            # Aliased commands support only user completion.
+            super().__init__(alias, gdb.COMMAND_NONE)
+        else:
+            super().__init__(alias, gdb.COMMAND_NONE, gdb.COMPLETE_NONE)
+
+        # add or overwrite
+        runtime.alias_instances[alias] = self
+        return
+
+    def invoke(self, args, from_tty): # noqa
+        if not self._repeat_:
+            self.dont_repeat()
+        gdb.execute("{} {}".format(self._command_, args), from_tty=from_tty)
+        return
