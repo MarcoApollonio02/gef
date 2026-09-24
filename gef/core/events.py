@@ -116,9 +116,9 @@ class EventHandler:
         if runtime.current_arch is None:
             set_arch(get_arch())
 
-        # delayed breakpoint for brva (command not extracted until Phase 2)
+        # delayed breakpoint for brva
         try:
-            from gef.commands.break_relative_virtual_address import BreakRelativeVirtualAddressCommand
+            from gef.commands.debugging.breakpoint import BreakRelativeVirtualAddressCommand
         except ModuleNotFoundError:
             BreakRelativeVirtualAddressCommand = None
         if BreakRelativeVirtualAddressCommand and BreakRelativeVirtualAddressCommand.delayed_bp_set is False and is_alive():
