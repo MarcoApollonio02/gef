@@ -4008,7 +4008,7 @@ class KernelAddressHeuristicFinder:
 
         # plan 1 (directly)
         from gef.core.kernel import Kernel, KernelConstsArm32, KernelConstsArm64, KernelConstsX64, KernelConstsX86
-        from gef.commands.tls_command import TlsCommand
+        from gef.commands.process.base_address import TlsCommand
         if KernelAddressHeuristicFinder.USE_DIRECTLY:
             x = Symbol.get_ksymaddr("debugfs_list")
             if x:
@@ -4060,7 +4060,7 @@ class KernelAddressHeuristicFinder:
 
         # plan 1 (directly)
         from gef.core.kernel import Kernel, KernelConstsArm32, KernelConstsArm64, KernelConstsX64, KernelConstsX86
-        from gef.commands.tls_command import TlsCommand
+        from gef.commands.process.base_address import TlsCommand
         if KernelAddressHeuristicFinder.USE_DIRECTLY:
             x = Symbol.get_ksymaddr("dmabuf_list")
             if x:
