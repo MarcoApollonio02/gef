@@ -5,8 +5,8 @@ Vectors (retrieved from gdb's `info auxv` with a stack-walking fallback).
 
 Reads of the mutable global `current_arch` go through `runtime.current_arch`
 (never a by-name import) to avoid the stale-binding pitfall documented in
-runtime.py. References to modules that are not yet extracted (process,
-gef.commands.auxv) are imported lazily inside the method that needs them.
+runtime.py. References to command modules (gef.commands.process) are
+imported lazily inside the method that needs them.
 """
 import gdb
 import re
@@ -76,7 +76,7 @@ class Auxv:
         else:
             return None
 
-        from gef.commands.auxv import AuxvCommand
+        from gef.commands.process.info import AuxvCommand
 
         # find auxv start
         auxv_keys = AuxvCommand.AT_CONSTANTS.keys()
