@@ -15,7 +15,7 @@ References to `gef.core.process` (arch predicates) and the not-yet-extracted
 `UnicornEmulator` additionally late-imports `KernelAddressHeuristicFinder`
 (`gef.core.pagewalk`), `X86` (`gef.arch.x86`), `ContextCodeCommand`
 (`gef.commands.debugging.context`) and `KernelCurrentCommand`
-(`gef.commands.kernel.task`), because importing them at module level would
+(`gef.commands.kernel.basic`), because importing them at module level would
 either create an import cycle (`gef.core.utils` imports this module) or reach
 the not-yet-extracted command layer.
 """
@@ -677,7 +677,7 @@ class UnicornEmulator:
 
         def mem_hook(self, emu, access, address, size, value, _user_data):
             """Map memory on demand when Unicorn reports an invalid access."""
-            from gef.commands.kernel.task import KernelCurrentCommand
+            from gef.commands.kernel.basic import KernelCurrentCommand
             from gef.core.pagewalk import KernelAddressHeuristicFinder
             try:
                 pc = self.from_emu(emu.reg_read(self.pc_reg))
