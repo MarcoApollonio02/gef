@@ -36,7 +36,7 @@ from gef.core.memory import (
     u64,
 )
 from gef.core.process import ProcessMap
-from gef.core.utils import GefUtil, slicer
+from gef.core.utils import GefUtil, byteswap, slicer
 
 
 @register_command
