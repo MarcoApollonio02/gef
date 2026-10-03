@@ -38,19 +38,27 @@ def _safe_extract(tar, dest):
     outside `dest`, and any member that is not a regular file, directory, or a
     (validated) link. Validating each member this way replaces the
     `filter="data"` argument, which does not exist on the Python 3.8 floor.
+
+    Link targets are resolved the way `tarfile` will resolve them: symlink
+    `linkname` is relative to the symlink's own directory, while a hardlink
+    `linkname` is relative to the archive/extraction root (`dest`).
     """
     dest = os.path.realpath(dest)
     for member in tar.getmembers():
         target = os.path.realpath(os.path.join(dest, member.name))
         if target != dest and not target.startswith(dest + os.sep):
             raise ValueError("unsafe path in archive: {:s}".format(member.name))
-        if member.issym() or member.islnk():
-            link_target = os.path.realpath(
-                os.path.join(os.path.dirname(target), member.linkname))
-            if link_target != dest and not link_target.startswith(dest + os.sep):
-                raise ValueError("unsafe link target in archive: {:s}".format(member.name))
-        elif not (member.isfile() or member.isdir()):
+        if member.issym():
+            link_base = os.path.dirname(target)
+        elif member.islnk():
+            link_base = dest
+        elif member.isfile() or member.isdir():
+            continue
+        else:
             raise ValueError("unsupported member type in archive: {:s}".format(member.name))
+        link_target = os.path.realpath(os.path.join(link_base, member.linkname))
+        if link_target != dest and not link_target.startswith(dest + os.sep):
+            raise ValueError("unsafe link target in archive: {:s}".format(member.name))
     tar.extractall(dest)
 
 
@@ -80,7 +88,8 @@ def upgrade():
     if data is None:
         return 1
     tmp = tempfile.mkdtemp(prefix="gef-upgrade-")
-    staging = os.path.join(INSTALL_DIR, "gef.new")
+    staging_pkg = os.path.join(INSTALL_DIR, "gef.new")
+    staging_bootstrap = os.path.join(INSTALL_DIR, "gef-bootstrap.py.new")
     backup = os.path.join(INSTALL_DIR, "gef.old")
     try:
         archive = os.path.join(tmp, "gef.tar.gz")
@@ -100,25 +109,35 @@ def upgrade():
         if not os.path.isdir(src_pkg) or not os.path.isfile(src_bootstrap):
             return 1
 
-        # Stage the new package next to the live one; a failure here is harmless.
-        if os.path.isdir(staging):
-            shutil.rmtree(staging)
-        shutil.copytree(src_pkg, staging)
+        # Stage package AND bootstrap next to the live tree; a failure here is harmless.
+        if os.path.isdir(staging_pkg):
+            shutil.rmtree(staging_pkg)
+        if os.path.exists(staging_bootstrap):
+            os.remove(staging_bootstrap)
+        shutil.copytree(src_pkg, staging_pkg)
+        shutil.copy2(src_bootstrap, staging_bootstrap)
 
-        # Swap: move the live package aside, promote the staged one, drop the old.
+        # Swap: move the live package aside, promote the staged one, then the bootstrap.
         dst_pkg = os.path.join(INSTALL_DIR, "gef")
-        if os.path.isdir(backup):
-            shutil.rmtree(backup)
-        if os.path.isdir(dst_pkg):
-            os.rename(dst_pkg, backup)
+        dst_bootstrap = os.path.join(INSTALL_DIR, "gef-bootstrap.py")
+        swapped = False
         try:
-            os.rename(staging, dst_pkg)
+            if os.path.isdir(dst_pkg):
+                # Only clobber the backup when a live package actually exists; a
+                # backup left by a prior interrupted run may be the only copy.
+                if os.path.isdir(backup):
+                    shutil.rmtree(backup)
+                os.rename(dst_pkg, backup)
+            os.rename(staging_pkg, dst_pkg)
+            swapped = True
+            os.replace(staging_bootstrap, dst_bootstrap)
         except Exception:
-            # Restore the previous install if the promotion failed.
+            # Roll back to the previous install on any partial swap.
+            if swapped:
+                shutil.rmtree(dst_pkg, ignore_errors=True)
             if os.path.isdir(backup) and not os.path.isdir(dst_pkg):
                 os.rename(backup, dst_pkg)
             return 1
-        shutil.copy2(src_bootstrap, os.path.join(INSTALL_DIR, "gef-bootstrap.py"))
         if os.path.isdir(backup):
             shutil.rmtree(backup, ignore_errors=True)
         with open(hash_path(), "wb") as f:
@@ -128,5 +147,10 @@ def upgrade():
         return 1
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
-        if os.path.isdir(staging):
-            shutil.rmtree(staging, ignore_errors=True)
+        if os.path.isdir(staging_pkg):
+            shutil.rmtree(staging_pkg, ignore_errors=True)
+        if os.path.exists(staging_bootstrap):
+            try:
+                os.remove(staging_bootstrap)
+            except OSError:
+                pass

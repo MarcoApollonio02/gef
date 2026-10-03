@@ -88,6 +88,27 @@ def test_safe_extract_rejects_hardlink_escape(tmp_path):
             _safe_extract(tar, str(tmp_path))
 
 
+def test_safe_extract_rejects_hardlink_parent_escape_from_depth(tmp_path):
+    # tarfile resolves a hardlink's linkname relative to the archive root, so a
+    # single `..` from a depth-2 member escapes. Regression: resolving it
+    # relative to the member's own dir let `a/b` -> `../victim` through.
+    tar = _open_tar([("a/b", tarfile.LNKTYPE, b"", "../victim")])
+    with tar:
+        with pytest.raises(ValueError):
+            _safe_extract(tar, str(tmp_path))
+
+
+def test_safe_extract_allows_in_tree_hardlink(tmp_path):
+    # A hardlink whose archive-root-relative target stays inside dest is fine.
+    tar = _open_tar([
+        ("gef/real.txt", tarfile.REGTYPE, b"ok", ""),
+        ("gef/link.txt", tarfile.LNKTYPE, b"", "gef/real.txt"),
+    ])
+    with tar:
+        _safe_extract(tar, str(tmp_path))
+    assert (tmp_path / "gef" / "link.txt").read_bytes() == b"ok"
+
+
 def test_safe_extract_rejects_fifo(tmp_path):
     tar = _open_tar([("pipe", tarfile.FIFOTYPE, b"", "")])
     with tar:
@@ -211,3 +232,40 @@ def test_upgrade_returns_1_when_download_fails(monkeypatch, tmp_path):
 
     assert upgrade() == 1
     assert (install / "gef" / "keep.py").read_text() == "keep"
+
+
+def test_upgrade_preserves_backup_only_state_on_failure(monkeypatch, tmp_path):
+    # A prior run interrupted after renaming gef -> gef.old leaves gef.old as the
+    # only working copy. A failed upgrade must not delete it.
+    install = tmp_path / "install"
+    install.mkdir()
+    (install / "gef.old").mkdir()
+    (install / "gef.old" / "keep.py").write_text("only copy")
+
+    monkeypatch.setattr(update_mod, "INSTALL_DIR", str(install))
+    monkeypatch.setattr(update_mod, "http_get", lambda *a, **k: _make_tar_gz(
+        [("gef-src/README.md", tarfile.REGTYPE, b"no package\n", "")]))
+
+    assert upgrade() == 1
+    assert (install / "gef.old" / "keep.py").read_text() == "only copy"
+    assert not (install / "gef").exists()
+
+
+def test_upgrade_succeeds_from_backup_only_state(monkeypatch, tmp_path):
+    # From a backup-only state, a valid upgrade installs the new package and
+    # clears the stale backup (dst_pkg is live again by then).
+    install = tmp_path / "install"
+    install.mkdir()
+    (install / "gef.old").mkdir()
+    (install / "gef.old" / "keep.py").write_text("only copy")
+    data = _valid_archive()
+
+    monkeypatch.setattr(update_mod, "INSTALL_DIR", str(install))
+    monkeypatch.setattr(update_mod, "http_get", lambda *a, **k: data)
+
+    assert upgrade() == 0
+    assert (install / "gef" / "__init__.py").read_text() == "# new\n"
+    assert (install / "gef-bootstrap.py").read_text() == "# new bootstrap\n"
+    assert not (install / "gef.old").exists()
+    assert not (install / "gef.new").exists()
+    assert not (install / "gef-bootstrap.py.new").exists()
