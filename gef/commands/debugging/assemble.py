@@ -459,7 +459,7 @@ class AsmListCommand(GenericCommand):
             if os.path.exists(x86data_js) and os.path.getsize(x86data_js) > 0:
                 x86 = open(x86data_js, "rb").read()
             else:
-                url = "https://raw.githubusercontent.com/bata24/gef/dev/asmdb/x86data.js"
+                url = "https://raw.githubusercontent.com/MarcoApollonio02/gef/dev/asmdb/x86data.js"
                 x86 = http_get(url)
                 if x86 is None:
                     err("Connection timed out: {:s}".format(url))

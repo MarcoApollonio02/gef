@@ -1801,21 +1801,14 @@ class GefCheckUpdateCommand(GenericCommand):
 
     @parse_args
     def do_invoke(self, args):
-        from gef.bootstrap import http_get
-        gef_remote = "https://raw.githubusercontent.com/bata24/gef/dev/gef.py"
-        gef_remote_data = http_get(gef_remote)
-
-        if gef_remote_data is None:
-            err("[-] Failed to get remote gef")
-            return
-
-        hash_gef_local = hashlib.sha512(open(GEF_FILEPATH, "rb").read()).digest()
-        hash_gef_remote = hashlib.sha512(gef_remote_data).digest()
-
-        if hash_gef_local == hash_gef_remote:
+        from gef.core.update import check_update
+        status = check_update()
+        if status == "no-update":
             info("No update")
-        else:
+        elif status == "update":
             info("Update found, try `python3 {:s} --upgrade`".format(GEF_FILEPATH))
+        else:
+            err("[-] Failed to get remote gef information")
         return
 
 

@@ -64,23 +64,9 @@ def http_get(url):
 
 
 def update_gef(argv):
-    """Try to update `gef` to the latest version."""
-    gef_local = os.path.realpath(argv[0])
-    hash_gef_local = hashlib.sha512(open(gef_local, "rb").read()).digest()
-    gef_remote = "https://raw.githubusercontent.com/bata24/gef/dev/gef.py"
-    gef_remote_data = http_get(gef_remote)
-    if gef_remote_data is None:
-        print("[-] Failed to get remote gef")
-        return 1
-
-    hash_gef_remote = hashlib.sha512(gef_remote_data).digest()
-    if hash_gef_local == hash_gef_remote:
-        print("[-] No update")
-    else:
-        with open(gef_local, "wb") as f:
-            f.write(gef_remote_data)
-        print("[+] Updated")
-    return 0
+    """Try to update `gef` to the latest version (fetch+extract the repo archive)."""
+    from gef.core.update import upgrade
+    return upgrade()
 
 
 class Gef:
