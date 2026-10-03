@@ -29,12 +29,24 @@ source /path/to/gef-bootstrap.py
 python sys.path.insert(0, "/root/.gef"); from gef import *; Gef.main()
 ```
 
-The installer places the `gef/` package directory at `/root/.gef/gef/` (instead of a single
-`gef.py`). `from gef import *` runs `gef/__init__.py`, which re-exports the public API lazily via
-PEP 562 `__getattr__`: `import gef` and `from gef import *` succeed even outside a GDB session, and
-the underlying modules (which need GDB's embedded Python) are imported on first attribute access.
-Command and architecture implementation classes are deliberately *not* individually re-exported —
-reach them through their submodules or the registries (see §6).
+The installer scripts (`install-uv.sh`, `install-no-uv.sh`, `install-minimal.sh`) fetch the
+fork's repo archive
+(`https://github.com/MarcoApollonio02/gef/archive/refs/heads/dev.tar.gz`), extract it, and install
+the package into `/root/.gef`: the `gef/` package directory at `/root/.gef/gef/` plus the shim at
+`/root/.gef/gef-bootstrap.py` (any legacy `/root/.gef/gef.py` is removed). The `.gdbinit` line is
+unchanged, as above. Upgrading re-downloads the same archive through the shim:
+
+```bash
+python3 /root/.gef/gef-bootstrap.py --upgrade
+```
+
+`gef/core/update.py` implements that path (it validates the archive, stages the new `gef/` and
+`gef-bootstrap.py`, and swaps them in atomically). `from gef import *` runs `gef/__init__.py`,
+which re-exports the public API lazily via PEP 562 `__getattr__`: `import gef` and
+`from gef import *` succeed even outside a GDB session, and the underlying modules (which need
+GDB's embedded Python) are imported on first attribute access. Command and architecture
+implementation classes are deliberately *not* individually re-exported — reach them through their
+submodules or the registries (see §6).
 
 ---
 
@@ -42,7 +54,7 @@ reach them through their submodules or the registries (see §6).
 
 The tree below is verified against the repo.
 
-```
+```text
 gef/
 ├── __init__.py          # PEP 562 lazy re-export of the public API
 ├── bootstrap.py         # Gef, Gef.main(), _discover() auto-discovery, update_gef
@@ -106,7 +118,7 @@ gef/
 
 Dependencies flow one direction only: higher layers may import lower ones, never the reverse.
 
-```
+```text
 Layer 0  runtime, errors, config, cache, color, highlight, display
          (state + formatting primitives)
 Layer 1  address, memory, registers, process, elf, instruction, symbols, strings, types,
@@ -150,10 +162,14 @@ flowchart TB
 
 ### Dependency rules
 
-1. **Core never imports `arch/*` or `commands/*`.** The single exception is `core/arch_base.py`,
-   the abstract contract that lets `set_arch` (in core) reference architectures without depending
-   on implementations. This is exactly why `highlight.py` lives in core: `gef_print` needs
-   highlighting, and pulling it from the command layer would invert the layering.
+1. **Core never imports `arch/*` or `commands/*` at module import time.** This is what guarantees
+   no import-time cycles. The only cross-layer import at module scope is `core/arch_base.py`, the
+   abstract contract `set_arch` needs. Where core needs a concrete command or architecture at
+   *runtime*, it reaches up through a function-local (late) import inside the method that needs it —
+   39 such late imports exist today across `core/syscall.py`, `core/pagewalk.py`, `core/types.py`,
+   `core/unicorn.py`, `core/symbols.py`, `core/process.py` and others — so nothing executes at import
+   time. This is likewise why `highlight.py` lives in core: `gef_print` needs highlighting, and
+   pulling it from the command layer would invert the layering.
 2. **`arch/*` never imports `commands/*`.** Architectures are a pure leaf layer; they depend only
    on `core.arch_base` and Layers 0–1.
 3. **Commands may import `core`, `arch`, and `commands.base`** — plus other bases co-located in the
@@ -174,7 +190,11 @@ everything in `runtime.CommandRegistry.registered`.
 
 The practical consequence: **drop a file in and it registers** — no central list to edit. A
 category subdirectory needs no registration either; the walk is recursive. A single broken module
-never prevents the others from loading; run `gef missing` to see why.
+never prevents the others from loading, but note the two failure channels are distinct: a module
+that fails to *import* is recorded in `runtime.missing_modules` and never registers at all (it
+never runs its `@register_command`), so it does not appear in `gef missing`; `gef missing` reports
+commands that registered but failed to *instantiate* in `Gef.load_commands()`, which populates
+`Gef.missing_commands`.
 
 ### The `current_arch` rule (critical)
 
@@ -347,7 +367,7 @@ The abstract contract in `core/arch_base.py` includes (among others): `arch`, `m
   `__gef_alias_instances__`, `current_arch`, ...).
 - **What the package is now:** a modular tree where commands and architectures are auto-discovered
   rather than declared, and shared state is funnelled through `runtime` and its registries. The
-  package registers 415 command classes today (334 subclass `GenericCommand` directly; the rest
+  package registers 415 command classes today (333 subclass `GenericCommand` directly; the rest
   inherit from extracted command families such as `ExecUntilCommand` and `PagewalkCommand`), as
   listed in `docs/COMMANDS.md`.
 - **Where components moved:** core domain types and state → `gef/core/`; the 19 architecture family
@@ -359,9 +379,9 @@ The abstract contract in `core/arch_base.py` includes (among others): `arch`, `m
   `current_arch` → `runtime.current_arch` across every module. `current_arch` is the only global
   that is rebound rather than mutated in place, so a name imported from `runtime` goes stale after
   `set_arch()`. §2 gives the rule and the grep that enforces it.
-- **The monolith is gone:** the single `gef.py` has been deleted. The `gef/` package (entered via
-  `gef-bootstrap.py` for quick trials or `from gef import *; Gef.main()` when installed) is the sole
-  source of GEF.
+- **The monolith is removed by this phase:** Phase 2.9 deletes the single `gef.py`, leaving the
+  `gef/` package (entered via `gef-bootstrap.py` for quick trials or `from gef import *;
+  Gef.main()` when installed) as the sole source of GEF.
 
 ---
 
