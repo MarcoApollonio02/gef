@@ -42,6 +42,7 @@
 - [06-i. Qemu-system/KGDB Cooperation - Linux Dynamic Inspection](#06-i-qemu-systemkgdb-cooperation---linux-dynamic-inspection)
 - [06-j. Qemu-system/KGDB Cooperation - TrustZone](#06-j-qemu-systemkgdb-cooperation---trustzone)
 - [06-k. Qemu-system/KGDB Cooperation - Other](#06-k-qemu-systemkgdb-cooperation---other)
+- [06-k. Qemu-system/KGDB Cooperation - SMM](#06-k-qemu-systemkgdb-cooperation---smm)
 - [07-a. Misc - Conversion](#07-a-misc---conversion)
 - [07-b. Misc - Search](#07-b-misc---search)
 - [07-c. Misc - Generation](#07-c-misc---generation)
@@ -10560,6 +10561,113 @@ usage: uefi-ovmf-info [-h]
 
 options:
   -h, --help  show this help message and exit
+```
+
+# 06-k. Qemu-system/KGDB Cooperation - SMM
+## smm-dump
+
+Dump SMRAM to disk when the CPU is in System Management Mode.
+
+By default dumps only when :func:`is_in_smm` is True (i.e. ``$pc`` lies
+inside the SMRAM physical range) -- otherwise prints a warning and exits.
+Pass ``--force`` to dump regardless of the in-SMM verdict (useful for
+inspecting SMRAM contents without first driving the guest into SMM) and
+``--commit`` to actually write bytes (without it the command is a dry run,
+mirroring :class:`SmartMemoryDumpCommand`).
+
+
+### Syntax
+
+```text
+usage: smm-dump [-h] [-f] [-c]
+
+options:
+  -h, --help    show this help message and exit
+  -f, --force   dump even if the CPU is not currently in SMM.
+  -c, --commit  actually write the dump file (without this flag, dry run only).
+```
+
+### Examples
+
+```gdb
+smm-dump                   # dry run; prints where the dump would go
+smm-dump --commit          # dump SMRAM only if in SMM
+smm-dump --commit --force  # dump SMRAM regardless of in-SMM status
+```
+
+### Notes
+
+```text
+When `is_in_smm()` is True, SMRAM is read via virtmode :func:`read_memory` (GDB's `m` packet routes through the CPU's current AS, which during SMM is the per-CPU SMM AS); falls back to :func:`read_physmem` only if the virtmode read is empty. Physmode/`monitor xp`/`monitor gpa2hva` paths use the system AS, where the chipset's SMRAM overlay is masked by D_OPEN and reads return `0xff` or `pc.ram` zero-fill, never real SMM bytes.
+```
+
+## smm-info
+
+Visualize SMM-relevant x86 architectural state.
+
+Prepends an SMM-status banner and (with ``-v``) appends a 256-byte
+save-state hexdump at SMRAM base on top of the rich CR0/CR3/CR4/CR8/XCR0/
+DR0-7/EFER/GDT/IDT/LDT/TR breakdown produced via
+:meth:`QemuRegistersCommand.qregisters_x86_x64`.
+
+
+### Syntax
+
+```text
+usage: smm-info [-h] [-v] [-n]
+
+options:
+  -h, --help      show this help message and exit
+  -v, --verbose   also display a 256-byte save-state hexdump preview at SMRAM base.
+  -n, --no-pager  do not use the pager.
+```
+
+### Examples
+
+```gdb
+smm-info        # SMM banner + CR0/CR3/CR4/EFER/GDT/IDT/LDT/TR breakdown
+smm-info -v     # also print a 256-byte save-state preview via hexdump
+```
+
+### Notes
+
+```text
+Only meaningful when debugging qemu-system-x86[_64]. SMBASE is polled best-effort via the QEMU monitor and skipped silently when not exposed.
+```
+
+## smm-status
+
+Tell whether the CPU is currently in System Management Mode (SMM).
+
+Detection heuristic: in SMM the CPU executes from a code window inside the
+SMRAM physical region (SMBASE + 0x8000 in the legacy DOS layout, an
+arbitrary address inside TSEG on modern Q35). ``$pc in SMRAM`` is therefore
+a reliable in-SMM indicator on QEMU. The command also scans
+``monitor info registers`` for an SMM token as a secondary cross-check and
+reports whichever signals fire.
+
+
+### Syntax
+
+```text
+usage: smm-status [-h] [-q]
+
+options:
+  -h, --help   show this help message and exit
+  -q, --quiet  print only `in_smm` or `not_in_smm` (scriptable).
+```
+
+### Examples
+
+```gdb
+smm-status        # show in-SMM verdict with rationale
+smm-status --quiet # script-friendly single-token output
+```
+
+### Notes
+
+```text
+Only meaningful when debugging qemu-system-x86[_64]. SMM has no dedicated architectural flag exposed via the gdb stub, so detection relies on $pc lying within the SMRAM physical range resolved from `monitor info mtree -f`.
 ```
 
 # 07-a. Misc - Conversion
