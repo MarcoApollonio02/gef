@@ -206,7 +206,7 @@ def read_memory(addr, length):
 
     if is_arm64() and is_qemu_system():
         if Config.get_gef_setting("gef.read_memory_work_around_for_aarch64_secure_memory"):
-            from gef.commands.xsecure_mem import XSecureMemAddrCommand
+            from gef.commands.kernel.trustzone import XSecureMemAddrCommand
 
             sm = QemuMonitor.get_secure_memory_map()
             if sm:

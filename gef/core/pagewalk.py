@@ -44,7 +44,7 @@ class PageMap:
     @staticmethod
     @Cache.cache_until_next
     def get_page_maps_arm64_optee_secure_memory(verbose=False):
-        from gef.commands.xsecure_mem import XSecureMemAddrCommand
+        from gef.commands.kernel.trustzone import XSecureMemAddrCommand
         # heuristic search of qemu-system memory
         sm = QemuMonitor.get_secure_memory_map(verbose)
         if sm is None:
