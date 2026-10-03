@@ -7,7 +7,6 @@ Import failures are recorded per-module (runtime.missing_modules), not fatal —
 mirroring the legacy `Gef.missing_commands` / `gef missing` behavior.
 """
 import gdb
-import hashlib
 import importlib
 import os
 import pkgutil
