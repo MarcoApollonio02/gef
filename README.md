@@ -40,26 +40,28 @@ Numerous other commands have been added and enhanced. Enjoy!
 ### Install
 - Run the following command:
     ```bash
-    wget -q https://raw.githubusercontent.com/bata24/gef/dev/install-uv.sh -O- | sudo sh
+    wget -q https://raw.githubusercontent.com/MarcoApollonio02/gef/dev/install-uv.sh -O- | sudo sh
     ```
     - Notes
-        - To simplify installation, `gef.py` is always installed to `/root/.gef/gef.py`
+        - The installer downloads and extracts the repository archive, then installs the `gef/` package to `/root/.gef/gef/` together with the entry file `/root/.gef/gef-bootstrap.py`.
+        - Any legacy single-file `/root/.gef/gef.py` is removed; it no longer exists in the repository.
         - The required Python packages are in `/root/.gef/.venv-gef`.
-        - GEF's directory (`/root/.gef`) is also registered in `/root/.gdbinit`.
+        - GEF's directory (`/root/.gef`) is also registered in `/root/.gdbinit` (this line is unchanged: `python sys.path.insert(0, "/root/.gef"); from gef import *; Gef.main()`).
         - For more installation options (for non-`root` user, etc), see [docs/FAQ.md](docs/FAQ.md).
 
 - Or, quick trial (no installation):
     ```bash
-    wget https://raw.githubusercontent.com/bata24/gef/dev/gef.py
-    echo "source $(pwd)/gef.py" >> ~/.gdbinit
+    git clone https://github.com/MarcoApollonio02/gef
+    echo "source $(pwd)/gef/gef-bootstrap.py" >> ~/.gdbinit
     ```
     - Notes
+        - `gef-bootstrap.py` adds its directory to `sys.path`, imports the `gef` package, and runs `Gef.main()`.
         - Most features work fine even without external tools or `root` privileges.
         - For limitations, see [docs/FAQ.md](docs/FAQ.md).
 
 ### Upgrade
 ```bash
-python3 /root/.gef/gef.py --upgrade
+python3 /root/.gef/gef-bootstrap.py --upgrade
 ```
 
 - Note
@@ -844,9 +846,9 @@ For a comprehensive list and additional details, see [docs/SUPPORTED-MODE.md](do
 ### Other
 - The category is introduced in `gef help`.
     - ![](images/gef-help.png)
-- Combined into one file (from `gef-extras`). The following are moved from `gef-extras`.
+- Combined into the main GEF distribution (from `gef-extras`). The following are moved from `gef-extras`.
     - `current-stack-frame`, `xref-telescope`, `bytearray`, and `bincompare`.
-    - This is because a single file is more attractive for me than ease of maintenance.
+    - This is because bundling them with the main GEF distribution is more attractive for me than maintaining them separately.
 - The system-call table used by `syscall-args` is moved from `gef-extras`.
     - It was updated up to Linux kernel 7.0 for each architecture.
 - Removed some features that I don't use.
@@ -864,6 +866,8 @@ For a comprehensive list and additional details, see [docs/SUPPORTED-MODE.md](do
 - See [docs/FAQ.md](docs/FAQ.md).
 
 ## Links
+- About this fork
+    - This repository is [`MarcoApollonio02/gef`](https://github.com/MarcoApollonio02/gef), a fork of [`bata24/gef`](https://github.com/bata24/gef) (itself a fork of [`hugsy/gef`](https://github.com/hugsy/gef)). The fork's `dev` branch is the source of all install, quick-trial, and upgrade instructions above.
 - Why I decided to make this
     - [gefを改造した話](https://hackmd.io/@bata24/rJVtBJsrP)
 - The story behind each command, etc.

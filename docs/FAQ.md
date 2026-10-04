@@ -16,10 +16,12 @@
 
 # About GEF's Files or Directories
 
-## Where is `gef.py`?
-By default, GEF (`gef.py`) is placed at `/root/.gef/gef.py`.
+## Where is the GEF code?
+By default, GEF is installed under `/root/.gef`:
+- The entry file is `/root/.gef/gef-bootstrap.py`.
+- The code is the `gef/` package at `/root/.gef/gef/`.
 
-GEF is primarily a single file (`gef.py`). Optional configuration and helper files may accompany it.
+GEF used to be a single file (`gef.py`), but it no longer exists: the monolith was split into the `gef/` package. The installers place the package under `/root/.gef/gef/` and the entry file at `/root/.gef/gef-bootstrap.py`.
 
 ## What is `~/.gef.rc`?
 This is the GEF configuration file. It is not present by default.
@@ -31,22 +33,20 @@ This includes the current values of items configurable with `gef config` and use
 ## What is `~/.gdbinit`?
 This is the command file that GDB will execute when it starts up.
 
-By including the following command to load `gef.py`, GEF will be loaded automatically.
+By including one of the following commands to load GEF, GEF will be loaded automatically.
 There are two ways to load GEF from `.gdbinit`; either one works.
 ```
-# New style
+# Installed (the installer adds this line)
 python sys.path.insert(0, "/root/.gef"); from gef import *; Gef.main()
 
-# Old style
-source /root/.gef/gef.py
-
-# Another old style
-source /root/.gdbinit-gef.py  # In the old installer, GEF was located here
+# Quick trial from a checkout (no installation)
+source /path/to/gef/gef-bootstrap.py
 ```
 
 Notes:
-- The former (new style) imports GEF using Python. Because a `*.pyc` file is generated and cached, subsequent startups are faster. This is the default setting in recent versions of GEF.
-- The latter (old style) is the traditional method, where GEF is loaded directly. It takes longer to load each time, but the command is simpler.
+- The installed style imports GEF using Python. Because a `*.pyc` file is generated and cached, subsequent startups are faster. This is the default setting produced by the installers.
+- The quick-trial style sources `gef-bootstrap.py`, which adds its directory to `sys.path`, imports the `gef` package, and runs `Gef.main()`.
+- The previous single-file style (`source .../gef.py`) no longer applies: the monolith `gef.py` has been replaced by the `gef/` package.
 
 ## What is `/tmp/gef`?
 This is the directory where GEF temporarily stores files.
@@ -54,7 +54,7 @@ This is the directory where GEF temporarily stores files.
 Since it is used for caching, deleting it does not cause any issues.
 It will be created automatically the next time GEF starts.
 
-The variable `GEF_TEMP_DIR` is defined in `gef.py` and can be changed if necessary.
+The variable `GEF_TEMP_DIR` is defined in `gef/core/utils.py` and can be changed if necessary.
 
 ## What is `install-uv.sh`?
 This is the new installer that creates and uses a Python virtual environment (`venv`) with `uv`.
@@ -65,10 +65,12 @@ The key difference is that Python packages are installed into the virtual enviro
 By default, it installs into `/root/.gef/.venv-gef`.
 External tools such as `rp++`(`rp-lin`), `seccomp-tools`, etc. are also installed under this directory (`/root/.gef/.venv-gef/bin`).
 
+Like the other installers, it downloads and extracts the repository archive, and installs the `gef/` package to `/root/.gef/gef/` together with the entry file `/root/.gef/gef-bootstrap.py` (removing any legacy `/root/.gef/gef.py`).
+
 Usage:
 ```
 # Run the following commands as `root` or `sudo`
-wget -q https://raw.githubusercontent.com/bata24/gef/dev/install-uv.sh -O- | sudo sh
+wget -q https://raw.githubusercontent.com/MarcoApollonio02/gef/dev/install-uv.sh -O- | sudo sh
 ```
 
 ## What is `install-no-uv.sh`?
@@ -82,11 +84,11 @@ Usage:
 
 # On Ubuntu 23.04 or later, global Python package installation via pip3 is restricted.
 # Use the --break-system-packages option.
-wget -q https://raw.githubusercontent.com/bata24/gef/dev/install-no-uv.sh -O- \
+wget -q https://raw.githubusercontent.com/MarcoApollonio02/gef/dev/install-no-uv.sh -O- \
 | sed -e 's/pip3 install/pip3 install --break-system-packages/g' | sudo sh
 
 # For Ubuntu 22.10 or earlier
-wget -q https://raw.githubusercontent.com/bata24/gef/dev/install-no-uv.sh -O- | sudo sh
+wget -q https://raw.githubusercontent.com/MarcoApollonio02/gef/dev/install-no-uv.sh -O- | sudo sh
 ```
 
 ## What is `install-minimal.sh`?
@@ -97,17 +99,18 @@ Most core features work, but commands that depend on extra Python packages or ex
 Usage:
 ```
 # Run the following commands as `root` or `sudo`
-wget -q https://raw.githubusercontent.com/bata24/gef/dev/install-minimal.sh -O- | sudo sh
+wget -q https://raw.githubusercontent.com/MarcoApollonio02/gef/dev/install-minimal.sh -O- | sudo sh
 ```
 
 Notes:
-- The process is straightforward: download `gef.py`, place it in the appropriate location, and add a line to `.gdbinit` to load it. You can also do the same thing manually.
+- The process is straightforward: download and extract the repository archive, install the `gef/` package to `/root/.gef/gef/` with the entry file `/root/.gef/gef-bootstrap.py`, and add a line to `.gdbinit` to load it. You can also do the same thing manually.
+- Any legacy single-file `/root/.gef/gef.py` is removed.
 - Because it does not install any Python packages, it does not create a `venv`.
 
 ## What is `gef.venv.conf`?
 This is the path information file required by GEF that is automatically generated when you install GEF using `install-uv.sh`.
 It is not generated if you use `install-no-uv.sh` or `install-minimal.sh`.
-Place this file in the same directory as `gef.py`.
+Place this file in the GEF directory, i.e. the same directory as `gef-bootstrap.py` (`/root/.gef`).
 
 It contains three pieces of path information:
 - `GEF_VENV_GEM_HOME`
@@ -132,7 +135,7 @@ There are three installers.
     - This is the currently recommended installer for GEF.
 - Minimal install
     - This is the installation method provided by `install-minimal.sh`.
-    - Simply download `gef.py` and place it in the appropriate location.
+    - It simply downloads and extracts the repository archive and installs the `gef/` package to `/root/.gef/gef/` with the entry file `/root/.gef/gef-bootstrap.py`.
     - Because this method is very simple, it can also be performed manually.
 - Normal install
     - This is the installation method provided by `install-no-uv.sh`.
@@ -167,7 +170,7 @@ This is NOT officially supported; proceed at your own risk. Future updates may b
 
 ```
 # First, download GEF install script
-wget -q https://raw.githubusercontent.com/bata24/gef/dev/install-uv.sh -P /tmp
+wget -q https://raw.githubusercontent.com/MarcoApollonio02/gef/dev/install-uv.sh -P /tmp
 
 # apt-get install as root
 sudo apt-get update
@@ -188,15 +191,17 @@ sudo rm -rf /tmp/gef
 Alternative simple method (no external tools; simple loading):
 
 ```
-# Download
-wget -q https://raw.githubusercontent.com/bata24/gef/dev/gef.py -O ~/.gdbinit-gef.py
+# Download and extract the repository archive
+wget -q https://github.com/MarcoApollonio02/gef/archive/refs/heads/dev.tar.gz -O /tmp/gef.tar.gz
+tar -xzf /tmp/gef.tar.gz -C "$HOME"
+mv "$HOME/gef-dev" "$HOME/.gef"   # GEF_DIR now contains gef/ and gef-bootstrap.py
 
 # Add path to .gdbinit
-echo "source $HOME/.gdbinit-gef.py" >> ~/.gdbinit
+echo "source $HOME/.gef/gef-bootstrap.py" >> ~/.gdbinit
 ```
 
 Notes:
-- GEF is designed to have as few dependencies as possible. Many commands should work with just `gef.py` without any additional external tools.
+- GEF is designed to have as few dependencies as possible. Many commands should work with just the `gef/` package and its `gef-bootstrap.py` entry file without any additional external tools.
 - If you do not install external tools, the features that will not be available are listed below.
 
 ## If I do not install external tools, which commands will no longer be available?
@@ -576,7 +581,7 @@ If you are referring to system-wide `glibc`, you can resolve this with the follo
 2. Add `set debug-file-directory /usr/lib/debug` to `~/.gdbinit`.
 
 ## The command to get the source (e.g., `ptr-mangle --source`) does not work.
-Do not use `~` in paths that point to the `gef.py` directory in `.gdbinit`.
+Do not use `~` in paths that point to the GEF directory in `.gdbinit`.
 
 Python's `inspect` may not expand tildes reliably; use absolute paths instead.
 I encountered this behavior in Python 3.9.2 on Debian 11.
