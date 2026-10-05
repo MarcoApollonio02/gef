@@ -25,7 +25,7 @@ from gef.core.address import AddressUtil
 from gef.core.auxv import Auxv
 from gef.core.color import Color, err, gef_print, titlify, warn
 from gef.core.elf import Elf
-from gef.core.instruction import Disasm, get_insn
+from gef.core.instruction import Disasm
 from gef.core.memory import hexdump, is_valid_addr, read_cstring_from_memory, read_int_from_memory
 from gef.core.process import (
     Path,

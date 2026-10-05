@@ -3,8 +3,8 @@
 Auto-discovery walks the `gef.commands` and `gef.arch` packages and imports
 every submodule in deterministic (alphabetical) order, so dropping a new
 command or architecture file registers it with zero edits to any central list.
-Import failures are recorded per-module (runtime.missing_modules), not fatal —
-mirroring the legacy `Gef.missing_commands` / `gef missing` behavior.
+Import and command-load failures are recorded in runtime.missing_modules,
+not fatal — the same state `gef missing` reports.
 """
 import gdb
 import importlib
@@ -21,14 +21,10 @@ from gef.core.color import Color, err, gef_print, titlify, warn
 from gef.core.config import Config
 from gef.core.display import hexon
 from gef.core.events import EventHandler, EventHooking
+from gef.core.http import http_get
 from gef.core.process import get_arch, is_alive, set_arch
 from gef.core.runtime import ArchRegistry, CommandRegistry
 from gef.core.utils import GEF_FILEPATH, GEF_TEMP_DIR, GefUtil
-
-try:
-    from gef.commands.base import GefAlias  # Phase 2; absent/broken in Phase 1
-except Exception:
-    GefAlias = None
 
 
 def _discover(package):
@@ -48,20 +44,6 @@ def _discover(package):
     return
 
 
-def http_get(url):
-    """Basic HTTP wrapper for GET request."""
-    import urllib.request
-    try:
-        req = urllib.request.Request(url)
-        req.add_header("Cache-Control", "no-cache, no-store")
-        http = urllib.request.urlopen(req, timeout=5)
-        if http.getcode() != 200:
-            return None
-        return http.read()
-    except Exception:
-        return None
-
-
 def update_gef(argv):
     """Try to update `gef` to the latest version (fetch+extract the repo archive)."""
     from gef.core.update import upgrade
@@ -70,8 +52,6 @@ def update_gef(argv):
 
 class Gef:
     """A collection of utility functions that are related to GEF start up."""
-
-    missing_commands = {}
 
     @staticmethod
     def list_current_commands():
@@ -89,6 +69,11 @@ class Gef:
     @staticmethod
     def load_commands():
         """Load all the commands and functions defined by GEF into GDB."""
+        # Imported here rather than at module scope: `gef.commands.base` builds
+        # classes on `gdb.Command`, so a module-scope import would make
+        # `import gef.bootstrap` fail wherever gdb is absent. Importing at load
+        # time keeps the failure loud (no silent `None`) and inside GDB.
+        from gef.commands.base import GefAlias
 
         DEBUG_PERF_TIME = False
         DEBUG_CHECK_COMMAND_CONFLICT = False
@@ -137,7 +122,7 @@ class Gef:
                         GefAlias(alias, cmd_class._cmdline_, pre_defined=True)
 
             except Exception as reason:
-                Gef.missing_commands[cmd_class._cmdline_] = reason
+                runtime.missing_modules[cmd_class._cmdline_] = reason
                 nb_missing += 1
 
         if DEBUG_PERF_TIME:
@@ -342,7 +327,7 @@ class Gef:
         gdb.execute("set print frame-arguments all")
 
         # wire ArchRegistry to the concrete Architecture base and auto-discover
-        # all architectures and commands (Phase 1: no commands exist yet)
+        # all architectures and commands
         ArchRegistry._base = Architecture
         from gef import commands as _commands_pkg
         import gef.arch as _arch_pkg
@@ -356,7 +341,7 @@ class Gef:
         try:
             gdb.execute("gef restore")
         except gdb.error:
-            pass  # no gef command registered in Phase 1; Phase 2 will add these
+            pass  # e.g. no saved settings yet
 
         # follow mode
         if Config.get_gef_setting("gef.follow_child"):

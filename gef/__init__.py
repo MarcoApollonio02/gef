@@ -3,7 +3,8 @@
 This is the package form of the former monolithic gef.py. See
 docs/ARCHITECTURE.md for the layout and layering rules.
 
-Phase 1 status: core + arch + bootstrap + discovery. Commands arrive in Phase 2.
+The package contains the core domain, the architecture families, the command
+implementations, and the bootstrap that discovers and registers them.
 
 All public names are exposed lazily (PEP 562, ``__getattr__``) so that plain
 ``import gef`` and ``from gef import *`` work even outside a GDB session;

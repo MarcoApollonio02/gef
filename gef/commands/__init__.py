@@ -1,7 +1,8 @@
 """gef.commands — command framework public surface.
 
-Phase 1: only the command *base* infrastructure is re-exported here. Actual
-command implementations arrive in Phase 2.
+The command *base* infrastructure is re-exported here. Concrete command
+implementations live in the category subpackages and are auto-discovered by
+gef.bootstrap.
 """
 
 from gef.commands.base import (

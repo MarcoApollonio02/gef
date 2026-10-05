@@ -7,7 +7,8 @@ import os
 import shutil
 import tarfile
 import tempfile
-import urllib.request
+
+from gef.core.http import http_get
 
 GEF_REPO = "MarcoApollonio02/gef"
 GEF_REF = "dev"
@@ -20,15 +21,6 @@ INSTALL_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(_
 
 def hash_path():
     return os.path.join(INSTALL_DIR, HASH_FILENAME)
-
-
-def http_get(url, timeout=60):
-    """Return the URL body as bytes, or None on any failure."""
-    try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
-            return resp.read()
-    except Exception:
-        return None
 
 
 def _safe_extract(tar, dest):
@@ -64,7 +56,7 @@ def _safe_extract(tar, dest):
 
 def check_update():
     """Return 'no-update', 'update', 'unknown' (no recorded hash), or 'error'."""
-    data = http_get(ARCHIVE_URL)
+    data = http_get(ARCHIVE_URL, timeout=60)
     if data is None:
         return "error"
     try:
@@ -84,7 +76,7 @@ def upgrade():
 
     Returns 0 on success, 1 on failure.
     """
-    data = http_get(ARCHIVE_URL)
+    data = http_get(ARCHIVE_URL, timeout=60)
     if data is None:
         return 1
     tmp = tempfile.mkdtemp(prefix="gef-upgrade-")

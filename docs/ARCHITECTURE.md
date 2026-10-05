@@ -163,8 +163,9 @@ flowchart TB
 ### Dependency rules
 
 1. **Core never imports `arch/*` or `commands/*` at module import time.** This is what guarantees
-   no import-time cycles. The only cross-layer import at module scope is `core/arch_base.py`, the
-   abstract contract `set_arch` needs. Where core needs a concrete command or architecture at
+   no import-time cycles. The dependency runs the other way: core defines the abstract
+   `Architecture` contract in `core/arch_base.py`, and `arch/*` imports `core.arch_base`. Where core
+   needs a concrete command or architecture at
    *runtime*, it reaches up through a function-local (late) import inside the method that needs it —
    39 such late imports exist today across `core/syscall.py`, `core/pagewalk.py`, `core/types.py`,
    `core/unicorn.py`, `core/symbols.py`, `core/process.py` and others — so nothing executes at import

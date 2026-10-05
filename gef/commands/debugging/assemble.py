@@ -14,7 +14,6 @@ import sys
 
 import gdb
 
-from gef.bootstrap import http_get
 from gef.commands.base import (
     GenericCommand,
     only_if_gdb_running,
@@ -27,6 +26,7 @@ from gef.core.address import AddressUtil, Endian
 from gef.core.cache import Cache
 from gef.core.color import err, gef_print, info
 from gef.core.config import Config
+from gef.core.http import http_get
 from gef.core.instruction import Disasm
 from gef.core.memory import read_memory
 from gef.core.process import is_alive

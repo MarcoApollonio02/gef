@@ -14,7 +14,6 @@ import sys
 
 import gdb
 
-from gef.bootstrap import http_get
 from gef.commands.base import (
     BufferingOutput,
     GenericCommand,
@@ -30,6 +29,7 @@ from gef.core.cache import Cache
 from gef.core.color import Color, err, gef_print, info, ok, titlify
 from gef.core.config import Config
 from gef.core.exec import ExecSyscall
+from gef.core.http import http_get
 from gef.core.memory import (
     is_valid_addr,
     read_int16_from_memory,

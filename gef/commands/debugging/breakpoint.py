@@ -3,7 +3,6 @@
 Auto-discovered by gef.bootstrap via pkgutil.walk_packages.
 """
 import argparse
-import difflib
 import os
 
 import gdb

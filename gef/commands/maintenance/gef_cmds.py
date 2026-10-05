@@ -17,7 +17,6 @@ from gef.commands.base import (
     BufferingOutput,
     GenericCommand,
     GefAlias,
-    exclude_specific_arch,
     only_if_gdb_running,
     only_if_specific_arch,
     parse_args,
@@ -682,13 +681,12 @@ class GefMissingCommand(GenericCommand):
 
     @parse_args
     def do_invoke(self, args):
-        from gef.bootstrap import Gef
-        missing_commands = Gef.missing_commands.keys()
+        missing_commands = runtime.missing_modules.keys()
         if not missing_commands:
             ok("No missing command")
             return
         for missing_command in missing_commands:
-            reason = Gef.missing_commands[missing_command]
+            reason = runtime.missing_modules[missing_command]
             warn("Command `{}` is missing, reason  ->  {}".format(missing_command, reason))
         return
 
@@ -1807,6 +1805,8 @@ class GefCheckUpdateCommand(GenericCommand):
             info("No update")
         elif status == "update":
             info("Update found, try `python3 {:s} --upgrade`".format(GEF_FILEPATH))
+        elif status == "unknown":
+            info("[-] No recorded install hash; cannot compare (run --upgrade to establish one)")
         else:
             err("[-] Failed to get remote gef information")
         return

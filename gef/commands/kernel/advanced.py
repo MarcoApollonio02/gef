@@ -5111,7 +5111,7 @@ class KernelPciDeviceCommand(GenericCommand, BufferingOutput):
     _note_ = "\n".join(_note_)
 
     def initialize(self):
-        from gef.bootstrap import http_get
+        from gef.core.http import http_get
         if hasattr(self, "initialized") and self.initialized:
             return True
 
