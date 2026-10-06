@@ -681,12 +681,12 @@ class GefMissingCommand(GenericCommand):
 
     @parse_args
     def do_invoke(self, args):
-        missing_commands = runtime.missing_modules.keys()
+        missing_commands = runtime.missing_commands.keys()
         if not missing_commands:
             ok("No missing command")
             return
         for missing_command in missing_commands:
-            reason = runtime.missing_modules[missing_command]
+            reason = runtime.missing_commands[missing_command]
             warn("Command `{}` is missing, reason  ->  {}".format(missing_command, reason))
         return
 

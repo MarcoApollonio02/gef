@@ -195,7 +195,7 @@ never prevents the others from loading, but note the two failure channels are di
 that fails to *import* is recorded in `runtime.missing_modules` and never registers at all (it
 never runs its `@register_command`), so it does not appear in `gef missing`; `gef missing` reports
 commands that registered but failed to *instantiate* in `Gef.load_commands()`, which populates
-`Gef.missing_commands`.
+`runtime.missing_commands`.
 
 ### The `current_arch` rule (critical)
 

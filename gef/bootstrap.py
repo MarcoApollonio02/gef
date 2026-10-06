@@ -3,8 +3,9 @@
 Auto-discovery walks the `gef.commands` and `gef.arch` packages and imports
 every submodule in deterministic (alphabetical) order, so dropping a new
 command or architecture file registers it with zero edits to any central list.
-Import and command-load failures are recorded in runtime.missing_modules,
-not fatal — the same state `gef missing` reports.
+Import failures are recorded in `runtime.missing_modules` (keyed by dotted
+module name) and command-load failures in `runtime.missing_commands` (keyed
+by `_cmdline_`); neither is fatal, and `gef missing` reports the latter.
 """
 import gdb
 import importlib
@@ -122,7 +123,7 @@ class Gef:
                         GefAlias(alias, cmd_class._cmdline_, pre_defined=True)
 
             except Exception as reason:
-                runtime.missing_modules[cmd_class._cmdline_] = reason
+                runtime.missing_commands[cmd_class._cmdline_] = reason
                 nb_missing += 1
 
         if DEBUG_PERF_TIME:
