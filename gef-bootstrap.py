@@ -9,5 +9,15 @@ import sys
 
 _bootstrap_dir = os.path.dirname(globals().get("__file__", os.path.realpath("gef-bootstrap.py")))
 sys.path.insert(0, _bootstrap_dir)
+
+try:
+    import gdb  # noqa: F401
+except ImportError:
+    if len(sys.argv) == 2 and sys.argv[1].lower() in ("--update", "--upgrade", "-u"):
+        from gef.core.update import upgrade
+        sys.exit(upgrade())
+    print("[-] gef cannot run as standalone (use --upgrade to update the installation)")
+    sys.exit(0)
+
 from gef import *  # noqa: F401,F403
 Gef.main()

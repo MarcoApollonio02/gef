@@ -44,7 +44,7 @@ from gef.core.strings import String
 
 GEF_TEMP_DIR = os.path.join(tempfile.gettempdir(), "gef")
 GEF_RC = os.getenv("GEF_RC") or os.path.join(os.getenv("HOME") or "~", ".gef.rc")
-GEF_FILEPATH = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+GEF_FILEPATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))), "gef-bootstrap.py")
 
 
 

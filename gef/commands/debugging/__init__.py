@@ -1,0 +1,1 @@
+"""GEF debugging commands (category 01). Auto-discovered."""

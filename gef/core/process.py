@@ -1002,7 +1002,7 @@ class ProcessMap:
         if runtime.current_arch is None:
             return []
 
-        from gef.commands.elf_info import ElfInfoCommand
+        from gef.commands.process.general import ElfInfoCommand
 
         def is_valid_addr_fast(addr):
             try:

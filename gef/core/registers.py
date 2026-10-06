@@ -76,7 +76,7 @@ def get_register(regname, use_mbed_exec=False, use_monitor=False):
             return int(r.group(1), 16)
 
     if use_mbed_exec and is_kgdb() and (is_x86_64() or is_arm64()):
-        from gef.commands.read_system_register_for_kgdb import ReadSystemRegisterForKgdbCommand
+        from gef.commands.kernel.register import ReadSystemRegisterForKgdbCommand
 
         if ReadSystemRegisterForKgdbCommand.is_supported_reg(regname):
             try:

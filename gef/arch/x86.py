@@ -12,6 +12,7 @@ from gef.core.arch_base import Architecture
 from gef.core.address import AddressUtil
 from gef.core.color import Color
 from gef.core.elf import Elf
+from gef.core.exec import ExecAsm
 from gef.core.memory import (read_int_from_memory, read_cstring_from_memory,
                              read_memory, write_memory, is_valid_addr,
                              p32, p64, u8, u16, u32, u64)

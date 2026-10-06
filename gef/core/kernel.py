@@ -6,7 +6,7 @@ structure offsets; `Kernel` provides kernel map/version/cmdline/slab helpers.
 Extracted verbatim from gef.py (KernelConsts* ~L58445, Kernel ~L64257). Bare
 `current_arch` reads were rewritten to `runtime.current_arch`, and the monolith
 global `__gef_command_instances__` to `runtime.CommandRegistry.instances`. The
-Phase-2-only `gef.commands.idt_info.IdtInfoCommand` reference is a late import
+Phase-2-only `gef.commands.kernel.register.IdtInfoCommand` reference is a late import
 guarded by `ModuleNotFoundError` inside the referencing method.
 """
 import collections
@@ -2288,7 +2288,7 @@ class Kernel:
                     idt_data = read_memory(base, min(limit + 1, runtime.current_arch.ptrsize * 2 * 256))
                     entries = slice_unpack(idt_data, runtime.current_arch.ptrsize * 2)
                     try:
-                        from gef.commands.idt_info import IdtInfoCommand
+                        from gef.commands.kernel.register import IdtInfoCommand
                     except ModuleNotFoundError:
                         return None
                     idt0 = IdtInfoCommand.idt_unpack(entries[0])

@@ -502,7 +502,7 @@ class GlibcHeap:
     @Cache.cache_until_next
     def search_for_mp_():
         """search for mp_ from main_arena, then return addr."""
-        from gef.commands.heap_base import HeapBaseCommand
+        from gef.commands.process.base_address import HeapBaseCommand
 
         main_arena_ptr = GlibcHeap.search_for_main_arena_from_tls()
         if main_arena_ptr is None:
@@ -728,7 +728,7 @@ class GlibcHeap:
     @Cache.cache_until_next
     def search_for_main_arena_from_tls():
         """search for main arena from TLS, then return &addr."""
-        from gef.commands.tls import TlsCommand
+        from gef.commands.process.base_address import TlsCommand
         from gef.core.process import get_pagesize, is_m68k
 
 
@@ -1131,7 +1131,7 @@ class GlibcHeap:
 
         @property
         def heap_base(self):
-            from gef.commands.heap_base import HeapBaseCommand
+            from gef.commands.process.base_address import HeapBaseCommand
 
             if self.is_main_arena:
                 return HeapBaseCommand.heap_base()

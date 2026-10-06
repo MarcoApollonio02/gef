@@ -13,6 +13,7 @@ gef.commands `TlsCommand` / `XSecureMemAddrCommand`) are late-imported inside
 the referencing method.
 """
 import gdb
+import itertools
 import re
 
 from gef.core import runtime
@@ -43,7 +44,7 @@ class PageMap:
     @staticmethod
     @Cache.cache_until_next
     def get_page_maps_arm64_optee_secure_memory(verbose=False):
-        from gef.commands.xsecure_mem import XSecureMemAddrCommand
+        from gef.commands.kernel.trustzone import XSecureMemAddrCommand
         # heuristic search of qemu-system memory
         sm = QemuMonitor.get_secure_memory_map(verbose)
         if sm is None:
@@ -4007,7 +4008,7 @@ class KernelAddressHeuristicFinder:
 
         # plan 1 (directly)
         from gef.core.kernel import Kernel, KernelConstsArm32, KernelConstsArm64, KernelConstsX64, KernelConstsX86
-        from gef.commands.tls_command import TlsCommand
+        from gef.commands.process.base_address import TlsCommand
         if KernelAddressHeuristicFinder.USE_DIRECTLY:
             x = Symbol.get_ksymaddr("debugfs_list")
             if x:
@@ -4059,7 +4060,7 @@ class KernelAddressHeuristicFinder:
 
         # plan 1 (directly)
         from gef.core.kernel import Kernel, KernelConstsArm32, KernelConstsArm64, KernelConstsX64, KernelConstsX86
-        from gef.commands.tls_command import TlsCommand
+        from gef.commands.process.base_address import TlsCommand
         if KernelAddressHeuristicFinder.USE_DIRECTLY:
             x = Symbol.get_ksymaddr("dmabuf_list")
             if x:
