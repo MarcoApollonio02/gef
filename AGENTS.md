@@ -60,9 +60,9 @@ for the package layout, the layering rules, and the contributor walkthroughs.
    - Commands (and `core/`) must never import `gef.bootstrap` (Layer 4).
 2. **`current_arch` is never imported by name.** It is rebound by `set_arch()`; always access it
    as `runtime.current_arch`. In executable code there are **zero** bare `current_arch`
-   references; occurrences inside help strings/comments are intentional and preserved.
-   Enforce with:
-   `grep -rn '\bcurrent_arch\b' gef/ --include='*.py' | grep -v 'gef/core/runtime.py' | grep -v 'runtime.current_arch' | grep -v '"' | grep -v "'"` → must print nothing.
+   references; occurrences inside help strings (like `(default: current_arch.pc)`) and comments
+   are intentional and preserved. Enforce with:
+   `grep -rn '\bcurrent_arch\b' gef/ --include='*.py' | grep -v 'gef/core/runtime.py' | grep -v 'runtime.current_arch' | grep -v '#' | grep -v '"' | grep -v "'"` → must print nothing.
 3. **Registry access.** Use `runtime.CommandRegistry` / `runtime.ArchRegistry`; never create or
    reference module-level `__gef_command_instances__`-style globals.
 4. **Family co-location.** An inheritance family of commands lives in one file.
