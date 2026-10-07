@@ -51,7 +51,7 @@ Numerous other commands have been added and enhanced. Enjoy!
 
 - Or, quick trial (no installation):
     ```bash
-    git clone https://github.com/MarcoApollonio02/gef
+    git clone -b dev https://github.com/MarcoApollonio02/gef
     echo "source $(pwd)/gef/gef-bootstrap.py" >> ~/.gdbinit
     ```
     - Notes

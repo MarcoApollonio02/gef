@@ -38,13 +38,11 @@ from gef.core.color import Color, err, info
 from gef.core.color import gef_print  # noqa: F401  (re-export for GefUtil.show_last_exception users)
 from gef.core.config import Config
 from gef.core.errors import show_last_exception  # noqa: F401  (re-export)
-from gef.core.memory import is_valid_addr, read_int_from_memory, u128
+from gef.core.memory import is_double_link_list, is_single_link_list, is_valid_addr, read_int_from_memory, u128
 from gef.core.strings import String
 
 
-GEF_TEMP_DIR = os.path.join(tempfile.gettempdir(), "gef")
-GEF_RC = os.getenv("GEF_RC") or os.path.join(os.getenv("HOME") or "~", ".gef.rc")
-GEF_FILEPATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))), "gef-bootstrap.py")
+from gef.core.runtime import GEF_FILEPATH, GEF_RC, GEF_TEMP_DIR  # noqa: F401  (re-exported; canonical home)
 
 
 
@@ -352,53 +350,9 @@ def switch_to_intel_syntax(f):
 
 
 
-@Cache.cache_until_next
-def is_single_link_list(addr):
-    # +------+   +------+           +------+
-    # | head |-->| next |--> ... -->| next |--> NULL
-    # +------+   +------+           +------+
+# is_single_link_list / is_double_link_list are canonical in `gef.core.memory`
+# and imported above (kept importable from here for compatibility).
 
-    seen = []
-    while True:
-        if addr == 0:
-            return True
-        if addr in seen:
-            return False
-        if not is_valid_addr(addr):
-            return False
-        seen.append(addr)
-        addr = read_int_from_memory(addr)
-
-
-@Cache.cache_until_next
-def is_double_link_list(addr, min_len=0):
-    # +------+<-+   +------+<-+        <-+   +------+<-+   +------+
-    # | head |--|-->| next |--|--> ... --|-->| next |--|-->| head |
-    # +------+  |   +------+  |          |   +------+  |   +------+
-    # | tail |  +---| prev |  +---       +---| prev |  +---| tail |
-    # +------+      +------+                 +------+      +------+
-
-    # list next pointer
-    seen = []
-    while True:
-        if not is_valid_addr(addr):
-            return False
-        if addr in seen:
-            break
-        seen.append(addr)
-        addr = read_int_from_memory(addr)
-
-    if addr != seen[0]:
-        return False
-
-    # check prev pointer
-    for i, x in enumerate(seen):
-        p = read_int_from_memory(x + runtime.current_arch.ptrsize)
-        if p != seen[i - 1]:
-            return False
-
-    # minimum length check
-    return len(seen) > min_len
 
 
 

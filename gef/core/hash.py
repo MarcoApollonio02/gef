@@ -15,17 +15,7 @@ import sys
 
 from gef.core.strings import String
 
-try:
-    from gef.core.utils import GEF_TEMP_DIR
-except ModuleNotFoundError as exc:
-    if exc.name != "gdb":
-        raise
-    # `gef.core.utils` imports gdb at module level, so importing it fails outside a
-    # GDB session (e.g. the unit-test tier). Mirror the constant's definition there
-    # so this module stays importable while `GEF_TEMP_DIR` remains a real global.
-    import tempfile
-
-    GEF_TEMP_DIR = os.path.join(tempfile.gettempdir(), "gef")
+from gef.core.runtime import GEF_TEMP_DIR
 
 
 class Hash:

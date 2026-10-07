@@ -11401,4 +11401,3 @@ class SyscallCSKY(Syscall):
                 raise
             syscall_list.append([nr, name, sc_def[func]])
         return syscall_list
-#

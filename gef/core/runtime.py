@@ -10,6 +10,21 @@ This module is the single home for mutable global state and the C-track seam:
 
 This module must NOT import gdb or any higher layer (arch/*, commands/*).
 """
+
+import os
+import tempfile
+
+# Known filesystem paths. These live here (Layer 0, gdb-free) rather than in
+# `gef.core.utils`, which imports gdb at module level — so they stay importable
+# outside a GDB session (e.g. the unit-test tier). `gef.core.utils` re-exports
+# them so existing `from gef.core.utils import ...` callers are unaffected.
+GEF_TEMP_DIR = os.path.join(tempfile.gettempdir(), "gef")
+GEF_RC = os.getenv("GEF_RC") or os.path.join(os.getenv("HOME") or "~", ".gef.rc")
+GEF_FILEPATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))),
+    "gef-bootstrap.py",
+)
+
 class CommandRegistry:
     """Holds registered command classes and instantiated commands.
 

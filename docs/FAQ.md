@@ -194,7 +194,8 @@ Alternative simple method (no external tools; simple loading):
 # Download and extract the repository archive
 wget -q https://github.com/MarcoApollonio02/gef/archive/refs/heads/dev.tar.gz -O /tmp/gef.tar.gz
 tar -xzf /tmp/gef.tar.gz -C "$HOME"
-mv "$HOME/gef-dev" "$HOME/.gef"   # GEF_DIR now contains gef/ and gef-bootstrap.py
+mv "$HOME/gef-dev" "$HOME/.gef"  # make sure "$HOME/.gef" does not already exist first
+   # GEF_DIR now contains gef/ and gef-bootstrap.py
 
 # Add path to .gdbinit
 echo "source $HOME/.gef/gef-bootstrap.py" >> ~/.gdbinit
