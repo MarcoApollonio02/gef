@@ -15,3 +15,5 @@ docs/superpowers/
 __pycache__/
 *.pyc
 .venv-dev/
+!/.github/
+!/.github/copilot-instructions.md
