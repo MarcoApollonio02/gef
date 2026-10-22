@@ -265,7 +265,7 @@ class HeapBaseCommand(GenericCommand):
         return None
 
     @staticmethod
-    @Cache.cache_this_session_skip_None_cache
+    @Cache.cache_this_session(cache_None=False)
     def heap_base(force_heuristic=False):
         heap_base = getattr(HeapBaseCommand, "heap_base_user_specific", None)
         if is_valid_addr(heap_base):

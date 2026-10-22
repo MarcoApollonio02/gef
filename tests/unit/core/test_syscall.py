@@ -20,9 +20,14 @@ from gef.core.syscall import Syscall, SyscallX86_64
 def clean_syscall_cache():
     """Drop the session cache so stubbed globals are not shadowed by stale results."""
     from gef.core.cache import Cache
-    Cache.__gef_caches__["this_session"].clear()
+    # Clear each per-function dict in place (as Cache.reset_gef_caches does):
+    # since the upstream Cache port, wrappers capture their dict at decoration
+    # time, so clearing the outer dict alone would not invalidate them.
+    for fcache in Cache.__gef_caches__["this_session"].values():
+        fcache.clear()
     yield
-    Cache.__gef_caches__["this_session"].clear()
+    for fcache in Cache.__gef_caches__["this_session"].values():
+        fcache.clear()
 
 
 def test_module_imports_without_gdb():

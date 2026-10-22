@@ -851,7 +851,7 @@ class GlibcHeap:
         return None
 
     @staticmethod
-    @Cache.cache_this_session_skip_None_cache
+    @Cache.cache_this_session(cache_None=False)
     def search_for_main_arena():
         """Search for the address of main_arena using multiple strategies and caches the result."""
         from gef.core.process import is_arm32, is_arm64, is_x86

@@ -2646,7 +2646,7 @@ class Kernel:
             return "{:d}.{:d}.{:d}".format(*self.version_tuple)
 
     @staticmethod
-    @Cache.cache_this_session_skip_None_cache
+    @Cache.cache_this_session(cache_None=False)
     def kernel_version():
         # fast path
         linux_banner = None
@@ -2694,7 +2694,7 @@ class Kernel:
         return None
 
     @staticmethod
-    @Cache.cache_this_session_skip_None_cache
+    @Cache.cache_this_session(cache_None=False)
     def kernel_cmdline():
         saved_command_line = None
         if is_kdb():
