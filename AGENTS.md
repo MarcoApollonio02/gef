@@ -1,14 +1,13 @@
 # AGENTS.md — guide for AI coding agents working on this repository
 
 This file is the single source of truth for agent-facing instructions. Agent-specific files
-(`CLAUDE.md`, `GEMINI.md`, `AGENT.md`, `.github/copilot-instructions.md`) are thin pointers here —
-edit **this** file, not them.
+(`CLAUDE.md`, `GEMINI.md`, `AGENT.md`, `.github/copilot-instructions.md`) are thin pointers here.
 
 ## What this repo is
 
 A fork of `bata24/gef` ([origin](https://github.com/MarcoApollonio02/gef), default branch `dev`):
 a GDB plugin (GEF — GDB Enhanced Features) implemented as a Python package loaded into GDB's
-embedded Python interpreter. It has been modularized from a single ~160k-line `gep.py` monolith
+embedded Python interpreter. It has been modularized from a single ~160k-line `gef.py` monolith
 into the `gef/` package; the monolith no longer exists in this repo. **Operators work on branches
 and open PRs against `dev`** — pushing to `dev` directly is protected by a repository ruleset.
 
@@ -42,8 +41,6 @@ docs/
 └── FAQ.md
 asmdb/                  ← data blob fetched on demand by the assemble command
 install-*.sh            ← installers (fetch+extract the repo archive into /root/.gef/)
-dev/                    ← maintainers' dev tooling (not shipped; may lag behind)
-docs/superpowers/       ← design specs + implementation plans (gitignored, local only)
 ```
 
 Read `docs/ARCHITECTURE.md` before touching anything structural — it is the canonical reference
@@ -137,11 +134,9 @@ actual output, not the intention that "it should work".
 
 ## Development workflow with AI agents (use the superpowers skills)
 
-This repo is developed with the **superpowers** skills (available under `~/.agents/skills/`).
-Follow them in this order when implementing anything beyond a one-line fix. The agent's own
-provider environment should be treated as default (inherit the session model when launching
-subagents).
-
+This repo is developed with the **superpowers** skills.
+Follow them in this order when implementing anything beyond a one-line fix.
+If the skill is missing or not installed advise the user to install it first.
 1. **brainstorming** — before designing a feature. Understanding intent and tradeoffs first.
 2. Write a **spec** in `docs/superpowers/specs/` and an **implementation plan** in
    `docs/superpowers/plans/` (both gitignored; local working documents).
