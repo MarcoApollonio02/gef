@@ -6,7 +6,9 @@ gef.bootstrap via pkgutil.walk_packages.
 """
 import argparse
 import os
+import re
 import subprocess
+import tempfile
 
 import gdb
 
@@ -23,7 +25,7 @@ from gef.commands.base import (
 from gef.core import runtime
 from gef.core.address import AddressUtil
 from gef.core.cache import Cache
-from gef.core.color import Color, err, gef_print, info, ok, titlify, warn
+from gef.core.color import Color, err, gef_print, info, titlify, warn
 from gef.core.config import Config
 from gef.core.kernel import Kernel
 from gef.core.memory import (
@@ -37,10 +39,8 @@ from gef.core.memory import (
 from gef.core.process import (
     Pid,
     get_pagesize,
-    is_in_smm,
-    scan_smm_token_in_monitor,
 )
-from gef.core.qemu import QemuMonitor, disable_phys, enable_phys, read_physmem
+from gef.core.qemu import SystemManagementMemory, disable_phys, enable_phys, read_physmem
 from gef.core.registers import get_register
 from gef.core.strings import String
 from gef.core.symbols import ModuleLoader, Symbol
@@ -159,208 +159,199 @@ class KernelSearchCodePtrCommand(GenericCommand, BufferingOutput):
 
 
 @register_command
-class SmmStatusCommand(GenericCommand):
-    """Tell whether the CPU is currently in System Management Mode (SMM).
-
-    Detection heuristic: in SMM the CPU executes from a code window inside the
-    SMRAM physical region (SMBASE + 0x8000 in the legacy DOS layout, an
-    arbitrary address inside TSEG on modern Q35). ``$pc in SMRAM`` is therefore
-    a reliable in-SMM indicator on QEMU. The command also scans
-    ``monitor info registers`` for an SMM token as a secondary cross-check and
-    reports whichever signals fire.
-    """
+class SmmStatusCommand(GenericCommand, BufferingOutput):
+    """Display the current SMM status and an SMRAM preview."""
 
     _cmdline_ = "smm-status"
-    _category_ = "06-k. Qemu-system/KGDB Cooperation - SMM"
+    _category_ = "06-l. Qemu-system/KGDB Cooperation - SMM"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
-    parser.add_argument("-q", "--quiet", action="store_true",
-                        help="print only `in_smm` or `not_in_smm` (scriptable).")
+    parser.add_argument("-q", "--quiet", action="store_true", help="print only in_smm, not_in_smm, or unknown.")
+    parser.add_argument("-n", "--no-pager", action="store_true", help="do not use the pager.")
     _syntax_ = parser.format_help()
 
     _example_ = [
-        "{0:s}        # show in-SMM verdict with rationale",
-        "{0:s} --quiet # script-friendly single-token output",
+        "{0:s}",
+        "{0:s} --quiet",
     ]
     _example_ = "\n".join(_example_).format(_cmdline_)
 
-    _note_ = ("Only meaningful when debugging qemu-system-x86[_64]. "
-              "SMM has no dedicated architectural flag exposed via the gdb "
-              "stub, so detection relies on $pc lying within the SMRAM "
-              "physical range resolved from `monitor info mtree -f`.")
+    _note_ = [
+        "The QEMU monitor SMM flag is preferred.",
+        "On older QEMU builds, the physical instruction address is compared with the detected SMRAM range.",
+        "The preview uses the physical instruction address in SMRAM, or the detected SMRAM base.",
+    ]
+    _note_ = "\n".join(_note_)
+
+    @staticmethod
+    def format_status(status):
+        state = status["state"]
+        if state is True:
+            verdict = Color.colorify("CURRENTLY IN SMM", "bold red")
+        elif state is False:
+            verdict = Color.colorify("NOT in SMM", "bold green")
+        else:
+            verdict = Color.colorify("SMM STATE UNKNOWN", "bold yellow")
+
+        pc = status["pc"]
+        if pc is None:
+            pc_text = "unavailable"
+        else:
+            pc_text = "{:#x}".format(pc)
+        smram = status["smram"]
+        if smram is None:
+            region_text = "unavailable"
+        else:
+            base, size, label = smram
+            region_text = "[{:#x}-{:#x}) {} ({:s})".format(base, base + size, label, GefUtil.get_size_str(size))
+
+        pc_phys = status["pc_phys"]
+        phys_text = "unavailable" if pc_phys is None else "{:#x}".format(pc_phys)
+        lines = ["{:s}: $pc={:s}, physical PC={:s}, SMRAM={:s}".format(verdict, pc_text, phys_text, region_text)]
+        if status["monitor_state"] is not None:
+            reason = "QEMU monitor reports {:s}".format(status["monitor_token"])
+            if status["pc_in_smram"] is not None and status["pc_in_smram"] != status["monitor_state"]:
+                reason += "; PC-range heuristic disagrees (monitor result takes precedence)"
+        elif status["source"] == "pc-range":
+            reason = "physical PC is {:s}the detected SMRAM range; QEMU exposes no SMM marker".format(
+                "inside " if status["pc_in_smram"] else "outside ",
+            )
+        else:
+            reason = "neither a QEMU SMM marker nor a usable physical PC/SMRAM pair is available"
+        lines.append("  rationale: {:s}".format(reason))
+        return lines
+
+    def add_smram_preview(self, status):
+        smram = status["smram"]
+        if smram is None:
+            self.warn_add_out("SMRAM range is unavailable; preview skipped")
+            return
+
+        base, size = smram[:2]
+        preview = base
+        title = "SMRAM preview"
+        if status["state"] is True and status["pc_in_smram"]:
+            preview = max(base, status["pc_phys"] & ~0xf)
+            title = "SMRAM preview at the current PC"
+        preview_size = min(0x100, base + size - preview)
+        self.out.append(titlify(title))
+        data, stats = SystemManagementMemory.read_smram(
+            preview, preview_size, in_smm=status["state"] is True, return_stats=True,
+        )
+        if data is not None:
+            self.out.append(hexdump(data, base=preview, show_symbol=False))
+        else:
+            self.warn_add_out("Could not read all of SMRAM at {:#x} ({:#x}/{:#x} bytes); preview skipped".format(
+                preview, stats["read_bytes"], preview_size,
+            ))
+            for start, end in stats["unreadable_ranges"]:
+                self.warn_add_out("Unreadable SMRAM range: [{:#x}-{:#x})".format(start, end))
+        return
 
     @parse_args
     @only_if_gdb_running
     @only_if_specific_gdb_mode(mode=("qemu-system",))
     @only_if_specific_arch(arch=("x86_32", "x86_64"))
     def do_invoke(self, args):
-        smram = QemuMonitor.get_smram_map(verbose=not args.quiet)
-        if smram is None:
-            if not args.quiet:
-                err("Could not resolve SMRAM map")
-            return
-        smram_base, smram_size = smram
-        smram_end = smram_base + smram_size
-        pc = get_register("$pc")
-        if pc is None:
-            if not args.quiet:
-                err("Could not read $pc")
-            return
-
-        in_smm_pc = smram_base <= pc < smram_end
-        in_smm_mon, smm_token = scan_smm_token_in_monitor()
-        in_smm = in_smm_pc or in_smm_mon
-
+        status = SystemManagementMemory.get_smm_status()
         if args.quiet:
-            gef_print("in_smm" if in_smm else "not_in_smm")
+            token = {True: "in_smm", False: "not_in_smm", None: "unknown"}[status["state"]]
+            gef_print(token)
             return
 
-        if in_smm:
-            verdict = Color.colorify("CURRENTLY IN SMM", "bold red")
-        else:
-            verdict = Color.colorify("NOT in SMM", "bold green")
-        gef_print("{}: $pc={:#x}, SMRAM=[{:#x}-{:#x}) ({} bytes)".format(
-            verdict, pc, smram_base, smram_end, GefUtil.get_size_str(smram_size)))
-
-        reasons = []
-        if in_smm_pc:
-            reasons.append("$pc within SMRAM range")
-        if in_smm_mon:
-            reasons.append("`monitor info registers` mentions '{}'".format(smm_token))
-        if reasons:
-            gef_print("  rationale: {}".format("; ".join(reasons)))
-        else:
-            gef_print("  rationale: no SMM indicators found")
+        self.out = self.format_status(status)
+        self.add_smram_preview(status)
+        self.print_output(check_terminal_size=True)
         return
 
 
 @register_command
 class SmmDumpCommand(GenericCommand):
-    """Dump SMRAM to disk when the CPU is in System Management Mode.
-
-    By default dumps only when :func:`is_in_smm` is True (i.e. ``$pc`` lies
-    inside the SMRAM physical range) -- otherwise prints a warning and exits.
-    Pass ``--force`` to dump regardless of the in-SMM verdict (useful for
-    inspecting SMRAM contents without first driving the guest into SMM) and
-    ``--commit`` to actually write bytes (without it the command is a dry run,
-    mirroring :class:`SmartMemoryDumpCommand`).
-    """
+    """Dump the detected SMRAM range to a file."""
 
     _cmdline_ = "smm-dump"
-    _category_ = "06-k. Qemu-system/KGDB Cooperation - SMM"
+    _category_ = "06-l. Qemu-system/KGDB Cooperation - SMM"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
-    parser.add_argument("-f", "--force", action="store_true",
-                        help="dump even if the CPU is not currently in SMM.")
-    parser.add_argument("-c", "--commit", action="store_true",
-                        help="actually write the dump file (without this flag, dry run only).")
+    parser.add_argument("-f", "--force", action="store_true", help="try to dump even when the current CPU is not in SMM.")
+    parser.add_argument("-c", "--commit", action="store_true", help="actually perform the dump.")
     _syntax_ = parser.format_help()
 
     _example_ = [
-        "{0:s}                   # dry run; prints where the dump would go",
-        "{0:s} --commit          # dump SMRAM only if in SMM",
-        "{0:s} --commit --force  # dump SMRAM regardless of in-SMM status",
+        "{0:s}",
+        "{0:s} --commit",
+        "{0:s} --commit --force",
     ]
     _example_ = "\n".join(_example_).format(_cmdline_)
 
-    _note_ = ("When `is_in_smm()` is True, SMRAM is read via virtmode "
-              ":func:`read_memory` (GDB's `m` packet routes through the CPU's "
-              "current AS, which during SMM is the per-CPU SMM AS); falls back "
-              "to :func:`read_physmem` only if the virtmode read is empty. "
-              "Physmode/`monitor xp`/`monitor gpa2hva` paths use the system AS, "
-              "where the chipset's SMRAM overlay is masked by D_OPEN and reads "
-              "return `0xff` or `pc.ram` zero-fill, never real SMM bytes.")
+    _note_ = [
+        "An in-SMM dump uses the current CPU's SMM address space.",
+        "A forced dump outside SMM is best-effort because chipset access controls may return masked bytes.",
+    ]
+    _note_ = "\n".join(_note_)
 
-    @staticmethod
-    def read_smram_in_smm(smram_base, smram_size):
-        """Read SMRAM via the per-CPU SMM AS (virtmode).
+    def dump_smram(self, smram, in_smm):
+        base, size, label = smram
+        dt = GefUtil.now_str()
+        directory = os.path.join(GEF_TEMP_DIR, "mem-dump-{:s}-XXXXXXXX".format(dt))
+        filename = "{:016x}-{:016x}_{:s}.raw".format(base, base + size - 1, re.sub(r"[^a-zA-Z0-9_.-]+", "_", label))
+        filepath = os.path.join(directory, filename)
+        if not self.args.commit:
+            info("It will be saved to {:s} ({:s})".format(filepath, GefUtil.get_size_str(size)))
+            warn('This dry run mode skips dumping; add "--commit" to proceed')
+            return
 
-        Physmode, `monitor xp`, and `monitor gpa2hva`/`/proc/<pid>/mem` all use
-        the system AS, where the chipset's SMRAM overlay is masked by D_OPEN
-        when not in SMM -- returning `\xff` or `pc.ram` zero-fill. In virtmode
-        the GDB stub routes through the current CPU's AS (`cpu->as`), which in
-        SMM is the SMM AS. Since SMM enters in flat real mode (`CR0.PG=0`),
-        GVA==GPA and `read_memory(smram_base, smram_size)` lands inside SMRAM.
-        """
-        cur_mode = QemuMonitor.get_current_mmu_mode()
-        switched_to_virt = False
-        if cur_mode == "phys":
-            if not disable_phys():
-                return None
-            switched_to_virt = True
+        data, stats = SystemManagementMemory.read_smram(base, size, in_smm=in_smm, return_stats=True)
+        if data is None or len(data) != size:
+            err("Could not read all of SMRAM ({:#x}/{:#x} bytes)".format(stats["read_bytes"], size))
+            for start, end in stats["unreadable_ranges"]:
+                warn("Unreadable SMRAM range: [{:#x}-{:#x})".format(start, end))
+            return
+
+        if stats["fallback_chunks"]:
+            warn("{:d} SMRAM page(s) were not mapped in the current SMM page tables;".format(stats["fallback_chunks"]))
+            warn("their bytes came from QEMU's pc.ram backing or the physical-memory fallback")
+
+        if data and (data.count(0) == len(data) or data.count(0xff) == len(data)):
+            if data[0] == 0:
+                byte = 0
+            else:
+                byte = 0xff
+            warn("SMRAM read returned only {:#04x}; chipset masking may have hidden the real contents".format(byte))
+
         try:
-            try:
-                return read_memory(smram_base, smram_size)
-            except gdb.MemoryError:
-                return None
-        finally:
-            if switched_to_virt:
-                enable_phys()
+            directory = tempfile.mkdtemp(dir=GEF_TEMP_DIR, prefix="mem-dump-{:s}-".format(dt))
+            filepath = os.path.join(directory, filename)
+            with open(filepath, "wb") as file:
+                file.write(data)
+        except OSError as exception:
+            err("Could not write {:s}: {}".format(filepath, exception))
+            return
 
-    @staticmethod
-    def dump_smram(smram_base, smram_size, commit):
-        size_str = GefUtil.get_size_str(smram_size)
-        dirpath = os.path.join(GEF_TEMP_DIR, "mem-dump-" + GefUtil.now_str())
-        fname = "{:08x}-{:08x}_smram.raw".format(smram_base, smram_base + smram_size - 1)
-        filepath = os.path.join(dirpath, fname)
-        if commit:
-            data = None
-            if is_in_smm():
-                data = SmmDumpCommand.read_smram_in_smm(smram_base, smram_size)
-                if not data:
-                    warn("virtmode+SMM-AS read empty; falling back to read_physmem.")
-            if not data:
-                try:
-                    data = read_physmem(smram_base, smram_size)
-                except Exception as e:
-                    err("SMRAM read failed at {:#x}/{:#x}: {}".format(smram_base, smram_size, e))
-                    return None
-            if not data:
-                err("SMRAM read returned no data at {:#x}/{:#x}".format(smram_base, smram_size))
-                return None
-            if data.count(0) == len(data):
-                warn("SMRAM dump is all zero bytes -- TSEG may be masked from the "
-                     "system AS (D_OPEN closed) or SMRAM was never written by firmware.")
-            try:
-                os.makedirs(dirpath, exist_ok=True)
-            except OSError as e:
-                err("Could not create dump directory {}: {}".format(dirpath, e))
-                return None
-            try:
-                with open(filepath, "wb") as fd:
-                    fd.write(data)
-            except OSError as e:
-                err("Could not write dump file {}: {}".format(filepath, e))
-                return None
-            info("Saved SMRAM to {:s} ({:s})".format(filepath, GefUtil.get_size_str(len(data))))
-            return filepath
-        info("Dry run: would dump SMRAM [{:#x}-{:#x}) ({}) to {:s}".format(
-            smram_base, smram_base + smram_size, size_str, filepath))
-        warn('Add "--commit" to actually write the file.')
-        return filepath
+        info("Saved to {:s} ({:s})".format(filepath, GefUtil.get_size_str(len(data))))
+        return
 
     @parse_args
     @only_if_gdb_running
     @only_if_specific_gdb_mode(mode=("qemu-system",))
     @only_if_specific_arch(arch=("x86_32", "x86_64"))
     def do_invoke(self, args):
-        smram = QemuMonitor.get_smram_map(verbose=True)
+        status = SystemManagementMemory.get_smm_status()
+        smram = status["smram"]
         if smram is None:
-            err("Could not resolve SMRAM map")
+            err("Could not resolve the SMRAM range")
             return
-        smram_base, smram_size = smram
 
-        in_smm = is_in_smm()
-        if in_smm:
-            ok("CPU is currently in SMM - proceeding with SMRAM dump.")
-        elif args.force:
-            warn("Not in SMM, but --force given; proceeding with SMRAM dump.")
+        if status["state"] is True:
+            info("The current CPU is in SMM")
+        elif not args.force:
+            warn("The current CPU is not known to be in SMM; skipping the dump")
+            warn("Use --force for a best-effort read through the system address space")
+            return
         else:
-            warn("Not in SMM and --force not given; skipping SMRAM dump.")
-            warn("Hint: pass --force to dump regardless of in-SMM status.")
-            return
+            warn("The current CPU is not known to be in SMM; forcing a best-effort read")
 
-        SmmDumpCommand.dump_smram(smram_base, smram_size, args.commit)
+        self.dump_smram(smram, status["state"] is True)
         return
 
 
@@ -375,7 +366,7 @@ class SmmInfoCommand(GenericCommand, BufferingOutput):
     """
 
     _cmdline_ = "smm-info"
-    _category_ = "06-k. Qemu-system/KGDB Cooperation - SMM"
+    _category_ = "06-l. Qemu-system/KGDB Cooperation - SMM"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("-v", "--verbose", action="store_true",
@@ -393,22 +384,9 @@ class SmmInfoCommand(GenericCommand, BufferingOutput):
               "SMBASE is polled best-effort via the QEMU monitor and skipped "
               "silently when not exposed.")
 
-    def smm_banner(self, smram, pc, in_smm_pc, in_smm_mon, smm_token):
-        smram_base, smram_size = smram
-        smram_end = smram_base + smram_size
+    def smm_banner(self, status):
         self.out.append(titlify("SMM Status"))
-        verdict = (Color.colorify("CURRENTLY IN SMM", "bold red")
-                   if in_smm_pc or in_smm_mon
-                   else Color.colorify("NOT in SMM", "bold green"))
-        self.out.append("{}: $pc={:#x}, SMRAM=[{:#x}-{:#x}) ({} bytes)".format(
-            verdict, pc, smram_base, smram_end, GefUtil.get_size_str(smram_size)))
-        reasons = []
-        if in_smm_pc:
-            reasons.append("$pc within SMRAM range")
-        if in_smm_mon:
-            reasons.append("`monitor info registers` mentions '{}'".format(smm_token))
-        self.out.append("  rationale: {}".format(
-            "; ".join(reasons) if reasons else "no SMM indicators found"))
+        self.out.extend(SmmStatusCommand.format_status(status))
         return
 
     def smm_smbase(self):
@@ -423,17 +401,19 @@ class SmmInfoCommand(GenericCommand, BufferingOutput):
             self.out.append("SMBASE not exposed by this QEMU build")
         return
 
-    def smm_save_state_preview(self, smram_base):
+    def smm_save_state_preview(self, status):
         self.out.append(titlify("Save-state preview (256 bytes at SMRAM base)"))
-        try:
-            data = read_physmem(smram_base, 0x100)
-        except Exception as e:
-            data = None
-            self.out.append("(SMRAM read at {:#x} failed: {})".format(smram_base, e))
-        if data:
-            self.out.append(hexdump(data, base=smram_base, show_symbol=False))
-        elif data is not None:
-            self.out.append("(SMRAM read at {:#x} returned no data)".format(smram_base))
+        base, size = status["smram"][:2]
+        preview = base
+        if status["state"] is True and status["pc_in_smram"]:
+            preview = max(base, status["pc_phys"] & ~0xf)
+        data = SystemManagementMemory.read_smram(
+            preview, min(0x100, base + size - preview), in_smm=status["state"] is True,
+        )
+        if data is not None:
+            self.out.append(hexdump(data, base=preview, show_symbol=False))
+        else:
+            self.out.append("(SMRAM read at {:#x} returned no data)".format(preview))
         return
 
     @parse_args
@@ -442,21 +422,13 @@ class SmmInfoCommand(GenericCommand, BufferingOutput):
     @only_if_specific_arch(arch=("x86_32", "x86_64"))
     def do_invoke(self, args):
         from gef.commands.kernel.register import QemuRegistersCommand
-        smram = QemuMonitor.get_smram_map(verbose=args.verbose)
-        if smram is None:
+        status = SystemManagementMemory.get_smm_status()
+        if status["smram"] is None:
             err("Could not resolve SMRAM map")
             return
-        smram_base, smram_size = smram
-        pc = get_register("$pc")
-        if pc is None:
-            err("Could not read $pc")
-            return
-
-        in_smm_pc = smram_base <= pc < smram_base + smram_size
-        in_smm_mon, smm_token = scan_smm_token_in_monitor()
 
         self.out = []
-        self.smm_banner(smram, pc, in_smm_pc, in_smm_mon, smm_token)
+        self.smm_banner(status)
         # `qregisters_x86_x64` only touches `self.out` (no other instance
         # state), so it can be called as an unbound method on a SmmInfoCommand
         # instance. Instantiating QemuRegistersCommand() would try to re-register
@@ -464,7 +436,7 @@ class SmmInfoCommand(GenericCommand, BufferingOutput):
         QemuRegistersCommand.qregisters_x86_x64(self)
         self.smm_smbase()
         if args.verbose:
-            self.smm_save_state_preview(smram_base)
+            self.smm_save_state_preview(status)
         self.print_output()
         return
 

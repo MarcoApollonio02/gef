@@ -378,59 +378,6 @@ class QemuMonitor:
         return None
 
     @staticmethod
-    @Cache.cache_this_session
-    def get_smram_map(verbose=False):
-        """Return ``(smram_base, smram_size)`` for the SMRAM region, or ``None``.
-
-        SMM (System Management Mode) lives in dedicated physical memory whose
-        name varies across QEMU machine models: ``smram`` (legacy DOS layout),
-        ``tseg`` (Top Of Low Usable DRAM — modern Q35/OVMF), ``hseg``/``abseg``
-        (high/AB segments on older i440fx). Scan ``monitor info mtree -f`` and
-        pick the largest labelled region. If none is found, warn once and fall
-        back to the legacy DOS-style default ``(0x30000, 0x10000)``.
-        """
-        from gef.core.process import is_qemu_system, is_x86
-        if not is_qemu_system() or not is_x86():
-            return None
-
-        try:
-            ret = gdb.execute("monitor info mtree -f", to_string=True)
-        except gdb.error as e:
-            err("Could not query `monitor info mtree -f`: {}".format(e))
-            return None
-
-        candidates = []
-        # e.g.  "  0000000000030000-000000000003ffff (prio 0, i/o): smram"
-        pat = re.compile(r"^\s+([0-9a-f]+)-([0-9a-f]+)\s+\([^:]*\):\s*(\S+)")
-        for line in ret.splitlines():
-            m = pat.search(line)
-            if not m:
-                continue
-            base = int(m.group(1), 16)
-            end = int(m.group(2), 16)
-            label = m.group(3).lower()
-            if any(name in label for name in ("smram", "tseg", "hseg", "abseg", "smm")):
-                size = end - base
-                if (size & 0xFFF) == 0xFFF:
-                    size += 1  # same page-frame fixup as get_gic_addrs (gef.py:12277)
-                candidates.append((base, size))
-                if verbose:
-                    info("Found SMRAM candidate via mtree: base={:#x} size={:#x} label={}".format(
-                        base, size, m.group(3)))
-
-        if candidates:
-            from gef.core.utils import GefUtil
-            smram_base, smram_size = max(candidates, key=lambda c: c[1])
-            if verbose:
-                info("SMRAM range resolved to base={:#x} size={:#x} ({})".format(
-                    smram_base, smram_size, GefUtil.get_size_str(smram_size)))
-            return (smram_base, smram_size)
-
-        warn("No SMRAM/tseg/hseg region in `monitor info mtree -f`; "
-             "falling back to legacy default 0x30000/0x10000.")
-        return (0x30000, 0x10000)
-
-    @staticmethod
     @Cache.cache_until_next(per_inferior=True)
     def get_mtree_regions(address_space=None):
         """Return the regions of `monitor info mtree -f` as a list of (start, end, attr, name).
@@ -531,3 +478,220 @@ def disable_phys():
         gdb.execute("maintenance flush dcache", to_string=True)
         MemoryCache.set_default_namespace("virtual")
         return True
+
+
+class SystemManagementMemory:
+
+    @staticmethod
+    @Cache.cache_until_next(per_inferior=True)
+    def get_smram_map():
+
+        from gef.core.process import is_qemu_system, is_x86
+        """Return the most useful SMRAM range as ``(base, size, label)``.
+        QEMU names the protected range differently depending on the chipset and
+        firmware (TSEG, HSEG, ABSEG, or SMRAM).  The flat memory tree is a more
+        reliable source than assuming the architectural reset SMBASE.  Do not
+        guess the range when QEMU does not expose a labelled region: firmware
+        may have relocated SMBASE away from its architectural reset value.
+        """
+        if not is_qemu_system() or not is_x86():
+            return None
+
+        candidates = []
+        rank = {"tseg": 4, "smram": 4, "hseg": 3, "abseg": 3}
+        for base, end, _, region_name in QemuMonitor.get_mtree_regions():
+            label = region_name.split(" ")[0]
+            words = re.split(r"[^a-z0-9]+", label.lower())
+            kind = next((name for name in rank if name in words), None)
+            if kind is None or end <= base:
+                continue
+            candidates.append((rank[kind], end - base, base, label))
+
+        if candidates:
+            _, size, base, label = max(candidates)
+            return base, size, label
+        return None
+
+    @staticmethod
+    @Cache.cache_until_next(per_cpu=True)
+    def get_smm_monitor_state():
+
+        from gef.core.process import is_qemu_system, is_x86
+        """Return ``(state, token)`` from QEMU's current-CPU register dump.
+        ``state`` is None when this QEMU version does not expose an SMM marker.
+        """
+        if not is_qemu_system() or not is_x86():
+            return None, None
+        try:
+            output = gdb.execute("monitor info registers", to_string=True)
+        except gdb.error:
+            return None, None
+
+        match = re.search(r"\bSMM\s*=\s*(0x[0-9a-f]+|[0-9]+)\b", output, re.IGNORECASE)
+        if match:
+            token = match.group(1)
+            value = int(token, 16 if token.lower().startswith("0x") else 10)
+            return value != 0, "SMM={:d}".format(value)
+
+        lowered = output.lower()
+        for marker in ("in smm", "smmode"):
+            if marker in lowered:
+                return True, marker
+        return None, None
+
+    @staticmethod
+    @Cache.cache_until_next(per_cpu=True)
+    def get_smm_status():
+
+        from gef.core.kernel import Kernel
+        from gef.core.process import is_qemu_system, is_x86
+        from gef.core.registers import get_register
+        """Return details about the current CPU's SMM state.
+        QEMU's explicit ``SMM=`` marker is authoritative.  Older builds without
+        that marker fall back to checking whether the physical instruction address lies in SMRAM.
+        """
+        smram = SystemManagementMemory.get_smram_map()
+        monitor_state, monitor_token = SystemManagementMemory.get_smm_monitor_state()
+        pc = get_register("$pc")
+        pc_phys = None
+        pc_in_smram = None
+        if smram is not None and pc is not None:
+            cs = QemuMonitor.get_x86_segments().get("CS")
+            if cs is not None:
+                linear = pc if cs[2] & (1 << 21) else (cs[1] + pc) & 0xffffffff
+                pc_phys = Kernel.v2p(linear)
+        if smram is not None and pc_phys is not None:
+            base, size, _ = smram
+            pc_in_smram = base <= pc_phys < base + size
+
+        if monitor_state is not None:
+            state = monitor_state
+            source = "qemu-monitor"
+        elif pc_in_smram is not None:
+            state = pc_in_smram
+            source = "pc-range"
+        else:
+            state = None
+            source = None
+
+        return {
+            "state": state,
+            "source": source,
+            "monitor_state": monitor_state,
+            "monitor_token": monitor_token,
+            "pc": pc,
+            "pc_phys": pc_phys,
+            "pc_in_smram": pc_in_smram,
+            "smram": smram,
+        }
+
+    @staticmethod
+    def read_smram_backing(base, size):
+
+        from gef.core.process import Pid
+        """Read SMRAM from QEMU's pc.ram backing, bypassing the TSEG blackhole."""
+        smram = SystemManagementMemory.get_smram_map()
+        if smram is None:
+            return None
+        smram_base, smram_size, _ = smram
+        if not smram_base <= base or base + size > smram_base + smram_size:
+            return None
+
+        qemu_pid = Pid.get_pid()
+        if qemu_pid is None:
+            return None
+
+        # TSEG overlays pc.ram with tseg-blackhole. Resolve pc.ram at address zero,
+        # then apply the guest-physical offset ourselves.
+        try:
+            output = gdb.execute("monitor gpa2hva 0", to_string=True)
+            match = re.search(r"is\s+(0x[0-9a-f]+)", output, re.IGNORECASE)
+            if not match:
+                return None
+            host_address = int(match.group(1), 16) + base
+            with open("/proc/{:d}/mem".format(qemu_pid), "rb") as file:
+                file.seek(host_address)
+                data = file.read(size)
+        except (gdb.error, OSError, ValueError):
+            return None
+        if len(data) == size:
+            return data
+        return None
+
+    @staticmethod
+    def read_smram_current_address_space(base, size):
+        """Return readable ``(offset, data)`` chunks from the current SMM address space."""
+        chunks = []
+        with QemuMonitor.use_mmu_mode("virt") as available:
+            if not available:
+                return chunks
+
+            offset = 0
+            while offset < size:
+                current = base + offset
+                chunk_size = min(0x1000 - (current & 0xfff), size - offset)
+                try:
+                    output = gdb.execute("monitor gva2gpa {:#x}".format(current), to_string=True)
+                    match = re.search(r"gpa:\s*(0x[0-9a-f]+)", output, re.IGNORECASE)
+                    if match and int(match.group(1), 16) == current:
+                        chunk = read_memory(current, chunk_size)
+                        if len(chunk) == chunk_size:
+                            chunks.append((offset, chunk))
+                except (gdb.error, gdb.MemoryError):
+                    pass
+                offset += chunk_size
+        return chunks
+
+    @staticmethod
+    def read_smram(base, size, in_smm=False, return_stats=False):
+
+        from gef.core.utils import align
+        """Read SMRAM through the current CPU's SMM address space when possible."""
+        stats = {"smm_chunks": 0, "fallback_chunks": 0, "read_bytes": 0, "unreadable_ranges": []}
+        if size == 0:
+            if return_stats:
+                return (b"", stats)
+            return b""
+        result = SystemManagementMemory.read_smram_backing(base, size)
+
+        if result is None:
+            try:
+                result = read_physmem(base, size)
+            except Exception:
+                result = None
+
+        if result is not None:
+            fallback_size = min(len(result), size)
+        else:
+            fallback_size = 0
+        data = bytearray(size)
+        if fallback_size:
+            data[:fallback_size] = result[:fallback_size]
+        if in_smm:
+            chunks = SystemManagementMemory.read_smram_current_address_space(base, size)
+        else:
+            chunks = []
+        end = fallback_size
+        for offset, chunk in chunks:
+            data[offset:offset + len(chunk)] = chunk
+            if end < offset:
+                stats["unreadable_ranges"].append((base + end, base + offset))
+            end = max(end, offset + len(chunk))
+
+        if end < size:
+            stats["unreadable_ranges"].append((base + end, base + size))
+
+        stats["smm_chunks"] = len(chunks)
+        if in_smm and fallback_size:
+            total_chunks = align((base & 0xfff) + fallback_size, 0x1000) // 0x1000
+            stats["fallback_chunks"] = total_chunks - sum(offset < fallback_size for offset, chunk in chunks)
+        stats["read_bytes"] = size - sum(end - start for start, end in stats["unreadable_ranges"])
+        if stats["unreadable_ranges"]:
+            result = None
+        else:
+            result = bytes(data)
+        if return_stats:
+            return (result, stats)
+        return result
+
+

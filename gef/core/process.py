@@ -308,50 +308,11 @@ def is_smp_enabled():
         return False
 
 
-@Cache.cache_until_next
+@Cache.cache_until_next(per_cpu=True)
 def is_in_smm():
-    """Determine whether the CPU is currently in System Management Mode (SMM).
-
-    SMM entry code (SMBASE + 0x8000 in the legacy DOS layout) lies inside the
-    SMRAM physical window, which is otherwise inaccessible to instruction
-    fetch. Thus ``$pc in SMRAM`` is a reliable in-SMM indicator on QEMU.
-    Cached ``until_next`` so it ticks over as the user steps/continues.
-    """
-    from gef.core.qemu import QemuMonitor
-    smram = QemuMonitor.get_smram_map()
-    if smram is None:
-        return False
-    smram_base, smram_size = smram
-    pc = get_register("$pc")
-    if pc is None:
-        return False
-    return smram_base <= pc < smram_base + smram_size
-
-
-@Cache.cache_until_next
-def scan_smm_token_in_monitor():
-    """Scan ``monitor info registers`` for an SMM indicator token.
-
-    Returns ``(bool, token_or_None)``. QEMU's x86 dump prints a state line
-    like ``EIP=... EFL=... SMM=N HLT=...`` where ``SMM=0`` means inactive and
-    ``SMM=1`` means active. We trigger only on a nonzero ``SMM=`` value (plus
-    two defensive substrings for QEMU-version variation). Absence of a token
-    does not prove non-SMM state.
-    """
-    if not is_qemu_system() or not is_x86():
-        return False, None
-    try:
-        res = gdb.execute("monitor info registers", to_string=True)
-    except gdb.error:
-        return False, None
-    low = res.lower()
-    m = re.search(r"\bsmm=([0-9]+)\b", low)
-    if m and int(m.group(1)) != 0:
-        return True, "SMM={}".format(int(m.group(1)))
-    for needle in ("in smm", "smmode"):
-        if needle in low:
-            return True, needle
-    return False, None
+    """Return whether the current QEMU x86 CPU is in System Management Mode."""
+    from gef.core.qemu import SystemManagementMemory
+    return SystemManagementMemory.get_smm_status()["state"] is True
 
 
 def is_alive():

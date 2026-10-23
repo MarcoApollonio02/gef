@@ -42,7 +42,7 @@
 - [06-i. Qemu-system/KGDB Cooperation - Linux Dynamic Inspection](#06-i-qemu-systemkgdb-cooperation---linux-dynamic-inspection)
 - [06-j. Qemu-system/KGDB Cooperation - TrustZone](#06-j-qemu-systemkgdb-cooperation---trustzone)
 - [06-k. Qemu-system/KGDB Cooperation - Other](#06-k-qemu-systemkgdb-cooperation---other)
-- [06-k. Qemu-system/KGDB Cooperation - SMM](#06-k-qemu-systemkgdb-cooperation---smm)
+- [06-l. Qemu-system/KGDB Cooperation - SMM](#06-l-qemu-systemkgdb-cooperation---smm)
 - [07-a. Misc - Conversion](#07-a-misc---conversion)
 - [07-b. Misc - Search](#07-b-misc---search)
 - [07-c. Misc - Generation](#07-c-misc---generation)
@@ -10563,17 +10563,10 @@ options:
   -h, --help  show this help message and exit
 ```
 
-# 06-k. Qemu-system/KGDB Cooperation - SMM
+# 06-l. Qemu-system/KGDB Cooperation - SMM
 ## smm-dump
 
-Dump SMRAM to disk when the CPU is in System Management Mode.
-
-By default dumps only when :func:`is_in_smm` is True (i.e. ``$pc`` lies
-inside the SMRAM physical range) -- otherwise prints a warning and exits.
-Pass ``--force`` to dump regardless of the in-SMM verdict (useful for
-inspecting SMRAM contents without first driving the guest into SMM) and
-``--commit`` to actually write bytes (without it the command is a dry run,
-mirroring :class:`SmartMemoryDumpCommand`).
+Dump the detected SMRAM range to a file.
 
 
 ### Syntax
@@ -10583,22 +10576,23 @@ usage: smm-dump [-h] [-f] [-c]
 
 options:
   -h, --help    show this help message and exit
-  -f, --force   dump even if the CPU is not currently in SMM.
-  -c, --commit  actually write the dump file (without this flag, dry run only).
+  -f, --force   try to dump even when the current CPU is not in SMM.
+  -c, --commit  actually perform the dump.
 ```
 
 ### Examples
 
 ```gdb
-smm-dump                   # dry run; prints where the dump would go
-smm-dump --commit          # dump SMRAM only if in SMM
-smm-dump --commit --force  # dump SMRAM regardless of in-SMM status
+smm-dump
+smm-dump --commit
+smm-dump --commit --force
 ```
 
 ### Notes
 
 ```text
-When `is_in_smm()` is True, SMRAM is read via virtmode :func:`read_memory` (GDB's `m` packet routes through the CPU's current AS, which during SMM is the per-CPU SMM AS); falls back to :func:`read_physmem` only if the virtmode read is empty. Physmode/`monitor xp`/`monitor gpa2hva` paths use the system AS, where the chipset's SMRAM overlay is masked by D_OPEN and reads return `0xff` or `pc.ram` zero-fill, never real SMM bytes.
+An in-SMM dump uses the current CPU's SMM address space.
+A forced dump outside SMM is best-effort because chipset access controls may return masked bytes.
 ```
 
 ## smm-info
@@ -10637,37 +10631,33 @@ Only meaningful when debugging qemu-system-x86[_64]. SMBASE is polled best-effor
 
 ## smm-status
 
-Tell whether the CPU is currently in System Management Mode (SMM).
-
-Detection heuristic: in SMM the CPU executes from a code window inside the
-SMRAM physical region (SMBASE + 0x8000 in the legacy DOS layout, an
-arbitrary address inside TSEG on modern Q35). ``$pc in SMRAM`` is therefore
-a reliable in-SMM indicator on QEMU. The command also scans
-``monitor info registers`` for an SMM token as a secondary cross-check and
-reports whichever signals fire.
+Display the current SMM status and an SMRAM preview.
 
 
 ### Syntax
 
 ```text
-usage: smm-status [-h] [-q]
+usage: smm-status [-h] [-q] [-n]
 
 options:
-  -h, --help   show this help message and exit
-  -q, --quiet  print only `in_smm` or `not_in_smm` (scriptable).
+  -h, --help      show this help message and exit
+  -q, --quiet     print only in_smm, not_in_smm, or unknown.
+  -n, --no-pager  do not use the pager.
 ```
 
 ### Examples
 
 ```gdb
-smm-status        # show in-SMM verdict with rationale
-smm-status --quiet # script-friendly single-token output
+smm-status
+smm-status --quiet
 ```
 
 ### Notes
 
 ```text
-Only meaningful when debugging qemu-system-x86[_64]. SMM has no dedicated architectural flag exposed via the gdb stub, so detection relies on $pc lying within the SMRAM physical range resolved from `monitor info mtree -f`.
+The QEMU monitor SMM flag is preferred.
+On older QEMU builds, the physical instruction address is compared with the detected SMRAM range.
+The preview uses the physical instruction address in SMRAM, or the detected SMRAM base.
 ```
 
 # 07-a. Misc - Conversion

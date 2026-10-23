@@ -29,7 +29,7 @@ from gef.core.cache import Cache
 from gef.core.color import Color, err, gef_print, titlify
 from gef.core.config import Config
 from gef.core.kernel import Kernel
-from gef.core.memory import is_valid_addr, read_int_from_memory, read_memory
+from gef.core.memory import MemoryCache, is_valid_addr, read_int_from_memory, read_memory
 from gef.core.pagewalk import KernelAddressHeuristicFinder, PageMap
 from gef.core.process import (
     get_pagesize,
@@ -39,6 +39,7 @@ from gef.core.process import (
     is_arm32,
     is_arm64,
     is_in_kernel,
+    is_in_smm,
     is_kgdb,
     is_qemu_system,
     is_riscv32,
@@ -48,7 +49,7 @@ from gef.core.process import (
     is_x86_32,
     is_x86_64,
 )
-from gef.core.qemu import read_physmem
+from gef.core.qemu import SystemManagementMemory, read_physmem
 from gef.core.registers import get_register
 from gef.core.strings import String
 from gef.core.symbols import Symbol
@@ -81,8 +82,32 @@ class PagewalkCommand(GenericCommand, BufferingOutput):
         key = "{:#x}_{:d}".format(paddr, size)
         if key in self.cache:
             return self.cache[key]
-        out = read_physmem(paddr, size)
+
+        # In SMM, QEMU can expose SMRAM through the current CPU address space.
+        in_smm = is_x86() and is_in_smm()
+        if in_smm:
+            smram = SystemManagementMemory.get_smram_map()
+        else:
+            smram = None
+        if smram is not None and smram[0] <= paddr and paddr + size <= smram[0] + smram[1]:
+            out = SystemManagementMemory.read_smram(paddr, size, in_smm=True)
+            if out is not None and len(out) == size:
+                self.cache[key] = out
+                return out
+
+        if in_smm:
+            namespace = "pagewalk-smm"
+        else:
+            namespace = "physical"
+        out = MemoryCache.read(paddr, size, reader=self.read_physmem_uncached, namespace=namespace)
         self.cache[key] = out
+        return out
+
+    def read_physmem_uncached(self, paddr, size):
+        """Fetch physical bytes for `MemoryCache.read`; callers normally use `read_physmem_cache`."""
+        out = read_physmem(paddr, size)
+        if out is None or len(out) != size:
+            raise gdb.MemoryError("Cannot access physical memory at address {:#x}".format(paddr))
         return out
 
     # merge pages that points same phys page
