@@ -516,37 +516,64 @@ def read_memory(addr, length, safe=False):
         raise
 
 
-def read_int_from_memory(addr):
-    """Return an integer read from memory."""
-    # It works even if current_arch is None
-    sz = AddressUtil.get_memory_alignment()
-    mem = read_memory(addr, sz)
-    unpack = {2:u16, 4:u32, 8:u64}[sz]
-    return unpack(mem)
+def read_int_from_memory(addr, safe=False, signed=False):
+    """Return an integer read from memory, signed when requested, or None on a safe read error."""
+    from gef.core.utils import GefUtil
+
+    try:
+        # It works even if current_arch is None
+        sz = AddressUtil.get_memory_alignment()
+        mem = read_memory(addr, sz)
+        unpack = GefUtil.get_unpack(sz)
+        return unpack(mem, signed)
+    except Exception:
+        if safe:
+            return None
+        raise
 
 
-def read_int8_from_memory(addr):
-    """Return a uint_8 read from memory."""
-    mem = read_memory(addr, 1)
-    return u8(mem)
+def read_int8_from_memory(addr, safe=False, signed=False):
+    """Return an 8-bit integer read from memory, signed when requested, or None on a safe read error."""
+    try:
+        mem = read_memory(addr, 1)
+        return u8(mem, signed)
+    except Exception:
+        if safe:
+            return None
+        raise
 
 
-def read_int16_from_memory(addr):
-    """Return a uint_16 read from memory."""
-    mem = read_memory(addr, 2)
-    return u16(mem)
+def read_int16_from_memory(addr, safe=False, signed=False):
+    """Return a 16-bit integer read from memory, signed when requested, or None on a safe read error."""
+    try:
+        mem = read_memory(addr, 2)
+        return u16(mem, signed)
+    except Exception:
+        if safe:
+            return None
+        raise
 
 
-def read_int32_from_memory(addr):
-    """Return a uint_32 read from memory."""
-    mem = read_memory(addr, 4)
-    return u32(mem)
+def read_int32_from_memory(addr, safe=False, signed=False):
+    """Return a 32-bit integer read from memory, signed when requested, or None on a safe read error."""
+    try:
+        mem = read_memory(addr, 4)
+        return u32(mem, signed)
+    except Exception:
+        if safe:
+            return None
+        raise
 
 
-def read_int64_from_memory(addr):
-    """Return a uint_64 read from memory."""
-    mem = read_memory(addr, 8)
-    return u64(mem)
+def read_int64_from_memory(addr, safe=False, signed=False):
+    """Return a 64-bit integer read from memory, signed when requested, or None on a safe read error."""
+    try:
+        mem = read_memory(addr, 8)
+        return u64(mem, signed)
+    except Exception:
+        if safe:
+            return None
+        raise
 
 
 def read_cstring_from_memory(addr, max_length=None):

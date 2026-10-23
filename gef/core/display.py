@@ -1,7 +1,13 @@
-"""Display hook for python-interactive (Layer 0)."""
+"""Display hook for python-interactive (Layer 0), plus the `ProgressBar` used by
+slow kernel walks.
+
+`ProgressBar` needs `GefUtil.get_terminal_size`; it is late-imported inside
+`render()` so this Layer-0 module stays free of the Layer-1 utils import chain.
+"""
 import builtins
 import re
 import sys
+import time
 
 
 class DisplayHook:
@@ -147,6 +153,131 @@ class DisplayHook:
         out = DisplayHook.pp(o, 0)
         print(out)
         return
+
+
+class ProgressBar:
+    """A progress bar for a slow loop. This is a substitute of the `tqdm` package."""
+
+    # If non-ASCII characters are included, they will affect
+    # the processing of dev/update-syscalls/update-syscalls.py and
+    # other programs for developing, so they should be written in hexadecimal.
+    BLOCKS = b" \xe2\x96\x8f\xe2\x96\x8e\xe2\x96\x8d\xe2\x96\x8c\xe2\x96\x8b\xe2\x96\x8a\xe2\x96\x89\xe2\x96\x88".decode()
+    MIN_INTERVAL = 0.1 # the same value as the default of tqdm
+
+    def __init__(self, iterable=None, total=None, desc=None, disable=False):
+        self.iterable = iterable
+        self.disable = disable
+        if total is None and iterable is not None:
+            try:
+                total = len(iterable)
+            except TypeError:
+                pass
+        self.total = total
+        self.desc = desc
+        self.n = 0
+        self.start_time = time.time()
+        self.last_draw_time = 0
+        self.last_width = 0
+        self.closed = False
+        self.refresh(force=True)
+        return
+
+    def __iter__(self):
+        for elem in self.iterable:
+            yield elem
+            self.update(1)
+        self.close()
+        return
+
+    def update(self, n=1):
+        self.n += n
+        self.refresh()
+        return
+
+    def set_description(self, desc):
+        self.desc = desc
+        self.refresh()
+        return
+
+    def __del__(self):
+        # some callers leave the bar without closing it, so erase it here like tqdm does
+        try:
+            self.close()
+        except Exception:
+            pass
+        return
+
+    def close(self):
+        if self.closed or self.disable:
+            return
+        self.closed = True
+        sys.stderr.write("\r" + " " * self.last_width + "\r")
+        sys.stderr.flush()
+        return
+
+    def refresh(self, force=False):
+        if self.disable:
+            return
+        now = time.time()
+        if not force and now - self.last_draw_time < self.MIN_INTERVAL:
+            return
+        self.last_draw_time = now
+        line = self.render()
+        sys.stderr.write("\r" + line.ljust(self.last_width))
+        sys.stderr.flush()
+        self.last_width = len(line)
+        return
+
+    @staticmethod
+    def format_time(sec):
+        m, s = divmod(int(sec), 60)
+        h, m = divmod(m, 60)
+        if h:
+            return "{:d}:{:02d}:{:02d}".format(h, m, s)
+        return "{:02d}:{:02d}".format(m, s)
+
+    @staticmethod
+    def format_rate(rate):
+        if rate == 0:
+            return "?it/s"
+        if rate >= 1:
+            return "{:.2f}it/s".format(rate)
+        return "{:.2f}s/it".format(1 / rate)
+
+    def make_bar(self, frac, width):
+        if width <= 0:
+            return ""
+        filled, part = divmod(int(frac * width * 8), 8)
+        bar = self.BLOCKS[-1] * filled
+        if filled < width:
+            bar += self.BLOCKS[part] + " " * (width - filled - 1)
+        return bar
+
+    def render(self):
+        from gef.core.utils import GefUtil
+
+        elapsed = time.time() - self.start_time
+        if elapsed:
+            rate = self.n / elapsed
+        else:
+            rate = 0
+        if self.desc:
+            desc = "{:s}: ".format(self.desc)
+        else:
+            desc = ""
+        if not self.total:
+            return "{:s}{:d}it [{:s}, {:s}]".format(desc, self.n, self.format_time(elapsed), self.format_rate(rate))
+        frac = min(self.n / self.total, 1.0)
+        if rate:
+            remain = self.format_time(max(self.total - self.n, 0) / rate)
+        else:
+            remain = "?"
+        left = "{:s}{:3.0f}%|".format(desc, frac * 100)
+        right = "| {:d}/{:d} [{:s}<{:s}, {:s}]".format(
+            self.n, self.total, self.format_time(elapsed), remain, self.format_rate(rate),
+        )
+        width = GefUtil.get_terminal_size()[1] - len(left) - len(right) - 1
+        return left + self.make_bar(frac, width) + right
 
 
 def hexon(): # noqa

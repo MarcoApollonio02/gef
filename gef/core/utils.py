@@ -16,6 +16,7 @@ Reads of the mutable global `current_arch` go through `runtime.current_arch`.
 `Gef` (gef.py main class, Phase 2) is late-imported inside the method that
 needs it.
 """
+import collections
 import datetime
 import functools
 import io
@@ -38,7 +39,9 @@ from gef.core.color import Color, err, info
 from gef.core.color import gef_print  # noqa: F401  (re-export for GefUtil.show_last_exception users)
 from gef.core.config import Config
 from gef.core.errors import show_last_exception  # noqa: F401  (re-export)
-from gef.core.memory import is_double_link_list, is_single_link_list, is_valid_addr, read_int_from_memory, u128
+from gef.core.memory import (is_double_link_list, is_single_link_list, is_valid_addr, p16, p32, p64, p8,
+                              read_int_from_memory, u128, u16, u32, u64, u8)
+from gef.core.registers import to_unsigned_long
 from gef.core.strings import String
 
 
@@ -356,8 +359,20 @@ def switch_to_intel_syntax(f):
 
 
 
+@Cache.cache_this_session
+def u2i(x, bits=64):
+    """Convert an unsigned integer to a signed integer of the specified bit width."""
+    if bits not in (8, 16, 32, 64):
+        raise ValueError("u2i: unsupported bit length: {!r}".format(bits))
+    pack = {8:p8, 16:p16, 32:p32, 64:p64}[bits]
+    unpack = GefUtil.get_unpack(bits // 8)
+    return unpack(pack(x & ((1 << bits) - 1)), s=True)
+
+
 class GefUtil:
     """A collection of utility functions that are related to GEF basic features."""
+
+    namedtuple_classes = {}
 
     @staticmethod
     @Cache.cache_until_next
@@ -366,6 +381,24 @@ class GefUtil:
         try:
             return gdb.lookup_type(_type).strip_typedefs()
         except RuntimeError:
+            return None
+
+    @staticmethod
+    def get_unpack(size=None):
+        """Return an integer unpacker for a byte size, defaulting to the current pointer size."""
+        if size is None:
+            size = runtime.current_arch.ptrsize
+        return {1: u8, 2: u16, 4: u32, 8: u64}[size]
+
+    @staticmethod
+    def offsetof(type_name, member):
+        """Return offsetof(type_name, member) from the loaded debug information, or None if unavailable.
+        `type_name` is a C type or typedef; an unknown bare name means a struct. `member` may be nested (`a.b`)."""
+        if " " not in type_name and GefUtil.cached_lookup_type(type_name) is None:
+            type_name = "struct " + type_name
+        try:
+            return to_unsigned_long(gdb.parse_and_eval("&(({:s} *)0)->{:s}".format(type_name, member)))
+        except gdb.error:
             return None
 
     @staticmethod
@@ -581,6 +614,14 @@ class GefUtil:
         if not keep_root:
             os.rmdir(directory)
         return
+
+    @staticmethod
+    def dict_to_namedtuple(name, dic):
+        """Return the dict as a namedtuple, reusing the class made for the same name and keys."""
+        key = (name, tuple(dic))
+        if key not in GefUtil.namedtuple_classes:
+            GefUtil.namedtuple_classes[key] = collections.namedtuple(name, dic.keys())
+        return GefUtil.namedtuple_classes[key](*dic.values())
 
     @staticmethod
     def make_legend(msg):

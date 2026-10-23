@@ -18,14 +18,15 @@ from gef.core import runtime
 from gef.core.address import AddressUtil
 from gef.core.cache import Cache
 from gef.core.color import Color, err, gef_print, info, warn
-from gef.core.memory import is_valid_addr, read_cstring_from_memory, read_int_from_memory, read_memory
+from gef.core.memory import (is_valid_addr, read_cstring_from_memory, read_int8_from_memory,
+                              read_int32_from_memory, read_int_from_memory, read_memory)
 from gef.core.pagewalk import KernelAddressHeuristicFinder, PageMap
-from gef.core.process import (get_pagesize, get_pagesize_mask_low, is_32bit, is_arm32, is_arm64,
+from gef.core.process import (get_pagesize, get_pagesize_mask_low, is_32bit, is_64bit, is_arm32, is_arm64,
                               is_in_kernel, is_kdb, is_kgdb, is_qemu_system, is_riscv32, is_riscv64,
                               is_vmware, is_x86)
 from gef.core.registers import get_register, to_unsigned_long
 from gef.core.symbols import Symbol
-from gef.core.utils import GefUtil, align_to_ptrsize, slice_unpack
+from gef.core.utils import GefUtil, align, align_to_ptrsize, slice_unpack
 
 class KernelConstsBase:
     """A class that manages constants by version."""
@@ -2892,4 +2893,887 @@ class Kernel:
         if r:
             return int(r.group(1), 16)
         return None
+
+
+
+class KernelListHead:
+    """Parse Linux circular doubly-linked lists.
+
+    How to use:
+        lh = KernelListHead(modules, runtime.current_arch.ptrsize)  # the address of the list head, then
+                                                             # offsetof(the struct, the list_head)
+        lh.parse()                                           # -> [entry, entry, ...] (None if the list is broken)
+        lh.parse(include_head=True)                          # -> the struct including the list head is also listed
+        lh.iter_entries()                                    # -> iterate lazily, and just stop if the list is broken
+        lh.iter_entries(backward=True)                       # -> follow `prev` instead of `next`
+        lh.broken                                            # -> True if the last walk stopped halfway
+        lh.broken_at                                         # -> the address the last walk stopped at
+        lh.broken_reason                                     # -> "unreadable" or "cyclic"
+
+    struct list_head {
+        struct list_head *next;
+        struct list_head *prev;
+    };
+    """
+
+    def __init__(self, address, offset=0):
+        """Set the address of the list head. `offset` is offsetof(the struct, the list_head)."""
+        self.address = address
+        self.offset = offset
+        self.broken = False
+        self.broken_at = None
+        self.broken_reason = None
+        return
+
+    def parse(self, include_head=False):
+        """Return the list of the structs linked from the list head. Return None if the list is broken."""
+        entries = list(self.iter_entries(include_head))
+        if self.broken:
+            return None
+        return entries
+
+    def iter_entries(self, include_head=False, backward=False):
+        """Iterate the structs linked from the list head. Just stop there if the list is broken.
+        `backward` follows `prev` instead of `next`, which allows to pick up the entries
+        located behind an unreadable one.
+        """
+        self.broken = False
+        self.broken_at = None
+        self.broken_reason = None
+        if backward:
+            link = runtime.current_arch.ptrsize
+        else:
+            link = 0
+        if include_head:
+            yield self.address - self.offset
+
+        seen = {self.address}
+        current = self.address
+        while True:
+            next_current = read_int_from_memory(current + link, safe=True)
+            if next_current is None:
+                self.broken = True
+                self.broken_at = current - self.offset
+                self.broken_reason = "unreadable"
+                return
+            current = next_current
+            if current == self.address: # went around the list
+                return
+            if current in seen: # the list is broken
+                self.broken = True
+                self.broken_at = current - self.offset
+                self.broken_reason = "cyclic"
+                return
+            seen.add(current)
+            yield current - self.offset
+
+
+class KernelXArray:
+    """Parse Linux XArrays and share their detected layout between commands.
+
+    How to use:
+        xa = KernelXArray(prog_idr)      # KernelXArray(prog_idr, xa_head_offset) skips the search below
+        if xa.find_head_offset(runtime.current_arch.ptrsize * 20) is None:
+            ...                           # offsetof(idr, idr_rt.xa_head) is not found
+        xa.head_offset                    # -> the found offset
+        xa.parse()                        # -> [entry, entry, ...]
+        xa.parse_indexed()                # -> [(index, entry), ...]
+        xa.broken                         # -> {node: reason, ...} if the last walk was incomplete
+
+    struct xarray {
+        spinlock_t xa_lock;
+        gfp_t xa_flags;
+        void __rcu *xa_head; // this points root xa_node. (lower 2-bits are some flags)
+    };
+
+    struct xa_node {
+        unsigned char shift;
+        unsigned char offset;
+        unsigned char count;
+        unsigned char nr_values;
+        struct xa_node __rcu *parent;
+        struct xarray *array;
+        union {
+            struct list_head private_list;
+            struct rcu_head rcu_head;
+        };
+        void __rcu *slots[XA_CHUNK_SIZE];
+        union {
+            unsigned long tags[XA_MAX_MARKS][XA_MARK_LONGS];
+            unsigned long marks[XA_MAX_MARKS][XA_MARK_LONGS];
+        };
+    };
+    """
+
+    ptrsize = None
+    kpath = None
+    offset_xa_head = None
+    offset_shift = 0
+    offset_count = 2
+    offset_array = None
+    offset_slots = None
+
+    def __init__(self, address, xa_head_offset=None):
+        """Set the address of the struct including the xarray. `xa_head_offset` is used if it is already known."""
+        self.initialize_layout()
+        self.address = address
+        self.head_offset = xa_head_offset
+        self.seen = set()
+        self.broken = {}
+        return
+
+    @classmethod
+    def initialize_layout(cls):
+        """Calculate the layout of xa_node for the current architecture."""
+        if cls.ptrsize == runtime.current_arch.ptrsize:
+            return
+
+        cls.ptrsize = runtime.current_arch.ptrsize
+        cls.offset_xa_head = None
+        cls.offset_array = align(4, cls.ptrsize) + cls.ptrsize
+        # Four u8 fields are followed by parent, array and a two-pointer union.
+        cls.offset_slots = cls.ptrsize * 5
+        return
+
+    def parse(self):
+        """Return the list of all entries in the xarray."""
+        return [entry for _, entry in self.parse_indexed()]
+
+    def parse_indexed(self):
+        """Return the list of (index, entry) pairs in the xarray."""
+        self.seen = set()
+        self.broken = {}
+        cls = type(self)
+        head_offset = self.head_offset
+        if head_offset is None:
+            head_offset = cls.offset_xa_head
+        if self.address == 0 or head_offset is None:
+            return []
+
+        entry = read_int_from_memory(self.address + head_offset)
+        return self.parse_entry(entry, 0)
+
+    @classmethod
+    def is_node(cls, entry):
+        """Return True if `entry` points to a xa_node."""
+        cls.initialize_layout()
+        if entry & 3 != 2:
+            return False
+
+        pointer_mask = (1 << (cls.ptrsize * 8)) - 1
+        error_entry = ((-4095 << 2) | 2) & pointer_mask
+        # Small internal entries are sibling/retry/zero; top entries encode errno.
+        return 4096 < entry < error_entry
+
+    @classmethod
+    def cache_head_offset(cls, head_address, entry):
+        """Return True if `entry` at `head_address` is xa_head, then cache offsetof(the struct, xa_head)."""
+        if not cls.is_node(entry):
+            return False
+
+        node = entry - 2
+        if not is_valid_addr(node):
+            return False
+
+        array = read_int_from_memory(node + cls.offset_array, safe=True)
+        if array is None:
+            return False
+        offset = head_address - array
+        # xa_lock grows to 72 bytes with CONFIG_LOCK_STAT, and more with CONFIG_PREEMPT_RT
+        if offset < 0 or offset >= cls.ptrsize * 32 or offset % cls.ptrsize:
+            return False
+
+        cls.offset_xa_head = offset
+        return True
+
+    def find_head_offset(self, max_offset):
+        """Search offsetof(the struct, xa_head) heuristically. Return None if it is not found."""
+        if self.head_offset is not None:
+            return self.head_offset
+
+        # The cached offset may be stale after reconnecting to another kernel, where a different
+        # config (e.g. CONFIG_LOCK_STAT) can move xa_head; drop it when the target changes.
+        cls = type(self)
+        # Our Kernel has no `path()` resolver; the selected inferior and connection are
+        # what change when reconnecting to another kernel.
+        kpath = (gdb.selected_inferior().num, gdb.selected_inferior().connection_num)
+        if cls.kpath != kpath:
+            cls.kpath = kpath
+            cls.offset_xa_head = None
+        # The offset may still come from an earlier walk on this target, so reuse it
+        # only if the head there still links back to a node here.
+        cached = cls.offset_xa_head
+        if cached is not None:
+            entry = read_int_from_memory(self.address + cached, safe=True)
+            if entry is not None and cls.cache_head_offset(self.address + cached, entry):
+                self.head_offset = cached
+                return self.head_offset
+
+        for offset in range(0, max_offset, cls.ptrsize):
+            entry = read_int_from_memory(self.address + offset, safe=True)
+            if entry is None:
+                break
+            if cls.cache_head_offset(self.address + offset, entry):
+                self.head_offset = offset
+                return self.head_offset
+
+        # An empty tree or one holding a single entry directly in xa_head has no node to
+        # verify, so the offset cannot be found. Do not adopt an unverified cached value.
+        return None
+
+    def parse_entry(self, entry, index):
+        """Return the list of (index, entry) pairs under `entry` recursively."""
+        cls = type(self)
+        if entry == 0:
+            return []
+
+        if not cls.is_node(entry):
+            if entry & 3 == 0 and is_valid_addr(entry):
+                return [(index, entry)]
+            return []
+
+        node = entry - 2
+        if node in self.seen: # the tree is broken
+            self.broken[node] = "cyclic"
+            return []
+        self.seen.add(node)
+
+        count = read_int8_from_memory(node + cls.offset_count, safe=True)
+        if count is None:
+            self.broken[node] = "unreadable"
+            return []
+        if count == 0:
+            return []
+
+        shift = read_int8_from_memory(node + cls.offset_shift, safe=True)
+        if shift is None:
+            self.broken[node] = "unreadable"
+            return []
+        slots = node + cls.offset_slots
+        elems = []
+        for i in range(64): # 16 or 64
+            child = read_int_from_memory(slots + cls.ptrsize * i, safe=True)
+            if child is None:
+                self.broken[node] = "unreadable"
+                break
+            if child == 0:
+                continue
+            elems += self.parse_entry(child, index + (i << shift))
+            count -= 1
+            if count == 0:
+                break
+        return elems
+
+
+class KernelRadixTree:
+    """Parse Linux radix trees, the predecessor of the xarray.
+    Linux v4.20 renames radix_tree_root to xarray, so use KernelXArray for v4.20 and later.
+
+    How to use:
+        rt = KernelRadixTree(irq_desc_tree)  # KernelRadixTree(root, rnode_offset) skips the search below
+        if rt.find_rnode_offset(runtime.current_arch.ptrsize * 10) is None:
+            ...                               # offsetof(the struct, rnode) is not found
+        rt.rnode_offset                       # -> the found offset
+        rt.parse()                            # -> [entry, entry, ...]
+        rt.broken                             # -> {node: reason, ...} if the last walk was incomplete
+
+    struct radix_tree_root {
+        unsigned int height; // ~v4.6
+        gfp_t gfp_mask;
+        struct radix_tree_node __rcu *rnode; // lower 2-bits are some flags
+    };
+
+    struct radix_tree_node {
+        unsigned char shift;       // v4.7~ (`unsigned int height` or `path` before that)
+        unsigned char offset;      // v4.7~
+        unsigned char count;       // v4.14~ (`unsigned int count` before that)
+        unsigned char exceptional; // v4.14~
+        struct radix_tree_node *parent;
+        struct radix_tree_root *root; // v4.14~ (`void *private_data` before that, or nothing)
+        union {                       // absent in the oldest layout
+            struct list_head private_list;
+            struct rcu_head rcu_head;
+        };
+        void __rcu *slots[RADIX_TREE_MAP_SIZE];
+        unsigned long tags[RADIX_TREE_MAX_TAGS][RADIX_TREE_TAG_LONGS];
+    };
+
+    Until v4.6 only rnode carries RADIX_TREE_INDIRECT_PTR and the slots of an internal node are
+    untagged, so root->height is needed to know where the leaves are. Since v4.7 every internal
+    node is tagged, just like the xarray.
+    """
+
+    RADIX_TREE_INDIRECT_PTR = 1
+    RADIX_TREE_EXCEPTIONAL_ENTRY = 2
+    MAX_HEIGHT = 16
+
+    def __init__(self, address, rnode_offset=None):
+        """Set the address of the struct including the radix_tree_root. `rnode_offset` is used if it is already known."""
+        self.address = address
+        self.rnode_offset = rnode_offset
+        self.rnode = None
+        self.height = None
+        self.num_slots = None
+        self.offset_count = None
+        self.size_count = None
+        self.offset_slots = None
+        self.seen = set()
+        self.broken = {}
+        return
+
+    def parse(self):
+        """Return the list of all leaf entries in the radix_tree."""
+        return list(self.iter_entries())
+
+    def parse_indexed(self):
+        """Return the list of (index, entry) pairs in the radix_tree."""
+        return list(self.iter_indexed_entries())
+
+    def iter_entries(self):
+        """Iterate all leaf entries in the radix_tree lazily."""
+        for _, entry in self.iter_indexed_entries():
+            yield entry
+        return
+
+    def find_rnode_offset(self, max_offset):
+        """Search offsetof(the struct, rnode) heuristically. Return None if it is not found.
+        A tree holding only one item keeps it in rnode directly without the tag, so it is
+        indistinguishable from any other pointer. Pass `rnode_offset` explicitly for such a tree.
+        """
+        if self.rnode_offset is not None:
+            return self.rnode_offset
+
+        default = type(self).default_rnode_offset()
+        candidates = [default] + [x for x in range(0, max_offset, runtime.current_arch.ptrsize) if x != default]
+        for offset in candidates:
+            entry = read_int_from_memory(self.address + offset, safe=True)
+            if entry is None:
+                continue
+            if self.is_rnode(entry):
+                self.rnode_offset = offset
+                return self.rnode_offset
+        return None
+
+    def read_root(self):
+        """Read rnode and height using the detected offset. Return False if the offset is unknown."""
+        if self.rnode_offset is None:
+            return False
+
+        self.rnode = read_int_from_memory(self.address + self.rnode_offset)
+        self.height = None
+        if type(self).use_height() and self.rnode_offset >= 8:
+            # ~v4.6: struct radix_tree_root starts with `unsigned int height`.
+            height = read_int32_from_memory(self.address + self.rnode_offset - 8)
+            if 0 < height <= type(self).MAX_HEIGHT:
+                self.height = height
+            elif self.rnode & 3 == type(self).RADIX_TREE_INDIRECT_PTR:
+                self.broken[self.address + self.rnode_offset - 8] = "invalid height"
+                return False
+        return True
+
+    @staticmethod
+    def use_height():
+        """Return True if the leaves are located by root->height instead of the node tag."""
+        kversion = Kernel.kernel_version()
+        return kversion is not None and kversion < "4.7"
+
+    @classmethod
+    def default_rnode_offset(cls):
+        """Return offsetof(radix_tree_root, rnode) derived from the kernel version."""
+        if cls.use_height():
+            return align_to_ptrsize(8) # height and gfp_mask
+        return align_to_ptrsize(4) # gfp_mask only
+
+    @staticmethod
+    def count_candidates():
+        """Return the (offsetof(count), sizeof(count)) candidates, the likely one first."""
+        kversion = Kernel.kernel_version()
+        if kversion is not None and kversion < "4.14":
+            # `unsigned int count` follows `unsigned int height`/`path`, or shift and offset.
+            return ((4, 4), (2, 1))
+        # v4.14~ packs shift, offset, count and exceptional into four u8.
+        return ((2, 1), (4, 4))
+
+    @staticmethod
+    def slot_unit_candidates(size_count):
+        """Return the offsetof(slots)/ptrsize candidates, the likely one first."""
+        ptrsize = runtime.current_arch.ptrsize
+        header = align(8 if size_count == 4 else 4, ptrsize)
+        # parent, then private_data or root, then a two-pointer union.
+        return ((header + ptrsize * 4) // ptrsize, (header + ptrsize * 2) // ptrsize)
+
+    @classmethod
+    def is_slot(cls, entry):
+        """Return True if `entry` looks like a slot of radix_tree_node."""
+        tag = entry & 3
+        if tag == cls.RADIX_TREE_EXCEPTIONAL_ENTRY: # a value, not a pointer
+            return True
+        if tag == 3: # unused encoding
+            return False
+        return is_valid_addr(entry - tag)
+
+    def detect_node_layout(self, node):
+        """Detect the layout of radix_tree_node, using node->count as the checksum."""
+        ptrsize = runtime.current_arch.ptrsize
+        for offset_count, size_count in self.count_candidates():
+            if size_count == 1:
+                count = read_int8_from_memory(node + offset_count, safe=True)
+            else:
+                count = read_int32_from_memory(node + offset_count, safe=True)
+            if count is None or count <= 0:
+                continue
+
+            for slot_unit in self.slot_unit_candidates(size_count):
+                # A CONFIG_BASE_SMALL node has 16 slots, so reading 64 of them runs off the object.
+                for num_slots in (64, 16): # RADIX_TREE_MAP_SIZE
+                    data = read_memory(node + ptrsize * slot_unit, ptrsize * num_slots, safe=True)
+                    if data is None:
+                        continue
+                    used = [x for x in slice_unpack(data, ptrsize) if x]
+                    if len(used) != count:
+                        shift = num_slots.bit_length()
+                        if size_count == 4:
+                            shadows = count >> shift
+                        else:
+                            shadows = 0
+                        if not shadows or (count & ((1 << shift) - 1)) + shadows != len(used):
+                            continue
+                        if shadows != sum(x & 3 == self.RADIX_TREE_EXCEPTIONAL_ENTRY for x in used):
+                            continue
+                    if not all(self.is_slot(x) for x in used):
+                        continue
+                    self.offset_count = offset_count
+                    self.size_count = size_count
+                    self.offset_slots = ptrsize * slot_unit
+                    self.num_slots = num_slots
+                    return True
+        return False
+
+    def is_rnode(self, entry):
+        """Return True if `entry` looks like rnode, which points to the root radix_tree_node."""
+        cls = type(self)
+        if entry & 3 != cls.RADIX_TREE_INDIRECT_PTR:
+            return False
+
+        node = entry - cls.RADIX_TREE_INDIRECT_PTR
+        if not is_valid_addr(node):
+            return False
+        return self.detect_node_layout(node)
+
+    def iter_indexed_entries(self):
+        """Iterate all (index, leaf entry) pairs in the radix_tree lazily."""
+        self.seen = set()
+        self.broken = {}
+        # Re-read the root every time, because the tree may be updated after the last walk.
+        if not self.read_root():
+            return
+
+        cls = type(self)
+        if self.rnode == 0:
+            return
+        if self.rnode & 3 != cls.RADIX_TREE_INDIRECT_PTR:
+            # The tree holds only one item, which is stored in rnode directly.
+            if self.rnode & 3 == 0 and is_valid_addr(self.rnode):
+                yield 0, self.rnode
+            return
+        yield from self.parse_node_indexed(self.rnode - cls.RADIX_TREE_INDIRECT_PTR, self.height, 0)
+        return
+
+    def parse_node(self, node, height):
+        """Iterate the leaf entries under `node` recursively.
+        `height` is the number of the remaining levels, or None if the internal nodes are tagged.
+        """
+        for _, entry in self.parse_node_indexed(node, height, 0):
+            yield entry
+        return
+
+    def parse_node_indexed(self, node, height, index):
+        """Iterate (index, leaf entry) pairs under `node` recursively."""
+        if node in self.seen: # the tree is broken
+            self.broken[node] = "cyclic"
+            return
+        self.seen.add(node)
+
+        if not is_valid_addr(node):
+            self.broken[node] = "unreadable"
+            return
+        if self.offset_slots is None and not self.detect_node_layout(node):
+            self.broken[node] = "unknown node layout"
+            return
+
+        cls = type(self)
+        data = read_memory(node + self.offset_slots, runtime.current_arch.ptrsize * self.num_slots, safe=True)
+        if data is None:
+            self.broken[node] = "unreadable"
+            return
+
+        if height is None:
+            shift = read_int8_from_memory(node)
+        else:
+            shift = (height - 1) * (self.num_slots.bit_length() - 1)
+
+        for slot, entry in enumerate(slice_unpack(data, runtime.current_arch.ptrsize)):
+            if entry == 0:
+                continue
+            if entry & 3 == cls.RADIX_TREE_EXCEPTIONAL_ENTRY: # a value, not a pointer
+                continue
+            child_index = index + (slot << shift)
+            if height is None:
+                if entry & 3 == cls.RADIX_TREE_INDIRECT_PTR:
+                    yield from self.parse_node_indexed(entry - cls.RADIX_TREE_INDIRECT_PTR, None, child_index)
+                elif is_valid_addr(entry):
+                    yield child_index, entry
+            elif height > 1:
+                yield from self.parse_node_indexed(entry, height - 1, child_index)
+            elif is_valid_addr(entry):
+                yield child_index, entry
+        return
+
+
+class KernelMapleTree:
+    """Parse Linux maple trees and share their detected layout between commands.
+    Linux v6.1 introduces maple_tree for mm_struct.mm_mt, v6.5 for sparse_irqs.
+
+    How to use:
+        mt = KernelMapleTree(mm)         # KernelMapleTree(mm, ma_root_offset) skips the search below
+        if mt.find_root_offset(runtime.current_arch.ptrsize * 0x20) is None:
+            ...                           # offsetof(mm_struct, mm_mt.ma_root) is not found
+        mt.root_offset                    # -> the found offset
+        mt.parse()                        # -> [entry, entry, ...]
+        mt.get_next()                     # -> entry (pop one by one, None if exhausted)
+        mt.broken                         # -> {node: reason, ...} if the last walk was incomplete
+
+    struct maple_tree {
+        union {
+            spinlock_t ma_lock;
+            lockdep_map_p ma_external_lock;
+        };
+        unsigned int ma_flags; // v6.6~
+        void __rcu *ma_root; // this points root maple_node. (lower 8-bits are some flags)
+        unsigned int ma_flags; // ~v6.5
+    };
+
+    struct maple_node {
+        union {
+            struct {
+                struct maple_pnode *parent;
+                void __rcu *slot[MAPLE_NODE_SLOTS]; // 64-bit: 31; 32-bit: 63
+            };
+            struct {
+                void *pad;
+                struct rcu_head rcu;
+                struct maple_enode *piv_parent;
+                unsigned char parent_slot;
+                enum maple_type type;
+                unsigned char slot_len;
+                unsigned int ma_flags;
+            };
+            struct maple_range_64 {
+                struct maple_pnode *parent;
+                unsigned long pivot[MAPLE_RANGE64_SLOTS - 1];     // 64-bit: 15; 32-bit: 31
+                union {
+                    void __rcu *slot[MAPLE_RANGE64_SLOTS];        // 64-bit: 16; 32-bit: 32
+                    struct {
+                        void __rcu *pad[MAPLE_RANGE64_SLOTS - 1]; // 64-bit: 15; 32-bit: 31
+                        struct maple_metadata meta;
+                    };
+                };
+            } mr64;
+            struct maple_arange_64 {
+                struct maple_pnode *parent;
+                unsigned long pivot[MAPLE_ARANGE64_SLOTS - 1]; // 64-bit: 9;  32-bit: 20
+                void __rcu *slot[MAPLE_ARANGE64_SLOTS];        // 64-bit: 10; 32-bit: 21
+                unsigned long gap[MAPLE_ARANGE64_SLOTS];       // 64-bit: 10; 32-bit: 21
+                struct maple_metadata meta;
+            } ma64;
+            struct maple_alloc {
+                unsigned long total;
+                unsigned char node_count;
+                unsigned int request_count;
+                struct maple_alloc *slot[MAPLE_ALLOC_SLOTS]; // 64-bit: 30; 32-bit: 31
+            } alloc;
+        };
+    };
+    """
+
+    MT_FLAGS_HEIGHT_MASK = 0x7c
+    MT_FLAGS_HEIGHT_OFFSET = 0x02
+    MAPLE_NODE_TYPE_SHIFT = 0x03
+    MAPLE_NODE_TYPE_MASK = 0x0f
+    MAPLE_NODE_POINTER_MASK = 0xff
+    MAPLE_DENSE = 0
+    MAPLE_LEAF_64 = 1
+    MAPLE_RANGE_64 = 2
+    MAPLE_ARANGE_64 = 3
+
+    ptrsize = None
+    num_node_slots = None
+    num_range64_slots = None
+    num_arange64_slots = None
+    offset_node_slot = None
+    offset_range64_slot = None
+    offset_arange64_slot = None
+
+    def __init__(self, address, ma_root_offset=None):
+        """Set the address of the struct including the maple_tree. `ma_root_offset` is used if it is already known."""
+        self.initialize_layout()
+        self.address = address
+        self.root_offset = ma_root_offset
+        self.ma_root = None
+        self.ma_flags = None
+        self.max_depth = 0
+        self.seen = set()
+        self.broken = {}
+        self.walker = None
+        return
+
+    @classmethod
+    def initialize_layout(cls):
+        """Calculate the layout of maple_node for the current architecture."""
+        if cls.ptrsize == runtime.current_arch.ptrsize:
+            return
+
+        cls.ptrsize = runtime.current_arch.ptrsize
+        if is_64bit():
+            cls.num_node_slots = 31
+            cls.num_range64_slots = 16
+            cls.num_arange64_slots = 10
+        else:
+            cls.num_node_slots = 63
+            cls.num_range64_slots = 32
+            cls.num_arange64_slots = 21
+        # maple_node (dense): slot[MAPLE_NODE_SLOTS] directly follows parent.
+        cls.offset_node_slot = cls.ptrsize
+        # maple_{a,}range_64: parent is followed by pivot[NR_SLOTS - 1], then slot[].
+        cls.offset_range64_slot = cls.ptrsize * cls.num_range64_slots
+        cls.offset_arange64_slot = cls.ptrsize * cls.num_arange64_slots
+        return
+
+    def parse(self):
+        """Return the list of all leaf entries in the maple_tree."""
+        return list(self.iter_entries())
+
+    def iter_entries(self):
+        """Iterate all leaf entries in the maple_tree lazily."""
+        self.seen = set()
+        self.broken = {}
+        # Re-read the root every time, because the tree may be updated after the last walk.
+        if not self.read_root():
+            return
+        if self.ma_root == 0:
+            return
+        if not type(self).is_node(self.ma_root):
+            # a tree holding a single entry at index 0 keeps it directly in ma_root
+            if is_valid_addr(self.ma_root):
+                yield self.ma_root
+            return
+        yield from self.parse_node(self.ma_root, 1)
+        return
+
+    def find_root_offset(self, max_offset):
+        """Search offsetof(the struct, ma_root) heuristically. Return None if it is not found.
+        ____cacheline_aligned_in_smp attribute, spinlock_t and lockdep_map_p can be different size
+        in each environment or situation, so search for it.
+
+        [x64 v6.4.2]
+        0xffff8bedc104db00|+0x0000|+000: 0x0000000000000000   // union  <-- maple_tree
+        0xffff8bedc104db08|+0x0008|+001: 0xffff8bedc1a6601e   // ma_root
+        0xffff8bedc104db10|+0x0010|+002: 0x000000000000030b   // ma_flags
+
+        [x64 v6.6.1]
+        0xffff972801b78a38|+0x0038|+007: 0x0000000000000000   // (the end of cacheline?)
+        0xffff972801b78a40|+0x0040|+008: 0x0000030b00000000   // ma_flags || union  <-- maple_tree
+        0xffff972801b78a48|+0x0048|+009: 0xffff972801b0cc1e   // ma_root
+        """
+        if self.root_offset is not None:
+            return self.root_offset
+
+        cls = type(self)
+        for offset in range(0, max_offset, cls.ptrsize):
+            entry = read_int_from_memory(self.address + offset, safe=True)
+            if entry is None:
+                continue
+            if cls.is_root(entry, self.address + offset):
+                self.root_offset = offset
+                return self.root_offset
+        return None
+
+    def read_root(self):
+        """Read ma_root and ma_flags using the detected offset. Return False if the offset is unknown."""
+        if self.root_offset is None:
+            return False
+
+        kversion = Kernel.kernel_version()
+        if kversion < "6.6":
+            offset_ma_flags = self.root_offset + type(self).ptrsize
+        else:
+            root_field = GefUtil.offsetof("maple_tree", "ma_root")
+            flags_field = GefUtil.offsetof("maple_tree", "ma_flags")
+            if root_field is not None and flags_field is not None:
+                offset_ma_flags = self.root_offset + flags_field - root_field
+            else:
+                offset_ma_flags = self.root_offset - 4
+                if is_64bit() and read_int32_from_memory(self.address + offset_ma_flags, safe=True) == 0:
+                    offset_ma_flags = self.root_offset - 8
+
+        self.ma_root = read_int_from_memory(self.address + self.root_offset, safe=True)
+        self.ma_flags = read_int32_from_memory(self.address + offset_ma_flags, safe=True)
+        if self.ma_root is None or self.ma_flags is None:
+            address = self.address + (self.root_offset if self.ma_root is None else offset_ma_flags)
+            self.broken[address] = "unreadable"
+            return False
+        self.max_depth = (self.ma_flags & self.MT_FLAGS_HEIGHT_MASK) >> self.MT_FLAGS_HEIGHT_OFFSET
+        return True
+
+    @classmethod
+    def is_root(cls, entry, address):
+        """Return True if `entry` read from `address` looks like ma_root, which points to the root maple_node."""
+        # ma_root holds a maple_enode, whose lower 8-bits keep the node type.
+        # 0x0e: maple_leaf_64 (= a small tree), 0x1e: maple_arange_64 (e.g., mm_struct.mm_mt),
+        # 0x16: maple_range_64 (a tree without MT_FLAGS_ALLOC_RANGE, e.g., execmem busy_areas)
+        if (entry & 0xff) not in [0x1e, 0x16, 0x0e] or not is_valid_addr(entry):
+            return False
+        # The parent of the root node points back to the maple_tree with MA_ROOT_PARENT.
+        parent = read_int_from_memory(entry & ~cls.MAPLE_NODE_POINTER_MASK, safe=True)
+        if parent is None or parent & 1 == 0:
+            return False
+        offset = address - (parent & ~1)
+        return 0 <= offset < cls.ptrsize * 32 and offset % cls.ptrsize == 0
+
+    @classmethod
+    def is_node(cls, entry):
+        """Return True if `entry` is a maple_enode, not a single entry stored directly in ma_root."""
+        # a maple_enode keeps xa_is_internal (lower 2 bits == 2); a value or a direct pointer does not
+        return (entry & 3) == 2 and entry > 0x1000
+
+    def get_next(self, _=None):
+        """Return the next leaf entry, or None if all entries are consumed."""
+        # Pop one entry. The unused argument is for compatibility with the vm_next based walker.
+        if self.walker is None:
+            self.walker = self.iter_entries()
+        return next(self.walker, None)
+
+    def parse_node(self, entry, depth):
+        """Iterate the leaf entries under `entry` recursively."""
+        cls = type(self)
+        pointer = entry & ~cls.MAPLE_NODE_POINTER_MASK
+        if pointer in self.seen:
+            self.broken[pointer] = "cyclic"
+            return
+        self.seen.add(pointer)
+
+        if self.max_depth < depth:
+            self.broken[pointer] = "depth limit"
+            return
+
+        node_type = (entry >> cls.MAPLE_NODE_TYPE_SHIFT) & cls.MAPLE_NODE_TYPE_MASK
+
+        if node_type == cls.MAPLE_DENSE:
+            slot_top, num_slots, is_leaf = pointer + cls.offset_node_slot, cls.num_node_slots, True
+        elif node_type == cls.MAPLE_LEAF_64:
+            slot_top, num_slots, is_leaf = pointer + cls.offset_range64_slot, cls.num_range64_slots, True
+        elif node_type == cls.MAPLE_RANGE_64:
+            slot_top, num_slots, is_leaf = pointer + cls.offset_range64_slot, cls.num_range64_slots, False
+        elif node_type == cls.MAPLE_ARANGE_64:
+            slot_top, num_slots, is_leaf = pointer + cls.offset_arange64_slot, cls.num_arange64_slots, False
+        else:
+            self.broken[pointer] = "invalid node type"
+            return
+
+        for i in range(num_slots):
+            slot = read_int_from_memory(slot_top + cls.ptrsize * i, safe=True)
+            if slot is None:
+                self.broken[pointer] = "unreadable"
+                return
+            if (slot & ~(cls.MAPLE_NODE_TYPE_MASK)) == 0:
+                continue
+            if is_leaf:
+                if is_valid_addr(slot):
+                    yield slot
+            else:
+                yield from self.parse_node(slot, depth + 1)
+        return
+
+
+class KernelRBTree:
+    """Parse Linux red-black trees.
+
+    How to use:
+        rb = KernelRBTree(htb + offset_rb_root)   # the address of the struct rb_root
+        rb.parse()                                 # -> [rb_node, rb_node, ...] (not sorted)
+        rb.broken                                  # -> {node: reason, ...} if the last walk was incomplete
+
+    struct rb_root {
+        struct rb_node *rb_node;
+    };
+
+    struct rb_node {
+        unsigned long __rb_parent_color; // the lowest bit is the color (0:RB_RED, 1:RB_BLACK)
+        struct rb_node *rb_right;
+        struct rb_node *rb_left;
+    };
+    Before v2.6.18, rb_parent and rb_color were separate fields before rb_right.
+    """
+
+    def __init__(self, address):
+        """Set the address of the struct rb_root."""
+        self.address = address
+        self.seen = set()
+        self.broken = {}
+        self.offset_right = GefUtil.offsetof("rb_node", "rb_right")
+        self.offset_left = GefUtil.offsetof("rb_node", "rb_left")
+        if self.offset_right is None or self.offset_left is None:
+            kernel_target = is_qemu_system() or is_vmware() or is_kgdb() or is_in_kernel()
+            if kernel_target:
+                kversion = Kernel.kernel_version()
+            else:
+                kversion = None
+            if kversion is not None and kversion < "2.6.18":
+                first_child = 2
+            else:
+                first_child = 1
+            self.offset_right = runtime.current_arch.ptrsize * first_child
+            self.offset_left = self.offset_right + runtime.current_arch.ptrsize
+        return
+
+    def parse(self):
+        """Return the list of all rb_nodes in the tree."""
+        self.seen = set()
+        self.broken = {}
+        if self.address == 0:
+            return []
+
+        root = read_int_from_memory(self.address, safe=True)
+        if root is None:
+            self.broken[self.address] = "unreadable"
+            return []
+        return self.parse_node(root)
+
+    def parse_node(self, rb_node):
+        """Return the list of the rb_nodes under `rb_node` recursively."""
+        if not rb_node:
+            return []
+        if rb_node & (runtime.current_arch.ptrsize - 1):
+            self.broken[rb_node] = "unaligned"
+            return []
+        if not is_valid_addr(rb_node):
+            self.broken[rb_node] = "unreadable"
+            return []
+        if rb_node in self.seen: # the tree is broken
+            self.broken[rb_node] = "cyclic"
+            return []
+        self.seen.add(rb_node)
+
+        right = read_int_from_memory(rb_node + self.offset_right, safe=True)
+        left = read_int_from_memory(rb_node + self.offset_left, safe=True)
+        if right is None or left is None:
+            self.broken[rb_node] = "unreadable"
+
+        ret = [rb_node]
+        if right:
+            ret += self.parse_node(right)
+        if left:
+            ret += self.parse_node(left)
+        return ret
+
 
