@@ -12,6 +12,7 @@ and to command classes (Phase 2) are late-imported inside the referencing
 function.
 """
 import gdb
+import re
 import struct
 
 from gef.core import runtime
@@ -19,6 +20,281 @@ from gef.core.address import AddressUtil, Endian
 from gef.core.cache import Cache
 from gef.core.color import Color
 from gef.core.config import Config
+
+
+class MemoryCache:
+    """A read-through block cache for memory readers.
+    The cost of reading memory via a remote gdb stub is dominated by the number of
+    round trips, not by the size (with qemu-system, 8 bytes costs 95us while 4096 bytes
+    costs 303us). Reading a whole block at once and reusing it makes many commands
+    1.2x-9.2x faster. A local inferior is much cheaper (1.41us vs 1.47us), so the gain
+    is small there, but reading a whole block does not cost more either.
+    Note: this reads more bytes than requested, so it may touch the neighbor registers
+    of a memory mapped device. read_raw() refuses the pages of the devices that QEMU cannot read
+    (see QemuMonitor.check_gic_address()). Use `gef config gef.disable_memory_cache True` for the others."""
+
+    BLOCK_SIZE = 0x1000
+    BLOCK_SIZE_SLOW = 0x40 # over a serial line, a large block costs more than it saves
+    MAX_BLOCKS = 0x1000 # 16MB at most, for a huge scan like `ks -rv`
+    ARM32_LPAE_PHYS_MASK = 0x0000_00ff_ffff_f000
+
+    __blocks__ = {}
+    __unreadable__ = set()
+    default_namespace = "virtual"
+
+    @staticmethod
+    @Cache.cache_until_next
+    def get_policy():
+        """Return (block_size, per_cpu). block_size == 0 means the cache is disabled."""
+        from gef.core.process import is_kgdb, is_over_serial, is_qemu_system
+
+        if Config.get_gef_setting("gef.disable_memory_cache") is True:
+            return 0, False
+        if is_kgdb() or is_over_serial():
+            return MemoryCache.BLOCK_SIZE_SLOW, False
+        # Under qemu-system, each cpu has its own page table ($cr3 differs per thread).
+        # Today GDB does not switch the general thread for a memory read, so a virtual
+        # address is always translated by cpu0, but do not rely on it and separate the
+        # cache by the selected thread.
+        return MemoryCache.BLOCK_SIZE, is_qemu_system()
+
+    @staticmethod
+    def reset(namespace=None):
+        """Clear all cached address spaces, or only the requested namespace."""
+        if namespace is None:
+            MemoryCache.__blocks__.clear()
+            MemoryCache.__unreadable__.clear()
+            return
+
+        for key in [key for key in MemoryCache.__blocks__ if key[0] == namespace]:
+            del MemoryCache.__blocks__[key]
+        for key in [key for key in MemoryCache.__unreadable__ if key[0] == namespace]:
+            MemoryCache.__unreadable__.remove(key)
+        return
+
+    @staticmethod
+    def set_default_namespace(namespace):
+        """Select the namespace used by ordinary virtual or physical reads."""
+        if namespace not in ("virtual", "physical"):
+            raise ValueError("Unsupported default memory namespace: {!r}".format(namespace))
+        MemoryCache.default_namespace = namespace
+        return
+
+    @staticmethod
+    def read_raw(addr, length):
+        """Return a `length` long byte array at `addr`, without using the cache.
+        `gdb.Inferior.read_memory()` does not tell the stub which thread is selected, so under
+        qemu-system a virtual address is always translated by the first cpu. When that cpu is
+        stopped in userland, it cannot reach the kernel, and the read fails even though the
+        selected cpu is stopped in the kernel. `gdb.parse_and_eval()` is evaluated in the
+        selected thread instead, so retry with it."""
+        from gef.core.qemu import QemuMonitor
+
+        if length == 0:
+            return b""
+        end = AddressUtil.get_vmem_end()
+        if not 0 <= addr < end or not 0 <= length <= end - addr:
+            raise gdb.MemoryError("Memory read outside address space: {:#x}+{:#x}".format(addr, length))
+        if QemuMonitor.check_gic_address(addr, length, physical=MemoryCache.default_namespace == "physical"):
+            raise gdb.MemoryError("Refused to read a device that QEMU cannot read: {:#x}+{:#x}".format(addr, length))
+        try:
+            return gdb.selected_inferior().read_memory(addr, length).tobytes()
+        except gdb.MemoryError as e:
+            out = bytearray()
+            try:
+                while len(out) < length:
+                    # a value bigger than `max-value-size` (64KB by default) is refused,
+                    # and a scan like `ks -rv` asks for the whole kernel image at once
+                    value = gdb.parse_and_eval("*(unsigned char (*)[{:d}]){:#x}".format(
+                        min(0x8000, length - len(out)), addr + len(out),
+                    ))
+                    out += value.bytes # `Value.bytes` needs GDB 14 or later
+            except (gdb.error, AttributeError):
+                raise e from None
+            return bytes(out)
+        except gdb.error as e:
+            # a core file raises it for a region that is not dumped
+            if "unavailable" in str(e):
+                raise gdb.MemoryError(str(e)) from None
+            raise
+
+    @staticmethod
+    def read(addr, length, reader=None, namespace=None):
+        """Return bytes at `addr`, using the block cache when available.
+        `reader` and `namespace` allow users such as page-table walkers to cache
+        address spaces other than the inferior's normal virtual memory without
+        mixing their contents.  Reads larger than the selected block size bypass
+        the cache and remain a single read.
+        """
+        if reader is None:
+            reader = MemoryCache.read_raw
+        if namespace is None:
+            namespace = MemoryCache.default_namespace
+        block_size, per_cpu = MemoryCache.get_policy()
+        if block_size == 0 or length > block_size:
+            return reader(addr, length)
+
+        if per_cpu:
+            ctx = Cache.cpu_context()
+        else:
+            ctx = gdb.selected_inferior().num
+        blocks = MemoryCache.__blocks__
+        base = addr & ~(block_size - 1)
+        out = b""
+        pos = base
+        while pos < addr + length:
+            key = (namespace, ctx, pos)
+            data = blocks.get(key)
+            if data is None:
+                if key in MemoryCache.__unreadable__:
+                    # The block is not entirely readable. Read only the requested range,
+                    # so that a memory error is raised only if it is really unreadable.
+                    return reader(addr, length)
+                try:
+                    data = reader(pos, block_size)
+                except gdb.MemoryError:
+                    if len(MemoryCache.__unreadable__) >= MemoryCache.MAX_BLOCKS:
+                        MemoryCache.__unreadable__.clear()
+                    MemoryCache.__unreadable__.add(key)
+                    return reader(addr, length)
+                if len(blocks) >= MemoryCache.MAX_BLOCKS:
+                    blocks.clear()
+                blocks[key] = data
+            out += data
+            pos += block_size
+        offset = addr - base
+        return out[offset:offset + length]
+
+    @staticmethod
+    @Cache.cache_until_next(per_cpu=True)
+    def get_arm32_lpae_root():
+        """Return the physical address of ARM32 Linux's LPAE master page table.
+        QEMU's gdbstub normally translates a virtual read with the page tables of the selected CPU. On ARM32 Linux, a secondary
+        CPU can be stopped while its active table is missing kernel PMDs that are present in the master ``swapper_pg_dir``. A
+        normal GDB read then fails even though the kernel address is valid. This root lets ``read_memory`` retry through that
+        authoritative table.
+        The fallback is limited to QEMU ARM32 with TTBCR.EAE set because the companion walker implements only ARM32's LPAE
+        long-descriptor format. x86/x64 does not have this ARM32 table-synchronization failure and uses the active CR3 through
+        the gdbstub. ARM64 keeps its kernel mappings in TTBR1_EL1, independently of the process-specific TTBR0_EL1, so it does
+        not need an equivalent ``swapper_pg_dir`` retry either.
+        """
+        from gef.core.process import is_arm32, is_qemu_system
+        from gef.core.registers import get_register
+
+        if not is_arm32() or not is_qemu_system():
+            return None
+        ttbcr = get_register("$TTBCR")
+        if ttbcr is None:
+            ttbcr = get_register("$TTBCR", use_mbed_exec=True)
+        if ttbcr is None or not ttbcr & (1 << 31):
+            return None
+
+        # Prefer GDB's symbol table because this fallback may itself be needed
+        # while kallsyms is being initialized. (Upstream also peeks at an already
+        # parsed kallsyms table here; our kallsyms state lives on the
+        # ksymaddr-remote command instance, so this falls through to TTBR1.)
+        try:
+            swapper = int(gdb.parse_and_eval("&swapper_pg_dir"))
+        except (gdb.error, OverflowError, ValueError):
+            swapper = None
+        if swapper is None:
+            try:
+                ttbr1 = int(gdb.parse_and_eval("$TTBR1"))
+            except gdb.error:
+                ttbr1 = get_register("$TTBR1", use_mbed_exec=True)
+            if ttbr1 is None:
+                return None
+            root = ttbr1 & MemoryCache.ARM32_LPAE_PHYS_MASK
+            # With a 3G/1G split, TTBR1 points to the last PMD after the PGD and three PMDs.
+            if (ttbcr >> 16) & 7 == 2:
+                root -= 0x4000
+            if root > 0:
+                return root
+            return None
+
+        try:
+            result = gdb.execute("monitor gva2gpa {:#x}".format(swapper), to_string=True)
+        except gdb.error:
+            return None
+        match = re.search(r"gpa:\s*(0x[0-9a-f]+)", result, re.IGNORECASE)
+        if not match:
+            return None
+        return int(match.group(1), 16) & ~0x1f
+
+    @staticmethod
+    def translate_arm32_lpae(vaddr, root, reader):
+        """Translate one ARM32 LPAE virtual address using physical reads.
+        ``root`` is the physical ``swapper_pg_dir`` address and ``reader`` reads physical bytes. The walk handles an L1 1GB
+        block, an L2 2MB block, or an L3 4KB page and returns the final physical address. Invalid descriptors return None.
+        This is deliberately not a general pagewalk implementation: it exists only so a failed ARM32 GDB virtual read can use
+        the Linux master table. The normal x86/x64 and ARM64 reads remain handled by their gdbstubs.
+        """
+        level1 = u64(reader(root + ((vaddr >> 30) & 0x3) * 8, 8))
+        kind = level1 & 0x3
+        if kind == 0x1:
+            return (level1 & 0x0000_00ff_c000_0000) | (vaddr & 0x3fff_ffff)
+        if kind != 0x3:
+            return None
+
+        level2_base = level1 & MemoryCache.ARM32_LPAE_PHYS_MASK
+        level2 = u64(reader(level2_base + ((vaddr >> 21) & 0x1ff) * 8, 8))
+        kind = level2 & 0x3
+        if kind == 0x1:
+            return (level2 & 0x0000_00ff_ffe0_0000) | (vaddr & 0x1f_ffff)
+        if kind != 0x3:
+            return None
+
+        level3_base = level2 & MemoryCache.ARM32_LPAE_PHYS_MASK
+        level3 = u64(reader(level3_base + ((vaddr >> 12) & 0x1ff) * 8, 8))
+        if level3 & 0x3 != 0x3:
+            return None
+        return (level3 & MemoryCache.ARM32_LPAE_PHYS_MASK) | (vaddr & 0xfff)
+
+    @staticmethod
+    def read_arm32_lpae(vaddr, length):
+        """Read ARM32 virtual memory through the LPAE ``swapper_pg_dir``.
+        This is the cache reader used only after the ordinary virtual read has failed. It temporarily enables physical mode,
+        translates each virtual page with ``translate_arm32_lpae``, and reads the resulting physical ranges. Reads are split at
+        4KB boundaries because consecutive virtual pages need not be consecutive in physical memory.
+        x86/x64 and ARM64 do not call this function: their normal gdbstub reads do not need the ARM32-specific master-table
+        recovery described by ``get_arm32_lpae_root``.
+        """
+        from gef.core.qemu import QemuMonitor, read_physmem
+
+        root = MemoryCache.get_arm32_lpae_root()
+        if root is None:
+            raise gdb.MemoryError("Could not find the ARM32 LPAE master page table")
+
+        with QemuMonitor.use_mmu_mode("phys") as available:
+            if not available:
+                raise gdb.MemoryError("Could not enable physical memory mode")
+
+            def read_physical(paddr, size):
+                try:
+                    return MemoryCache.read_raw(paddr, size)
+                except gdb.MemoryError:
+                    pass
+
+                # Some QEMU gdbstubs leave parts of guest RAM inaccessible even
+                # in physical mode.  Keep the normal physical-memory fallbacks,
+                # notably /proc/QEMU-PID/mem, for those pages.
+                out = read_physmem(paddr, size)
+                if out is None or len(out) != size:
+                    raise gdb.MemoryError(
+                        "Cannot access physical memory at address {:#x}".format(paddr)
+                    )
+                return out
+
+            out = bytearray()
+            while len(out) < length:
+                current = vaddr + len(out)
+                paddr = MemoryCache.translate_arm32_lpae(current, root, read_physical)
+                if paddr is None:
+                    raise gdb.MemoryError("swapper_pg_dir does not map address {:#x}".format(current))
+                size = min(0x1000 - (current & 0xfff), length - len(out))
+                out += read_physical(paddr, size)
+            return bytes(out)
+        return
 
 
 def hexdump(source, length=0x10, separator=".", color=True, show_symbol=True, base=0x00, unit=1):
@@ -174,6 +450,8 @@ def write_memory(addr, data):
         return length
     except gdb.MemoryError:
         pass
+    finally:
+        MemoryCache.reset() # it may be written partially even on failure
 
     # Under qemu-user/pin, you can not patch to `code` areas,
     # so you have to patch via /proc/pid/mem
@@ -184,42 +462,58 @@ def write_memory(addr, data):
 
     raise Exception("Memory write error")
 
-def read_memory(addr, length):
-    """Return a `length` long byte array with the copy of the process memory at `addr`."""
+def read_memory(addr, length, safe=False):
+    """Return bytes at `addr`, or None on a read error when safe is True."""
     from gef.core.process import Pid, is_arm64, is_pin, is_qemu_system
     from gef.core.qemu import QemuMonitor
 
-    if length == 0:
-        return b""
+    try:
+        if length == 0:
+            return b""
+        end = AddressUtil.get_vmem_end()
+        if not 0 <= addr < end or not 0 <= length <= end - addr:
+            raise gdb.MemoryError("Memory read outside address space: {:#x}+{:#x}".format(addr, length))
 
-    if is_pin():
-        # Memory read of Intel Pin is very slow, so speed it up
+        if is_pin():
+            # Memory read of Intel Pin is very slow, so speed it up
+            try:
+                pid = Pid.get_pid()
+                fd = open("/proc/{:d}/mem".format(pid), "rb")
+                fd.seek(addr)
+                content = fd.read(length)
+                fd.close()
+                return content
+            except Exception:
+                pass
+
+        if is_arm64() and is_qemu_system():
+            if Config.get_gef_setting("gef.read_memory_work_around_for_aarch64_secure_memory"):
+                from gef.commands.kernel.trustzone import XSecureMemAddrCommand
+
+                sm = QemuMonitor.get_secure_memory_map()
+                if sm:
+                    target_phys = XSecureMemAddrCommand.v2p_secure(addr) # heavy
+                    if target_phys:
+                        if sm.sm_base <= target_phys < sm.sm_base + sm.sm_size:
+                            target_offset = target_phys - sm.sm_base
+                            data = XSecureMemAddrCommand.read_secure_memory(sm, target_offset, length)
+                            if data:
+                                return data
+
         try:
-            pid = Pid.get_pid()
-            fd = open("/proc/{:d}/mem".format(pid), "rb")
-            fd.seek(addr)
-            content = fd.read(length)
-            fd.close()
-            return content
-        except Exception:
-            pass
-
-    if is_arm64() and is_qemu_system():
-        if Config.get_gef_setting("gef.read_memory_work_around_for_aarch64_secure_memory"):
-            from gef.commands.kernel.trustzone import XSecureMemAddrCommand
-
-            sm = QemuMonitor.get_secure_memory_map()
-            if sm:
-                target_phys = XSecureMemAddrCommand.v2p_secure(addr) # heavy
-                if target_phys:
-                    if sm.sm_base <= target_phys < sm.sm_base + sm.sm_size:
-                        target_offset = target_phys - sm.sm_base
-                        data = XSecureMemAddrCommand.read_secure_memory(sm, target_offset, length)
-                        if data:
-                            return data
-
-    # Don't include it in a try-catch, as we might expect a memory error on read_memory.
-    return gdb.selected_inferior().read_memory(addr, length).tobytes()
+            return MemoryCache.read(addr, length)
+        except gdb.MemoryError:
+            # An ARM32 CPU may be stopped with a TTBR0 whose kernel half is incomplete.
+            # In particular, secondary CPUs do not necessarily have the module PMDs
+            # copied into their active table.  The kernel's master page table remains
+            # authoritative, so retry through it before reporting an unreadable address.
+            if MemoryCache.get_arm32_lpae_root() is not None:
+                return MemoryCache.read(addr, length, reader=MemoryCache.read_arm32_lpae, namespace="arm32-lpae-swapper")
+            raise
+    except (gdb.MemoryError, MemoryError, OverflowError, ValueError, TypeError, struct.error):
+        if safe:
+            return None
+        raise
 
 
 def read_int_from_memory(addr):

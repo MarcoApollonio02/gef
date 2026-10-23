@@ -135,12 +135,14 @@ class Cache:
 
         for fcache in Cache.__gef_caches__["until_next"].values():
             fcache.clear()
-        # MemoryCache is not extracted yet; the call is a no-op until it lands.
         try:
             from gef.core.memory import MemoryCache
-            MemoryCache.reset()
         except ImportError:
-            pass
+            # A partial import of gef.core.memory (no MemoryCache yet) must not
+            # mask an ImportError raised inside MemoryCache.reset() itself.
+            MemoryCache = None
+        if MemoryCache is not None:
+            MemoryCache.reset()
         from gef.core.color import Color
         Color.cached_disabled = None
 

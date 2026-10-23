@@ -311,6 +311,8 @@ class GefCommand(GenericCommand):
         self.add_setting("cppfilt_command", "c++filt", "c++filt command (executable name or path)")
         # workarounds
         self.add_setting("readline_compat", False, "Workaround for readline SOH/ETX issue (SEGV)")
+        self.add_setting("disable_memory_cache", False,
+                         "Disable the block cache of read_memory (it may touch MMIO neighbors)")
         self.add_setting("read_memory_work_around_for_aarch64_secure_memory", False,
                          "Workaround for AArch64 secure memory read_memory failures")
         self.add_setting("physmap_base_for_read_physmem_kgdb_work_around", 0,

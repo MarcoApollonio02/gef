@@ -12,6 +12,7 @@ This module TOP-imports only from already-extracted Layer-1 modules
 modules (`process`, `pagewalk`, `utils`) are late-imported inside the
 referencing function/method.
 """
+import contextlib
 import gdb
 import re
 
@@ -19,7 +20,7 @@ from gef.core.address import AddressUtil
 from gef.core.cache import Cache
 from gef.core.color import err, info, warn
 from gef.core.config import Config
-from gef.core.memory import read_memory, write_memory
+from gef.core.memory import MemoryCache, read_memory, write_memory
 
 
 def read_physmem(paddr, size, already_physmode=False):
@@ -246,25 +247,28 @@ class QemuMonitor:
         return gic_list
 
     @staticmethod
-    @Cache.cache_until_next
-    def check_gic_address(vaddr):
-        gic_addrs = QemuMonitor.get_gic_addrs()
-        if not gic_addrs:
+    def check_gic_address(addr, length=1, physical=False):
+        """Return True if [addr, addr + length) shares a 4KB page with get_gic_addrs().
+        A page is checked as a whole, because MemoryCache reads the other registers of the page too."""
+        if not QemuMonitor.get_gic_addrs():
             return False
+        return any(QemuMonitor.is_gic_page(page, physical) for page in range(addr & ~0xfff, addr + length, 0x1000))
 
-        try:
-            ret = gdb.execute("monitor gva2gpa {:#x}".format(vaddr), to_string=True)
-        except gdb.error:
-            return False
-        r = re.search(r"gpa: (0x\S+)", ret)
-        if not r:
-            return False
-        paddr = int(r.group(1), 16)
-
-        for s, e in gic_addrs:
-            if s <= paddr < e:
-                return True
-        return False
+    @staticmethod
+    @Cache.cache_this_session
+    def is_gic_page(page, physical):
+        # These devices are mapped at boot and kept mapped, so the answer is kept for the session.
+        paddr = page
+        if not physical:
+            try:
+                ret = gdb.execute("monitor gva2gpa {:#x}".format(page), to_string=True)
+            except gdb.error:
+                return False
+            r = re.search(r"gpa: (0x\S+)", ret)
+            if not r:
+                return False
+            paddr = int(r.group(1), 16) & ~0xfff
+        return any(s < paddr + 0x1000 and paddr < e for s, e in QemuMonitor.get_gic_addrs())
 
     @staticmethod
     def get_current_mmu_mode():
@@ -273,8 +277,10 @@ class QemuMonitor:
             try:
                 response = gdb.execute("maintenance packet qqemu.PhyMemMode", to_string=True, from_tty=False)
                 if 'received: "0"' in response:
+                    MemoryCache.set_default_namespace("virtual")
                     return "virt"
                 elif 'received: "1"' in response:
+                    MemoryCache.set_default_namespace("physical")
                     return "phys"
                 else:
                     return False
@@ -282,11 +288,48 @@ class QemuMonitor:
                 return False
         elif is_vmware():
             try:
-                read_memory(0, 1)
+                MemoryCache.read_raw(0, 1)
+                MemoryCache.set_default_namespace("physical")
                 return "phys"
             except gdb.MemoryError:
+                MemoryCache.set_default_namespace("virtual")
                 return "virt"
         return None
+
+    @staticmethod
+    @contextlib.contextmanager
+    def use_mmu_mode(target_mode):
+        """Temporarily select QEMU/VMware virtual or physical memory mode."""
+        if target_mode not in ("virt", "phys"):
+            raise ValueError("Unsupported MMU mode: {!r}".format(target_mode))
+
+        original_mode = QemuMonitor.get_current_mmu_mode()
+        if original_mode is None:
+            # not QEMU-system/VMware: memory is always virtual
+            yield target_mode == "virt"
+            return
+        if original_mode not in ("virt", "phys"):
+            yield False
+            return
+        if original_mode == target_mode:
+            yield True
+            return
+
+        if target_mode == "phys":
+            switch_mode = enable_phys
+        else:
+            switch_mode = disable_phys
+        if original_mode == "phys":
+            restore_mode = enable_phys
+        else:
+            restore_mode = disable_phys
+        switched = switch_mode() is True
+        try:
+            yield switched
+        finally:
+            if switched and restore_mode() is not True:
+                QemuMonitor.get_current_mmu_mode()
+        return
 
     @staticmethod
     def get_secure_memory_map(verbose=False):
@@ -462,10 +505,14 @@ def enable_phys():
         gdb.execute("maintenance packet Qqemu.PhyMemMode:1", to_string=True, from_tty=False)
         response = gdb.execute("maintenance packet qqemu.PhyMemMode", to_string=True, from_tty=False)
         gdb.execute("maintenance flush dcache", to_string=True)
-        return 'received: "1"' in response
+        success = 'received: "1"' in response
+        if success:
+            MemoryCache.set_default_namespace("physical")
+        return success
     elif is_vmware():
         gdb.execute("monitor phys", to_string=True)
         gdb.execute("maintenance flush dcache", to_string=True)
+        MemoryCache.set_default_namespace("physical")
         return True
 
 
@@ -475,8 +522,12 @@ def disable_phys():
         gdb.execute("maintenance packet Qqemu.PhyMemMode:0", to_string=True, from_tty=False)
         response = gdb.execute("maintenance packet qqemu.PhyMemMode", to_string=True, from_tty=False)
         gdb.execute("maintenance flush dcache", to_string=True)
-        return 'received: "0"' in response
+        success = 'received: "0"' in response
+        if success:
+            MemoryCache.set_default_namespace("virtual")
+        return success
     elif is_vmware():
         gdb.execute("monitor virt", to_string=True)
         gdb.execute("maintenance flush dcache", to_string=True)
+        MemoryCache.set_default_namespace("virtual")
         return True
