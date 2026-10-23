@@ -387,6 +387,69 @@ class QemuMonitor:
              "falling back to legacy default 0x30000/0x10000.")
         return (0x30000, 0x10000)
 
+    @staticmethod
+    @Cache.cache_until_next(per_inferior=True)
+    def get_mtree_regions(address_space=None):
+        """Return the regions of `monitor info mtree -f` as a list of (start, end, attr, name).
+        `end` is exclusive and `attr` is like "prio 0, ram". If `address_space` is given, only its FlatView is used."""
+        try:
+            res = gdb.execute("monitor info mtree -f", to_string=True)
+        except gdb.error:
+            return []
+        regions = []
+        for view in re.split(r"(?m)^FlatView", res):
+            if address_space is not None and 'AS "{:s}"'.format(address_space) not in view:
+                continue
+            for start, end, attr, name in re.findall(r"(?m)^  ([0-9a-f]+)-([0-9a-f]+) \(([^)]*)\): (.*?)\r?$", view):
+                # the end is inclusive
+                regions.append((int(start, 16), int(end, 16) + 1, attr, name))
+        return regions
+
+    @staticmethod
+    @Cache.cache_until_next(per_cpu=True, per_inferior=True)
+    def get_x86_segments():
+        try:
+            res = gdb.execute("monitor info registers", to_string=True)
+        except gdb.error:
+            return {}
+        segments = {}
+        for name, selector, base, flags in re.findall(
+                r"^(CS|SS|DS|ES|FS|GS)\s*=\s*([0-9a-f]+)\s+([0-9a-f]+)\s+[0-9a-f]+\s+([0-9a-f]+)",
+                res, re.I | re.M):
+            segments[name.upper()] = (int(selector, 16), int(base, 16), int(flags, 16))
+        base, limit = QemuMonitor.parse_x86_descriptor_table_register(res, "GDT")
+        if base is not None:
+            segments["GDT"] = (base, limit)
+        ldt = QemuMonitor.parse_x86_system_segment(res, "LDT")
+        if ldt and not ldt["base_truncated"]:
+            segments["LDT"] = (ldt["base"], ldt["limit"])
+        cr0 = re.search(r"\bCR0=([0-9a-f]+)", res, re.I)
+        flags = re.search(r"\bEFL=([0-9a-f]+)", res, re.I)
+        vm86 = flags is not None and int(flags.group(1), 16) & (1 << 17)
+        segments["protected"] = bool(cr0 and int(cr0.group(1), 16) & 1 and not vm86)
+        return segments
+
+    @staticmethod
+    def parse_x86_descriptor_table_register(registers, name):
+        match = re.search(r"^{:s}\s*=\s*([0-9a-f]+)\s+([0-9a-f]+)".format(name), registers, re.I | re.M)
+        if not match:
+            return None, None
+        return int(match.group(1), 16), int(match.group(2), 16)
+
+    @staticmethod
+    def parse_x86_system_segment(registers, name):
+        match = re.search(
+            r"^{:s}\s*=\s*([0-9a-f]+)\s+([0-9a-f]+)\s+([0-9a-f]+)\s+([0-9a-f]+)".format(name),
+            registers, re.I | re.M,
+        )
+        if not match:
+            return None
+        selector, base, limit, flags = [int(value, 16) for value in match.groups()]
+        efer = re.search(r"\bEFER=([0-9a-f]+)", registers, re.I)
+        truncated = bool(selector & ~3 and efer and int(efer.group(1), 16) & (1 << 10)
+                         and len(match.group(2)) <= 8)
+        return {"selector": selector, "base": base, "limit": limit, "flags": flags, "base_truncated": truncated}
+
 
 def is_supported_physmode():
     """GDB mode determination function for physmem support."""
