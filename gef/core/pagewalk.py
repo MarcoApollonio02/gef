@@ -52,6 +52,11 @@ class _LateKernelModule:
         module = importlib.import_module("gef.core.kernel")
         return getattr(getattr(module, self._name), item)
 
+    def __call__(self, *args, **kwargs):
+        import importlib
+        module = importlib.import_module("gef.core.kernel")
+        return getattr(module, self._name)(*args, **kwargs)
+
 
 Kernel = _LateKernelModule("Kernel")
 Ksym = _LateKernelModule("Ksym")

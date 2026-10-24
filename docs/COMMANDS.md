@@ -11366,7 +11366,7 @@ Resolve the slab cache (kmem_cache) alias.
 ### Syntax
 
 ```text
-usage: kmem-cache-alias [-h] [-s] [-m] [-n] [-q] [names ...]
+usage: kmem-cache-alias [-h] [-s] [-m] [--meta] [-n] [-q] [names ...]
 
 positional arguments:
   names               filter by specific cache name(s) (substring match).
@@ -11375,6 +11375,7 @@ options:
   -h, --help          show this help message and exit
   -s, --sort-by-size  sort by object size.
   -m, --merged-only   show only merged caches grouped by physical cache.
+  --meta              display offset information.
   -n, --no-pager      do not use the pager.
   -q, --quiet         show result only.
 ```
@@ -11383,6 +11384,44 @@ options:
 
 ```text
 This command requires CONFIG_SYSFS=y.
+CONFIG_SLUB_TINY=y is unsupported because slab sysfs is unavailable.
+```
+
+## kobj
+
+Identify an arbitrary kernel address: mapping, allocator, slab cache, object base/offset and a type candidate.
+
+
+### Syntax
+
+```text
+usage: kobj [-h] [-v] [-r] [-q] ADDRESS
+
+positional arguments:
+  ADDRESS        target address.
+
+options:
+  -h, --help     show this help message and exit
+  -v, --verbose  also list caches merged into the same physical cache.
+  -r, --rescan   do not use cache in underlying commands.
+  -q, --quiet    suppress progress messages, show result only.
+```
+
+### Examples
+
+```gdb
+kobj 0xffff888012345678
+```
+
+### Notes
+
+```text
+Unified resolver combining kvmmap/virt2page/pageinfo/slab-contains/buddy-contains/vmalloc-dump.
+The type candidate is inferred from the slab cache name, so `Confidence` is reported honestly:
+mergeable caches (kmalloc-*) and unaligned addresses lower it. SLUB may merge dedicated caches,
+so use -v to list the caches sharing the same physical kmem_cache via kmem-cache-alias.
+GEF's pageinfo-based page classification currently supports v4.18 and later;
+slab object resolution works on older kernels too.
 ```
 
 ## slab-contains
@@ -11952,6 +11991,49 @@ Tracing `kmem_cache_alloc` type is not supported.
 This command requires CONFIG_RANDSTRUCT=n.
 ```
 
+## kpage-watch
+
+Track the alloc/free/slab lifecycle of a physical page (PFN) for cross-cache analysis.
+
+
+### Syntax
+
+```text
+usage: kpage-watch [-h] [-p PAGE] [--pfn PFN] [-s] [-t] [ADDRESS ...]
+
+positional arguments:
+  ADDRESS              the virtual address(es) whose backing page is watched.
+
+options:
+  -h, --help           show this help message and exit
+  -p, --page PAGE      watch by `struct page` address instead of a virtual address (can be repeated).
+  --pfn PFN            watch by page frame number (PFN) (can be repeated).
+  -s, --stop-on-reuse  stop at the first reuse (a re-allocation after a free).
+  -t, --backtrace      display a backtrace for each event.
+```
+
+### Examples
+
+```gdb
+kpage-watch 0xffff888012345600                           # watch the page backing this virtual address
+kpage-watch 0xffff888012345600 0xffff888012346000        # watch several pages at once
+kpage-watch -p 0xffffea000048d140 -p 0xffffea000048d180  # watch by struct page address
+kpage-watch --pfn 0x12345 --pfn 0x12346                  # watch by PFN
+kpage-watch 0xffff888012345600 -s                        # stop at the first reuse
+```
+
+### Notes
+
+```text
+Disable `-enable-kvm` option for qemu-system (#PF may occur).
+Append `tsc=unstable` option for kernel cmdline.
+ADDRESS, --page and --pfn can be mixed; each resolves to one watched PFN.
+This records events touching the watched PFNs, so the page-allocator/SLUB/page-table boundary is visible.
+Only events reached while continuing are recorded; the history before the command started is not.
+On SLAB the slab-assign hook may be missing (its helpers are inlined); page alloc/free and slab-release are still shown.
+This command requires CONFIG_RANDSTRUCT=n.
+```
+
 ## ktrace
 
 Trace kernel functions and arguments.
@@ -11980,6 +12062,45 @@ options:
 ```text
 If you set breakpoints in some commonly called functions, it became too slow to be useful.
 Use filtering options to reduce the number of functions targeted by breakpoints as much as possible.
+```
+
+## kuaf-watch
+
+Track the alloc/free/reuse lifecycle of a slab object (or an entire cache) for UAF analysis.
+
+
+### Syntax
+
+```text
+usage: kuaf-watch [-h] [-c CACHE] [-s] [-t] [ADDRESS ...]
+
+positional arguments:
+  ADDRESS              the slab object address(es) (or interior pointer) to watch.
+
+options:
+  -h, --help           show this help message and exit
+  -c, --cache CACHE    follow an entire slab cache by name instead of specific objects.
+  -s, --stop-on-reuse  stop at the first reuse (re-allocation) event.
+  -t, --backtrace      display a backtrace for each event.
+```
+
+### Examples
+
+```gdb
+kuaf-watch 0xffff888012345600                     # watch one object's alloc/free/reuse
+kuaf-watch 0xffff888012345600 0xffff888012345700  # watch several objects at once
+kuaf-watch --cache kmalloc-256                    # watch every object of a cache
+kuaf-watch 0xffff888012345600 -s                  # break at the first reuse
+```
+
+### Notes
+
+```text
+Disable `-enable-kvm` option for qemu-system (#PF may occur).
+Append `tsc=unstable` option for kernel cmdline.
+This is a higher-level view built on the same allocator breakpoints as kmalloc-tracer.
+In --cache mode the slab cache of every alloc/free is resolved, which is slower than single-object mode.
+This command requires CONFIG_RANDSTRUCT=n.
 ```
 
 ## thunk-tracer

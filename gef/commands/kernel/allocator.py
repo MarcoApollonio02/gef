@@ -27,7 +27,7 @@ from gef.core.cache import Cache
 from gef.core.color import Color, err, gef_print, info, titlify, warn
 from gef.core.config import Config
 from gef.core.display import ProgressBar
-from gef.core.kernel import Kernel
+from gef.core.kernel import AddrMap, Kernel, KernelRBTree, Ksym
 from gef.core.memory import (
     hexdump,
     is_double_link_list,
@@ -5315,38 +5315,26 @@ class KmemCacheAliasCommand(GenericCommand, BufferingOutput):
     parser.add_argument("-s", "--sort-by-size", action="store_true", help="sort by object size.")
     parser.add_argument("-m", "--merged-only", action="store_true",
                         help="show only merged caches grouped by physical cache.")
+    parser.add_argument("--meta", action="store_true", help="display offset information.")
     parser.add_argument("-n", "--no-pager", action="store_true", help="do not use the pager.")
     parser.add_argument("-q", "--quiet", action="store_true", help="show result only.")
     _syntax_ = parser.format_help()
 
     _note_ = [
         "This command requires CONFIG_SYSFS=y.",
+        "CONFIG_SLUB_TINY=y is unsupported because slab sysfs is unavailable.",
     ]
     _note_ = "\n".join(_note_)
 
-    def parse_rb_node(self, rb_node):
-        if not rb_node or not is_valid_addr(rb_node):
-            return []
-
-        right = read_int_from_memory(rb_node + runtime.current_arch.ptrsize * 1) & ~1 # remove RB_BLACK
-        left = read_int_from_memory(rb_node + runtime.current_arch.ptrsize * 2) & ~1 # remove RB_BLACK
-
-        ret = [rb_node]
-        if right:
-            ret += self.parse_rb_node(right)
-        if left:
-            ret += self.parse_rb_node(left)
-        return ret
-
+    @Cache.cache_this_session(cache_None=False)
     def initialize(self):
-        if hasattr(self, "initialized") and self.initialized:
-            return True
+        self.meta = []
 
         self.slab_kset = KernelAddressHeuristicFinder.get_slab_kset()
         if self.slab_kset is None:
-            self.quiet_err("Could not find slab_kset")
-            return False
-        self.quiet_info("slab_kset: {:#x}".format(self.slab_kset))
+            self.meta.append((self.quiet_err, "Could not find slab_kset"))
+            return None
+        self.meta.append((self.quiet_info, "slab_kset: {:#x}".format(self.slab_kset)))
 
         """
         struct kset {
@@ -5376,11 +5364,11 @@ class KmemCacheAliasCommand(GenericCommand, BufferingOutput):
                 continue
             # found
             self.offset_kobj_sd = runtime.current_arch.ptrsize * (i + 6)
-            self.quiet_info("offsetof(kset, kobj.sd): {:#x}".format(self.offset_kobj_sd))
+            self.meta.append((self.quiet_info, "offsetof(kset, kobj.sd): {:#x}".format(self.offset_kobj_sd)))
             break
         else:
-            self.quiet_err("Could not find offsetof(kset, kobj.sd)")
-            return False
+            self.meta.append((self.quiet_err, "Could not find offsetof(kset, kobj.sd)"))
+            return None
 
         """
         struct kernfs_node {
@@ -5437,27 +5425,35 @@ class KmemCacheAliasCommand(GenericCommand, BufferingOutput):
                 self.offset_union += runtime.current_arch.ptrsize
             self.offset_dir_children = self.offset_union + runtime.current_arch.ptrsize
             self.offset_symlink_target_kn = self.offset_union
-            self.quiet_info("offsetof(kernfs_node, name): {:#x}".format(self.offset_name))
-            self.quiet_info("offsetof(kernfs_node, rb): {:#x}".format(self.offset_rb))
-            self.quiet_info("offsetof(kernfs_node, dir.children): {:#x}".format(self.offset_dir_children))
-            self.quiet_info("offsetof(kernfs_node, symlink.target_kn): {:#x}".format(self.offset_symlink_target_kn))
+            self.meta.append((self.quiet_info, "offsetof(kernfs_node, name): {:#x}".format(self.offset_name)))
+            self.meta.append((self.quiet_info, "offsetof(kernfs_node, rb): {:#x}".format(self.offset_rb)))
+            self.meta.append((self.quiet_info, "offsetof(kernfs_node, dir.children): {:#x}".format(self.offset_dir_children)))
+            self.meta.append((self.quiet_info, "offsetof(kernfs_node, symlink.target_kn): {:#x}".format(self.offset_symlink_target_kn)))
             break
         else:
-            self.quiet_err("Could not find offsetof(kernfs_node, name)")
-            return False
+            self.meta.append((self.quiet_err, "Could not find offsetof(kernfs_node, name)"))
+            return None
 
-        self.initialized = True
         return True
+
+    def get_alias_groups(self):
+        self.args = self.parser.parse_args(["--quiet"])
+        kversion = Kernel.version()
+        if kversion is None or kversion < "3.14":
+            return None
+        self.allocator = Kernel.get_slab_type()
+        if self.allocator != "SLUB" or not self.initialize():
+            return None
+        return self.parse_kmem_cache_alias()
 
     def parse_kmem_cache_alias(self):
         # get children_root
         kset = read_int_from_memory(self.slab_kset)
         sd = read_int_from_memory(kset + self.offset_kobj_sd)
-        children_root = read_int_from_memory(sd + self.offset_dir_children)
 
         # parse
         alias_groups = {}
-        nodes = self.parse_rb_node(children_root)
+        nodes = KernelRBTree(sd + self.offset_dir_children).parse()
         for node in nodes:
             node = node - self.offset_rb
             name_ptr = read_int_from_memory(node + self.offset_name)
@@ -5477,21 +5473,39 @@ class KmemCacheAliasCommand(GenericCommand, BufferingOutput):
                 "name": name,
                 "object_size": 0,
                 "chunk_size": 0,
+                "kmem_cache": None,
+                "unresolved": False,
             }
+
+        def add_unresolved_cache(name, object_size, chunk_size, kmem_cache):
+            unresolved_key = "{:s}@{:#x}".format(name, kmem_cache)
+            alias_groups[unresolved_key] = {
+                "alias": "<UNRESOLVED>",
+                "slab_cache_name": name,
+                "name": name,
+                "object_size": object_size,
+                "chunk_size": chunk_size,
+                "kmem_cache": kmem_cache,
+                "unresolved": True,
+            }
+            return
 
         # parse slub-dump
         cmd = {"SLUB": "slub-dump", "SLUB_TINY": "slub-tiny-dump"}[self.allocator]
-        res = gdb.execute("{:s} --list --no-pager --quiet".format(cmd), to_string=True)
+        res = Color.remove_color(gdb.execute("{:s} --list --no-pager --quiet".format(cmd), to_string=True))
         used_names = []
         for line in res.splitlines():
-            r = re.search(r"(\d+)\s+\(0x\S+\)\s+(\d+)\s+\(0x\S+\)\s+(\S+)\s+0x\S+$", line)
+            r = re.search(r"(\d+)\s+\(0x\S+\)\s+(\d+)\s+\(0x\S+\)\s+(\S+)\s+(0x\S+)$", line)
+            if r is None:
+                continue
             object_size = int(r.group(1))
             chunk_size = int(r.group(2))
             name = r.group(3)
-            used_names.append([object_size, chunk_size, name])
+            kmem_cache = int(r.group(4), 16)
+            used_names.append([object_size, chunk_size, name, kmem_cache])
 
         # identify the actual slab_cache name in use
-        for object_size, chunk_size, slab_cache_name in used_names:
+        for object_size, chunk_size, slab_cache_name, kmem_cache in used_names:
             original_slab_cache_name = slab_cache_name
 
             # In older kernels, the slab_cache name may include the process name,
@@ -5504,65 +5518,102 @@ class KmemCacheAliasCommand(GenericCommand, BufferingOutput):
             # skip if not found
             if slab_cache_name not in alias_groups:
                 self.quiet_err("Could not find key: {:s}".format(original_slab_cache_name))
+                add_unresolved_cache(original_slab_cache_name, object_size, chunk_size, kmem_cache)
                 continue
 
+            target_name = alias_groups[slab_cache_name]["alias"]
+            target_size = re.search(r"^:[A-Za-z]*-?(\d+)$", target_name)
+            if target_size and int(target_size.group(1)) != chunk_size:
+                # Different caches may have the same name. In that case sysfs keeps
+                # only the last alias, so use the unclaimed group with the right size.
+                candidates = []
+                for k, v in alias_groups.items():
+                    group_size = re.search(r"^:[A-Za-z]*-?(\d+)$", k)
+                    if v["alias"] == "-" and not v["slab_cache_name"] and group_size:
+                        if int(group_size.group(1)) == chunk_size:
+                            candidates.append(k)
+                if len(candidates) != 1:
+                    add_unresolved_cache(original_slab_cache_name, object_size, chunk_size, kmem_cache)
+                    continue
+                target_name = candidates[0]
+
+            resolved = False
             for k in alias_groups.keys():
                 # already resolved
                 if alias_groups[k]["slab_cache_name"]:
                     continue
 
                 if alias_groups[k]["alias"] == "-":
-                    if k == alias_groups[slab_cache_name]["alias"]:
+                    if k == target_name:
                         # k: ":0000256" -> "-"
                         # slab_cache_name: "key_jar" -> ":0000256"
                         alias_groups[k]["slab_cache_name"] = slab_cache_name
                         alias_groups[k]["object_size"] = object_size
                         alias_groups[k]["chunk_size"] = chunk_size
+                        alias_groups[k]["kmem_cache"] = kmem_cache
+                        resolved = True
                     elif k == slab_cache_name:
                         # k: "kmalloc-256" -> "-"
                         # slab_cache_name: "kmalloc-256" -> "-"
                         alias_groups[k]["slab_cache_name"] = slab_cache_name
                         alias_groups[k]["object_size"] = object_size
                         alias_groups[k]["chunk_size"] = chunk_size
+                        alias_groups[k]["kmem_cache"] = kmem_cache
+                        resolved = True
                 else:
-                    if alias_groups[k]["alias"] == alias_groups[slab_cache_name]["alias"]:
+                    if alias_groups[k]["alias"] == target_name:
                         # k: "key_jar" -> ":0000256"
                         # slab_cache_name: "key_jar" -> ":0000256"
                         alias_groups[k]["slab_cache_name"] = slab_cache_name
                         alias_groups[k]["object_size"] = object_size
                         alias_groups[k]["chunk_size"] = chunk_size
+                        alias_groups[k]["kmem_cache"] = kmem_cache
+                        resolved = True
+
+            # A cache with no unclaimed sysfs node must remain visible as an
+            # unresolved physical cache instead of being folded into another
+            # cache with the same name.
+            if not resolved:
+                if not any(v["kmem_cache"] == kmem_cache for v in alias_groups.values()):
+                    add_unresolved_cache(original_slab_cache_name, object_size, chunk_size, kmem_cache)
         return alias_groups
 
     def make_output_merged(self, alias_groups):
-        chunk_label_color = Config.get_gef_setting("theme.heap_chunk_label")
-        chunk_size_color = Config.get_gef_setting("theme.heap_chunk_size")
+        chunk_label_color = Config.get("theme.heap_chunk_label")
+        chunk_size_color = Config.get("theme.heap_chunk_size")
 
-        # group entries by their Physical Cache Name
+        # group entries by their physical sysfs node
         merged_groups = {}
         for name, info in alias_groups.items():
             if not info["slab_cache_name"]:
                 continue
 
-            phys_name = info["slab_cache_name"]
-            if phys_name not in merged_groups:
-                merged_groups[phys_name] = []
+            if info["unresolved"]:
+                phys_id = name
+            else:
+                if info["alias"] == "-":
+                    phys_id = name
+                else:
+                    phys_id = info["alias"]
+            if phys_id not in merged_groups:
+                merged_groups[phys_id] = []
 
             entry = info.copy()
-            entry["logical_name"] = name
-            merged_groups[phys_name].append(entry)
+            entry["logical_name"] = info["name"]
+            merged_groups[phys_id].append(entry)
 
         # list keys
         if self.args.names:
             target_phys_groups = set()
 
             # Check every physical group
-            for phys_name, children in merged_groups.items():
+            for phys_id, children in merged_groups.items():
                 matched_group = False
                 for child in children:
                     child_name = child["logical_name"]
                     for filter_name in self.args.names:
                         if filter_name in child_name:
-                            target_phys_groups.add(phys_name)
+                            target_phys_groups.add(phys_id)
                             matched_group = True
                             break
 
@@ -5579,16 +5630,18 @@ class KmemCacheAliasCommand(GenericCommand, BufferingOutput):
 
         # sort by keys
         if self.args.sort_by_size:
-            sorted_phys_names = sorted(keys_to_process,
+            sorted_phys_ids = sorted(keys_to_process,
                 key=lambda k: (merged_groups[k][0]["object_size"] if merged_groups[k] else 0))
         else:
-            sorted_phys_names = sorted(keys_to_process)
+            sorted_phys_ids = sorted(keys_to_process,
+                key=lambda k: merged_groups[k][0]["slab_cache_name"])
 
         # print
         self.out.append(titlify("Merged Slab Caches"))
         found_merge = False
-        for phys_name in sorted_phys_names:
-            children = merged_groups[phys_name]
+        for phys_id in sorted_phys_ids:
+            children = merged_groups[phys_id]
+            phys_name = children[0]["slab_cache_name"]
 
             # MERGE-ONLY LOGIC:
             # We want to hide groups that are just [PhysicalOwner, SysfsID]
@@ -5605,7 +5658,7 @@ class KmemCacheAliasCommand(GenericCommand, BufferingOutput):
                 # filtering by name
                 if self.args.names:
                     for filter_name in self.args.names:
-                        if child["logical_name"] in filter_name:
+                        if filter_name in child["logical_name"]:
                             keep_this_group = True
                             break
             if real_aliases == 0 and not keep_this_group:
@@ -5613,10 +5666,11 @@ class KmemCacheAliasCommand(GenericCommand, BufferingOutput):
             found_merge = True
 
             # print header
-            header = "{:s} (Object size: {:s}, Chunk size: {:#x})".format(
+            header = "{:s} (Object size: {:s}, Chunk size: {:#x}, kmem_cache: {:#x})".format(
                 Color.colorify(phys_name, chunk_label_color),
                 Color.colorify_hex(children[0]["object_size"], chunk_size_color),
                 children[0]["chunk_size"],
+                children[0]["kmem_cache"],
             )
             self.out.append(header)
 
@@ -5642,7 +5696,9 @@ class KmemCacheAliasCommand(GenericCommand, BufferingOutput):
                             already_colored = True
                             break
 
-                if name_str == phys_name:
+                if child["unresolved"]:
+                    line = tree_char + Color.colorify(name_str, "yellow") + " (Unresolved Physical Cache)"
+                elif name_str == phys_name:
                     if not already_colored:
                         name_str = Color.colorify(name_str, "green")
                     line = tree_char + name_str + " (Physical Owner)"
@@ -5658,28 +5714,30 @@ class KmemCacheAliasCommand(GenericCommand, BufferingOutput):
         return
 
     def make_output(self, alias_groups):
-        fmt = "{:16s} {:16s} {:30s} {:12s} {:s}"
-        legend = ["Object Size", "Chunk Size", "Name", "Alias", "slab_cache name"]
+        fmt = "{:16s} {:16s} {:30s} {:12s} {:30s} {:s}"
+        legend = ["Object Size", "Chunk Size", "Name", "Alias", "slab_cache name", "kmem_cache"]
         self.out.append(GefUtil.make_legend(fmt.format(*legend)))
 
         # sort by keys
         if self.args.sort_by_size:
             sorted_alias_groups = sorted(alias_groups.items(),
-                key=lambda x: (x[1]["object_size"], x[1]["chunk_size"], x[1]["name"]))
+                key=lambda x: (x[1]["object_size"], x[1]["chunk_size"], x[1]["name"], x[1]["kmem_cache"] or 0))
         else:
-            sorted_alias_groups = sorted(alias_groups.items())
+            sorted_alias_groups = sorted(alias_groups.items(),
+                key=lambda x: (x[1]["name"], x[1]["kmem_cache"] or 0, x[1]["alias"]))
 
         found = False
         # print
-        for name, v in sorted_alias_groups:
+        for _name, v in sorted_alias_groups:
+            display_name = v["name"]
             # filtering by name
             if self.args.names:
                 for filter_name in self.args.names:
-                    if filter_name in name:
+                    if filter_name in display_name:
                         break
                     if filter_name in v["alias"]:
                         break
-                    if filter_name in v["slab_cache_name"]:
+                    if v["slab_cache_name"] and filter_name in v["slab_cache_name"]:
                         break
                 else:
                     continue
@@ -5687,14 +5745,13 @@ class KmemCacheAliasCommand(GenericCommand, BufferingOutput):
             # print flat
             found = True
             if v["object_size"] == 0:
-                self.out.append("{:16s} {:16s} {:30s} {:12s} {:s}".format(
-                    "-", "-", name, v["alias"], "<UNUSED>",
-                ))
+                self.out.append(fmt.format("-", "-", display_name, v["alias"], "<UNUSED>", "-"))
             else:
                 object_size = "{0:d} ({0:#x})".format(v["object_size"])
                 chunk_size = "{0:d} ({0:#x})".format(v["chunk_size"])
-                self.out.append("{:16s} {:16s} {:30s} {:12s} {:s}".format(
-                    object_size, chunk_size, name, v["alias"], v["slab_cache_name"],
+                self.out.append(fmt.format(
+                    object_size, chunk_size, display_name, v["alias"], v["slab_cache_name"],
+                    "{:#x}".format(v["kmem_cache"]),
                 ))
 
         if self.args.names and not found:
@@ -5709,7 +5766,7 @@ class KmemCacheAliasCommand(GenericCommand, BufferingOutput):
     def do_invoke(self, args):
         self.quiet_info("Wait for memory scan")
 
-        kversion = Kernel.kernel_version()
+        kversion = Kernel.version()
         if kversion is None:
             err("Could not find Linux kernel")
             return
@@ -5717,16 +5774,25 @@ class KmemCacheAliasCommand(GenericCommand, BufferingOutput):
             self.quiet_err("Unsupported before v3.14")
             return
 
-        if not hasattr(self, "allocator"):
-            self.allocator = Kernel.get_slab_type()
+        self.allocator = Kernel.get_slab_type()
 
-        if self.allocator not in ["SLUB", "SLUB_TINY"]:
+        if self.allocator == "SLUB_TINY":
+            self.quiet_err("Unsupported: CONFIG_SLUB_TINY has no slab sysfs support")
+            return
+
+        if self.allocator != "SLUB":
             self.quiet_err("Unsupported: SLAB, SLOB, Unknown allocator")
             return
 
         ret = self.initialize()
+        if args.meta or not ret:
+            for func, line in self.meta:
+                func(line)
         if not ret:
             self.quiet_err("Failed to initialize")
+            return
+
+        if args.meta:
             return
 
         self.out = []
@@ -5737,6 +5803,7 @@ class KmemCacheAliasCommand(GenericCommand, BufferingOutput):
             self.make_output(alias_groups)
         self.print_output()
         return
+
 
 
 @register_command
@@ -6555,4 +6622,478 @@ class VmallocDumpCommand(GenericCommand, BufferingOutput):
         self.dump_areas(areas)
 
         self.print_output()
+        return
+
+
+@register_command
+class KobjCommand(GenericCommand):
+    """Identify an arbitrary kernel address: mapping, allocator, slab cache, object base/offset and a type candidate."""
+
+    _cmdline_ = "kobj"
+    _category_ = "06-h. Qemu-system/KGDB Cooperation - Linux Allocator"
+
+    parser = argparse.ArgumentParser(prog=_cmdline_)
+    parser.add_argument("address", metavar="ADDRESS", type=AddressUtil.parse_address, help="target address.")
+    parser.add_argument("-v", "--verbose", action="store_true", help="also list caches merged into the same physical cache.")
+    parser.add_argument("-r", "--rescan", action="store_true", help="do not use cache in underlying commands.")
+    parser.add_argument("-q", "--quiet", action="store_true", help="suppress progress messages, show result only.")
+    _syntax_ = parser.format_help()
+
+    _example_ = "{0:s} 0xffff888012345678".format(_cmdline_)
+
+    _note_ = [
+        "Unified resolver combining kvmmap/virt2page/pageinfo/slab-contains/buddy-contains/vmalloc-dump.",
+        "The type candidate is inferred from the slab cache name, so `Confidence` is reported honestly:",
+        "mergeable caches (kmalloc-*) and unaligned addresses lower it. SLUB may merge dedicated caches,",
+        "so use -v to list the caches sharing the same physical kmem_cache via kmem-cache-alias.",
+        "GEF's pageinfo-based page classification currently supports v4.18 and later;",
+        "slab object resolution works on older kernels too.",
+    ]
+    _note_ = "\n".join(_note_)
+
+    # Well-known caches whose name differs from the struct, or that are frequently targeted.
+    # Dedicated caches whose name already matches the struct fall through to the generic guess.
+    CACHE_TYPE_HINTS = {
+        "filp": "struct file",
+        "cred_jar": "struct cred",
+        "names_cache": "path name buffer (PATH_MAX)",
+        "files_cache": "struct files_struct",
+        "fs_cache": "struct fs_struct",
+        "sighand_cache": "struct sighand_struct",
+        "signal_cache": "struct signal_struct",
+        "inode_cache": "struct inode",
+        "shmem_inode_cache": "struct shmem_inode_info",
+        "proc_inode_cache": "struct proc_inode",
+        "sock_inode_cache": "struct socket_alloc",
+        "skbuff_head_cache": "struct sk_buff",
+        "skbuff_fclone_cache": "struct sk_buff_fclones (paired/fclone sk_buff instances)",
+        "kmalloc_large": "large kmalloc allocation (multi-page)",
+        "key_jar": "struct key",
+        "mnt_cache": "struct mount",
+        "uid_cache": "struct user_struct",
+        "pool_workqueue": "struct pool_workqueue",
+        "task_delay_info": "struct task_delay_info",
+        "posix_timers_cache": "struct k_itimer",
+        "pde_opener": "struct pde_opener",
+        "eventpoll_epi": "struct epitem",
+        "eventpoll_pwq": "struct eppoll_entry",
+        # Canonical self-named dedicated caches (KMEM_CACHE), rarely merged.
+        "dentry": "struct dentry",
+        "task_struct": "struct task_struct",
+        "mm_struct": "struct mm_struct",
+        "vm_area_struct": "struct vm_area_struct",
+        "anon_vma": "struct anon_vma",
+        "anon_vma_chain": "struct anon_vma_chain",
+        "cred": "struct cred",
+        "pid": "struct pid",
+        "nsproxy": "struct nsproxy",
+        "seq_file": "struct seq_file",
+        "user_namespace": "struct user_namespace",
+    }
+
+    def run(self, cmd):
+        try:
+            return Color.remove_color(gdb.execute(cmd, to_string=True))
+        except gdb.error:
+            return ""
+
+    def emit(self, label, value):
+        gef_print("{:14s}{}".format(label, value))
+        return
+
+    def classify(self, addr):
+        """Return (start, end, label, kind) of the most specific known region containing addr, or None."""
+        F = KernelAddressHeuristicFinder
+        ranges = []
+
+        def add(start, end, label, kind):
+            if start and end and start < end and start <= addr < end:
+                ranges.append((end - start, start, end, label, kind))
+            return
+
+        try:
+            klayout = Kernel.layout()
+            add(klayout.text_base, klayout.text_end, "kernel image (.text)", "kernel_image")
+            add(klayout.ro_base, klayout.ro_end, "kernel image (.rodata)", "kernel_image")
+            add(klayout.rw_base, klayout.rw_end, "kernel image (.data/.bss)", "kernel_image")
+        except Exception:
+            pass
+
+        # On 32-bit the image lives inside the linear map and Kernel.layout() may miss the
+        # .data/.bss range, so also derive image bounds from kallsyms when available.
+        for start_sym, end_sym, label in (
+            ("_stext", "_end", "kernel image"),
+            ("_stext", "_etext", "kernel image (.text)"),
+            ("__start_rodata", "__end_rodata", "kernel image (.rodata)"),
+            ("_sdata", "_edata", "kernel image (.data)"),
+        ):
+            try:
+                add(Ksym.get_addr(start_sym), Ksym.get_addr(end_sym), label, "kernel_image")
+            except Exception:
+                pass
+
+        # modules may be outside MODULES_VADDR~MODULES_END (e.g., ARM64 with KASLR allocates them in vmalloc)
+        for _module, _name, regions in Kernel.modules().get_loaded() or []:
+            for _type, base, size in regions:
+                add(base, base + size, "modules", "module")
+
+        try:
+            consts = F.consts()
+            add(consts.MODULES_VADDR, consts.MODULES_END, "modules", "module")
+            if is_x86_64() or is_arm64():
+                add(F.get_VMEMMAP_START(), F.get_VMEMMAP_END(), "vmemmap (struct page array)", "vmemmap")
+            add(F.get_VMALLOC_START(), F.get_VMALLOC_END(), "vmalloc", "vmalloc")
+            add(F.get_PAGE_OFFSET(), F.get_PAGE_OFFSET_END(), "direct-map (physmap)", "physmap")
+            for start_attr, end_attr, label in (
+                ("FIXADDR_START", "FIXADDR_TOP", "fixmap"),
+                ("CPU_ENTRY_AREA_BASE", "CPU_ENTRY_AREA_END", "cpu_entry_area"),
+                ("VSYSCALL_ADDR", "VSYSCALL_END", "vsyscall"),
+                ("LDT_BASE_ADDR", "LDT_END_ADDR", "ldt"),
+                ("EFI_VA_START", "EFI_VA_END", "efi"),
+            ):
+                add(getattr(consts, start_attr, None), getattr(consts, end_attr, None), label, "other")
+        except Exception:
+            pass
+
+        if not ranges:
+            return None
+        ranges.sort()
+        _size, start, end, label, kind = ranges[0]
+        return start, end, label, kind
+
+    def type_candidate(self, name, aligned, object_size=None):
+        """Infer a C type candidate from the slab cache name. Returns (candidate, confidence)."""
+        if aligned:
+            conf_ok = "high"
+        else:
+            conf_ok = "low"
+        if aligned:
+            conf_maybe = "medium"
+        else:
+            conf_maybe = "low"
+
+        if name == "mnt_cache":
+            # `mnt_cache` allocated struct vfsmount through v3.2 and struct mount
+            # afterwards.  Prefer the target's DWARF and use the version only when
+            # neither type can be matched to the allocator's reported object size.
+            matches = []
+            for type_name in ("struct mount", "struct vfsmount"):
+                type_obj = GefUtil.cached_lookup_type(type_name)
+                if type_obj is None:
+                    continue
+                try:
+                    size = int(type_obj.sizeof)
+                except (gdb.error, TypeError):
+                    continue
+                if object_size is None or size <= object_size:
+                    matches.append((type_name, size))
+            if object_size is not None:
+                exact = [entry for entry in matches if entry[1] == object_size]
+                if len(exact) == 1:
+                    return exact[0][0], conf_ok
+            if len(matches) == 1:
+                return matches[0][0], conf_ok
+            kversion = Kernel.version()
+            return ("struct vfsmount" if kversion and kversion < "3.3" else "struct mount"), conf_ok
+
+        if name in self.CACHE_TYPE_HINTS:
+            return self.CACHE_TYPE_HINTS[name], conf_ok
+        for prefix in ("kmalloc-cg-", "dma-kmalloc-", "kmalloc-rcl-", "kmalloc-"):
+            if name.startswith(prefix):
+                return "generic kmalloc buffer ({:s}); type not determinable".format(name), conf_maybe
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+            return "struct {:s} (guessed from cache name)".format(name), conf_maybe
+        return "object from '{:s}' cache (type unknown)".format(name), conf_maybe
+
+    def parse_slab(self, out):
+        """Parse slab-contains output. Returns dict on success, None if not a slab object."""
+        m = re.search(r"^name: (\S+)\s+object_size: (\S+) \(chunk_size: (0x\S+)\)\s+num_pages: (0x\S+)", out, re.M)
+        if not m:
+            return None
+        result = {
+            "name": m.group(1), "object_size": int(m.group(2), 0), "chunk_size": int(m.group(3), 16),
+            "object_base": None, "offset": 0, "state": None,
+        }
+        m = re.search(r"^object_base: (0x\S+)", out, re.M)
+        if m:
+            result["object_base"] = int(m.group(1), 16)
+        m = re.search(r"remarks: unaligned \(offset: \+(0x\S+)\)", out)
+        if m:
+            result["offset"] = int(m.group(1), 16)
+        if "before first object" in out or "after last object" in out:
+            result["offset"] = -1
+            result["padding"] = True
+        m = re.search(r"^status: (freed|in-use)", out, re.M)
+        if m:
+            if m.group(1) == "freed":
+                result["state"] = "freed"
+            else:
+                result["state"] = "allocated"
+        return result
+
+    def color_state(self, state):
+        if state == "freed":
+            return Color.colorify("freed", Config.get("theme.heap_chunk_address_freed"))
+        if state == "allocated":
+            return Color.colorify("allocated", Config.get("theme.heap_chunk_address_used"))
+        return state or "unknown"
+
+    def report_slab(self, addr, page, slab):
+        aligned = slab["offset"] == 0
+        if page is not None:
+            self.emit("Page", "{:#x}".format(page))
+        self.emit("Allocator", Kernel.get_slab_type())
+        self.emit("Slab cache", Color.colorify(slab["name"], Config.get("theme.heap_chunk_label")))
+        if slab["object_base"] is not None:
+            self.emit("Object base", "{:#x}".format(slab["object_base"]))
+            self.emit("Object offset", "+{:#x}".format(addr - slab["object_base"]))
+        if slab.get("padding"):
+            self.emit("Candidate", "slab padding (no object)")
+            self.emit("Confidence", "high")
+            return
+        if slab["state"]:
+            self.emit("State", self.color_state(slab["state"]))
+        candidate, confidence = self.type_candidate(slab["name"], aligned, slab["object_size"])
+
+        # If the physical cache has merged aliases, the reported name is only the owner: the
+        # object may belong to any merged cache. Verify for high-confidence (dedicated) names,
+        # and always when -v, then downgrade and list the alternatives.
+        aliases = None
+        if confidence == "high" or self.args.verbose:
+            aliases = self.get_merged_aliases(slab["name"])
+        if aliases != [] and confidence == "high":
+            confidence = "medium"
+
+        self.emit("Candidate", candidate)
+        self.emit("Confidence", confidence)
+        if not aligned and slab["offset"] != -1:
+            self.emit("Remarks", Color.redify("address is not at an object boundary"))
+        if aliases is None and confidence == "medium":
+            self.emit("Remarks", "cache merge status could not be verified")
+        if aliases:
+            self.emit("Merged with", ", ".join(aliases))
+            self.emit("Remarks", "merged cache: object may instead be one of the above types")
+        return
+
+    def get_merged_aliases(self, name):
+        """Return the caches merged into the same physical cache as `name` (excluding itself),
+        [] when verified not merged, or None when merge status could not be determined."""
+        groups = runtime.CommandRegistry.instances["kmem-cache-alias"].get_alias_groups()
+        if groups is None:
+            return None
+        matches = [entry for entry in groups.values() if entry["slab_cache_name"] == name]
+        if not matches or any(entry["unresolved"] for entry in matches):
+            return None
+        if len({entry["kmem_cache"] for entry in matches}) != 1:
+            return None
+        return sorted({entry["name"] for entry in matches if entry["alias"] != "-" and entry["name"] != name})
+
+    def report_page_alloc(self, addr):
+        pi = self.run("pageinfo {:#x}".format(addr)) or ""
+        buddy_match = re.search(r"^in_buddy_list\s*:\s*(True|False)\s*$", pi, re.M)
+        refcount_match = re.search(r"^refcount\s*:\s*(0x[0-9a-fA-F]+)\s*$", pi, re.M)
+        if not buddy_match or not refcount_match:
+            self.emit("Allocator", "unknown (not slab; page metadata unavailable)")
+            self.emit("State", "unknown")
+            self.emit("Candidate", "not a slab object; buddy/page-type data unavailable on this target")
+            self.emit("Confidence", "low")
+            return
+
+        ptype = ""
+        m = re.search(r"page_type\s*:\s*\S+ \((.+)\)", pi)
+        if m:
+            ptype = m.group(1)
+        refcount = int(refcount_match.group(1), 16)
+        in_buddy = buddy_match.group(1) == "True"
+
+        self.emit("Allocator", "buddy (page allocator)")
+        if in_buddy:
+            self.emit("State", self.color_state("freed"))
+            block = self.run("buddy-contains -L {:#x}".format(addr))
+            m = re.search(r"order: (\d+) \((0x\S+) bytes", block)
+            if m:
+                self.emit("Block", "order {:s} ({:s} bytes)".format(m.group(1), m.group(2)))
+            self.emit("Candidate", "free page block in buddy allocator")
+            self.emit("Confidence", "medium")
+            return
+
+        self.emit("State", self.color_state("allocated") if refcount else "unknown")
+        if "table" in ptype:
+            candidate, confidence = "page table page ({:s})".format(ptype), "medium"
+        elif "slab" in ptype.lower():
+            candidate, confidence = "slab page (cache could not be resolved)", "low"
+        else:
+            candidate, confidence = "raw page (page cache / anonymous / driver buffer)", "low"
+        self.emit("Candidate", candidate)
+        self.emit("Confidence", confidence)
+        return
+
+    def report_lowmem(self, addr):
+        page = Kernel.virt2page(addr & -KernelAddressHeuristicFinder.consts().PAGE_SIZE)
+        slab = self.parse_slab(self.run("slab-contains {:s}{:#x}".format(self.rr, addr)))
+        if slab:
+            self.report_slab(addr, page, slab)
+            return
+        if page is not None:
+            self.emit("Page", "{:#x}".format(page))
+        self.report_page_alloc(addr)
+        return
+
+    def report_vmemmap(self, addr):
+        self.emit("Allocator", "n/a (page descriptor array)")
+        consts = KernelAddressHeuristicFinder.consts()
+        start = KernelAddressHeuristicFinder.get_VMEMMAP_START()
+        if consts is not None:
+            stride = consts.sizeof_struct_page
+        else:
+            stride = None
+        if start is None or not stride:
+            self.emit("Candidate", "VMEMMAP address; sizeof(struct page) is unknown")
+            self.emit("Confidence", "low")
+            return
+
+        delta = addr - start
+        page = addr - (delta % stride)
+        offset = addr - page
+        self.emit("Descriptor", "{:#x}".format(page))
+        self.emit("Stride", "{:#x} (sizeof(struct page))".format(stride))
+        if offset:
+            self.emit("Object offset", "+{:#x}".format(offset))
+
+        # Sparse VMEMMAP reserves a broad virtual range but only populates the
+        # portions that describe real memory sections.  Check the whole record,
+        # rather than treating every canonical address in that range as a page.
+        populated = is_valid_addr(page) and is_valid_addr(page + stride - 1)
+        if not populated:
+            self.emit("Candidate", "unpopulated VMEMMAP range (not a readable struct page)")
+            self.emit("Confidence", "low")
+        elif offset:
+            self.emit("Candidate", "interior pointer into struct page")
+            self.emit("Confidence", "low")
+            self.emit("Remarks", Color.redify("address is not at a struct page boundary"))
+        else:
+            self.emit("Candidate", "struct page (describes one physical page frame)")
+            self.emit("Confidence", "high")
+        return
+
+    def find_vmalloc_chunk(self, addr):
+        """Return (start, end, flags) of the vmalloc used chunk containing addr, or None."""
+        out = self.run("vmalloc-dump {:s} --quiet --no-pager --only-used".format(self.rr if self.rr else ""))
+        for line in out.splitlines():
+            fields = line.split()
+            if len(fields) < 4 or fields[1] != "in-use" or "-" not in fields[2]:
+                continue
+            try:
+                start_str, end_str = fields[2].split("-")
+                start, end = int(start_str, 16), int(end_str, 16)
+            except ValueError:
+                continue
+            if start <= addr < end:
+                if len(fields) > 4:
+                    flags = " ".join(fields[4:])
+                else:
+                    flags = ""
+                return start, end, flags
+        return None
+
+    def emit_vmalloc_chunk(self, addr, chunk, candidate_prefix):
+        start, end, flags = chunk
+        self.emit("Object base", "{:#x}".format(start))
+        self.emit("Object offset", "+{:#x}".format(addr - start))
+        self.emit("Size", "{:#x}".format(end - start))
+        if flags:
+            self.emit("Flags", flags)
+        self.emit("Candidate", candidate_prefix + (" ({:s})".format(flags) if flags else ""))
+        self.emit("Confidence", "medium")
+        return
+
+    def report_vmalloc(self, addr):
+        self.emit("Allocator", "vmalloc")
+        chunk = self.find_vmalloc_chunk(addr)
+        if chunk:
+            self.emit_vmalloc_chunk(addr, chunk, "vmalloc allocation")
+            return
+        self.emit("Candidate", "vmalloc region (no matching used chunk found)")
+        self.emit("Confidence", "low")
+        return
+
+    def report_module(self, addr):
+        self.emit("Allocator", "module loader (vmalloc-backed)")
+        for _module, name, regions in Kernel.modules().get_loaded() or []:
+            for region_name, base, size in regions:
+                if not base <= addr < base + size:
+                    continue
+                self.emit("Module", name)
+                self.emit("Object base", "{:#x}".format(base))
+                self.emit("Object offset", "+{:#x}".format(addr - base))
+                self.emit("Candidate", "kernel module image ({:s} {:s})".format(name, region_name))
+                self.emit("Confidence", "high")
+                self.report_symbol(addr)
+                return
+        # Modules share the vmalloc range on some arches; fall back to the vmalloc chunk lookup.
+        chunk = self.find_vmalloc_chunk(addr)
+        if chunk:
+            self.emit_vmalloc_chunk(addr, chunk, "vmalloc allocation in module VA range")
+            self.report_symbol(addr)
+            return
+        self.emit("Candidate", "module region (module not identified)")
+        self.emit("Confidence", "low")
+        self.report_symbol(addr)
+        return
+
+    def report_kernel_image(self, addr):
+        self.emit("Allocator", "n/a (static kernel image)")
+        self.emit("Candidate", "static kernel code/data")
+        self.emit("Confidence", "high")
+        self.report_symbol(addr)
+        return
+
+    def report_symbol(self, addr):
+        sym = Symbol.format(addr)
+        if sym:
+            self.emit("Symbol", sym)
+        return
+
+    @parse_args
+    @only_if_gdb_running
+    @only_if_specific_gdb_mode(mode=("qemu-system", "vmware", "kgdb"))
+    @only_if_specific_arch(arch=("x86_32", "x86_64", "ARM32", "ARM64"))
+    @only_if_in_kernel_or_kpti_disabled
+    def do_invoke(self, args):
+        if Kernel.version() is None:
+            err("Could not find Linux kernel")
+            return
+
+        self.quiet_info("Resolving")
+        if args.rescan:
+            self.rr = "-r "
+        else:
+            self.rr = ""
+
+        addr = args.address
+        self.emit("Address", "{:#x}".format(addr))
+
+        region = self.classify(addr)
+        if region is None:
+            self.emit("Mapping", "unknown")
+            kind = None
+        else:
+            _start, _end, label, kind = region
+            self.emit("Mapping", label)
+
+        if kind == "vmemmap":
+            self.report_vmemmap(addr)
+        elif kind == "vmalloc":
+            self.report_vmalloc(addr)
+        elif kind == "module":
+            self.report_module(addr)
+        elif kind == "kernel_image":
+            self.report_kernel_image(addr)
+        elif kind == "other":
+            self.emit("Allocator", "n/a")
+            self.emit("Candidate", "special kernel region")
+            self.emit("Confidence", "high")
+            self.report_symbol(addr)
+        else:
+            self.report_lowmem(addr)
         return

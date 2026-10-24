@@ -29,28 +29,30 @@ from gef.commands.base import (
 from gef.core import runtime
 from gef.core.address import AddressUtil
 from gef.core.cache import Cache
-from gef.core.color import Color, err, gef_print, titlify, warn
+from gef.core.color import Color, err, gef_print, info, titlify, warn
 from gef.core.config import Config
 from gef.core.instruction import Disasm
-from gef.core.kernel import Kernel
+from gef.core.kernel import Kernel, KernelPerCpu, Ksym
 from gef.core.memory import (
+    is_valid_addr,
     p16,
     p32,
     p64,
     p8,
     read_cstring_from_memory,
     read_int32_from_memory,
+    read_int8_from_memory,
     read_int_from_memory,
     read_memory,
     write_memory,
 )
 from gef.core.pagewalk import KernelAddressHeuristicFinder
-from gef.core.process import get_pagesize, get_pagesize_mask_low
+from gef.core.process import get_pagesize, get_pagesize_mask_low, is_arm32, is_arm64
 from gef.core.registers import get_register
 from gef.core.strings import String
 from gef.core.symbols import Symbol
 from gef.core.syscall import Syscall
-from gef.core.utils import GefUtil, align, slice_unpack, slicer
+from gef.core.utils import GefUtil, align, slice_unpack, slicer, u2i
 
 
 class CallUsermodehelperSetupBreakpoint(gdb.Breakpoint):
@@ -2736,3 +2738,1016 @@ class KernelTraceCommand(GenericCommand):
                 bp.delete()
         return
 
+
+class KuafWatchAllocBreakpoint(gdb.Breakpoint):
+    """Create a breakpoint at an allocator entry for kuaf-watch."""
+
+    def __init__(self, loc, sym, watcher):
+        super().__init__("*{:#x}".format(loc), gdb.BP_BREAKPOINT, internal=False)
+        self.sym = sym
+        self.watcher = watcher
+        self.enabled = False
+        return
+
+    def stop(self):
+        Cache.reset_gef_caches()
+        # Capture the caller and execution context before the function can schedule.
+        try:
+            ret_addr = KmallocTracerCommand.get_return_address()
+        except gdb.error:
+            return False
+        KuafWatchAllocRetBreakpoint(ret_addr, self.sym, ret_addr, self.watcher)
+        return False
+
+
+
+class KuafWatchAllocRetBreakpoint(gdb.Breakpoint):
+    """Create a breakpoint at an allocator return for kuaf-watch."""
+
+    def __init__(self, loc, sym, caller_pc, watcher):
+        super().__init__("*{:#x}".format(loc), gdb.BP_BREAKPOINT, internal=True)
+        self.sym = sym
+        self.caller_pc = caller_pc
+        self.watcher = watcher
+        task_addr, task_name = KmallocTracerCommand.get_task()
+        self.call_context = Kernel.get_call_context(task_addr)
+        KmallocTracerCommand.clear_disabled_breakpoints("KuafWatchAllocRetBreakpoint", owner=self.watcher)
+        return
+
+    def stop(self):
+        Cache.reset_gef_caches()
+        task_addr, task_name = KmallocTracerCommand.get_task()
+        if self.call_context != Kernel.get_call_context(task_addr, at_return=True):
+            return False
+        allocated = AddressUtil.parse_address(runtime.current_arch.return_register)
+        self.enabled = False
+        return self.watcher.handle_alloc(allocated, self.sym, self.caller_pc)
+
+
+
+class KuafWatchFreeBreakpoint(gdb.Breakpoint):
+    """Create a breakpoint at kfree for kuaf-watch."""
+
+    def __init__(self, loc, sym, index_of_addr_arg, watcher):
+        super().__init__("*{:#x}".format(loc), gdb.BP_BREAKPOINT, internal=False)
+        self.sym = sym
+        self.index_of_addr_arg = index_of_addr_arg
+        self.watcher = watcher
+        self.enabled = False
+        return
+
+    def stop(self):
+        Cache.reset_gef_caches()
+        to_free = KmallocTracerCommand.get_ith_parameter(self.index_of_addr_arg)
+        if to_free == 0:
+            return False
+        caller_pc = KmallocTracerCommand.get_return_address()
+        return self.watcher.handle_free(to_free, self.sym, caller_pc)
+
+
+
+class KuafWatchBulkFreeBreakpoint(gdb.Breakpoint):
+    """Create a breakpoint at kmem_cache_free_bulk for kuaf-watch."""
+
+    def __init__(self, loc, sym, watcher):
+        super().__init__("*{:#x}".format(loc), gdb.BP_BREAKPOINT, internal=False)
+        self.sym = sym
+        self.watcher = watcher
+        self.enabled = False
+        return
+
+    def stop(self):
+        Cache.reset_gef_caches()
+        size = KmallocTracerCommand.get_ith_parameter(1)
+        objects = KmallocTracerCommand.get_ith_parameter(2)
+        if size == 0 or objects == 0:
+            return False
+
+        caller_pc = KmallocTracerCommand.get_return_address()
+        stop = False
+        ptrsize = runtime.current_arch.ptrsize
+        try:
+            # Keep remote reads bounded while still handling every object in the batch.
+            for index in range(0, size, 256):
+                count = min(size - index, 256)
+                data = read_memory(objects + index * ptrsize, count * ptrsize)
+                for to_free in slice_unpack(data, ptrsize):
+                    if to_free == 0:
+                        continue
+                    # In object mode avoid the comparatively expensive slab lookup for
+                    # unrelated entries. Cache mode intentionally resolves every entry.
+                    if self.watcher.cache_name is None and to_free not in self.watcher.watched:
+                        continue
+                    stop |= self.watcher.handle_free(to_free, self.sym, caller_pc)
+        except (gdb.error, OverflowError, ValueError):
+            pass
+        return stop
+
+
+
+@register_command
+class KuafWatchCommand(GenericCommand):
+    """Track the alloc/free/reuse lifecycle of a slab object (or an entire cache) for UAF analysis."""
+
+    _cmdline_ = "kuaf-watch"
+    _category_ = "06-i. Qemu-system/KGDB Cooperation - Linux Dynamic Inspection"
+
+    parser = argparse.ArgumentParser(prog=_cmdline_)
+    parser.add_argument("address", metavar="ADDRESS", nargs="*", type=AddressUtil.parse_address,
+                        help="the slab object address(es) (or interior pointer) to watch.")
+    parser.add_argument("-c", "--cache", help="follow an entire slab cache by name instead of specific objects.")
+    parser.add_argument("-s", "--stop-on-reuse", action="store_true", help="stop at the first reuse (re-allocation) event.")
+    parser.add_argument("-t", "--backtrace", action="store_true", help="display a backtrace for each event.")
+    _syntax_ = parser.format_help()
+
+    _example_ = [
+        "{0:s} 0xffff888012345600                     # watch one object's alloc/free/reuse",
+        "{0:s} 0xffff888012345600 0xffff888012345700  # watch several objects at once",
+        "{0:s} --cache kmalloc-256                    # watch every object of a cache",
+        "{0:s} 0xffff888012345600 -s                  # break at the first reuse",
+    ]
+    _example_ = "\n".join(_example_).format(_cmdline_)
+
+    _note_ = [
+        "Disable `-enable-kvm` option for qemu-system (#PF may occur).",
+        "Append `tsc=unstable` option for kernel cmdline.",
+        "This is a higher-level view built on the same allocator breakpoints as kmalloc-tracer.",
+        "In --cache mode the slab cache of every alloc/free is resolved, which is slower than single-object mode.",
+        "This command requires CONFIG_RANDSTRUCT=n.",
+    ]
+    _note_ = "\n".join(_note_)
+
+    def resolve_offsets(self):
+        self.offset_pid = None
+        ret = gdb.execute("ktask --no-pager --meta", to_string=True)
+        r = re.search(r"offsetof\(task_struct, pid\): (0x\S+)", ret)
+        if r:
+            self.offset_pid = int(r.group(1), 16)
+        return
+
+    def get_task_info(self):
+        cpu = KernelPerCpu.get_cpu_index(gdb.selected_thread())
+        task_addr, comm = KmallocTracerCommand.get_task()
+        pid = None
+        if task_addr and self.offset_pid is not None:
+            pid = read_int32_from_memory(task_addr + self.offset_pid)
+        return task_addr, comm, pid, cpu
+
+    def lookup_cache(self, addr):
+        ret = KmallocTracerCommand.virt2name_and_size(addr)
+        if ret:
+            return ret[0]
+        return None
+
+    def resolve_object(self, addr):
+        """Resolve (object_base, cache_name, object_size, state) for a slab address, or None."""
+        out = Color.remove_color(gdb.execute("slab-contains {:#x}".format(addr), to_string=True))
+        m = re.search(r"^name: (\S+)\s+object_size: (\S+)", out, re.M)
+        if not m:
+            return None
+        name, object_size = m.group(1), int(m.group(2), 0)
+        m = re.search(r"^object_base: (0x\S+)", out, re.M)
+        if not m:
+            return None
+        base = int(m.group(1), 16)
+        m = re.search(r"^status: (freed|in-use)", out, re.M)
+        state = None
+        if m:
+            if m.group(1) == "freed":
+                state = "freed"
+            else:
+                state = "allocated"
+        return base, name, object_size, state
+
+    def emit_event(self, tag, addr, cache, caller_pc, api):
+        _task_addr, _comm, pid, cpu = self.get_task_info()
+        caller = Symbol.format(caller_pc, bracket="", missing="?" if caller_pc is None else "{:#x}".format(caller_pc))
+        if tag == "FREE":
+            theme = "theme.heap_chunk_address_freed"
+        else:
+            theme = "theme.heap_chunk_address_used"
+        addr_s = Color.colorify_hex(addr, Config.get(theme))
+        cache_s = Color.colorify(cache or "?", Config.get("theme.heap_chunk_label"))
+        gef_print("[{:5s}] {:s}  cache={:s}".format(tag, addr_s, cache_s))
+        if pid is None:
+            pid_s = "?"
+        else:
+            pid_s = "{:d}".format(pid)
+        gef_print("        caller={:s}  pid={:s} cpu={:s}  api={:s}".format(
+            caller, pid_s, "?" if cpu is None else str(cpu), api,
+        ))
+        if self.backtrace:
+            KmallocTracerCommand.print_backtrace(True)
+        return
+
+    def handle_alloc(self, allocated, sym, caller_pc):
+        if self.cache_name is None:
+            if allocated not in self.watched:
+                return False
+            cache = self.lookup_cache(allocated) or self.watched[allocated]
+        else:
+            cache = self.lookup_cache(allocated)
+            if cache != self.cache_name:
+                return False
+        reuse = allocated in self.freed_slots
+        self.freed_slots.discard(allocated)
+        self.emit_event("ALLOC", allocated, cache, caller_pc, sym)
+        return self.stop_on_reuse and reuse
+
+    def handle_free(self, to_free, sym, caller_pc):
+        if self.cache_name is None:
+            if to_free not in self.watched:
+                return False
+            cache = self.watched[to_free]
+        else:
+            cache = self.lookup_cache(to_free)
+            if cache != self.cache_name:
+                return False
+        self.freed_slots.add(to_free)
+        self.emit_event("FREE", to_free, cache, caller_pc, sym)
+        return False
+
+    @parse_args
+    @only_if_gdb_running
+    @only_if_specific_gdb_mode(mode=("qemu-system",))
+    @only_if_specific_arch(arch=("x86_32", "x86_64", "ARM32", "ARM64"))
+    @only_if_in_kernel
+    @only_if_kvm_disabled
+    def do_invoke(self, args):
+        if args.cache is None and not args.address:
+            err("Specify an ADDRESS or --cache CACHE")
+            return
+
+        kversion = Kernel.version()
+        if kversion is None:
+            err("Could not find Linux kernel")
+            return
+        if kversion < "3.0":
+            err("Unsupported before v3.0")
+            return
+
+        allocator = Kernel.get_slab_type()
+        if allocator not in ["SLUB", "SLUB_TINY", "SLAB"]:
+            err("Unsupported: SLOB, Unknown allocator")
+            return
+
+        info("Wait for memory scan")
+        self.resolve_offsets()
+        self.stop_on_reuse = args.stop_on_reuse
+        self.backtrace = args.backtrace
+        self.watched = {}
+        self.freed_slots = set()
+
+        if args.cache is not None:
+            self.cache_name = args.cache
+            info("Watching cache: {:s}".format(Color.colorify(self.cache_name, Config.get("theme.heap_chunk_label"))))
+        else:
+            self.cache_name = None
+            for address in args.address:
+                resolved = self.resolve_object(address)
+                if resolved is None:
+                    err("{:#x} is not a slab object".format(address))
+                    continue
+                base, cache, object_size, state = resolved
+                if base in self.watched:
+                    # several interior pointers can designate the same object
+                    continue
+                self.watched[base] = cache
+                if state == "freed":
+                    self.freed_slots.add(base)
+                gef_print("[{:5s}] {:s}  cache={:s}  object_size={:#x}  state={:s}".format(
+                    "WATCH",
+                    Color.colorify_hex(base, Config.get("theme.heap_chunk_address_used")),
+                    Color.colorify(cache, Config.get("theme.heap_chunk_label")),
+                    object_size, state or "unknown",
+                ))
+            if not self.watched:
+                err("No slab object to watch")
+                return
+
+        try:
+            # set breakpoints (reuse kmalloc-tracer's allocator symbol tables)
+            kmalloc_syms, kfree_syms = KmallocTracerCommand.get_kmalloc_kfree_syms()
+            # Dedicated caches (task_struct, cred, filp, ...) - the usual UAF targets - are
+            # released with kmem_cache_free, not kfree, so track it as well (ptr is arg 1).
+            kfree_syms = kfree_syms + [["kmem_cache_free", 1]]
+            breakpoints = []
+            for sym, _index_of_size_arg in kmalloc_syms:
+                func_addr = Ksym.get_addr(sym)
+                if func_addr:
+                    gef_print(sym + ": ", end="")
+                    breakpoints.append(KuafWatchAllocBreakpoint(func_addr, sym, self))
+            for sym, index_of_addr_arg in kfree_syms:
+                func_addr = Ksym.get_addr(sym)
+                if func_addr:
+                    gef_print(sym + ": ", end="")
+                    breakpoints.append(KuafWatchFreeBreakpoint(func_addr, sym, index_of_addr_arg, self))
+            bulk_free_sym = "kmem_cache_free_bulk"
+            func_addr = Ksym.get_addr(bulk_free_sym)
+            if func_addr:
+                gef_print(bulk_free_sym + ": ", end="")
+                breakpoints.append(KuafWatchBulkFreeBreakpoint(func_addr, bulk_free_sym, self))
+            if not breakpoints:
+                warn("No allocator hooks resolved; nothing will be observed")
+                return
+            for bp in breakpoints:
+                bp.enabled = True
+
+            info("Setup is complete. continuing...")
+            gdb.execute("continue")
+
+        finally:
+            info("kuaf-watch is complete, cleaning up...")
+            GefUtil.delete_breakpoints(self, report_pending=True)
+        return
+
+
+
+class KpageWatchAllocBreakpoint(gdb.Breakpoint):
+    """Create a breakpoint at the page allocator entry for kpage-watch."""
+
+    def __init__(self, loc, sym, index_of_order_arg, watcher):
+        super().__init__("*{:#x}".format(loc), gdb.BP_BREAKPOINT, internal=False)
+        self.sym = sym
+        self.index_of_order_arg = index_of_order_arg
+        self.watcher = watcher
+        self.enabled = False
+        return
+
+    def stop(self):
+        Cache.reset_gef_caches()
+        task_addr, task_name = KmallocTracerCommand.get_task()
+        # the bulk allocator falls back to this one; its return records the page instead
+        names = ["KpageWatchAllocRetBreakpoint", "KpageWatchAllocBulkRetBreakpoint"]
+        if GefUtil.is_nested_call(self.watcher, names, task_addr):
+            return False
+        order = KmallocTracerCommand.get_ith_parameter(self.index_of_order_arg)
+        caller_pc = KmallocTracerCommand.get_return_address()
+        KpageWatchAllocRetBreakpoint(caller_pc, self.sym, order, caller_pc, task_addr, self.watcher)
+        return False
+
+
+
+class KpageWatchAllocRetBreakpoint(gdb.Breakpoint):
+    """Create a breakpoint at the page allocator return for kpage-watch."""
+
+    def __init__(self, loc, sym, order, caller_pc, task_addr, watcher):
+        super().__init__("*{:#x}".format(loc), gdb.BP_BREAKPOINT, internal=True)
+        self.sym = sym
+        self.order = order
+        self.caller_pc = caller_pc
+        self.task_addr = task_addr
+        self.watcher = watcher
+        self.call_context = Kernel.get_call_context(task_addr)
+        self.interrupt_context = Kernel.get_interrupt_context()
+        KmallocTracerCommand.clear_disabled_breakpoints("KpageWatchAllocRetBreakpoint", owner=self.watcher)
+        return
+
+    def stop(self):
+        Cache.reset_gef_caches()
+        task_addr, task_name = KmallocTracerCommand.get_task()
+        if self.call_context != Kernel.get_call_context(task_addr, at_return=True):
+            return False
+        self.enabled = False
+        page = AddressUtil.parse_address(runtime.current_arch.return_register)
+        return self.watcher.record("alloc", self.sym, page, order=self.order, caller_pc=self.caller_pc)
+
+
+
+class KpageWatchAllocBulkBreakpoint(gdb.Breakpoint):
+    """Create a breakpoint at the bulk page allocator entry for kpage-watch."""
+
+    def __init__(self, loc, sym, has_page_list, watcher):
+        super().__init__("*{:#x}".format(loc), gdb.BP_BREAKPOINT, internal=False)
+        self.sym = sym
+        self.has_page_list = has_page_list
+        self.watcher = watcher
+        self.enabled = False
+        return
+
+    def stop(self):
+        Cache.reset_gef_caches()
+        task_addr, task_name = KmallocTracerCommand.get_task()
+        # (gfp, preferred_nid, nodemask, int nr_pages, struct list_head *page_list (~v6.13), struct page **page_array)
+        nr_pages = u2i(KmallocTracerCommand.get_ith_parameter(3), 32)
+        if self.has_page_list:
+            page_list = KmallocTracerCommand.get_ith_parameter(4)
+        else:
+            page_list = 0
+        page_array = KmallocTracerCommand.get_ith_parameter(5 if self.has_page_list else 4)
+        pages_at_entry = self.watcher.watched_pages_in_bulk(page_list, page_array, nr_pages)
+        caller_pc = KmallocTracerCommand.get_return_address()
+        KpageWatchAllocBulkRetBreakpoint(caller_pc, self.sym, page_list, page_array, nr_pages, pages_at_entry, caller_pc,
+                                         task_addr, self.watcher)
+        return False
+
+
+
+class KpageWatchAllocBulkRetBreakpoint(gdb.Breakpoint):
+    """Create a breakpoint at the bulk page allocator return for kpage-watch."""
+
+    def __init__(self, loc, sym, page_list, page_array, nr_pages, pages_at_entry, caller_pc, task_addr, watcher):
+        super().__init__("*{:#x}".format(loc), gdb.BP_BREAKPOINT, internal=True)
+        self.sym = sym
+        self.page_list = page_list
+        self.page_array = page_array
+        self.nr_pages = nr_pages
+        self.pages_at_entry = pages_at_entry
+        self.caller_pc = caller_pc
+        self.task_addr = task_addr
+        self.watcher = watcher
+        self.call_context = Kernel.get_call_context(task_addr)
+        self.interrupt_context = Kernel.get_interrupt_context()
+        KmallocTracerCommand.clear_disabled_breakpoints("KpageWatchAllocBulkRetBreakpoint", owner=self.watcher)
+        return
+
+    def stop(self):
+        Cache.reset_gef_caches()
+        task_addr, task_name = KmallocTracerCommand.get_task()
+        if self.call_context != Kernel.get_call_context(task_addr, at_return=True):
+            return False
+        self.enabled = False
+        stop = False
+        # the pages that were already there at the entry are not allocated by this call
+        for page in self.watcher.watched_pages_in_bulk(self.page_list, self.page_array, self.nr_pages):
+            if page not in self.pages_at_entry:
+                stop |= self.watcher.record("alloc", self.sym, page, order=0, caller_pc=self.caller_pc)
+        return stop
+
+
+
+class KpageWatchFreeBreakpoint(gdb.Breakpoint):
+    """Create a breakpoint at the buddy free entry for kpage-watch."""
+
+    def __init__(self, loc, sym, index_of_page_arg, index_of_order_arg, watcher):
+        super().__init__("*{:#x}".format(loc), gdb.BP_BREAKPOINT, internal=False)
+        self.sym = sym
+        self.index_of_page_arg = index_of_page_arg
+        self.index_of_order_arg = index_of_order_arg
+        self.watcher = watcher
+        self.enabled = False
+        return
+
+    def stop(self):
+        Cache.reset_gef_caches()
+        page = KmallocTracerCommand.get_ith_parameter(self.index_of_page_arg)
+        order = 0
+        if self.index_of_order_arg is not None:
+            order = KmallocTracerCommand.get_ith_parameter(self.index_of_order_arg)
+        caller_pc = KmallocTracerCommand.get_return_address()
+        return self.watcher.record("free", self.sym, page, order=order, caller_pc=caller_pc)
+
+
+
+class KpageWatchBatchFreeBreakpoint(gdb.Breakpoint):
+    """Create a breakpoint at the batched free path (folio_batch or page list) for kpage-watch.
+    These paths return order-0 pages straight to the pcp lists without going through
+    free_frozen_pages/__free_pages, so a page freed here would otherwise be missed."""
+
+    def __init__(self, loc, sym, mode, watcher):
+        super().__init__("*{:#x}".format(loc), gdb.BP_BREAKPOINT, internal=False)
+        self.sym = sym
+        self.mode = mode
+        self.watcher = watcher
+        self.enabled = False
+        return
+
+    def stop(self):
+        Cache.reset_gef_caches()
+        arg0 = KmallocTracerCommand.get_ith_parameter(0)
+        caller_pc = KmallocTracerCommand.get_return_address()
+        stop = False
+        try:
+            if self.mode == "folio_batch":
+                # struct folio_batch { u8 nr; u8 i; bool drained; struct folio *folios[PAGEVEC_SIZE]; }
+                nr = read_int8_from_memory(arg0)
+                for i in range(min(nr, 31)):
+                    folio = read_int_from_memory(arg0 + runtime.current_arch.ptrsize + runtime.current_arch.ptrsize * i)
+                    # a large folio (e.g. THP) is freed here as well
+                    order = self.watcher.folio_order(folio)
+                    stop |= self.watcher.record("free", self.sym, folio, order=order, caller_pc=caller_pc)
+            else:
+                # a list_head of pages linked by page->lru; a watched page matches when a node
+                # falls inside its struct page (no need to know offsetof(page, lru)).
+                for page in self.watcher.watched_pages_in_list(arg0):
+                    stop |= self.watcher.record("free", self.sym, page, order=0, caller_pc=caller_pc)
+        except gdb.error:
+            pass
+        return stop
+
+
+
+class KpageWatchSlabBreakpoint(gdb.Breakpoint):
+    """Create a breakpoint at allocate_slab entry for kpage-watch."""
+
+    def __init__(self, loc, sym, page_kind, watcher):
+        super().__init__("*{:#x}".format(loc), gdb.BP_BREAKPOINT, internal=False)
+        self.sym = sym
+        self.page_kind = page_kind
+        self.watcher = watcher
+        self.enabled = False
+        return
+
+    def stop(self):
+        Cache.reset_gef_caches()
+        task_addr, task_name = KmallocTracerCommand.get_task()
+        if GefUtil.is_nested_call(self.watcher, ["KpageWatchSlabRetBreakpoint"], task_addr):
+            return False
+        kmem_cache = KmallocTracerCommand.get_ith_parameter(0)
+        caller_pc = KmallocTracerCommand.get_return_address()
+        KpageWatchSlabRetBreakpoint(caller_pc, self.sym, self.page_kind, kmem_cache, caller_pc, task_addr, self.watcher)
+        return False
+
+
+
+class KpageWatchSlabRetBreakpoint(gdb.Breakpoint):
+    """Create a breakpoint at allocate_slab return for kpage-watch."""
+
+    def __init__(self, loc, sym, page_kind, kmem_cache, caller_pc, task_addr, watcher):
+        super().__init__("*{:#x}".format(loc), gdb.BP_BREAKPOINT, internal=True)
+        self.sym = sym
+        self.page_kind = page_kind
+        self.kmem_cache = kmem_cache
+        self.caller_pc = caller_pc
+        self.task_addr = task_addr
+        self.watcher = watcher
+        self.call_context = Kernel.get_call_context(task_addr)
+        self.interrupt_context = Kernel.get_interrupt_context()
+        KmallocTracerCommand.clear_disabled_breakpoints("KpageWatchSlabRetBreakpoint", owner=self.watcher)
+        return
+
+    def stop(self):
+        Cache.reset_gef_caches()
+        task_addr, task_name = KmallocTracerCommand.get_task()
+        if self.call_context != Kernel.get_call_context(task_addr, at_return=True):
+            return False
+        self.enabled = False
+        page = self.watcher.slab_page(AddressUtil.parse_address(runtime.current_arch.return_register), self.page_kind)
+        return self.watcher.record("slab_assign", self.sym, page, caller_pc=self.caller_pc, kmem_cache=self.kmem_cache)
+
+
+
+class KpageWatchSlabFreeBreakpoint(gdb.Breakpoint):
+    """Create a breakpoint at __free_slab entry for kpage-watch."""
+
+    def __init__(self, loc, sym, page_kind, watcher):
+        super().__init__("*{:#x}".format(loc), gdb.BP_BREAKPOINT, internal=False)
+        self.sym = sym
+        self.page_kind = page_kind
+        self.watcher = watcher
+        self.enabled = False
+        return
+
+    def stop(self):
+        Cache.reset_gef_caches()
+        kmem_cache = KmallocTracerCommand.get_ith_parameter(0)
+        page = self.watcher.slab_page(KmallocTracerCommand.get_ith_parameter(1), self.page_kind)
+        caller_pc = KmallocTracerCommand.get_return_address()
+        return self.watcher.record("slab_free", self.sym, page, caller_pc=caller_pc, kmem_cache=kmem_cache)
+
+
+
+@register_command
+class KpageWatchCommand(GenericCommand):
+    """Track the alloc/free/slab lifecycle of a physical page (PFN) for cross-cache analysis."""
+
+    _cmdline_ = "kpage-watch"
+    _category_ = "06-i. Qemu-system/KGDB Cooperation - Linux Dynamic Inspection"
+
+    parser = argparse.ArgumentParser(prog=_cmdline_)
+    parser.add_argument("address", metavar="ADDRESS", nargs="*", type=AddressUtil.parse_address,
+                        help="the virtual address(es) whose backing page is watched.")
+    parser.add_argument("-p", "--page", action="append", default=[], type=AddressUtil.parse_address,
+                        help="watch by `struct page` address instead of a virtual address (can be repeated).")
+    parser.add_argument("--pfn", action="append", default=[], type=AddressUtil.parse_address,
+                        help="watch by page frame number (PFN) (can be repeated).")
+    parser.add_argument("-s", "--stop-on-reuse", action="store_true",
+                        help="stop at the first reuse (a re-allocation after a free).")
+    parser.add_argument("-t", "--backtrace", action="store_true", help="display a backtrace for each event.")
+    _syntax_ = parser.format_help()
+
+    _example_ = [
+        "{0:s} 0xffff888012345600                           # watch the page backing this virtual address",
+        "{0:s} 0xffff888012345600 0xffff888012346000        # watch several pages at once",
+        "{0:s} -p 0xffffea000048d140 -p 0xffffea000048d180  # watch by struct page address",
+        "{0:s} --pfn 0x12345 --pfn 0x12346                  # watch by PFN",
+        "{0:s} 0xffff888012345600 -s                        # stop at the first reuse",
+    ]
+    _example_ = "\n".join(_example_).format(_cmdline_)
+
+    _note_ = [
+        "Disable `-enable-kvm` option for qemu-system (#PF may occur).",
+        "Append `tsc=unstable` option for kernel cmdline.",
+        "ADDRESS, --page and --pfn can be mixed; each resolves to one watched PFN.",
+        "This records events touching the watched PFNs, so the page-allocator/SLUB/page-table boundary is visible.",
+        "Only events reached while continuing are recorded; the history before the command started is not.",
+        "On SLAB the slab-assign hook may be missing (its helpers are inlined); page alloc/free and slab-release are still shown.",
+        "This command requires CONFIG_RANDSTRUCT=n.",
+    ]
+    _note_ = "\n".join(_note_)
+
+    def resolve_offsets(self):
+        self.name_offset = None
+        allocator = Kernel.get_slab_type()
+        command = {"SLUB": "slub-dump", "SLUB_TINY": "slub-tiny-dump", "SLAB": "slab-dump"}.get(allocator)
+        if command is None:
+            return
+        ret = Color.remove_color(gdb.execute("{:s} --meta --no-pager".format(command), to_string=True))
+        r = re.search(r"offsetof\(kmem_cache, name\): (0x\S+)", ret)
+        if r:
+            self.name_offset = int(r.group(1), 16)
+        return
+
+    def get_task_info(self):
+        thread = gdb.selected_thread()
+        cpu = KernelPerCpu.get_cpu_index(thread)
+        task_addr, comm = KmallocTracerCommand.get_task()
+        return task_addr, comm, cpu
+
+    def pfn_of(self, page):
+        if not is_valid_addr(page):
+            return None
+        phys = Kernel.page2phys(page)
+        if phys is None:
+            return None
+        return phys >> self.page_shift
+
+    def cache_name(self, kmem_cache):
+        if self.name_offset is None or not kmem_cache:
+            return None
+        try:
+            name_ptr = read_int_from_memory(kmem_cache + self.name_offset)
+            return read_cstring_from_memory(name_ptr)
+        except gdb.error:
+            return None
+
+    def slab_page(self, value, page_kind):
+        # SLAB before v3.13 passes page_address(page), and its slab_destroy() takes the slab descriptor
+        if page_kind == "virt":
+            if value:
+                return Kernel.virt2page(value)
+            return None
+        if page_kind == "slab_desc":
+            # struct slab { struct list_head list; unsigned long colouroff; void *s_mem; ... }
+            colouroff = read_int_from_memory(value + runtime.current_arch.ptrsize * 2)
+            s_mem = read_int_from_memory(value + runtime.current_arch.ptrsize * 3)
+            return Kernel.virt2page(s_mem - colouroff)
+        return value
+
+    def slab_matched_pfns(self, page):
+        # sibling command module: lazy import per layering rule 1
+        from gef.commands.kernel.page import PageInfoCommand
+        base_pfn = self.pfn_of(page)
+        if base_pfn is None:
+            return []
+        # a slab may be a compound page: compare the head PFN of both sides.
+        head = PageInfoCommand.get_head_page(page)
+        if head is None:
+            head_pfn = base_pfn
+        else:
+            head_pfn = self.pfn_of(head)
+        matched = []
+        for pfn, (target_page, _virt) in self.watched.items():
+            # a multi-page slab of SLAB before v3.13 is not compound: use the block seen when it was allocated
+            if pfn == base_pfn or self.blocks.get(pfn) == page:
+                matched.append(pfn)
+                continue
+            target_head = PageInfoCommand.get_head_page(target_page)
+            if target_head is not None and self.pfn_of(target_head) == head_pfn:
+                matched.append(pfn)
+        return matched
+
+    def watched_pages_in_list(self, list_head):
+        # walk a list_head of page->lru nodes; a watched page matches when a node lands
+        # inside its struct page, so offsetof(page, lru) never has to be known.
+        if not is_valid_addr(list_head):
+            return []
+        found = []
+        node = read_int_from_memory(list_head)
+        for _ in range(4096):
+            if node == list_head or not is_valid_addr(node):
+                break
+            for target_page, _virt in self.watched.values():
+                if target_page <= node < target_page + self.sizeof_struct_page:
+                    found.append(target_page)
+            node = read_int_from_memory(node)
+        return found
+
+    def watched_pages_in_bulk(self, page_list, page_array, nr_pages):
+        # the bulk allocator links order-0 pages to page_list, or fills the empty slots of page_array
+        if page_list:
+            return self.watched_pages_in_list(page_list)
+        if not is_valid_addr(page_array) or nr_pages <= 0:
+            return []
+        targets = [target_page for target_page, _virt in self.watched.values()]
+        pages = []
+        for index in range(0, nr_pages, 4096):
+            count = min(nr_pages - index, 4096)
+            data = read_memory(page_array + index * runtime.current_arch.ptrsize, count * runtime.current_arch.ptrsize)
+            pages.extend(page for page in slice_unpack(data, runtime.current_arch.ptrsize) if page in targets)
+        return pages
+
+    def folio_order(self, folio):
+        # sibling command module: lazy import per layering rule 1
+        from gef.commands.kernel.page import PageInfoCommand
+        # folio_order(): a large folio keeps its order in the low byte of _flags_1 (the flags of page[1])
+        if not PageInfoCommand.has_flag(read_int_from_memory(folio), "PG_head"):
+            return 0
+        return read_int_from_memory(folio + self.sizeof_struct_page) & 0xff
+
+    def direct_map_virt(self, page, phys):
+        # the same resolution as buddy-dump: physmap + phys, or page2virt when it falls outside the direct map
+        consts = KernelAddressHeuristicFinder.consts()
+        page_offset = KernelAddressHeuristicFinder.get_PAGE_OFFSET()
+        if is_arm64():
+            physmap = consts.physmap_base
+        elif is_arm32():
+            phys_offset = consts.PHYS_OFFSET
+            if page_offset is None or phys_offset is None:
+                physmap = None
+            else:
+                physmap = page_offset - phys_offset
+        else:
+            physmap = page_offset
+        if physmap is not None:
+            # check the range before normalizing, or a 32-bit PA of 4 GiB or more wraps into the direct map
+            virt = physmap + phys
+            page_offset_end = KernelAddressHeuristicFinder.get_PAGE_OFFSET_END()
+            if page_offset is None or page_offset_end is None:
+                return AddressUtil.normalize_address(virt)
+            if page_offset <= virt < page_offset_end:
+                return virt
+        return Kernel.page2virt(page)
+
+    def emit_event(self, tag, pfn, api, page, order, cache, caller_pc):
+        task_addr, comm, cpu = self.get_task_info()
+        caller = Symbol.format(caller_pc, bracket="", missing="?" if caller_pc is None else "{:#x}".format(caller_pc))
+        if tag == "FREE":
+            theme = "theme.heap_chunk_address_freed"
+        else:
+            theme = "theme.heap_chunk_address_used"
+        target_page, virt = self.watched[pfn]
+        if virt is None:
+            virt_s = "-"
+        else:
+            virt_s = Color.colorify_hex(virt, Config.get("theme.heap_page_address"))
+        page_s = Color.colorify_hex(target_page, Config.get(theme))
+        detail = "pfn={:#x} page={:s} virt={:s}".format(pfn, page_s, virt_s)
+        if page != target_page:
+            # the event is about the block whose head is `page` (e.g. a higher order allocation)
+            detail += " head={:#x}".format(page)
+        if order is not None:
+            detail += " order={:d}".format(order)
+        if cache:
+            detail += "  cache={:s}".format(Color.colorify(cache, Config.get("theme.heap_chunk_label")))
+        gef_print("[{:6s}] {:s}".format(tag, detail))
+        gef_print("         via {:s}  caller={:s}  comm={:s} cpu={:s}".format(
+            api, caller, comm, "?" if cpu is None else str(cpu),
+        ))
+        if self.backtrace:
+            KmallocTracerCommand.print_backtrace(True)
+        return
+
+    def record(self, kind, api, page, order=None, caller_pc=None, kmem_cache=None):
+        if kind in ("alloc", "free"):
+            base_pfn = self.pfn_of(page)
+            if base_pfn is None:
+                return False
+            # order comes from a register; ignore an out-of-range read so span stays sane.
+            if order is None or order < 0 or order > 20:
+                order = 0
+            span = 1 << order
+            matched = [pfn for pfn in self.watched if base_pfn <= pfn < base_pfn + span]
+            # another block at the same page ends the one remembered for a watched page
+            self.blocks = {pfn: block for pfn, block in self.blocks.items() if block != page}
+        else:
+            order = None
+            matched = self.slab_matched_pfns(page)
+        if not matched:
+            return False
+
+        cache = self.cache_name(kmem_cache)
+        tag = {"alloc": "ALLOC", "free": "FREE", "slab_assign": "SLAB", "slab_free": "UNSLAB"}[kind]
+        reuse = False
+        for pfn in matched:
+            if kind in ("alloc", "slab_assign") and pfn in self.freed:
+                reuse = True
+            self.emit_event(tag, pfn, api, page, order, cache, caller_pc)
+            if kind in ("free", "slab_free"):
+                self.freed.add(pfn)
+            else:
+                self.freed.discard(pfn)
+            if kind == "alloc":
+                self.blocks[pfn] = page
+            elif kind == "free":
+                self.blocks.pop(pfn, None)
+        return self.stop_on_reuse and reuse
+
+    def build_alloc_syms(self, kversion):
+        if kversion < "5.13":
+            return [["__alloc_pages_nodemask", 1]]
+        elif kversion < "6.10":
+            return [["__alloc_pages", 1]]
+        elif kversion < "6.14":
+            return [["__alloc_pages_noprof", 1]]
+        else:
+            # v6.15+: the nolock allocator (e.g. for BPF) takes pages from the freelists by itself.
+            # alloc_pages_nolock_noprof() of v6.18+ calls alloc_frozen_pages_nolock_noprof().
+            syms = [["__alloc_frozen_pages_noprof", 1]]
+            sym, func_addr = self.first_resolvable(["alloc_frozen_pages_nolock_noprof", "alloc_pages_nolock_noprof",
+                                                    "try_alloc_pages_noprof"])
+            if sym:
+                # (gfp_flags, nid, order) or (nid, order)
+                syms.append([sym, 2 if sym == "alloc_frozen_pages_nolock_noprof" else 1])
+            return syms
+
+    def build_bulk_alloc_syms(self, kversion):
+        # order-0 pages allocated in bulk (e.g. vmalloc, page_pool) are taken from the pcp lists by itself.
+        # [sym, whether page_list comes before page_array]
+        if kversion >= "6.14":
+            return ["alloc_pages_bulk_noprof", False]
+        elif kversion >= "6.10":
+            return ["alloc_pages_bulk_noprof", True]
+        elif kversion >= "5.13":
+            return ["__alloc_pages_bulk", True]
+        else:
+            return [None, None]
+
+    def build_free_syms(self, kversion):
+        # Hook the functions reached only after the refcount dropped to zero (not __free_pages,
+        # which also runs for a put that does not free). [sym, index of page, index of order or None]
+        if kversion >= "6.14":
+            # v6.15+: __free_pages -> ___free_pages -> __free_frozen_pages, skipping free_frozen_pages.
+            sym, func_addr = self.first_resolvable(["__free_frozen_pages", "free_frozen_pages"])
+            if sym:
+                return [[sym, 0, 1]]
+            return []
+        elif kversion >= "6.10":
+            return [["free_unref_page", 0, 1]]
+        elif kversion >= "5.14":
+            return [["free_unref_page", 0, 1], ["__free_pages_ok", 0, 1]]
+        elif kversion >= "4.15":
+            return [["free_unref_page", 0, None], ["__free_pages_ok", 0, 1]]
+        else:
+            return [["free_hot_cold_page", 0, None], ["__free_pages_ok", 0, 1]]
+
+    def build_batch_free_syms(self, kversion):
+        # order-0 pages freed in bulk skip the functions above and go straight to the pcp lists.
+        # Before v4.15 free_hot_cold_page_list calls free_hot_cold_page per page, so it needs no hook.
+        if kversion >= "6.9":
+            return ["free_unref_folios", "folio_batch"]
+        elif kversion >= "4.15":
+            return ["free_unref_page_list", "list"]
+        else:
+            return [None, None]
+
+    def build_slab_syms(self, allocator, kversion):
+        # The function that hands a fresh page to a cache, and the one that gives it back,
+        # as ordered candidates (the caller hooks the first that resolves). SLAB uses different
+        # symbols than SLUB, and its inner helpers are often inlined, so an outer one is tried too.
+        # {sym: how the page is passed (see slab_page)}
+        if allocator == "SLAB":
+            if kversion < "3.13":
+                return {"kmem_getpages": "virt"}, {"kmem_freepages": "virt", "slab_destroy": "slab_desc"}
+            return {"kmem_getpages": "page", "cache_grow_begin": "page"}, {"kmem_freepages": "page", "slab_destroy": "page"}
+        return {"allocate_slab": "page"}, {"__free_slab": "page"}
+
+    @staticmethod
+    def first_resolvable(syms):
+        for sym in syms:
+            func_addr = Ksym.get_addr(sym)
+            if func_addr:
+                return sym, func_addr
+        return None, None
+
+    @parse_args
+    @only_if_gdb_running
+    @only_if_specific_gdb_mode(mode=("qemu-system",))
+    @only_if_specific_arch(arch=("x86_32", "x86_64", "ARM32", "ARM64"))
+    @only_if_in_kernel
+    @only_if_kvm_disabled
+    def do_invoke(self, args):
+        if not args.pfn and not args.page and not args.address:
+            err("Specify an ADDRESS, --page PAGE or --pfn PFN")
+            return
+
+        kversion = Kernel.version()
+        if kversion is None:
+            err("Could not find Linux kernel")
+            return
+        if kversion < "3.0":
+            err("Unsupported before v3.0")
+            return
+
+        allocator = Kernel.get_slab_type()
+        if allocator == "Unknown":
+            err("Unsupported: Unknown allocator")
+            return
+
+        info("Wait for memory scan")
+
+        consts = KernelAddressHeuristicFinder.consts()
+        if consts is None or consts.PAGE_SHIFT is None:
+            err("Failed to resolve kernel constants")
+            return
+        self.page_shift = consts.PAGE_SHIFT
+
+        # resolve the watched PFNs and their struct pages
+        pfns = list(args.pfn)
+        for page in args.page:
+            phys = Kernel.page2phys(page)
+            if phys is None:
+                err("{:#x} is not a valid struct page".format(page))
+                continue
+            pfns.append(phys >> self.page_shift)
+        for address in args.address:
+            page = Kernel.virt2page(address)
+            if page is not None:
+                phys = Kernel.page2phys(page)
+            else:
+                phys = None
+            if phys is None:
+                err("Could not resolve the page of {:#x}".format(address))
+                continue
+            pfns.append(phys >> self.page_shift)
+
+        self.watched = {}
+        for pfn in pfns:
+            if pfn in self.watched:
+                continue
+            target_page = Kernel.phys2page(pfn << self.page_shift)
+            if target_page is None:
+                err("Could not resolve the struct page of pfn {:#x}".format(pfn))
+                continue
+            virt = self.direct_map_virt(target_page, pfn << self.page_shift)
+            self.watched[pfn] = (target_page, virt)
+            gef_print("[WATCH ] pfn={:#x} page={:#x} virt={:s} phys={:#x}".format(
+                pfn,
+                target_page,
+                "-" if virt is None else Color.colorify_hex(virt, Config.get("theme.heap_page_address")),
+                pfn << self.page_shift,
+            ))
+        if not self.watched:
+            err("No page to watch")
+            return
+
+        self.resolve_offsets()
+        self.sizeof_struct_page = consts.sizeof_struct_page or (runtime.current_arch.ptrsize * 8)
+        self.stop_on_reuse = args.stop_on_reuse
+        self.backtrace = args.backtrace
+        self.freed = set()
+        self.blocks = {}
+
+        if self.name_offset is None:
+            warn("Slab cache names are unavailable (offset not resolved); slab events show no cache")
+
+        # set breakpoints
+        breakpoints = []
+        try:
+            for sym, index_of_order_arg in self.build_alloc_syms(kversion):
+                func_addr = Ksym.get_addr(sym)
+                if func_addr:
+                    gef_print(sym + ": ", end="")
+                    breakpoints.append(KpageWatchAllocBreakpoint(func_addr, sym, index_of_order_arg, self))
+            bulk_sym, has_page_list = self.build_bulk_alloc_syms(kversion)
+            if bulk_sym:
+                func_addr = Ksym.get_addr(bulk_sym)
+            else:
+                func_addr = None
+            if func_addr:
+                gef_print(bulk_sym + ": ", end="")
+                breakpoints.append(KpageWatchAllocBulkBreakpoint(func_addr, bulk_sym, has_page_list, self))
+            for sym, index_of_page_arg, index_of_order_arg in self.build_free_syms(kversion):
+                func_addr = Ksym.get_addr(sym)
+                if func_addr:
+                    gef_print(sym + ": ", end="")
+                    breakpoints.append(KpageWatchFreeBreakpoint(func_addr, sym, index_of_page_arg, index_of_order_arg, self))
+            slab_assign_syms, slab_free_syms = self.build_slab_syms(allocator, kversion)
+            sym, func_addr = self.first_resolvable(slab_assign_syms)
+            if func_addr:
+                gef_print(sym + ": ", end="")
+                breakpoints.append(KpageWatchSlabBreakpoint(func_addr, sym, slab_assign_syms[sym], self))
+            sym, func_addr = self.first_resolvable(slab_free_syms)
+            if func_addr:
+                gef_print(sym + ": ", end="")
+                breakpoints.append(KpageWatchSlabFreeBreakpoint(func_addr, sym, slab_free_syms[sym], self))
+            batch_sym, batch_mode = self.build_batch_free_syms(kversion)
+            if batch_sym:
+                func_addr = Ksym.get_addr(batch_sym)
+            else:
+                func_addr = None
+            if func_addr:
+                gef_print(batch_sym + ": ", end="")
+                breakpoints.append(KpageWatchBatchFreeBreakpoint(func_addr, batch_sym, batch_mode, self))
+            if not breakpoints:
+                warn("No page hooks resolved; nothing will be observed")
+                return
+            for bp in breakpoints:
+                bp.enabled = True
+
+            info("Setup is complete. continuing...")
+            gdb.execute("continue")
+            info("kpage-watch is complete, cleaning up...")
+        finally:
+            GefUtil.delete_breakpoints(self, report_pending=True)
+        return
