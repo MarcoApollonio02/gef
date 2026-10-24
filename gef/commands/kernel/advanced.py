@@ -28,7 +28,7 @@ from gef.commands.base import (
     register_command,
 )
 from gef.core import runtime
-from gef.core.address import AddressUtil
+from gef.core.address import AddressUtil, Endian
 from gef.core.cache import Cache
 from gef.core.color import Color, err, info, titlify, warn
 from gef.core.config import Config
@@ -36,6 +36,7 @@ from gef.core.instruction import Disasm, get_insn, get_insn_next
 from gef.core.display import ProgressBar
 from gef.core.kernel import Kernel, KernelListHead, KernelNftables, KernelSlub, KernelTask, Ksym
 from gef.core.memory import (
+    hexdump,
     is_ascii_string,
     is_double_link_list,
     is_valid_addr,
@@ -78,7 +79,7 @@ from gef.core.strings import String
 from gef.core.symbols import Symbol
 from gef.core.syscall import Syscall
 from gef.core.utils import (GEF_TEMP_DIR, GefUtil, align, align_to_ptrsize, slicer, slice_unpack,
-                            switch_to_intel_syntax)
+                            switch_to_intel_syntax, u2i)
 
 
 @register_command
@@ -4630,6 +4631,10 @@ class KernelTimerCommand(GenericCommand, BufferingOutput):
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("-hh", "--help-simple", action="store_true", help="show help without ASCII diagram.")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--classic-only", action="store_true", help="dump only classic timers.")
+    group.add_argument("--hr-only", action="store_true", help="dump only high-resolution timers.")
+    parser.add_argument("--meta", action="store_true", help="display offset information.")
     parser.add_argument("-n", "--no-pager", action="store_true", help="do not use the pager.")
     parser.add_argument("-q", "--quiet", action="store_true", help="enable quiet mode.")
     _syntax_ = parser.format_help()
@@ -4637,79 +4642,174 @@ class KernelTimerCommand(GenericCommand, BufferingOutput):
     _note_ = [
         "Simplified timer structure (per-cpu):",
         "",
-        "+-timer_bases[0]----+    +-timer_list--+    +-timer_list--+",
-        "| ...               |    | entry       |    | entry       |",
-        "| vectors[0]        |--->|   next      |--->|   next      |--->...",
-        "| ...               |    |   pprev     |    |   pprev     |",
-        "| vectors[512or576] |    | expires     |    | expires     |",
-        "| ...               |    | function    |    | function    |",
-        "+-timer_bases[1]----+    | ...         |    | ...         |",
-        "| ...               |    +-------------+    +-------------+",
-        "| vectors[0]        |",
-        "| ...               |",
-        "| vectors[512or576] |",
-        "| ...               |",
-        "+-------------------+",
+        "+-timer_bases[0]-----+    +-timer_list--+    +-timer_list--+",
+        "| ...                |    | entry       |    | entry       |",
+        "| vectors[0]         |--->|   next      |--->|   next      |--->...",
+        "| ...                |    |   pprev     |    |   pprev     |",
+        "| vectors[512or576]  |    | expires     |    | expires     |",
+        "| ...                |    | function    |    | function    |",
+        "+-timer_bases[1]-----+    | ...         |    | ...         |",
+        "| ...                |    +-------------+    +-------------+",
+        "| vectors[0]         |",
+        "| ...                |",
+        "| vectors[512or576]  |",
+        "| ...                |",
+        "+-timer_bases[2]-----+ <-- v6.10~",
+        "| ...                |",
+        "+--------------------+",
+        "",
+        "Before v4.8, each cpu has one `tvec_base` (pointed by `tvec_bases` before v4.2) with 512 buckets",
+        "(tv1 to tv5). They are `struct list_head` before v4.2, and `struct hlist_head` after.",
         "",
         "Simplified hrtimer structure (per-cpu):",
         "",
-        "+-hrtimer_cpu_bases-+",
-        "| ...               |",
-        "| clock_bases[0]    |   +--->+-hrtimer------+",
-        "|   ...             |   |    | node         |",
-        "|   clockid         |   |    |   node       |",
-        "|   ...             |   |    |     color    |",
-        "|   active          |   |    |     right    |--->hrtimer",
-        "|      rb_root      |   |    |     left     |--->hrtimer",
-        "|        rb_root    |---+    |   expires    |",
-        "|        ...        |        | ...          |",
-        "|   get_time        |        | function     |",
-        "|   ...             |        | ...          |",
-        "| ...               |        +--------------+",
-        "| clock_bases[8]    |",
-        "|   ...             |",
-        "+-------------------+",
+        "+-hrtimer_cpu_bases--+",
+        "| ...                |",
+        "| clock_bases[0]     |   +--->+-hrtimer-------+",
+        "|   ...              |   |    | node          |",
+        "|   clockid          |   |    |   node        |",
+        "|   ...              |   |    |     color     |",
+        "|   active           |   |    |     right     |--->hrtimer",
+        "|      rb_root       |   |    |     left      |--->hrtimer",
+        "|        rb_root     |---+    |   prev(v7.1~) |--->hrtimer",
+        "|        ...         |        |   next(v7.1~) |--->hrtimer",
+        "|   get_time(~v6.17) |        |   expires     |",
+        "|   ...              |        | ...           |",
+        "| ...                |        | function      |",
+        "| clock_bases[8]     |        | ...           |",
+        "|   ...              |        +---------------+",
+        "+--------------------+",
+        "",
+        "- Classic timers are sorted by `time_to_expired`, the signed difference from `jiffies` in unsigned long.",
+        "- hrtimers are sorted by `expires`, since they are listed in the order of the rbtree.",
+        "- The member offsets come from the debug information (vmlinux or `ktypes-load`) when available.",
+        "  They are verified by `timer_base.cpu` and `hrtimer_clock_base.cpu_base` and `index`.",
     ]
     _note_ = "\n".join(_note_)
 
-    def initialize(self):
-        from gef.commands.kernel.basic import KernelCurrentCommand
-        if hasattr(self, "initialized") and self.initialized:
-            return True
+    clockid_dict = {
+        0: "CLOCK_REALTIME",
+        1: "CLOCK_MONOTONIC",
+        2: "CLOCK_PROCESS_CPUTIME_ID",
+        3: "CLOCK_THREAD_CPUTIME_ID",
+        4: "CLOCK_MONOTONIC_RAW",
+        5: "CLOCK_REALTIME_COARSE",
+        6: "CLOCK_MONOTONIC_COARSE",
+        7: "CLOCK_BOOTTIME",
+        8: "CLOCK_REALTIME_ALARM",
+        9: "CLOCK_BOOTTIME_ALARM",
+        10: "CLOCK_SGI_CYCLE",
+        11: "CLOCK_TAI",
+    }
+
+    def initialize(self, classic=True, high_resolution=True):
+        self.meta = []
+        self.incomplete = []
+        self.klayout = Kernel.layout()
+        self.module_text_ranges = None
+        self.cpu_masks = None
 
         # resolve __per_cpu_offset
-        __per_cpu_offset = KernelAddressHeuristicFinder.get_per_cpu_offset()
-        if __per_cpu_offset is None:
-            self.quiet_info("__per_cpu_offset: Not found")
-            self.cpu_offset = []
+        self.percpu = Kernel.per_cpu()
+        if self.percpu.per_cpu_offset is None:
+            self.meta.append((self.quiet_info, "__per_cpu_offset: Not found"))
         else:
-            self.quiet_info("__per_cpu_offset: {:#x}".format(__per_cpu_offset))
-            self.cpu_offset = KernelCurrentCommand.get_each_cpu_offset(__per_cpu_offset)
+            self.meta.append((self.quiet_info, "__per_cpu_offset: {:#x}".format(self.percpu.per_cpu_offset)))
+        self.classic = None
+        self.hrtimer = None
+        if classic:
+            self.classic = self.get_classic_layout()
+        if high_resolution:
+            self.hrtimer = self.get_hrtimer_layout()
+        self.classic_timer_initialized = self.classic is not None
+        self.hrtimer_initialized = self.hrtimer is not None
+        return self.classic_timer_initialized or self.hrtimer_initialized
 
-        ### classic timer (unit: tick)
+    def get_classic_layout(self):
+        layout = self.resolve_classic_layout()
+        if layout is not None and not self.verify_classic_layout(layout):
+            # the target has been replaced since the layout was cached
+            Cache.clear_cache_for(self.resolve_classic_layout)
+            layout = self.resolve_classic_layout()
+        if layout is None:
+            self.meta.extend(Kernel.export_meta(self, self.classic_meta))
+            return None
+        if not layout["verified"]:
+            # resolve it again the next time
+            Cache.clear_cache_for(self.resolve_classic_layout)
+        self.meta.extend(Kernel.export_meta(self, layout["meta"]))
+        return layout
 
-        # timer_bases
-        self.timer_bases = KernelAddressHeuristicFinder.get_timer_bases()
-        if not self.timer_bases:
-            self.quiet_err("timer_bases: Not found")
-            return False
-        self.quiet_info("timer_bases: {:#x}".format(self.timer_bases))
+    def get_hrtimer_layout(self):
+        layout = self.resolve_hrtimer_bases()
+        if layout is not None and not self.verify_hrtimer_bases(layout, self.percpu.addr_of(layout["hrtimer_bases"], 0)):
+            Cache.clear_cache_for(self.resolve_hrtimer_bases)
+            Cache.clear_cache_for(self.resolve_hrtimer_members)
+            layout = self.resolve_hrtimer_bases()
+        if layout is None:
+            self.meta.extend(Kernel.export_meta(self, self.hrtimer_meta))
+            return None
+        self.meta.extend(Kernel.export_meta(self, layout["meta"]))
 
-        # per_cpu_timer_bases
-        if self.cpu_offset == []:
-            self.per_cpu_timer_bases = [self.timer_bases]
-        else:
-            self.per_cpu_timer_bases = [AddressUtil.normalize_address(x + self.timer_bases) for x in self.cpu_offset]
+        members = self.resolve_hrtimer_members()
+        if members is None:
+            # every rbtree is empty now, so the offsets are not verified and must not be cached
+            members = self.guess_hrtimer_members()
+        self.meta.extend(Kernel.export_meta(self, members["meta"]))
+        return {**layout, **members}
 
-        # len(timer_bases)
-        if Symbol.get_ksymaddr("sysctl_timer_migration"):
-            self.nr_bases = 2
-        else:
-            self.nr_bases = 1
-        self.quiet_info("nr_bases: {:d}".format(self.nr_bases))
+    def resolve_timer_list(self, meta, kind):
+        """Return the offsets of `struct timer_list`.
 
-        # sizeof(struct timer_base)
+        struct timer_list {
+            struct hlist_node entry; // struct list_head (~v4.1)
+            unsigned long expires;
+            struct tvec_base *base; // ~v4.1
+            void (*function)(struct timer_list *); // (unsigned long) ~v4.14
+            unsigned long data; // ~v4.14
+            u32 flags; // v4.2~
+        #ifdef CONFIG_LOCKDEP
+            struct lockdep_map lockdep_map;
+        #endif
+        };
         """
+        ptrsize = runtime.current_arch.ptrsize
+        offsets = {}
+        fixed = {"expires": ptrsize * 2, "function": ptrsize * (4 if kind == "tvec_list" else 3)}
+        for name, value in fixed.items():
+            offset = GefUtil.offsetof("timer_list", name)
+            source = "debug info"
+            if offset is None:
+                offset, source = value, "fixed"
+            offsets["offset_" + name] = offset
+            meta.append(("info", "offsetof(timer_list, {:s}): {:#x} ({:s})".format(name, offset, source)))
+        return offsets
+
+    def is_timer_base_header(self, timer_base, cpu, offset_clk):
+        """Check the members of `struct timer_base` that never change after the initialization."""
+        ptrsize = runtime.current_arch.ptrsize
+        try:
+            clk = read_int_from_memory(timer_base + offset_clk)
+            next_expiry = read_int_from_memory(timer_base + offset_clk + ptrsize)
+            data = read_memory(timer_base + offset_clk + ptrsize * 2, 7)
+        except gdb.MemoryError:
+            return False
+        if clk == 0 or u32(data[:4]) != cpu or any(x > 1 for x in data[4:]):
+            return False
+        # see `find_timer_base_layout()`
+        return not next_expiry or abs(self.time_to_expire(next_expiry, clk)) < 1 << 30
+
+    def count_timer_bases(self, cpu_addrs, offset_clk, stride, limit):
+        nr_bases = 1
+        while nr_bases < limit:
+            if not all(self.is_timer_base_header(addr + stride * nr_bases, cpu, offset_clk) for cpu, addr in cpu_addrs[:4]):
+                break
+            nr_bases += 1
+        return nr_bases
+
+    def resolve_timer_base(self, timer_bases, meta):
+        """Return the layout of `timer_bases[NR_BASES]` (v4.8~), or None.
+
         struct timer_base {
             raw_spinlock_t lock;
             struct timer_list *running_timer;
@@ -4727,50 +4827,386 @@ class KernelTimerCommand(GenericCommand, BufferingOutput):
             struct hlist_head vectors[WHEEL_SIZE];
         } ____cacheline_aligned;
         """
-        self.roughly_sizeof_timer_base = 0
-        if self.nr_bases == 2:
-            timer_base = self.per_cpu_timer_bases[0]
+        ptrsize = runtime.current_arch.ptrsize
+        cpu_addrs = self.percpu.possible_addrs_of(timer_bases)
+        if not cpu_addrs or cpu_addrs[0][0] != 0:
+            meta.append(("err", "per-cpu timer_bases: Not found"))
+            return None
 
-            i = 512
-            while True:
-                v = read_int_from_memory(timer_base + runtime.current_arch.ptrsize * i)
-                if v != 0 and not is_valid_addr(v):
-                    self.roughly_sizeof_timer_base = runtime.current_arch.ptrsize * i
+        offset_vectors = GefUtil.offsetof("timer_base", "vectors")
+        offset_cpu = GefUtil.offsetof("timer_base", "cpu")
+        offset_clk = GefUtil.offsetof("timer_base", "clk")
+        sizeof_timer_base = GefUtil.sizeof("timer_base")
+        sizeof_vectors = GefUtil.sizeof("((struct timer_base *)0)->vectors")
+        if None not in (offset_vectors, offset_cpu, offset_clk, sizeof_timer_base, sizeof_vectors):
+            if all(self.is_timer_base_header(addr, cpu, offset_clk) for cpu, addr in cpu_addrs[:4]):
+                try:
+                    sizeof_timer_bases = GefUtil.type_size(gdb.parse_and_eval("timer_bases").type)
+                except gdb.error:
+                    sizeof_timer_bases = None
+                if sizeof_timer_bases:
+                    nr_bases = sizeof_timer_bases // sizeof_timer_base
+                    source_nr_bases = "debug info"
+                else:
+                    nr_bases = self.count_timer_bases(cpu_addrs, offset_clk, sizeof_timer_base, 3)
+                    source_nr_bases = "heuristic"
+                return {
+                    "nr_bases": (nr_bases, source_nr_bases),
+                    "sizeof_timer_base": (sizeof_timer_base, "debug info"),
+                    "offset_vectors": (offset_vectors, "debug info"),
+                    "offset_cpu": (offset_cpu, "debug info"),
+                    "nr_vectors": (sizeof_vectors // ptrsize, "debug info"),
+                }
+            meta.append(("warn", "The debug information of struct timer_base does not match the memory"))
+
+        found = KernelAddressHeuristicFinder.find_timer_base_layout(cpu_addrs[0][1], 0)
+        if found is None:
+            meta.append(("err", "Could not determine the layout of struct timer_base"))
+            return None
+        offset_clk, wheels = found
+        offset_cpu = offset_clk + ptrsize * 2
+
+        # NR_BASES is 1 without CONFIG_NO_HZ_COMMON, 2 (BASE_STD, BASE_DEF) before v6.10,
+        # and 3 (BASE_LOCAL, BASE_GLOBAL, BASE_DEF) after. Each of them is cacheline aligned.
+        # `tick_nohz_idle_enter` is a global function that exists only with CONFIG_NO_HZ_COMMON=y.
+        # (`sysctl_timer_migration` is a data symbol, so it is invisible with CONFIG_KALLSYMS_ALL=n)
+        if not Ksym.get_addr("tick_nohz_idle_enter"):
+            limit = 1
+        elif Kernel.version() < "6.10":
+            limit = 2
+        else:
+            limit = 3
+        if len(cpu_addrs) > 1:
+            # the cpu number of each base is a strong evidence, which a vendor backport cannot break
+            limit = 3
+
+        # An empty wheel matches both WHEEL_SIZEs, so every base of every cpu is checked.
+        # The stride found from the next base also tells the right one.
+        candidates = []
+        for offset_vectors, wheel_size in wheels:
+            end = offset_vectors + wheel_size * ptrsize
+            stride, nr_bases = align(end, 64), 1
+            for cacheline in (64, 128, 32, 256):
+                size = align(end, cacheline)
+                if all(self.is_timer_base_header(addr + size, cpu, offset_clk) for cpu, addr in cpu_addrs[:4]):
+                    stride = size
+                    nr_bases = self.count_timer_bases(cpu_addrs, offset_clk, stride, limit)
                     break
-                i += 1
+            nonempty = 0
+            for _cpu, addr in cpu_addrs:
+                for n in range(nr_bases):
+                    result = KernelAddressHeuristicFinder.check_timer_wheel(addr + stride * n, offset_cpu + 8, offset_vectors, wheel_size)
+                    if result is None or result[0] > 1:
+                        break
+                    nonempty += result[1]
+                else:
+                    continue
+                break
+            else:
+                candidates.append((nr_bases, nonempty, stride, offset_vectors, wheel_size))
+        if not candidates:
+            meta.append(("err", "Could not determine the layout of struct timer_base"))
+            return None
+
+        candidates.sort(reverse=True)
+        nr_bases, nonempty, stride, offset_vectors, wheel_size = candidates[0]
+        verified = len(candidates) == 1 or candidates[1][:2] != (nr_bases, nonempty)
+        if not verified:
+            meta.append(("warn", "Every timer wheel is empty, so WHEEL_SIZE is not verified"))
+        return {
+            "verified": (verified, "heuristic"),
+            "nr_bases": (nr_bases, "heuristic"),
+            "sizeof_timer_base": (stride, "heuristic"),
+            "offset_vectors": (offset_vectors, "heuristic"),
+            "offset_cpu": (offset_cpu, "heuristic"),
+            "nr_vectors": (wheel_size, "heuristic"),
+        }
+
+    def resolve_tvec_base(self, tvec_bases, meta):
+        """Return the layout of `tvec_bases` (~v4.7), or None. See `find_tvec_base_layout()`."""
+        ptrsize = runtime.current_arch.ptrsize
+        slot = self.percpu.addr_of(tvec_bases, 0)
+        if slot is None:
+            meta.append(("err", "per-cpu tvec_bases: Not found"))
+            return None
+
+        # ~v4.1 holds a pointer to the struct, and v4.2~ holds the struct itself
+        for pointer in (True, False):
+            if pointer:
+                base = read_int_from_memory(slot, safe=True)
+            else:
+                base = slot
+            if not base or not is_valid_addr(base):
+                continue
+            offset_tv1 = GefUtil.offsetof("tvec_base", "tv1")
+            offset_tv5 = GefUtil.offsetof("tvec_base", "tv5")
+            sizeof_tv5 = GefUtil.sizeof("((struct tvec_base *)0)->tv5")
+            sizeof_head = GefUtil.sizeof("((struct tvec_base *)0)->tv1.vec[0]")
+            if None not in (offset_tv1, offset_tv5, sizeof_tv5, sizeof_head):
+                nr_vectors = (offset_tv5 + sizeof_tv5 - offset_tv1) // sizeof_head
+                found = (offset_tv1, nr_vectors, sizeof_head == ptrsize)
+                source = "debug info"
+            else:
+                found = KernelAddressHeuristicFinder.find_tvec_base_layout(base, 0)
+                source = "heuristic"
+            if found is None:
+                continue
+            offset_vectors, nr_vectors, is_hlist = found
+            return {
+                "pointer": (pointer, source),
+                "offset_vectors": (offset_vectors, source),
+                "nr_vectors": (nr_vectors, source),
+                "hlist": (is_hlist, source),
+                # `int cpu` is followed by 2 bools with hlist_head (v4.2~)
+                "offset_cpu": (offset_vectors - 8 if is_hlist else None, source),
+            }
+        meta.append(("err", "Could not determine the layout of struct tvec_base"))
+        return None
+
+    @Cache.cache_this_session(cache_None=False, per_inferior=True, until_new_objfile=True)
+    def resolve_classic_layout(self):
+        """Return the layout of the timer wheel, verified by the memory, or None."""
+        self.classic_meta = meta = []
+
+        kind = None
+        timer_bases = KernelAddressHeuristicFinder.get_timer_bases()
+        if timer_bases:
+            meta.append(("info", "timer_bases: {:#x}".format(timer_bases)))
+            base_layout = self.resolve_timer_base(timer_bases, meta)
+            kind = "wheel"
+        else:
+            tvec_bases = KernelAddressHeuristicFinder.get_tvec_bases()
+            if not tvec_bases:
+                meta.append(("err", "timer_bases: Not found"))
+                return None
+            meta.append(("info", "tvec_bases: {:#x}".format(tvec_bases)))
+            base_layout = self.resolve_tvec_base(tvec_bases, meta)
+            if base_layout:
+                if base_layout["hlist"][0]:
+                    kind = "tvec_hlist"
+                else:
+                    kind = "tvec_list"
+        if base_layout is None:
+            return None
+
+        layout = {"kind": kind, "verified": True}
+        if kind == "wheel":
+            layout["timer_bases"] = timer_bases
+        else:
+            layout["tvec_bases"] = tvec_bases
+        for name, (value, source) in base_layout.items():
+            layout[name] = value
+            if name in ("offset_cpu", "hlist", "verified"):
+                continue
+            label = {
+                "nr_bases": "NR_BASES",
+                "sizeof_timer_base": "sizeof(timer_base)",
+                "offset_vectors": "offsetof({:s}, vectors)".format("timer_base" if kind == "wheel" else "tvec_base"),
+                "nr_vectors": "the number of the buckets",
+                "pointer": "tvec_bases is a pointer",
+            }[name]
+            if name == "pointer":
+                fmt = "{:s}: {!s} ({:s})"
+            elif name.startswith("nr_"):
+                fmt = "{:s}: {:d} ({:s})"
+            else:
+                fmt = "{:s}: {:#x} ({:s})"
+            meta.append(("info", fmt.format(label, value, source)))
+        layout.update(self.resolve_timer_list(meta, kind))
 
         # jiffies
-        self.jiffies = KernelAddressHeuristicFinder.get_jiffies()
-        if not self.jiffies:
-            self.quiet_err("jiffies: Not found")
-            return False
-        self.quiet_info("jiffies: {:#x}".format(self.jiffies))
+        jiffies = KernelAddressHeuristicFinder.get_jiffies()
+        if not jiffies:
+            meta.append(("err", "jiffies: Not found"))
+            return None
+        meta.append(("info", "jiffies: {:#x}".format(jiffies)))
+        layout["jiffies"] = jiffies
+        layout["meta"] = meta
+        return layout
 
-        ### High-resolution kernel timer (unit: nano seconds)
+    def iter_classic_bases(self, layout):
+        """Yield (cpu, the index of timer_base or None, the address of timer_base/tvec_base)."""
+        if layout["kind"] == "wheel":
+            for cpu, addr in self.percpu.possible_addrs_of(layout["timer_bases"]):
+                for n in range(layout["nr_bases"]):
+                    yield cpu, n, addr + layout["sizeof_timer_base"] * n
+            return
 
-        # hrtimer_bases
-        self.hrtimer_bases = KernelAddressHeuristicFinder.get_hrtimer_bases()
-        if not self.hrtimer_bases:
-            self.quiet_err("hrtimer_bases: Not found")
-            return False
-        self.quiet_info("hrtimer_bases: {:#x}".format(self.hrtimer_bases))
+        for cpu, slot in self.percpu.possible_addrs_of(layout["tvec_bases"]):
+            base = slot
+            if layout["pointer"]:
+                base = read_int_from_memory(slot, safe=True)
+                if not base or not is_valid_addr(base):
+                    self.incomplete.append("tvec_bases of cpu{:d} is unreadable".format(cpu))
+                    continue
+            yield cpu, None, base
+        return
 
-        # per_cpu_hrtimer_bases
-        if self.cpu_offset == []:
-            self.per_cpu_hrtimer_cpu_bases = [self.hrtimer_bases]
+    def verify_classic_base(self, layout, cpu, base):
+        ptrsize = runtime.current_arch.ptrsize
+        if layout["offset_cpu"] is not None:
+            return read_int32_from_memory(base + layout["offset_cpu"], safe=True) == cpu
+        # the empty list_head of tv1 links to itself
+        head = base + layout["offset_vectors"]
+        first = read_int_from_memory(head, safe=True)
+        return bool(first) and read_int_from_memory(first + ptrsize, safe=True) == head
+
+    def verify_classic_layout(self, layout):
+        for cpu, _n, base in self.iter_classic_bases(layout):
+            return self.verify_classic_base(layout, cpu, base)
+        return False
+
+    def walk_hlist(self, head):
+        """Return the nodes of the hlist at `head` verified by `pprev`, and the reason if the walk stopped."""
+        ptrsize = runtime.current_arch.ptrsize
+        nodes = []
+        link = head
+        node = read_int_from_memory(head, safe=True)
+        while node:
+            # it also stops at a cycle, where `pprev` does not point to the current link
+            if not is_valid_addr(node) or read_int_from_memory(node + ptrsize, safe=True) != link:
+                return nodes, "broken at {:#x}".format(node)
+            nodes.append(node)
+            link = node
+            node = read_int_from_memory(node, safe=True)
+        if node is None:
+            return nodes, "unreadable at {:#x}".format(link)
+        return nodes, None
+
+    def collect_classic_timers(self):
+        """Return [{"cpu", "base", "timer", "expires", "function"}, ...] of every queued timer_list."""
+        layout = self.classic
+        ptrsize = runtime.current_arch.ptrsize
+        is_hlist = layout["kind"] != "tvec_list"
+        if is_hlist:
+            sizeof_head = ptrsize
         else:
-            self.per_cpu_hrtimer_cpu_bases = [AddressUtil.normalize_address(x + self.hrtimer_bases) for x in self.cpu_offset]
+            sizeof_head = ptrsize * 2
+        timers = []
+        for cpu, n, base in self.iter_classic_bases(layout):
+            name = "cpu{:d} {:s}".format(cpu, "timer_base[{:d}]".format(n) if n is not None else "tvec_base")
+            if not self.verify_classic_base(layout, cpu, base):
+                self.incomplete.append("{:s} ({:#x}) does not match the layout".format(name, base))
+                continue
+            vectors = base + layout["offset_vectors"]
+            heads = read_memory(vectors, layout["nr_vectors"] * sizeof_head, safe=True)
+            if heads is None:
+                self.incomplete.append("{:s} ({:#x}) is unreadable".format(name, base))
+                continue
+            heads = slice_unpack(heads, ptrsize)
+            for i in range(layout["nr_vectors"]):
+                head = vectors + i * sizeof_head
+                if is_hlist:
+                    if heads[i] == 0:
+                        continue
+                    nodes, reason = self.walk_hlist(head)
+                else:
+                    if heads[i * 2] == head:
+                        continue
+                    lh = KernelListHead(head)
+                    nodes = list(lh.iter_entries())
+                    if lh.broken:
+                        reason = "{:s} at {:#x}".format(lh.broken_reason, lh.broken_at)
+                    else:
+                        reason = None
+                if reason:
+                    self.incomplete.append("the bucket {:d} of {:s} is {:s}".format(i, name, reason))
+                for timer in nodes:
+                    expires = read_int_from_memory(timer + layout["offset_expires"], safe=True)
+                    function = read_int_from_memory(timer + layout["offset_function"], safe=True)
+                    if expires is None or function is None:
+                        self.incomplete.append("timer_list {:#x} is unreadable".format(timer))
+                        continue
+                    timers.append({"cpu": cpu, "base": n, "timer": timer, "expires": expires, "function": function})
+        return timers
 
-        """
+    def get_classic_timers(self):
+        """Return {"timers": [{"cpu", "base", "timer", "expires", "function"}, ...], "incomplete": [reason, ...]}
+        of every queued timer_list without printing, or None if the timer wheel is not resolved."""
+        if not self.initialize(classic=True, high_resolution=False):
+            return None
+        timers = self.collect_classic_timers()
+        return {"timers": timers, "incomplete": self.incomplete}
+
+    def time_to_expire(self, expires, now):
+        """Return `expires - now` as the kernel does in `time_after()`, which wraps in unsigned long."""
+        bits = runtime.current_arch.ptrsize * 8
+        return u2i(expires - now, bits)
+
+    def get_cpu_label(self, cpu):
+        states = []
+        if self.cpu_masks:
+            possible = self.cpu_masks.get("possible")
+            present = self.cpu_masks.get("present")
+            online = self.cpu_masks.get("online")
+            if possible is not None:
+                states.append("possible" if cpu in possible else "impossible")
+            if present is not None:
+                states.append("present" if cpu in present else "not present")
+            if online is not None:
+                states.append("online" if cpu in online else "offline")
+        label = "cpu{:d}".format(cpu)
+        if states:
+            label += " ({:s})".format(", ".join(states))
+        return label
+
+    def dump_timer(self):
+        layout = self.classic
+        jiffies = read_int_from_memory(layout["jiffies"], safe=True)
+        if jiffies is None:
+            self.err_add_out("jiffies is unreadable")
+            return
+
+        timers = {}
+        for timer in self.collect_classic_timers():
+            timers.setdefault((timer["cpu"], timer["base"]), []).append(timer)
+
+        for cpu, n, base in self.iter_classic_bases(layout):
+            if n is None:
+                self.out.append(titlify("{:s} tvec_base: {:#x}".format(self.get_cpu_label(cpu), base)))
+            else:
+                self.out.append(titlify("{:s} timer_base[{:d}]: {:#x}".format(self.get_cpu_label(cpu), n, base)))
+
+            # print legend
+            if not self.args.quiet:
+                fmt = "{:18s}  {:18s}  {:23s}  {:18s} {:s}"
+                legend = ["timer_list", "expires", "time_to_expired", "function", "symbol"]
+                self.out.append(GefUtil.make_legend(fmt.format(*legend)))
+
+            entries = timers.get((cpu, n), [])
+            for timer in sorted(entries, key=lambda x: self.time_to_expire(x["expires"], jiffies)):
+                tte = self.time_to_expire(timer["expires"], jiffies)
+                self.out.append("{:#018x}  {:#018x}  {:#018x} tick  {:s}".format(
+                    timer["timer"], timer["expires"], tte,
+                    Symbol.format(timer["function"], missing="NO_SYMBOL", show_address=True, nocolor=True),
+                ).rstrip())
+        return
+
+    def verify_hrtimer_bases(self, layout, cpu_base):
+        """Check `clock_base[i].cpu_base == cpu_base` and `clock_base[i].index == i`."""
+        if cpu_base is None:
+            return False
+        for n in range(layout["nr_clock_bases"]):
+            htb = cpu_base + layout["offset_clock_base"] + layout["sizeof_clock_base"] * n
+            if read_int_from_memory(htb + layout["offset_cpu_base"], safe=True) != cpu_base:
+                return False
+            if read_int32_from_memory(htb + layout["offset_index"], safe=True) != n:
+                return False
+        return True
+
+    @Cache.cache_this_session(cache_None=False, per_inferior=True, until_new_objfile=True)
+    def resolve_hrtimer_bases(self):
+        """Return the layout of `hrtimer_cpu_base.clock_base[]`, verified by the memory, or None.
+
         struct hrtimer_cpu_base {
             raw_spinlock_t lock;
             unsigned int cpu;
             unsigned int active_bases;
             unsigned int clock_was_set_seq;
-            unsigned int hres_active : 1,
-                         in_hrtirq : 1,
-                         hang_detected : 1,
-                         softirq_activated : 1;
+            unsigned int hres_active : 1, in_hrtirq : 1, hang_detected : 1,      // ~v7.0
+                         softirq_activated : 1, online : 1;                      // ~v7.0
+            bool hres_active, deferred_rearm, deferred_needs_update,             // v7.1~
+                 hang_detected, softirq_activated, online;                       // v7.1~
         #ifdef CONFIG_HIGH_RES_TIMERS
             unsigned int nr_events;
             unsigned short nr_retries;
@@ -4785,24 +5221,32 @@ class KernelTimerCommand(GenericCommand, BufferingOutput):
             struct hrtimer *next_timer;
             ktime_t softirq_expires_next;
             struct hrtimer *softirq_next_timer;
+            ktime_t deferred_expires_next; // v7.1~
             struct hrtimer_clock_base {
                 struct hrtimer_cpu_base *cpu_base;
                 unsigned int index;
                 clockid_t clockid;
                 seqcount_raw_spinlock_t seq; // v4.16~
+                ktime_t expires_next; // v7.1~ (== the expires of active.rb_root.rb_leftmost)
                 struct hrtimer *running; // v4.16~
-                struct timerqueue_head {
-                    struct rb_root_cached {          // v5.4~
-                        struct rb_root rb_root;      // v5.4~
-                        struct rb_node *rb_leftmost; // v5.4~
+                struct timerqueue_head { // struct timerqueue_linked_head at v7.1~
+                    struct rb_root_cached {          // v5.4~ (struct rb_root_linked at v7.1~;
+                        struct rb_root rb_root;      // v5.4~  the layout is the same, only
+                        struct rb_node *rb_leftmost; // v5.4~  rb_leftmost gets the _linked type)
                     } rb_root;                       // v5.4~
                     struct rb_root head;             // ~v5.3
                     struct timerqueue_node *next;    // ~v5.3
                 } active;
+                ktime_t resolution; // ~v4.1
                 ktime_t (*get_time)(void); // ~v6.17
+                ktime_t softirq_time; // ~v4.1
                 ktime_t offset;
             } __hrtimer_clock_base_align clock_base[HRTIMER_MAX_CLOCK_BASES];
+            call_single_data_t csd;
         } ____cacheline_aligned;
+
+        The members before `clock_base[]` differ a lot between the versions (e.g., `clock_base[]` is
+        right after `lock` before v3.10), but `clock_base[]` is found by its `cpu_base` and `index`.
 
         DEFINE_PER_CPU(struct hrtimer_cpu_base, hrtimer_bases) =
         {
@@ -4824,7 +5268,7 @@ class KernelTimerCommand(GenericCommand, BufferingOutput):
                     .clockid = CLOCK_BOOTTIME,
                     .get_time = &ktime_get_boottime,
                 },
-                {
+                {                                         // v3.10~
                     .index = HRTIMER_BASE_TAI,
                     .clockid = CLOCK_TAI,
                     .get_time = &ktime_get_clocktai,
@@ -4834,80 +5278,200 @@ class KernelTimerCommand(GenericCommand, BufferingOutput):
                     .clockid = CLOCK_MONOTONIC,
                     .get_time = &ktime_get,
                 },
-                {                                         // v4.16~
-                    .index = HRTIMER_BASE_REALTIME_SOFT,
-                    .clockid = CLOCK_REALTIME,
-                    .get_time = &ktime_get_real,
-                },
-                {                                         // v4.16~
-                    .index = HRTIMER_BASE_BOOTTIME_SOFT,
-                    .clockid = CLOCK_BOOTTIME,
-                    .get_time = &ktime_get_boottime,
-                },
-                {                                         // v4.16~
-                    .index = HRTIMER_BASE_TAI_SOFT,
-                    .clockid = CLOCK_TAI,
-                    .get_time = &ktime_get_clocktai,
-                },
+                ...                                       // v4.16~ (REALTIME_SOFT, BOOTTIME_SOFT, TAI_SOFT)
             }
         };
         """
+        self.hrtimer_meta = meta = []
+        ptrsize = runtime.current_arch.ptrsize
+        kversion = Kernel.version()
 
-        hrtimer_cpu_base = self.per_cpu_hrtimer_cpu_bases[0]
+        hrtimer_bases = KernelAddressHeuristicFinder.get_hrtimer_bases()
+        if not hrtimer_bases:
+            meta.append(("err", "hrtimer_bases: Not found"))
+            return None
+        meta.append(("info", "hrtimer_bases: {:#x}".format(hrtimer_bases)))
+        hrtimer_cpu_base = self.percpu.addr_of(hrtimer_bases, 0)
+        if hrtimer_cpu_base is None:
+            meta.append(("err", "per-cpu hrtimer_bases: Not found"))
+            return None
 
-        ktime_get = Symbol.get_ksymaddr("ktime_get")
-        ktime_get_real = Symbol.get_ksymaddr("ktime_get_real")
-        ktime_get_ofs = None
-        ktime_get_real_ofs = None
-        i = 0
-        while True:
-            ofs = runtime.current_arch.ptrsize * i
-            try:
-                v = read_int_from_memory(hrtimer_cpu_base + ofs)
-            except gdb.MemoryError:
-                self.quiet_err("Memory read error")
-                return False
-            if v == ktime_get:
-                ktime_get_ofs = ofs
-            elif v == ktime_get_real:
-                ktime_get_real_ofs = ofs
+        layout = {"hrtimer_bases": hrtimer_bases}
+        offset_clock_base = GefUtil.offsetof("hrtimer_cpu_base", "clock_base")
+        sizeof_clock_base = GefUtil.sizeof("hrtimer_clock_base")
+        sizeof_clock_bases = GefUtil.sizeof("((struct hrtimer_cpu_base *)0)->clock_base")
+        members = {name: GefUtil.offsetof("hrtimer_clock_base", name) for name in ("cpu_base", "index", "clockid", "get_time")}
+        source = None
+        if None not in (offset_clock_base, sizeof_clock_base, sizeof_clock_bases, members["cpu_base"], members["index"], members["clockid"]):
+            layout.update({
+                "offset_clock_base": offset_clock_base,
+                "sizeof_clock_base": sizeof_clock_base,
+                "nr_clock_bases": sizeof_clock_bases // sizeof_clock_base,
+                "offset_cpu_base": members["cpu_base"],
+                "offset_index": members["index"],
+                "offset_clockid": members["clockid"],
+                "offset_get_time": members["get_time"],
+            })
+            if self.verify_hrtimer_bases(layout, hrtimer_cpu_base):
+                source = "debug info"
+            else:
+                meta.append(("warn", "The debug information of struct hrtimer_clock_base does not match the memory"))
+
+        if source is None:
+            source = "heuristic"
+            layout.update({"offset_cpu_base": 0, "offset_index": ptrsize, "offset_clockid": ptrsize + 4})
+
+            # `clock_base[i].cpu_base` points back to the `hrtimer_cpu_base` itself, so it gives the
+            # head and the stride of `clock_base[]` directly. Unlike the calculation from `get_time`
+            # below, it is exact even when the tail of `struct hrtimer_clock_base` is padded up to
+            # the alignment (~v4.15), and it is the only way for v6.18 or later where `get_time`
+            # has been removed.
+            anchor = KernelAddressHeuristicFinder.find_clock_base_anchor(hrtimer_cpu_base)
+            if anchor:
+                layout["offset_clock_base"], layout["sizeof_clock_base"], _ = anchor
+
+            # A merge-window build names the previous release (`6.17.0-11846-g...`) but already has
+            # the next layout, so look for `get_time` instead of deciding by version alone.
+            ktime_get = Ksym.get_addr("ktime_get")
+            ktime_get_real = Ksym.get_addr("ktime_get_real")
+            ktime_get_ofs = None
+            ktime_get_real_ofs = None
+            if kversion < "6.18" and ktime_get and ktime_get_real:
+                if anchor:
+                    limit = layout["offset_clock_base"] + layout["sizeof_clock_base"] * 2
+                else:
+                    limit = 0x400
+                for ofs in range(0, limit, ptrsize):
+                    v = read_int_from_memory(hrtimer_cpu_base + ofs, safe=True)
+                    if v is None:
+                        break
+                    if v == ktime_get:
+                        ktime_get_ofs = ofs
+                    elif v == ktime_get_real:
+                        ktime_get_real_ofs = ofs
+                    if ktime_get_ofs and ktime_get_real_ofs:
+                        break
+
             if ktime_get_ofs and ktime_get_real_ofs:
-                break
-            i += 1
-        self.sizeof_hrtimer_clock_base = ktime_get_real_ofs - ktime_get_ofs
+                if not anchor:
+                    # fallback: `get_time` and `offset` are the last members of the structure
+                    layout["sizeof_clock_base"] = ktime_get_real_ofs - ktime_get_ofs
+                    clock_base_1 = ktime_get_ofs + ptrsize + 8 # get_time, offset
+                    layout["offset_clock_base"] = clock_base_1 - layout["sizeof_clock_base"]
+                layout["offset_get_time"] = ktime_get_ofs - layout["offset_clock_base"]
+            elif anchor:
+                layout["offset_get_time"] = None # removed at v6.18
+            else:
+                meta.append(("err", "clock_base: Not found"))
+                return None
 
-        clock_base_1 = ktime_get_ofs + runtime.current_arch.ptrsize + 8 # get_time, offset
-        self.offset_clock_base = clock_base_1 - self.sizeof_hrtimer_clock_base
-        self.offset_clockid = runtime.current_arch.ptrsize + 4 # cpu_base, index
-        self.offset_get_time = ktime_get_ofs - self.offset_clock_base
-        self.offset_rb_root = self.offset_get_time - runtime.current_arch.ptrsize * 2
+            # HRTIMER_MAX_CLOCK_BASES is 3 (~v3.9), 4 (v3.10~) or 8 (v4.16~)
+            nr_clock_bases = 0
+            while nr_clock_bases < 8:
+                layout["nr_clock_bases"] = nr_clock_bases + 1
+                if not self.verify_hrtimer_bases(layout, hrtimer_cpu_base):
+                    break
+                nr_clock_bases += 1
+            layout["nr_clock_bases"] = nr_clock_bases
+            if nr_clock_bases < 3:
+                meta.append(("err", "clock_base: Not found"))
+                return None
 
-        kversion = Kernel.kernel_version()
-        if kversion < "4.16":
-            self.num_of_clock_base = 4
+        layout["source"] = source
+        meta.append(("info", "offsetof(hrtimer_cpu_base, clock_base): {:#x} ({:s})".format(layout["offset_clock_base"], source)))
+        meta.append(("info", "sizeof(hrtimer_clock_base): {:#x} ({:s})".format(layout["sizeof_clock_base"], source)))
+        meta.append(("info", "HRTIMER_MAX_CLOCK_BASES: {:d} ({:s})".format(layout["nr_clock_bases"], source)))
+        meta.append(("info", "offsetof(hrtimer_clock_base, clockid): {:#x} ({:s})".format(layout["offset_clockid"], source)))
+        if layout["offset_get_time"] is not None:
+            meta.append(("info", "offsetof(hrtimer_clock_base, get_time): {:#x} ({:s})".format(layout["offset_get_time"], source)))
+        layout["meta"] = meta
+        return layout
+
+    def iter_clock_bases(self):
+        """Yield (cpu, hrtimer_cpu_base, index, hrtimer_clock_base)."""
+        layout = self.resolve_hrtimer_bases()
+        for cpu, cpu_base in self.percpu.possible_addrs_of(layout["hrtimer_bases"]):
+            for n in range(layout["nr_clock_bases"]):
+                yield cpu, cpu_base, n, cpu_base + layout["offset_clock_base"] + layout["sizeof_clock_base"] * n
+        return
+
+    def is_rb_root_cached(self, htbs, ofs):
+        """Check whether `htb + ofs` looks like a `struct rb_root_cached` (or `timerqueue_head`) for all `htbs`."""
+        found = False
+        for htb in htbs:
+            try:
+                rb_root = read_int_from_memory(htb + ofs)
+                rb_leftmost = read_int_from_memory(htb + ofs + runtime.current_arch.ptrsize)
+                if rb_root == 0 and rb_leftmost == 0:
+                    continue # empty rbtree, no information
+                if not is_valid_addr(rb_root) or not is_valid_addr(rb_leftmost):
+                    return False
+                if read_int_from_memory(rb_root) & ~0b11: # the root node has no parent
+                    return False
+                if read_int_from_memory(rb_leftmost + runtime.current_arch.ptrsize * 2): # rb_left
+                    return False
+            except gdb.MemoryError:
+                return False
+            found = True
+        return found
+
+    def is_callback(self, address):
+        """Return True if `address` is in the kernel text or the text of a loaded module."""
+        if not address or not is_valid_addr(address):
+            return False
+        if self.klayout.text_base is not None and self.klayout.text_end is not None:
+            if self.klayout.text_base <= address < self.klayout.text_end:
+                return True
+        if self.module_text_ranges is None:
+            self.module_text_ranges = Kernel.modules().get_text_ranges()
+        return any(start <= address < end for start, end, _module, _name in self.module_text_ranges)
+
+    def guess_offset_active(self):
+        """Return the offset of `active` in `struct hrtimer_clock_base` expected from the version."""
+        ptrsize = runtime.current_arch.ptrsize
+        kversion = Kernel.version()
+        if is_x86_32():
+            align_u64 = 4
         else:
-            self.num_of_clock_base = 8
+            align_u64 = 8
+        offset = align(ptrsize + 4 + 4, ptrsize) # cpu_base, index, clockid
+        if kversion >= "4.16":
+            offset += 4 # seq (without CONFIG_LOCKDEP)
+            if kversion >= "7.1":
+                offset = align(offset, align_u64) + 8 # expires_next
+            offset = align(offset, ptrsize) + ptrsize # running
+        return offset
 
-        self.initialized = True
-        return True
+    def find_hrtimer_members(self, samples):
+        """Resolve the offsets of `expires`, `function` and `base` in `struct hrtimer` from the queued ones.
+        `struct timerqueue_node` has gained a sorted list at v7.1, which shifts the members
+        placed after it. `base`, which points back to the hrtimer_clock_base, is used as
+        an anchor to absorb such a difference."""
+        ptrsize = runtime.current_arch.ptrsize
+        if not samples:
+            return None
+        for i in range(3, 0x80 // ptrsize):
+            offset_base = ptrsize * i
+            if not all(read_int_from_memory(hrtimer + offset_base, safe=True) == htb for hrtimer, htb in samples):
+                continue
+            if all(self.is_callback(read_int_from_memory(hrtimer + offset_base - ptrsize, safe=True)) for hrtimer, _ in samples):
+                # `..., expires}, _softexpires, function, base` (~v7.0)
+                # `function` is right before `base`
+                return offset_base - ptrsize - 8 * 2, offset_base - ptrsize, offset_base
+            # `..., prev, next, expires}, base, is_queued, ..., is_lazy,
+            #  _softexpires, function` (v7.1~); `expires` is right before `base`
+            for j in range(i + 1, 0x80 // ptrsize):
+                if all(self.is_callback(read_int_from_memory(hrtimer + ptrsize * j, safe=True)) for hrtimer, _ in samples):
+                    return offset_base - 8, ptrsize * j, offset_base
+            return None
+        return None
 
-    def parse_rb_node(self, rb_node):
-        if not rb_node or not is_valid_addr(rb_node):
-            return []
+    @Cache.cache_this_session(cache_None=False, per_inferior=True, until_new_objfile=True)
+    def resolve_hrtimer_members(self):
+        """Return the offsets of `hrtimer_clock_base.active` and `struct hrtimer`, verified by the queued
+        hrtimers, or None if they are not verified (e.g., every rbtree is empty).
 
-        right = read_int_from_memory(rb_node + runtime.current_arch.ptrsize * 1) & ~1 # remove RB_BLACK
-        left = read_int_from_memory(rb_node + runtime.current_arch.ptrsize * 2) & ~1 # remove RB_BLACK
-
-        ret = [rb_node]
-        if right:
-            ret += self.parse_rb_node(right)
-        if left:
-            ret += self.parse_rb_node(left)
-        return ret
-
-    def dump_hrtimer(self):
-        """
-        struct hrtimer {
+        struct hrtimer { // ~v7.0
             struct timerqueue_node {
                 struct rb_node {
                     unsigned long __rb_parent_color;
@@ -4924,148 +5488,265 @@ class KernelTimerCommand(GenericCommand, BufferingOutput):
             u8 is_soft;
             u8 is_hard;
         };
-        """
 
-        clockid_dict = {
-            0: "CLOCK_REALTIME",
-            1: "CLOCK_MONOTONIC",
-            2: "CLOCK_PROCESS_CPUTIME_ID",
-            3: "CLOCK_THREAD_CPUTIME_ID",
-            4: "CLOCK_MONOTONIC_RAW",
-            5: "CLOCK_REALTIME_COARSE",
-            6: "CLOCK_MONOTONIC_COARSE",
-            7: "CLOCK_BOOTTIME",
-            8: "CLOCK_REALTIME_ALARM",
-            9: "CLOCK_BOOTTIME_ALARM",
-            10: "CLOCK_SGI_CYCLE",
-            11: "CLOCK_TAI",
+        struct hrtimer { // v7.1~
+            struct timerqueue_linked_node {
+                struct rb_node_linked {
+                    struct rb_node node;         // same as above, so the rbtree walk is common
+                    struct rb_node_linked *prev; // sorted by expires, NULL terminated,
+                    struct rb_node_linked *next; // so they are not list_head
+                } node;
+                ktime_t expires;
+            } node;
+            struct hrtimer_clock_base *base;
+            bool is_queued; // was `u8 state`
+            bool is_rel;
+            bool is_soft;
+            bool is_hard;
+            bool is_lazy;
+            ktime_t _softexpires;
+            enum hrtimer_restart (*function)(struct hrtimer *);
+        };
+
+        `qemu-buildroot-x64-7.0-rc7` still uses the old layout, and
+        `qemu-buildroot-x64-7.1.1` uses the new one.
+        """
+        layout = self.resolve_hrtimer_bases()
+        if layout is None:
+            return None
+        meta = []
+
+        offsets = self.get_hrtimer_member_type_info(layout)
+        htbs = [htb for _cpu, _cpu_base, _n, htb in self.iter_clock_bases()]
+        ptrsize = runtime.current_arch.ptrsize
+        # `active` follows cpu_base, index, clockid (, seq, (expires_next,) running).
+        # It is just a calculation, so verify it and scan if it is wrong (e.g., CONFIG_LOCKDEP=y).
+        candidates = [self.guess_offset_active()] + list(range(ptrsize * 2, layout["sizeof_clock_base"] - 8, ptrsize))
+        if offsets is not None:
+            candidates.insert(0, offsets["offset_active"])
+        for offset_active in candidates:
+            if self.is_rb_root_cached(htbs, offset_active):
+                break
+        else:
+            return None
+        samples = self.collect_hrtimer_samples(htbs, offset_active)
+
+        if offsets is not None:
+            if offsets["offset_active"] == offset_active and all(
+                read_int_from_memory(hrtimer + offsets["offset_base"], safe=True) == htb for hrtimer, htb in samples
+            ):
+                source = "debug info"
+            else:
+                meta.append(("warn", "The debug information of struct hrtimer does not match the memory"))
+                offsets = None
+        if offsets is None:
+            source = "heuristic"
+            members = self.find_hrtimer_members(samples)
+            if members is None:
+                return None
+            offsets = {"offset_active": offset_active}
+            offsets["offset_expires"], offsets["offset_function"], offsets["offset_base"] = members
+
+        meta.append(("info", "offsetof(hrtimer_clock_base, active): {:#x} ({:s})".format(offsets["offset_active"], source)))
+        meta.append(("info", "offsetof(hrtimer, node.expires): {:#x} ({:s})".format(offsets["offset_expires"], source)))
+        meta.append(("info", "offsetof(hrtimer, function): {:#x} ({:s})".format(offsets["offset_function"], source)))
+        meta.append(("info", "offsetof(hrtimer, base): {:#x} ({:s})".format(offsets["offset_base"], source)))
+        offsets["meta"] = meta
+        return offsets
+
+    def get_hrtimer_member_type_info(self, layout):
+        """Return the offsets of `hrtimer_clock_base.active` and `struct hrtimer` from the debug information,
+        or None if they are unavailable or `clock_base[]` does not match it."""
+        offsets = {
+            "offset_active": GefUtil.offsetof("hrtimer_clock_base", "active"),
+            "offset_expires": GefUtil.offsetof("hrtimer", "node.expires"),
+            "offset_function": GefUtil.offsetof("hrtimer", "function"),
+            "offset_base": GefUtil.offsetof("hrtimer", "base"),
+        }
+        if None in offsets.values() or layout["source"] != "debug info":
+            return None
+        return offsets
+
+    def collect_hrtimer_samples(self, htbs, offset_active):
+        """Return [(hrtimer, hrtimer_clock_base), ...] of some queued hrtimers."""
+        samples = []
+        for htb in htbs:
+            nodes, _reason = self.walk_rbtree(htb + offset_active)
+            samples += [(hrtimer, htb) for hrtimer in nodes[:4]]
+            if len(samples) >= 16:
+                break
+        return samples
+
+    def guess_hrtimer_members(self):
+        """Return the offsets from the debug information or expected from the version, used only while
+        they cannot be verified."""
+        offsets = self.get_hrtimer_member_type_info(self.resolve_hrtimer_bases())
+        if offsets is not None:
+            offsets["meta"] = [
+                ("warn", "Every hrtimer rbtree is empty, so the following offsets are not verified"),
+                ("info", "offsetof(hrtimer_clock_base, active): {:#x} (debug info)".format(offsets["offset_active"])),
+                ("info", "offsetof(hrtimer, node.expires): {:#x} (debug info)".format(offsets["offset_expires"])),
+                ("info", "offsetof(hrtimer, function): {:#x} (debug info)".format(offsets["offset_function"])),
+                ("info", "offsetof(hrtimer, base): {:#x} (debug info)".format(offsets["offset_base"])),
+            ]
+            return offsets
+
+        ptrsize = runtime.current_arch.ptrsize
+        if is_x86_32():
+            align_u64 = 4
+        else:
+            align_u64 = 8
+        offset_active = self.guess_offset_active()
+        if Kernel.version() < "7.1":
+            offset_expires = align(ptrsize * 3, align_u64) # rb_node
+            offset_function = offset_expires + 8 * 2 # expires, _softexpires
+            offset_base = offset_function + ptrsize
+        else:
+            offset_expires = align(ptrsize * 5, align_u64) # rb_node, prev, next
+            offset_base = offset_expires + 8
+            offset_function = align(offset_base + ptrsize + 5, align_u64) + 8 # base, 5 bools, _softexpires
+        meta = [
+            ("warn", "Every hrtimer rbtree is empty, so the following offsets are not verified"),
+            ("info", "offsetof(hrtimer_clock_base, active): {:#x} (version)".format(offset_active)),
+            ("info", "offsetof(hrtimer, node.expires): {:#x} (version)".format(offset_expires)),
+            ("info", "offsetof(hrtimer, function): {:#x} (version)".format(offset_function)),
+            ("info", "offsetof(hrtimer, base): {:#x} (version)".format(offset_base)),
+        ]
+        return {
+            "offset_active": offset_active,
+            "offset_expires": offset_expires,
+            "offset_function": offset_function,
+            "offset_base": offset_base,
+            "meta": meta,
         }
 
-        for cpu, hrtimer_cpu_base in enumerate(self.per_cpu_hrtimer_cpu_bases):
-            clock_base = hrtimer_cpu_base + self.offset_clock_base
-            for base_n in range(self.num_of_clock_base):
-                htb = clock_base + self.sizeof_hrtimer_clock_base * base_n
-                clockid = read_int32_from_memory(htb + self.offset_clockid)
-                get_time = read_int_from_memory(htb + self.offset_get_time)
-                self.out.append(titlify("cpu{:d} hrtimer_clock_base[{:d}]: {:#x}  [{:s}; get_time: {:#x}{:s}]".format(
-                    cpu, base_n, htb,
-                    clockid_dict.get(clockid, "UNKNOWN"),
-                    get_time,
-                    Symbol.get_symbol_string(get_time, nosymbol_string=" <NO_SYMBOL>"),
-                ).rstrip()))
+    def walk_rbtree(self, root):
+        """Return the nodes of the rbtree at `root` in order, verified by their parent, and the reason if the walk stopped."""
+        ptrsize = runtime.current_arch.ptrsize
+        nodes = []
+        stack = []
+        seen = set()
+        parent = 0
+        node = read_int_from_memory(root, safe=True)
+        if node is None:
+            return nodes, "unreadable at {:#x}".format(root)
+        while stack or node:
+            while node:
+                if node in seen or not is_valid_addr(node):
+                    return nodes, "broken at {:#x}".format(node)
+                parent_color = read_int_from_memory(node, safe=True)
+                if parent_color is None or parent_color & ~0b11 != parent:
+                    return nodes, "broken at {:#x}".format(node)
+                seen.add(node)
+                stack.append(node)
+                parent = node
+                node = read_int_from_memory(node + ptrsize * 2, safe=True) # rb_left
+                if node is None:
+                    return nodes, "unreadable at {:#x}".format(parent)
+            node = stack.pop()
+            nodes.append(node)
+            parent = node
+            node = read_int_from_memory(node + ptrsize, safe=True) # rb_right
+            if node is None:
+                return nodes, "unreadable at {:#x}".format(parent)
+        return nodes, None
 
-                # print legend
-                if not self.args.quiet:
-                    fmt = "{:18s}  {:18s}  {:23s}  {:18s} {:s}"
-                    legend = ["hrtimer", "expires", "time_to_expired", "function", "symbol"]
-                    self.out.append(GefUtil.make_legend(fmt.format(*legend)))
+    def dump_hrtimer(self):
+        layout = self.hrtimer
+        for cpu, cpu_base, n, htb in self.iter_clock_bases():
+            name = "cpu{:d} hrtimer_clock_base[{:d}]".format(cpu, n)
+            if (read_int_from_memory(htb + layout["offset_cpu_base"], safe=True) != cpu_base or
+                    read_int32_from_memory(htb + layout["offset_index"], safe=True) != n):
+                self.incomplete.append("{:s} ({:#x}) does not match the layout".format(name, htb))
+                continue
+            clockid = read_int32_from_memory(htb + layout["offset_clockid"], safe=True)
+            if clockid is None:
+                self.incomplete.append("{:s} clockid is unreadable".format(name))
+                continue
+            if layout["offset_get_time"] is None: # v6.18 or later
+                self.out.append(titlify("{:s} hrtimer_clock_base[{:d}]: {:#x}  [{:s}]".format(
+                    self.get_cpu_label(cpu), n, htb,
+                    self.clockid_dict.get(clockid, "UNKNOWN"),
+                )).rstrip())
+            else:
+                get_time = read_int_from_memory(htb + layout["offset_get_time"], safe=True)
+                if get_time is None:
+                    self.incomplete.append("{:s} get_time is unreadable".format(name))
+                    continue
+                self.out.append(titlify("{:s} hrtimer_clock_base[{:d}]: {:#x}  [{:s}; get_time: {:s}]".format(
+                    self.get_cpu_label(cpu), n, htb, self.clockid_dict.get(clockid, "UNKNOWN"),
+                    Symbol.format(get_time, missing="NO_SYMBOL", show_address=True, nocolor=True),
+                )).rstrip())
 
-                rb_node = read_int_from_memory(htb + self.offset_rb_root)
-                for hrtimer in self.parse_rb_node(rb_node):
-                    expires = read_int64_from_memory(hrtimer + runtime.current_arch.ptrsize * 3)
-                    function = read_int_from_memory(hrtimer + runtime.current_arch.ptrsize * 3 + 8 * 2)
-                    if is_32bit() and not is_valid_addr(function):
-                        expires = read_int64_from_memory(hrtimer + runtime.current_arch.ptrsize * 3 + 4)
-                        function = read_int_from_memory(hrtimer + runtime.current_arch.ptrsize * 3 + 4 + 8 * 2)
-                    self.out.append("{:#018x}  {:#018x}  {:23s}  {:#018x}{:s}".format(
-                        hrtimer, expires,
-                        "? (too hard to calc)",
-                        function,
-                        Symbol.get_symbol_string(function, nosymbol_string=" <NO_SYMBOL>"),
-                    ).rstrip())
-        return
+            # print legend
+            if not self.args.quiet:
+                fmt = "{:18s}  {:18s}  {:23s}  {:18s} {:s}"
+                legend = ["hrtimer", "expires", "time_to_expired", "function", "symbol"]
+                self.out.append(GefUtil.make_legend(fmt.format(*legend)))
 
-    def dump_timer(self):
-        """
-        struct timer_list {
-            struct hlist_node entry;
-            unsigned long expires;
-            void (*function)(struct timer_list *);
-            u32 flags;
-        #ifdef CONFIG_LOCKDEP
-            struct lockdep_map lockdep_map;
-        #endif
-        };
-        """
-
-        jiffies = read_int_from_memory(self.jiffies)
-
-        for cpu, timer_base in enumerate(self.per_cpu_timer_bases):
-            # dump timer_list
-            for base_n in range(self.nr_bases):
-                tb = timer_base + self.roughly_sizeof_timer_base * base_n
-                self.out.append(titlify("cpu{:d} timer_base[{:d}]: {:#x}".format(cpu, base_n, tb)))
-
-                # print legend
-                if not self.args.quiet:
-                    fmt = "{:18s}  {:18s}  {:23s}  {:18s} {:s}"
-                    legend = ["timer_list", "expires", "time_to_expired", "function", "symbol"]
-                    self.out.append(GefUtil.make_legend(fmt.format(*legend)))
-
-                i = 0
-                while True:
-                    addr = tb + runtime.current_arch.ptrsize * i
-                    try:
-                        v = read_int_from_memory(addr)
-                    except gdb.MemoryError:
-                        self.err_add_out("Memory read error")
-                        return
-
-                    if v == 0:
-                        i += 1
-                        continue
-
-                    if i < 512:
-                        if not is_valid_addr(v):
-                            i += 1
-                            continue
-                        if read_int_from_memory(v + runtime.current_arch.ptrsize) != addr:
-                            i += 1
-                            continue
-                    else:
-                        if not is_valid_addr(v):
-                            break
-                        if read_int_from_memory(v + runtime.current_arch.ptrsize) != addr:
-                            break
-
-                    timer_list = v
-                    expires = read_int_from_memory(timer_list + runtime.current_arch.ptrsize * 2)
-                    function = read_int_from_memory(timer_list + runtime.current_arch.ptrsize * 3)
-                    sym = Symbol.get_symbol_string(function, nosymbol_string=" <NO_SYMBOL>")
-                    tte = expires - jiffies
-                    self.out.append("{:#018x}  {:#018x}  {:#018x} tick  {:#018x}{:s}".format(
-                        v, expires, tte, function, sym,
-                    ).rstrip())
-                    i += 1
+            nodes, reason = self.walk_rbtree(htb + layout["offset_active"])
+            if reason:
+                self.incomplete.append("the rbtree of {:s} is {:s}".format(name, reason))
+            for hrtimer in nodes:
+                expires = read_int64_from_memory(hrtimer + layout["offset_expires"], safe=True)
+                function = read_int_from_memory(hrtimer + layout["offset_function"], safe=True)
+                if expires is None or function is None:
+                    self.incomplete.append("hrtimer {:#x} is unreadable".format(hrtimer))
+                    continue
+                timer_base = read_int_from_memory(hrtimer + layout["offset_base"], safe=True)
+                if timer_base != htb:
+                    self.incomplete.append("hrtimer {:#x} does not point back to {:s}".format(hrtimer, name))
+                    continue
+                if not self.is_callback(function):
+                    self.incomplete.append("hrtimer {:#x} callback {:#x} is outside kernel/module text".format(hrtimer, function))
+                self.out.append("{:#018x}  {:#018x}  {:23s}  {:s}".format(
+                    hrtimer, expires, "? (too hard to calc)",
+                    Symbol.format(function, missing="NO_SYMBOL", show_address=True, nocolor=True),
+                ).rstrip())
         return
 
     @parse_args
     @only_if_gdb_running
-    @only_if_specific_gdb_mode(mode=("qemu-system", "vmware"))
-    @only_if_specific_arch(arch=("x86_32", "x86_64", "ARM32", "ARM64"))
+    @only_if_specific_gdb_mode(mode=("qemu-system", "vmware", "kgdb"))
+    @only_if_specific_arch(arch=("x86_32", "x86_64", "ARM32", "ARM64", "RISCV32", "RISCV64"))
     @only_if_in_kernel_or_kpti_disabled
     def do_invoke(self, args):
-        kversion = Kernel.kernel_version()
+        kversion = Kernel.version()
         if kversion is None:
             err("Could not find Linux kernel")
             return
-        if kversion < "4.8":
-            err("Unsupported before v4.8")
-            return
-        if "6.18" <= kversion:
-            # Read-write function pointers have been removed,
-            # so there is no longer any point in displaying them with this command.
-            err("Unsupported after v6.18")
+        if kversion < "3.0":
+            err("Unsupported before v3.0")
             return
 
         self.quiet_info("Wait for memory scan")
 
-        if not self.initialize():
+        ret = self.initialize(classic=not args.hr_only, high_resolution=not args.classic_only)
+        self.cpu_masks = self.percpu.get_cpu_masks()
+        for name, cpus in self.cpu_masks.items():
+            if cpus is None:
+                value = "unknown"
+            else:
+                value = ", ".join(str(cpu) for cpu in sorted(cpus)) or "none"
+            self.meta.append((self.quiet_info, "cpu {:s}: {:s}".format(name, value)))
+        failed = ((not args.hr_only and not self.classic_timer_initialized)
+                  or (not args.classic_only and not self.hrtimer_initialized))
+        if args.meta or failed:
+            for func, line in self.meta:
+                func(line)
+        if not ret:
+            return
+
+        if args.meta:
             return
 
         self.out = []
-        self.dump_timer()
-        self.dump_hrtimer()
+        if self.classic_timer_initialized:
+            self.dump_timer()
+        if self.hrtimer_initialized:
+            self.dump_hrtimer()
+        for reason in self.incomplete:
+            self.warn_add_out("Incomplete: {:s}".format(reason))
         self.print_output(check_terminal_size=True)
         return
 
@@ -5871,234 +6552,6 @@ class KernelDmesgCommand(GenericCommand, BufferingOutput):
             self.out.append("No retained printk records")
         self.print_output()
         self.cache = self.out[::]
-        return
-
-
-
-@register_command
-class SyscallTableViewCommand(GenericCommand, BufferingOutput):
-    """Display syscall_table entries."""
-
-    _cmdline_ = "syscall-table-view"
-    _category_ = "06-g. Qemu-system/KGDB Cooperation - Linux Advanced"
-    _aliases_ = ["kst"]
-
-    parser = argparse.ArgumentParser(prog=_cmdline_)
-    parser.add_argument("-f", "--filter", action="append", type=re.compile, default=[], help="REGEXP filter.")
-    parser.add_argument("-n", "--no-pager", action="store_true", help="do not use the pager.")
-    parser.add_argument("-q", "--quiet", action="store_true", help="enable quiet mode.")
-    _syntax_ = parser.format_help()
-
-    _example_ = [
-        "{0:s}",
-        "{0:s} --filter write",
-    ]
-    _example_ = "\n".join(_example_).format(_cmdline_)
-
-    @switch_to_intel_syntax
-    def parse_syscall_table(self, sys_call_table_addr):
-        # scan
-        cached_table = []
-        i = 0
-        while True:
-            addr = sys_call_table_addr + i * runtime.current_arch.ptrsize
-            if not is_valid_addr(addr):
-                break
-            syscall_function_addr = read_int_from_memory(addr)
-            if (is_arm32() or is_arm64()) and syscall_function_addr % 4: # should be aligned
-                break
-            if not is_valid_addr(syscall_function_addr): # if entry is valid, no error
-                break
-
-            # check symbol
-            symbol = Symbol.get_symbol_string(syscall_function_addr)
-            if symbol is None:
-                symbol = Symbol.get_ksymaddr_symbol(syscall_function_addr)
-                if symbol is None:
-                    symbol = " <NO_SYMBOL>"
-            elif "+" in symbol:
-                break
-
-            # check if valid insn or not
-            insn = get_insn(syscall_function_addr)
-            insn2 = get_insn_next(syscall_function_addr)
-            if insn is None or insn2 is None:
-                break
-
-            if is_x86():
-                # detect endbr, so slide
-                if insn.mnemonic in ["endbr64", "endbr32"]:
-                    codelen = len(insn.opcodes)
-                    insn2 = get_insn_next(insn.address + codelen)
-                    insn = get_insn(insn.address + codelen)
-
-                # detect `call non-essential-function` e.g., perf, trace, debug, ...
-                while insn and insn2 and insn.mnemonic == "call":
-                    codelen = len(insn.opcodes)
-                    insn2 = get_insn_next(insn.address + codelen)
-                    insn = get_insn(insn.address + codelen)
-
-            elif is_arm64():
-                # detect bti, so slide
-                if insn.mnemonic in ["bti"]:
-                    codelen = len(insn.opcodes)
-                    insn2 = get_insn_next(insn.address + codelen)
-                    insn = get_insn(insn.address + codelen)
-
-                # detect `bl non-essential-function` e.g., perf, trace, debug, ...
-                while insn and insn2 and insn.mnemonic == "bl":
-                    codelen = len(insn.opcodes)
-                    insn2 = get_insn_next(insn.address + codelen)
-                    insn = get_insn(insn.address + codelen)
-
-            elif is_arm32():
-                # detect `bl non-essential-function` e.g., perf, trace, debug, ...
-                while insn and insn2 and insn.mnemonic in ["bl", "blx"]:
-                    codelen = len(insn.opcodes)
-                    insn2 = get_insn_next(insn.address + codelen)
-                    insn = get_insn(insn.address + codelen)
-
-            # check again
-            if insn is None or insn2 is None:
-                break
-
-            # check if the target system call is disabled
-            is_valid = True
-            if is_x86():
-                if is_x86_64():
-                    err = "0xffffffffffffffda"
-                else:
-                    err = "0xffffffda"
-                if len(insn.operands) == 2 and insn.operands[-1] == err:
-                    if insn2.mnemonic == "ret":
-                        is_valid = False
-                    elif insn2.mnemonic == "jmp":
-                        try:
-                            insn3 = get_insn(AddressUtil.parse_address(insn2.operands[-1]))
-                            if insn3 and insn3.mnemonic == "ret":
-                                is_valid = False
-                        except (gdb.error, ValueError):
-                            pass
-            elif is_arm64():
-                if len(insn.operands) == 2 and insn.operands[-1].split("\t")[0].strip() == "#0xffffffffffffffda":
-                    is_valid = False
-                elif len(insn.operands) == 3 and insn.operands[-1] == "// #-38":
-                    is_valid = False
-
-            cached_table.append([i, addr, syscall_function_addr, symbol, is_valid])
-            i += 1
-        return cached_table
-
-    def syscall_table_view(self, orig_tag, sys_call_table_addr, syscall_list, nr_base=0):
-        if syscall_list is None:
-            self.quiet_add_out("{} {}".format(Color.colorify("[+]", "bold red"), "Could not find the syscall table"))
-            return
-
-        if sys_call_table_addr is None:
-            self.quiet_add_out("{} {}".format(Color.colorify("[+]", "bold red"), "Could not find the symbol"))
-            return
-
-        # It maintains the cache both when running with and without symbols.
-        try:
-            AddressUtil.parse_address("_stext")
-            tag = "symboled_" + orig_tag
-        except gdb.error:
-            tag = orig_tag
-
-        # parse
-        if tag not in self.cached_table:
-            self.cached_table[tag] = self.parse_syscall_table(sys_call_table_addr)
-
-        # print legend
-        if not self.args.quiet:
-            fmt = "{:8s} {:5s} {:7s} {:30s} {:18s} {:18s} {:s}"
-            legend = ["Tag", "Index", "IsValid", "Syscall Name", "Table Address", "Function Address", "Symbol"]
-            self.out.append(GefUtil.make_legend(fmt.format(*legend)))
-
-        # for duplication check
-        seen_count = {}
-        for _, _, syscall_function_addr, _, _ in self.cached_table[tag]:
-            seen_count[syscall_function_addr] = seen_count.get(syscall_function_addr, 0) + 1
-
-        # print
-        for i, addr, syscall_function_addr, symbol, is_valid in self.cached_table[tag]:
-            nr = nr_base + i
-            if nr in syscall_list.nr_table:
-                expected_name = syscall_list.nr_table[nr].name
-            else:
-                expected_name = "<UNDEFINED_IN_THIS_ARCH>"
-
-            fmt = "{:8s} [{:03d}] {:7s} {:30s} {:#018x} {:#018x}{:s}"
-            if seen_count[syscall_function_addr] == 1 and is_valid: # valid entry
-                msg = fmt.format(orig_tag, i, "valid", expected_name, addr, syscall_function_addr, symbol)
-            if seen_count[syscall_function_addr] > 1 or not is_valid: # invalid entry
-                msg = fmt.format(orig_tag, i, "invalid", expected_name, addr, syscall_function_addr, symbol)
-                msg = Color.grayify(msg)
-
-            if not self.args.filter:
-                self.out.append(msg)
-            else:
-                for re_pattern in self.args.filter:
-                    if re_pattern.search(msg):
-                        self.out.append(msg)
-        return
-
-    def dump_syscall_table(self):
-        if is_x86_32():
-            self.quiet_add_out(titlify("sys_call_table (x86)"))
-            sys_call_table_addr = KernelAddressHeuristicFinder.get_sys_call_table_x86()
-            self.syscall_table_view("x86", sys_call_table_addr, Syscall.get_syscall_table("X86", "N32"))
-
-        elif is_x86_64():
-            self.quiet_add_out(titlify("sys_call_table (x64)"))
-            sys_call_table_addr = KernelAddressHeuristicFinder.get_sys_call_table_x64()
-            self.syscall_table_view("x86_64", sys_call_table_addr, Syscall.get_syscall_table("X86", "64"))
-
-            kversion = Kernel.kernel_version()
-
-            self.quiet_add_out(titlify("ia32_sys_call_table"))
-            if kversion < "6.6.26":
-                sys_call_table_addr = KernelAddressHeuristicFinder.get_sys_call_table_x86()
-                self.syscall_table_view("x86_32", sys_call_table_addr, Syscall.get_syscall_table("X86", "32"))
-            else:
-                self.quiet_add_out("ia32_sys_call_table is removed from 6.6.26.")
-                self.quiet_add_out("each entry is embedded in `ia32_sys_call()` as call instruction.")
-
-            self.quiet_add_out(titlify("x32_sys_call_table"))
-            if kversion < "6.6.26":
-                sys_call_table_addr = KernelAddressHeuristicFinder.get_sys_call_table_x32()
-                self.syscall_table_view("x86_x32", sys_call_table_addr, Syscall.get_syscall_table("X86", "64"), nr_base=0x4000_0000)
-            else:
-                self.quiet_add_out("x32_sys_call_table is removed from 6.6.26.")
-                self.quiet_add_out("each entry is embedded in `x32_sys_call()` as call instruction.")
-
-        elif is_arm32():
-            self.quiet_add_out(titlify("sys_call_table (arm32)"))
-            sys_call_table_addr = KernelAddressHeuristicFinder.get_sys_call_table_arm32()
-            self.syscall_table_view("arm32", sys_call_table_addr, Syscall.get_syscall_table("ARM", "N32"))
-
-        elif is_arm64():
-            self.quiet_add_out(titlify("sys_call_table (arm64)"))
-            sys_call_table_addr = KernelAddressHeuristicFinder.get_sys_call_table_arm64()
-            self.syscall_table_view("arm64", sys_call_table_addr, Syscall.get_syscall_table("ARM64", "ARM"))
-
-            self.quiet_add_out(titlify("compat_sys_call_table (arm32)"))
-            sys_call_table_addr = KernelAddressHeuristicFinder.get_sys_call_table_arm64_compat()
-            self.syscall_table_view("arm64_32", sys_call_table_addr, Syscall.get_syscall_table("ARM", "32"))
-        return
-
-    @parse_args
-    @only_if_gdb_running
-    @only_if_specific_gdb_mode(mode=("qemu-system", "vmware"))
-    @only_if_specific_arch(arch=("x86_32", "x86_64", "ARM32", "ARM64"))
-    @only_if_in_kernel_or_kpti_disabled
-    def do_invoke(self, args):
-        if not hasattr(self, "cached_table"):
-            self.cached_table = {}
-
-        self.out = []
-        self.dump_syscall_table()
-        self.print_output(check_terminal_size=True)
         return
 
 
@@ -14199,5 +14652,2000 @@ class KernelRefsCommand(GenericCommand, BufferingOutput):
                 line += "  " + owner
             self.out.append(line)
 
+        self.print_output(check_terminal_size=True)
+        return
+
+
+@register_command
+class KernelSkbCommand(GenericCommand, BufferingOutput):
+    """Parse a single sk_buff and show its buffer layout, refcount and fragment information."""
+
+    _cmdline_ = "kskb"
+    _category_ = "06-g. Qemu-system/KGDB Cooperation - Linux Advanced"
+
+    parser = argparse.ArgumentParser(prog=_cmdline_)
+    parser.add_argument("skb", metavar="SKB_ADDR", nargs="?", type=AddressUtil.parse_address,
+                        help="a `struct sk_buff` address.")
+    parser.add_argument("-hh", "--help-simple", action="store_true", help="show help without ASCII diagram.")
+    parser.add_argument("-d", "--dump", action="store_true",
+                        help="hexdump the first 64 bytes of the linear packet data.")
+    parser.add_argument("--meta", action="store_true", help="display offset information.")
+    parser.add_argument("-n", "--no-pager", action="store_true", help="do not use the pager.")
+    parser.add_argument("-q", "--quiet", action="store_true", help="show result only.")
+    _syntax_ = parser.format_help()
+
+    _example_ = [
+        "{0:s} 0xffff888012345000",
+        "{0:s} -d 0xffff888012345000",
+    ]
+    _example_ = "\n".join(_example_).format(_cmdline_)
+
+    _note_ = [
+        "Simplified sk_buff structure:",
+        "",
+        "+-sk_buff----+",
+        "| next, prev |  list linkage (rbnode/list in a union)",
+        "| ...        |",
+        "| len        |  total length (headlen + data_len)",
+        "| data_len   |  bytes held in fragments (nonlinear)",
+        "| ...        |",
+        "| tail       |  offset of the end of packet data",
+        "| end        |  offset of skb_shared_info",
+        "| head       |  start of the allocated buffer",
+        "| data       |  start of packet data",
+        "| truesize   |",
+        "| users      |  refcount",
+        "| ...        |",
+        "+------------+",
+        "",
+        "head        data          tail          head+end",
+        "|           |             |             |",
+        "v           v             v             v",
+        "+-----------+-------------+-------------+------------------+",
+        "|  headroom | packet data |  tailroom   | skb_shared_info  |",
+        "+-----------+-------------+-------------+------------------+",
+        "|<-- data ->|             |             |",
+        "|<-------- tail --------->|             |",
+        "|<---------------- end ---------------->|",
+        "",
+        "skb_shared_info (at head + end) holds nr_frags, frag_list, frags[] ...",
+        "On 64-bit, tail/end are u32 offsets from head; on 32-bit they are absolute pointers.",
+        "The offsets are taken from the debug information if available, otherwise probed from the memory.",
+        "frags[] is decoded only with the debug information.",
+        "truesize is an accounting value (e.g., 2 for a local TCP pure ACK), not the buffer size.",
+    ]
+    _note_ = "\n".join(_note_)
+
+    def dump_frags(self, shinfo, nr_frags):
+        for item in self.kskb.get_frags(shinfo, nr_frags):
+            i = item["index"]
+            if "error" in item:
+                self.out.append("    frags[{:d}]: ??? (unreadable)".format(i))
+                continue
+            page, offset, size, virt = item["page"], item["offset"], item["size"], item["virt"]
+            out = "    frags[{:d}]: page: {:#x}, ".format(i, page)
+            if virt:
+                out += "(virt: {:#x}), ".format(virt)
+            out += "offset: {:#x}, size: {:#x}".format(offset, size)
+            self.out.append(out)
+        return
+
+    def dump_shared_info(self, head, end):
+        shinfo = head + end
+        self.out.append("  skb_shared_info: {:#018x}".format(shinfo))
+        layout = self.kskb.resolve_shared_info_layout(shinfo)
+        if layout is None:
+            self.out.append("    nr_frags: ??? (layout could not be resolved)")
+            return
+        nr_frags, frag_list, nr_offset, max_frags, source = layout
+        if max_frags is None:
+            limit = ""
+        else:
+            limit = ", CONFIG_MAX_SKB_FRAGS={:d}".format(max_frags)
+        self.out.append("    nr_frags: {:d}  (offset +{:#x}, {:s}{:s})".format(
+            nr_frags, nr_offset, source, limit,
+        ))
+        if source == "DWARF":
+            self.dump_frags(shinfo, nr_frags)
+        if frag_list == 0:
+            self.out.append("    frag_list: (none)")
+        elif is_valid_addr(frag_list):
+            self.out.append("    frag_list: {:#018x}".format(frag_list))
+        return
+
+    @staticmethod
+    def get_data_dump(info):
+        """Return the hexdump lines of the first 64 bytes of the linear packet data (from data to head + tail)."""
+        data, headlen, size, raw = info["address"], info["headlen"], info["size"], info["data"]
+        if headlen == 0:
+            return ["data: (no linear data)"]
+        if raw is None:
+            return ["data: ??? (unreadable @ {:#018x})".format(data)]
+        lines = ["data (first {:#x} of {:#x} linear bytes @ {:#018x}):".format(size, headlen, data)]
+        lines += hexdump(raw, 0x10, show_symbol=False, base=data, unit=1).splitlines()
+        return lines
+
+    def dump_skb(self, skb, layout):
+        info = self.kskb.get_skb(skb, layout)
+        head = layout["head_value"]
+        data = layout["data_value"]
+        tail = layout["tail_value"]
+        end = layout["end_value"]
+
+        self.out.append("sk_buff: {:#018x}".format(skb))
+        # next / prev (list linkage at offset 0)
+        nxt, prv = info["next"], info["prev"]
+        self.out.append("  next: {:#018x}  prev: {:#018x}".format(nxt, prv))
+        self.out.append("  head: {:#018x}".format(head))
+        self.out.append("  data: {:#018x}  (headroom: {:#x})".format(data, data - head))
+        self.out.append("  tail: {:#x}  (-> {:#018x})".format(tail, head + tail))
+        self.out.append("  end:  {:#x}  (-> {:#018x})".format(end, head + end))
+
+        # headlen from the buffer geometry (skb->len - skb->data_len)
+        headlen = tail - (data - head)
+        len_v, data_len = info["len"], info["data_len"]
+        if len_v is not None:
+            self.out.append("  len: {:#x} ({:d})  data_len: {:#x}  (headlen: {:#x})".format(
+                len_v, len_v, data_len, headlen))
+            if len_v - data_len != headlen:
+                self.out.append("  [!] len - data_len does not match tail - (data - head)")
+        else:
+            self.out.append("  headlen (tail - data): {:#x} ({:d})".format(headlen, headlen))
+
+        if info["truesize"] is not None:
+            truesize = info["truesize"]
+            if truesize == 2:
+                note = " (local TCP pure ACK)"
+            else:
+                note = ""
+            self.out.append("  truesize: {:#x} ({:d}){:s}".format(truesize, truesize, note))
+        if info["users"] is not None:
+            users = info["users"]
+            self.out.append("  users: {:d}".format(users))
+
+        dtor = info["destructor"]
+        if dtor:
+            p, nm, off = dtor
+            if nm:
+                self.out.append("  destructor: {:#018x} <{:s}> (at +{:#x})".format(p, nm, off))
+            else:
+                self.out.append("  destructor: {:#018x} (at +{:#x})".format(p, off))
+
+        self.dump_shared_info(head, end)
+
+        if self.args.dump:
+            for line in self.get_data_dump(self.kskb.get_data(layout)):
+                self.out.append("  " + line)
+        return
+
+    def dump_meta(self, layout):
+        source = layout["source"]
+        for member in ["len", "data_len", "tail", "end", "head", "data", "truesize", "users", "destructor"]:
+            if layout[member] is not None:
+                self.quiet_info("offsetof(sk_buff, {:s}): {:#x} ({:s})".format(member, layout[member], source))
+        self.quiet_info("sk_buff_data_t: {:s} ({:s})".format("offset" if layout["tail_is_offset"] else "pointer", source))
+        return
+
+    @parse_args
+    @only_if_gdb_running
+    @only_if_specific_gdb_mode(mode=("qemu-system", "vmware", "kgdb"))
+    @only_if_specific_arch(arch=("x86_32", "x86_64", "ARM32", "ARM64", "RISCV32", "RISCV64"))
+    @only_if_in_kernel_or_kpti_disabled
+    def do_invoke(self, args):
+        skb = args.skb
+        self.out = []
+        if skb is None:
+            self.usage()
+            return
+        if not is_valid_addr(skb):
+            err("Invalid address: {:#x}".format(skb))
+            return
+
+        self.kskb = Kernel.skb()
+        layout = self.kskb.resolve_layout(skb)
+        if layout is None:
+            err("Could not resolve the sk_buff layout at {:#x}".format(skb))
+            return
+        if layout["dwarf_mismatch"]:
+            self.quiet_warn("The debug info of struct sk_buff does not match the memory; fall back to heuristic")
+        if layout["candidates"] > 1:
+            self.quiet_warn("{:d} candidates of the sk_buff layout are found; the first one is used".format(layout["candidates"]))
+        if args.meta:
+            self.dump_meta(layout)
+
+        self.dump_skb(skb, layout)
+        self.print_output(check_terminal_size=True)
+        return
+
+
+
+@register_command
+class KernelSocketCommand(GenericCommand, BufferingOutput):
+    """Walk from a file descriptor (or a raw struct sock) through socket, sock and its skb queues."""
+
+    _cmdline_ = "ksock"
+    _category_ = "06-g. Qemu-system/KGDB Cooperation - Linux Advanced"
+
+    parser = argparse.ArgumentParser(prog=_cmdline_)
+    parser.add_argument("sock", metavar="SOCK_ADDR", nargs="?", type=AddressUtil.parse_address,
+                        help="a raw `struct sock` address to inspect directly.")
+    parser.add_argument("-hh", "--help-simple", action="store_true", help="show help without ASCII diagram.")
+    parser.add_argument("-F", "--fd", type=lambda x: int(x, 0), default=None,
+                        help="filter by this file descriptor number.")
+    parser.add_argument("-T", "--task-filter", action="append", type=AddressUtil.parse_address, default=[],
+                        help="filter by specific task_struct address.")
+    parser.add_argument("-f", "--comm-filter", action="append", type=re.compile, default=[],
+                        help="comm string REGEXP filter.")
+    parser.add_argument("-l", "--list-skb", action="store_true", help="list each skb address in the queues.")
+    parser.add_argument("-d", "--dump", action="store_true",
+                        help="hexdump the first 64 bytes of each listed skb's linear packet data (implies --list-skb).")
+    parser.add_argument("--meta", action="store_true", help="display offset information.")
+    parser.add_argument("-n", "--no-pager", action="store_true", help="do not use the pager.")
+    parser.add_argument("-q", "--quiet", action="store_true", help="show result only.")
+    _syntax_ = parser.format_help()
+
+    _example_ = [
+        "{0:s} -q",
+        "{0:s} --fd 5",
+        "{0:s} -d --fd 5",
+        "{0:s} 0xffff888012345000",
+    ]
+    _example_ = "\n".join(_example_).format(_cmdline_)
+
+    _note_ = [
+        "This command requires CONFIG_RANDSTRUCT=n unless vmlinux with debug information is loaded.",
+        "",
+        "Simplified socket structure:",
+        "",
+        "+-file------+  +->+-socket----+  +->+-sock--------------------+",
+        "| ...       |  |  | state     |  |  | (sock_common)           |",
+        "| private   |--+  | type      |  |  |   skc_family            |",
+        "| ...       |     | flags     |  |  |   skc_state             |",
+        "+-----------+     | file      |  |  |   skc_prot              |--->struct proto (name)",
+        "                  | sk        |--+  | ...                     |",
+        "                  | ops       |     | sk_receive_queue        |--->skb->skb->...",
+        "                  | ...       |     | sk_write_queue          |--->skb->skb->...",
+        "                  +-----------+     | sk_error_queue          |--->skb->skb->...",
+        "                                    | sk_state_change         |",
+        "                                    | sk_data_ready           |",
+        "                                    | sk_write_space          |",
+        "                                    | sk_error_report         |",
+        "                                    | ...                     |",
+        "                                    | sk_destruct             |",
+        "                                    +-------------------------+",
+        "",
+        "The skc_state value is protocol-dependent; TCP_* names are shown only when the",
+        "resolved protocol is TCP-like. The offsets are taken from the debug information if available,",
+        "otherwise recovered heuristically because struct sock varies with the kernel version and configuration.",
+        "The protocol is shown only when its `struct proto` is verified.",
+        "",
+        "Use `kskb ADDR` to inspect a single sk_buff in detail.",
+    ]
+    _note_ = "\n".join(_note_)
+
+    def add_meta(self, name, value, source):
+        if not self.args.meta:
+            return
+        values = self.meta.setdefault(name, set())
+        item = (value, source)
+        if item in values:
+            return
+        line = "{:s}: {:#x} ({:s})".format(name, value, source)
+        if values:
+            line += " [{:s}]".format(self.meta_context)
+        values.add(item)
+        self.out.append(line)
+        return
+
+    def dump_queue(self, sk, name, off):
+        queue = self.ksocket.get_queue(sk, off)
+        head, qlen, skbs = queue["address"], queue["qlen"], queue["skbs"]
+        self.out.append("     |- {:<14s} {:#018x} ({:d} skb)".format(name, head, qlen if qlen else 0))
+        if self.args.list_skb and skbs:
+            for idx, skb in enumerate(skbs):
+                self.out.append("     |    [{:d}] {:#018x}".format(idx, skb))
+                if self.args.dump:
+                    self.dump_skb_data(skb, "     |        ")
+            if queue["truncated"]:
+                self.out.append("     |    ... (truncated by 4096-skb limit; qlen={:d})".format(qlen))
+        return
+
+    def dump_skb_data(self, skb, prefix):
+        """Hexdump the first 64 bytes of the linear packet data of an skb (shares kskb's layout resolver)."""
+        kskb = Kernel.skb()
+        layout = kskb.resolve_layout(skb)
+        if layout is None:
+            self.out.append("{:s}data: ??? (the sk_buff layout could not be resolved)".format(prefix))
+            return
+        for line in KernelSkbCommand.get_data_dump(kskb.get_data(layout)):
+            self.out.append(prefix + line)
+        return
+
+    def dump_sock(self, info, header):
+        for name, value, source in info["meta"]:
+            self.add_meta(name, value, source)
+        if self.args.meta:
+            return
+        sk, socket, file = info["sock"], info["socket"], info["file"]
+        if header:
+            self.out.append(header)
+        parts = ["sock: {:#018x}".format(sk)]
+        if socket:
+            parts.insert(0, "socket: {:#018x}".format(socket))
+        if file:
+            parts.insert(0, "file: {:#018x}".format(file))
+        self.out.append("  " + "  ".join(parts))
+        self.out.append("  `- sock {:#018x}".format(sk))
+
+        # family / state
+        fam = info["family"]
+        if fam is not None:
+            self.out.append("     |- {:<14s} {:s}".format("family", self.ksocket.AF_FAMILY.get(fam, str(fam))))
+            st = info["state"]
+            proto_name = (info["protocol_name"] or info["protocol_symbol"] or "").lower()
+            if proto_name.startswith(("tcp", "mptcp")):
+                state = self.ksocket.SK_STATE.get(st)
+            else:
+                state = None
+            self.out.append("     |- {:<14s} {:s}".format("state", state or "{:#x}".format(st)))
+
+        # socket->{type,state}
+        if socket:
+            stype, sstate = info["type"], info["socket_state"]
+            self.out.append("     |- {:<14s} {:s}".format("type", self.ksocket.SOCK_TYPE.get(stype, str(stype))))
+            self.out.append("     |- {:<14s} {:s}".format("socket_state", self.ksocket.SS_STATE.get(sstate, str(sstate))))
+
+        # protocol
+        prot, prot_sym, prot_iname = info["protocol"], info["protocol_symbol"], info["protocol_name"]
+        if prot is not None:
+            if prot_iname:
+                proto_disp = prot_iname
+            else:
+                proto_disp = self.ksocket.PROTO_SYMBOL_RE.sub("", prot_sym).upper() or prot_sym
+            if prot_sym:
+                annot = " <{:s}>".format(prot_sym)
+            else:
+                annot = ""
+            self.out.append("     |- {:<14s} {:s} ({:#x}{:s})".format("protocol", proto_disp, prot, annot))
+
+        # queues
+        queues = info["queues"]
+        if not queues:
+            self.out.append("     |- {:<14s} ??? (layout could not be resolved)".format("queues"))
+        for name in ("receive_queue", "write_queue", "error_queue"):
+            if name in queues:
+                self.dump_queue(sk, name, queues[name])
+
+        # callbacks
+        if info["callbacks"]:
+            self.out.append("     `- callbacks")
+            for label, p, nm, _, _ in info["callbacks"]:
+                if nm:
+                    self.out.append("        {:<16s} {:#018x} <{:s}>".format(label, p, nm))
+                else:
+                    self.out.append("        {:<16s} {:#018x}".format(label, p))
+        self.out.append("")
+        return
+
+    @parse_args
+    @only_if_gdb_running
+    @only_if_specific_gdb_mode(mode=("qemu-system", "vmware", "kgdb"))
+    @only_if_specific_arch(arch=("x86_32", "x86_64", "ARM32", "ARM64", "RISCV32", "RISCV64"))
+    @only_if_in_kernel_or_kpti_disabled
+    def do_invoke(self, args):
+        self.out = []
+        if args.dump:
+            args.list_skb = True  # dumping data only makes sense together with the skb listing
+
+        self.ksocket = Kernel.socket()
+        self.ksocket.initialize()
+        self.meta = {}
+
+        # direct mode: a raw struct sock address was given.
+        if args.sock is not None:
+            sk = args.sock
+            if not is_valid_addr(sk):
+                err("Invalid address: {:#x}".format(sk))
+                return
+            self.meta_context = "sock {:#x}".format(sk)
+            info = self.ksocket.get_socket(sk=sk, details=not args.meta)
+            self.dump_sock(info, "[direct] struct sock {:#018x}".format(sk))
+            for func, line in Kernel.export_meta(self, self.ksocket.meta):
+                func(line)
+            self.print_output(check_terminal_size=True)
+            return
+
+        self.quiet_info("Wait for memory scan")
+        socks = self.ksocket.collect_socket_files()
+        if socks is None:
+            for func, line in Kernel.export_meta(self, self.ksocket.meta):
+                func(line)
+            return
+        if not socks:
+            self.quiet_info("Nothing to dump")
+            return
+
+        # apply filters
+        matched = []
+        for s in socks:
+            if args.fd is not None and s["fd"] != args.fd:
+                continue
+            if args.task_filter and s["task"] not in args.task_filter:
+                continue
+            if args.comm_filter and not any(r.search(s["comm"] or "") for r in args.comm_filter):
+                continue
+            matched.append(s)
+        if not matched:
+            self.quiet_info("Nothing to dump")
+            return
+
+        for s in matched:
+            self.meta_context = "pid {:d}, fd {:d}, file {:#x}".format(s["pid"] or 0, s["fd"], s["file"])
+            info = self.ksocket.get_socket(file=s["file"], details=not args.meta)
+            if info["socket"] is None:
+                self.out.append("[pid {:d}] {:s}  fd {:d}  file {:#018x}  socket: <not found>".format(
+                    s["pid"] or 0, s["comm"] or "?", s["fd"], s["file"]))
+                self.out.append("")
+                continue
+            header = "[pid {:d}] {:s}  fd {:d}".format(s["pid"] or 0, s["comm"] or "?", s["fd"])
+            self.dump_sock(info, header)
+
+        for func, line in Kernel.export_meta(self, self.ksocket.meta):
+            func(line)
+        self.print_output(check_terminal_size=True)
+        return
+
+
+
+@register_command
+class KernelSyscallsCommand(GenericCommand, BufferingOutput):
+    """Display syscall_table entries."""
+
+    _cmdline_ = "ksyscalls"
+    _category_ = "06-g. Qemu-system/KGDB Cooperation - Linux Advanced"
+    _aliases_ = ["kst", "syscall-table-view"]
+
+    parser = argparse.ArgumentParser(prog=_cmdline_)
+    parser.add_argument("-f", "--filter", action="append", type=re.compile, default=[], help="REGEXP syscall name filter.")
+    parser.add_argument("-n", "--no-pager", action="store_true", help="do not use the pager.")
+    parser.add_argument("-q", "--quiet", action="store_true", help="enable quiet mode.")
+    _syntax_ = parser.format_help()
+
+    _example_ = [
+        "{0:s}",
+        "{0:s} --filter write",
+    ]
+    _example_ = "\n".join(_example_).format(_cmdline_)
+
+    _note_ = [
+        "On x86, Linux v6.9 and later dispatch syscalls via switch statements.",
+        "This command shows a table for readability; remaining syscall tables are used for tracing, not dispatch.",
+    ]
+    _note_ = "\n".join(_note_)
+
+    @staticmethod
+    def is_plausible_address(addr):
+        """Check an address without issuing a remote memory read."""
+        if not isinstance(addr, int) or not 0 <= addr < AddressUtil.get_vmem_end():
+            return False
+        if is_arm32():
+            return bool(addr & 1) or addr % 4 == 0
+        if is_arm64():
+            return addr % 4 == 0
+        return True
+
+    @Cache.cache_this_session(per_inferior=True, until_new_objfile=True)
+    def get_ni_syscalls(self, abi):
+        ni_syscall_names = {
+            "x86": ["__ia32_sys_ni_syscall", "sys_ni_syscall"],
+            "x86_64": ["__x64_sys_ni_syscall", "sys_ni_syscall"],
+            "x86_32": ["__ia32_sys_ni_syscall", "sys_ni_syscall"],
+            "x86_x32": ["__x64_sys_ni_syscall", "sys_ni_syscall"],
+            "arm64": ["__arm64_sys_ni_syscall", "sys_ni_syscall"],
+            "arm64_32": ["__arm64_sys_ni_syscall", "sys_ni_syscall"],
+        }.get(abi, ["sys_ni_syscall"])
+        ni_syscalls = {}
+        for name in ni_syscall_names:
+            address = Ksym.get_addr(name)
+            if address is not None:
+                ni_syscalls[address] = name
+        return ni_syscalls
+
+    @staticmethod
+    def get_insn_pair(addr):
+        try:
+            if is_arm32() and Config.get("context_code.use_capstone"):
+                read_memory(addr & ~1, 1)
+                if addr & 1:
+                    mode = "THUMB"
+                else:
+                    mode = "ARM"
+                insns = list(Disasm.capstone_disassemble(addr, 2, mode=mode))
+            else:
+                insns = list(Disasm.gef_disassemble(addr, 2))
+        except (gdb.error, gdb.MemoryError):
+            return None, None
+        if len(insns) < 2:
+            return None, None
+        return insns[0], insns[1]
+
+    @Cache.cache_this_session(per_inferior=True, until_new_objfile=True)
+    def analyze_syscall_function(self, syscall_function_addr):
+        try:
+            if is_arm32():
+                symbol_addr = syscall_function_addr & ~1
+            else:
+                symbol_addr = syscall_function_addr
+            symbol = Symbol.format(symbol_addr, missing="NO_SYMBOL")
+        except (gdb.error, gdb.MemoryError):
+            return None
+        if "+" in symbol:
+            return None
+
+        insn, insn2 = self.get_insn_pair(syscall_function_addr)
+        if insn is None or insn2 is None:
+            return None
+
+        if is_x86():
+            prefix_mnemonics = ["endbr64", "endbr32"]
+            call_mnemonics = ["call"]
+        elif is_arm64():
+            prefix_mnemonics = ["bti"]
+            call_mnemonics = ["bl"]
+        elif is_arm32():
+            prefix_mnemonics = []
+            call_mnemonics = ["bl", "blx"]
+        else:
+            prefix_mnemonics = []
+            call_mnemonics = []
+
+        # Skip control-flow instrumentation before the actual syscall body.
+        if insn.mnemonic in prefix_mnemonics:
+            insn, insn2 = self.get_insn_pair(insn.address + len(insn.opcodes))
+        while insn and insn2 and insn.mnemonic in call_mnemonics:
+            insn, insn2 = self.get_insn_pair(insn.address + len(insn.opcodes))
+        # CONFIG_FRAME_POINTER saves the frame pointer first (push rbp; mov rax, -ENOSYS; mov rbp, rsp; pop rbp; ret)
+        if insn and is_x86() and insn.mnemonic == "push" and insn.operands[-1] in ("rbp", "ebp"):
+            insn, insn2 = self.get_insn_pair(insn.address + len(insn.opcodes))
+
+        if insn is None or insn2 is None:
+            return None
+
+        # check if the target system call is disabled
+        is_valid = True
+        if is_x86():
+            if is_x86_64():
+                err = "0xffffffffffffffda"
+            else:
+                err = "0xffffffda"
+            if len(insn.operands) == 2 and insn.operands[-1] == err:
+                while insn2 and (insn2.mnemonic in ("pop", "leave") or insn2.mnemonic == "mov" and insn2.operands[-1] in ("rsp", "esp")):
+                    insn2 = self.get_insn_pair(insn2.address + len(insn2.opcodes))[0]
+                if insn2 is None:
+                    pass
+                elif insn2.mnemonic == "ret":
+                    is_valid = False
+                elif insn2.mnemonic == "jmp":
+                    try:
+                        insn3 = get_insn(AddressUtil.parse_address(insn2.operands[-1]))
+                        if insn3 and insn3.mnemonic == "ret":
+                            is_valid = False
+                    except (gdb.error, gdb.MemoryError, ValueError):
+                        pass
+        elif is_arm64():
+            if len(insn.operands) == 2 and insn.operands[-1].split()[0] == "#0xffffffffffffffda":
+                is_valid = False
+            elif len(insn.operands) == 3 and insn.operands[-1] == "// #-38":
+                is_valid = False
+        return symbol, is_valid
+
+    @Cache.cache_this_session(per_inferior=True, until_new_objfile=True)
+    def scan_syscall_function_addrs(self, sys_call_table_addr, count):
+        try:
+            data = read_memory(sys_call_table_addr, count * runtime.current_arch.ptrsize)
+            candidates = slice_unpack(data, runtime.current_arch.ptrsize)
+        except gdb.MemoryError:
+            candidates = []
+            for i in range(count):
+                try:
+                    addr = sys_call_table_addr + i * runtime.current_arch.ptrsize
+                    candidates.append(read_int_from_memory(addr))
+                except gdb.MemoryError:
+                    break
+
+        function_addrs = []
+        for syscall_function_addr in candidates:
+            if not self.is_plausible_address(syscall_function_addr):
+                break
+            try:
+                if is_arm32():
+                    symbol_addr = syscall_function_addr & ~1
+                else:
+                    symbol_addr = syscall_function_addr
+                symbol = Symbol.format(symbol_addr, missing="NO_SYMBOL")
+            except (gdb.error, gdb.MemoryError):
+                break
+            if "+" in symbol:
+                break
+            if symbol == "<NO_SYMBOL>":
+                insn, insn2 = self.get_insn_pair(syscall_function_addr)
+                if insn is None or insn2 is None:
+                    break
+            function_addrs.append(syscall_function_addr)
+        return tuple(function_addrs)
+
+    @Cache.cache_this_session(per_inferior=True, until_new_objfile=True)
+    @switch_to_intel_syntax
+    def parse_syscall_table(self, sys_call_table_addr, indices=None):
+        table = []
+        if indices is None:
+            index_iter = itertools.count()
+        else:
+            index_iter = indices
+        for i in index_iter:
+            addr = sys_call_table_addr + i * runtime.current_arch.ptrsize
+            syscall_function_addr = read_int_from_memory(addr, safe=True)
+            if syscall_function_addr is None:
+                if indices is None:
+                    break
+                continue
+            if not self.is_plausible_address(syscall_function_addr):
+                if indices is None:
+                    break
+                continue
+
+            parsed = self.analyze_syscall_function(syscall_function_addr)
+            if parsed is None:
+                if indices is None:
+                    break
+                continue
+            symbol, is_valid = parsed
+            table.append([i, addr, syscall_function_addr, symbol, is_valid])
+        return table
+
+    def get_filtered_indices(self, syscall_list, nr_base):
+        all_indices = []
+        filtered_indices = []
+        for nr, entry in syscall_list.nr_table.items():
+            i = nr - nr_base
+            # x86-64 definitions contain both native and x32 numbers.
+            if not 0 <= i < 0x10000:
+                continue
+            all_indices.append(i)
+            if self.args.filter and GefUtil.matches_regex(entry.name, self.args.filter):
+                filtered_indices.append(i)
+        return tuple(sorted(all_indices)), tuple(sorted(filtered_indices))
+
+    def dump_one_syscall_table(self, title, abi, address_getter, syscall_list, nr_base=0):
+        # check syscall_list
+        if syscall_list is None:
+            self.quiet_add_out(titlify(title))
+            self.quiet_add_out("{} {}".format(Color.colorify("[!]", "bold red"), "Could not find the syscall table"))
+            return
+
+        # filter exists check
+        selection = None
+        if self.args.filter:
+            selection = self.get_filtered_indices(syscall_list, nr_base)
+            _, filtered_indices = selection
+            if not filtered_indices:
+                return
+
+        # check sys_call_table_addr
+        sys_call_table_addr = address_getter()
+        if sys_call_table_addr is None:
+            self.quiet_add_out(titlify(title))
+            removed_table = {
+                "x86_32": ("ia32_sys_call_table", "ia32_sys_call"),
+                "x86_x32": ("x32_sys_call_table", "x32_sys_call"),
+            }.get(abi)
+            kversion = Kernel.version()
+            if removed_table and kversion and "6.6.26" <= kversion:
+                self.quiet_add_out("{:s} is removed from 6.6.26.".format(removed_table[0]))
+                if Ksym.get_addr(removed_table[1]):
+                    self.quiet_add_out("each entry is embedded in `{:s}()` as call instruction.".format(removed_table[1]))
+                else:
+                    self.quiet_add_out("`{:s}()` is unavailable; the corresponding ABI may be disabled.".format(removed_table[1]))
+            else:
+                self.quiet_add_out("{} {}".format(Color.colorify("[!]", "bold red"), "Could not find the symbol"))
+            return
+
+        # parse with filtering
+        if selection is not None:
+            all_indices, filtered_indices = selection
+            function_addrs = self.scan_syscall_function_addrs(sys_call_table_addr, max(all_indices) + 1)
+            filtered_indices = tuple(i for i in filtered_indices if i < len(function_addrs))
+            table = self.parse_syscall_table(sys_call_table_addr, filtered_indices)
+        else:
+            table = self.parse_syscall_table(sys_call_table_addr)
+            function_addrs = tuple(row[2] for row in table)
+        if selection is not None and not table:
+            return
+
+        self.quiet_add_out(titlify(title))
+        ni_syscalls = self.get_ni_syscalls(abi)
+
+        # print legend
+        if not self.args.quiet:
+            fmt = "{:8s} {:5s} {:7s} {:30s} {:18s} {:18s} {:s}"
+            legend = ["ABI", "Index", "IsValid", "Syscall Name", "Table Address", "Function Address", "Symbol"]
+            self.out.append(GefUtil.make_legend(fmt.format(*legend)))
+
+        # for duplication check
+        seen_count = {}
+        for syscall_function_addr in function_addrs:
+            seen_count[syscall_function_addr] = seen_count.get(syscall_function_addr, 0) + 1
+
+        # print
+        for i, addr, syscall_function_addr, symbol, is_valid in table:
+            if is_arm32():
+                symbol_addr = syscall_function_addr & ~1
+            else:
+                symbol_addr = syscall_function_addr
+            if symbol_addr in ni_syscalls:
+                symbol = "<{:s}>".format(ni_syscalls[symbol_addr])
+            nr = nr_base + i
+            if nr in syscall_list.nr_table:
+                expected_name = syscall_list.nr_table[nr].name
+            else:
+                expected_name = "<UNDEFINED_IN_THIS_ARCH>"
+
+            fmt = "{:8s} [{:03d}] {:7s} {:30s} {:#018x} {:#018x} {:s}"
+            if seen_count[syscall_function_addr] == 1 and is_valid: # valid entry
+                msg = fmt.format(abi, i, "valid", expected_name, addr, syscall_function_addr, symbol)
+            if seen_count[syscall_function_addr] > 1 or not is_valid: # invalid entry
+                msg = fmt.format(abi, i, "invalid", expected_name, addr, syscall_function_addr, symbol)
+                msg = Color.grayify(msg)
+            self.out.append(msg)
+        return
+
+    def dump_syscall_tables(self):
+        if is_x86_32():
+            self.dump_one_syscall_table(
+                "sys_call_table (x86)", "x86", KernelAddressHeuristicFinder.get_sys_call_table_x86,
+                Syscall.get_syscall_table("X86", "N32"),
+            )
+
+        elif is_x86_64():
+            self.dump_one_syscall_table(
+                "sys_call_table (x64)", "x86_64", KernelAddressHeuristicFinder.get_sys_call_table_x64,
+                Syscall.get_syscall_table("X86", "64"),
+            )
+            self.dump_one_syscall_table(
+                "ia32_sys_call_table", "x86_32", KernelAddressHeuristicFinder.get_sys_call_table_x86,
+                Syscall.get_syscall_table("X86", "32"),
+            )
+            self.dump_one_syscall_table(
+                "x32_sys_call_table", "x86_x32", KernelAddressHeuristicFinder.get_sys_call_table_x32,
+                Syscall.get_syscall_table("X86", "64"), nr_base=0x4000_0000,
+            )
+
+        elif is_arm32():
+            self.dump_one_syscall_table(
+                "sys_call_table (arm32)", "arm32", KernelAddressHeuristicFinder.get_sys_call_table_arm32,
+                Syscall.get_syscall_table("ARM", "N32"),
+            )
+
+        elif is_arm64():
+            self.dump_one_syscall_table(
+                "sys_call_table (arm64)", "arm64", KernelAddressHeuristicFinder.get_sys_call_table_arm64,
+                Syscall.get_syscall_table("ARM64", "ARM"),
+            )
+            self.dump_one_syscall_table(
+                "compat_sys_call_table (arm32)", "arm64_32", KernelAddressHeuristicFinder.get_sys_call_table_arm64_compat,
+                Syscall.get_syscall_table("ARM", "32"),
+            )
+        return
+
+    @parse_args
+    @only_if_gdb_running
+    @only_if_specific_gdb_mode(mode=("qemu-system", "vmware", "kgdb"))
+    @only_if_specific_arch(arch=("x86_32", "x86_64", "ARM32", "ARM64"))
+    @only_if_in_kernel_or_kpti_disabled
+    def do_invoke(self, args):
+        self.out = []
+        self.dump_syscall_tables()
+        self.print_output(check_terminal_size=True)
+        return
+
+
+
+@register_command
+class KernelVfsCommand(GenericCommand, BufferingOutput):
+    """Display the VFS object graph of a file descriptor or VFS object."""
+
+    _cmdline_ = "kvfs"
+    _category_ = "06-g. Qemu-system/KGDB Cooperation - Linux Advanced"
+
+    parser = argparse.ArgumentParser(prog=_cmdline_)
+    parser.add_argument("-hh", "--help-simple", action="store_true", help="show help without ASCII diagram.")
+    parser.add_argument("address", nargs="?", metavar="ADDRESS", type=AddressUtil.parse_address,
+                        help="the address of struct file, dentry or inode.")
+    parser.add_argument("-t", "--type", choices=["auto", "file", "dentry", "inode"], default="auto",
+                        help="the type of ADDRESS. (default: %(default)s)")
+    parser.add_argument("-p", "--pid", type=int, help="select a file descriptor from this pid.")
+    parser.add_argument("-f", "--fd", type=int, help="select this file descriptor (requires --pid).")
+    parser.add_argument("--meta", action="store_true", help="display offset information.")
+    parser.add_argument("-n", "--no-pager", action="store_true", help="do not use the pager.")
+    parser.add_argument("-q", "--quiet", action="store_true", help="enable quiet mode.")
+    _syntax_ = parser.format_help()
+
+    _example_ = [
+        "{0:s} --pid 1337 --fd 3",
+        "{0:s} 0xffff888003b0a000",
+        "{0:s} --type inode 0xffff888003b0a000",
+    ]
+    _example_ = "\n".join(_example_).format(_cmdline_)
+
+    _note_ = [
+        "This command requires CONFIG_RANDSTRUCT=n unless vmlinux with debug information is loaded.",
+        "",
+        "ADDRESS is detected as struct file, dentry or inode unless --type is specified.",
+        "The filesystem type and mount device are best-effort when debug information is unavailable.",
+        "",
+        "Simplified VFS object graph:",
+        "",
+        "+-file-----+",
+        "| ...      |",
+        "| f_path   |",
+        "|   mnt    |    +-dentry--+",
+        "|   dentry |--->| d_name  |    +-inode-+",
+        "| ...      |    | d_inode |--->| i_ino |    +-super_block-+",
+        "+----------+    +---------+    | i_sb  |--->| s_type      |",
+        "                               +-------+    | s_dev       |",
+        "                                            +-------------+",
+    ]
+    _note_ = "\n".join(_note_)
+
+    FILE_TYPES = {
+        0o010000: "p",
+        0o020000: "c",
+        0o040000: "d",
+        0o060000: "b",
+        0o100000: "-",
+        0o120000: "l",
+        0o140000: "s",
+    }
+
+    def initialize(self):
+        self.meta = []
+
+        kversion = Kernel.version()
+        if kversion is None:
+            self.meta.append((self.quiet_err, "Could not find Linux kernel"))
+            return None
+
+        self.task_command = None
+        self.kpath = Kernel.path()
+
+        fd_mode = self.args.pid is not None or self.args.fd is not None
+        if fd_mode:
+            self.task_command = Kernel.task()
+            task_ready = self.task_command.initialize(files=True, threads=True)
+            self.meta.extend(Kernel.export_meta(self, self.task_command.meta))
+            if not task_ready:
+                self.task_command = None
+            if self.task_command is None:
+                return None
+            self.kpath = Kernel.path()
+
+        kind = self.args.type
+        address = self.args.address
+        if address is not None and not fd_mode:
+            try:
+                if kind == "inode":
+                    if not self.kpath.initialize_inode_offsets(address):
+                        self.meta.append((self.quiet_err, "Could not resolve the inode layout"))
+                        return None
+                elif kind == "file":
+                    if not self.kpath.initialize(file=address):
+                        self.meta.append((self.quiet_err, "Could not resolve the file layout"))
+                        return None
+                elif kind == "dentry":
+                    if not self.kpath.initialize(dentry=address):
+                        self.meta.append((self.quiet_err, "Could not resolve the dentry layout"))
+                        return None
+            except (gdb.MemoryError, OverflowError, RuntimeError):
+                self.meta.append((self.quiet_err, "Could not resolve the VFS object layout"))
+                return None
+
+        # KernelFileSystem adds the filesystem name and mount source. It relies on struct
+        # mount, introduced in v3.3, so older kernels use the stable super_block fields below.
+        self.kfs = None
+        if "3.3" <= kversion and kind != "inode":
+            kfs = Kernel.file_system()
+            if kfs.initialize():
+                self.kfs = kfs
+            self.meta.extend(Kernel.export_meta(self, kfs.meta, demote_err=True))
+
+        if address is not None and not fd_mode and kind == "auto" and not self.kpath.initialized:
+            try:
+                if not self.kpath.initialize(file=address) and not self.kpath.initialize(dentry=address):
+                    if not self.kpath.initialize_inode_offsets(address) or not self.is_inode(address):
+                        self.meta.append((self.quiet_err, "Could not resolve the VFS object layout"))
+                        return None
+            except (gdb.MemoryError, OverflowError, RuntimeError):
+                self.meta.append((self.quiet_err, "Could not resolve the VFS object layout"))
+                return None
+
+        if address is not None and not fd_mode and kind != "inode" and not self.kpath.initialized:
+            self.meta.append((self.quiet_err, "Could not resolve the VFS object layout"))
+            return None
+        if fd_mode and not self.kpath.initialized:
+            self.meta.append((self.quiet_err, "Could not resolve the VFS object layout"))
+            return None
+
+        self.meta.extend(Kernel.export_meta(self, self.kpath.meta))
+
+        self.offset_s_dev = runtime.current_arch.ptrsize * 2
+        # loff_t uses 8-byte alignment on ARM32, unlike the i386 ABI.
+        loff_t_align = 4
+        if is_64bit() or is_arm32():
+            loff_t_align = 8
+        s_maxbytes_end = runtime.current_arch.ptrsize * 3 + 8
+        offset_s_maxbytes = align(s_maxbytes_end, loff_t_align)
+        self.offset_s_type = offset_s_maxbytes + 8
+        offset_s_dev = GefUtil.offsetof("super_block", "s_dev")
+        offset_s_type = GefUtil.offsetof("super_block", "s_type")
+        if self.kfs is not None:
+            if self.kfs.offset_s_type is not None:
+                self.offset_s_type = self.kfs.offset_s_type
+            self.offset_s_dev = self.kfs.offset_s_dev
+        if offset_s_dev is not None:
+            self.offset_s_dev = offset_s_dev
+        if offset_s_type is not None:
+            self.offset_s_type = offset_s_type
+        self.meta.append((self.quiet_info, "offsetof(super_block, s_dev): {:#x}".format(self.offset_s_dev)))
+        self.meta.append((self.quiet_info, "offsetof(super_block, s_type): {:#x}".format(self.offset_s_type)))
+        return True
+
+    def get_task_by_pid(self, pid):
+        task_command = self.task_command
+        task_addrs = KernelTask.get_task_list(task_command.init_task, task_command.offset_tasks)
+        if task_command.enabled.get("threads"):
+            task_addrs = task_command.add_lwp_task(task_addrs)
+        for task in task_addrs:
+            if read_int32_from_memory(task + task_command.offset_pid) == pid:
+                return task
+        return None
+
+    def get_file_by_fd(self, pid, fd):
+        if fd < 0:
+            self.quiet_err("FD must not be negative")
+            return None
+        if self.task_command.offset_files is None or self.task_command.offset_fdt is None:
+            self.quiet_err("Could not find task_struct->files->fdt")
+            return None
+        task = self.get_task_by_pid(pid)
+        if task is None:
+            self.quiet_err("Could not find the task of pid {:d}".format(pid))
+            return None
+        try:
+            files = read_int_from_memory(task + self.task_command.offset_files)
+            fdt = read_int_from_memory(files + self.task_command.offset_fdt)
+            max_fds = read_int32_from_memory(fdt)
+            if fd >= max_fds:
+                self.quiet_err("FD {:d} is outside the fdtable (max_fds={:d})".format(fd, max_fds))
+                return None
+            array = read_int_from_memory(fdt + runtime.current_arch.ptrsize)
+            file = read_int_from_memory(array + runtime.current_arch.ptrsize * fd)
+        except (gdb.MemoryError, OverflowError):
+            self.quiet_err("Could not read fd {:d} of pid {:d}".format(fd, pid))
+            return None
+        if not is_valid_addr(file):
+            self.quiet_err("FD {:d} of pid {:d} is not open".format(fd, pid))
+            return None
+        return file
+
+    def is_inode(self, inode):
+        if not is_valid_addr(inode) or inode & (runtime.current_arch.ptrsize - 1):
+            return False
+        try:
+            mode = read_int16_from_memory(inode + self.kpath.offset_i_mode)
+            super_block = read_int_from_memory(inode + self.kpath.offset_i_sb)
+            read_int_from_memory(inode + self.kpath.offset_i_ino)
+        except (gdb.MemoryError, OverflowError):
+            return False
+        return mode & 0o170000 in self.FILE_TYPES and is_valid_addr(super_block)
+
+    def is_file(self, file):
+        kpath = self.kpath
+        try:
+            if kpath.offset_file_mnt is None and not kpath.initialize_file_offsets(file):
+                return False
+            vfsmnt = read_int_from_memory(file + kpath.offset_file_mnt)
+            dentry = read_int_from_memory(file + kpath.offset_file_dentry)
+        except (gdb.MemoryError, OverflowError, RuntimeError):
+            return False
+        return kpath.is_vfsmount(vfsmnt) and kpath.is_dentry(dentry)
+
+    def detect_type(self, address):
+        if self.kpath.initialized and self.is_file(address):
+            return "file"
+        if self.kpath.initialized and self.kpath.is_dentry(address):
+            return "dentry"
+        if self.is_inode(address):
+            return "inode"
+        return None
+
+    @staticmethod
+    def mode_string(mode):
+        chars = []
+        for shift in (6, 3, 0):
+            bits = (mode >> shift) & 7
+            chars.extend(("r" if bits & 4 else "-", "w" if bits & 2 else "-", "x" if bits & 1 else "-"))
+        if mode & 0o4000:
+            if chars[2] == "x":
+                chars[2] = "s"
+            else:
+                chars[2] = "S"
+        if mode & 0o2000:
+            if chars[5] == "x":
+                chars[5] = "s"
+            else:
+                chars[5] = "S"
+        if mode & 0o1000:
+            if chars[8] == "x":
+                chars[8] = "t"
+            else:
+                chars[8] = "T"
+        return KernelVfsCommand.FILE_TYPES.get(mode & 0o170000, "?") + "".join(chars)
+
+    def get_fstype_name(self, super_block):
+        if self.kfs is not None:
+            name = self.kfs.get_fstype_name(super_block)
+            if name:
+                return name
+        try:
+            fst = read_int_from_memory(super_block + self.offset_s_type)
+            if not is_valid_addr(fst):
+                return "???"
+            name_addr = read_int_from_memory(fst)
+            if not is_valid_addr(name_addr):
+                return "???"
+            return read_cstring_from_memory(name_addr, max_length=64, safe=True) or "???"
+        except (gdb.MemoryError, OverflowError):
+            return "???"
+
+    def dump_inode(self, inode, prefix, mount=None):
+        kpath = self.kpath
+        mode = read_int16_from_memory(inode + kpath.offset_i_mode)
+        ino = read_int_from_memory(inode + kpath.offset_i_ino)
+        super_block = read_int_from_memory(inode + kpath.offset_i_sb)
+        dev = read_int32_from_memory(super_block + self.offset_s_dev)
+        major = dev >> 20
+        minor = dev & ((1 << 20) - 1)
+        fstype = self.get_fstype_name(super_block)
+        if self.kfs is not None and mount is not None:
+            devname = self.kfs.get_dev_name(mount)
+        else:
+            devname = None
+
+        self.out.append(prefix + "struct inode {:#018x}".format(inode))
+        self.out.append(prefix + "|- i_ino {:d} ({:#x})".format(ino, ino))
+        self.out.append(prefix + "|- i_mode 0{:06o} ({:s})".format(mode, self.mode_string(mode)))
+        self.out.append(prefix + "`- struct super_block {:#018x}".format(super_block))
+        self.out.append(prefix + "   |- filesystem {:s}".format(fstype))
+        self.out.append(prefix + "   |- s_dev {:d}:{:d} ({:#x})".format(major, minor, dev))
+        self.out.append(prefix + "   `- mount source {:s}".format(devname or "???"))
+        return
+
+    def dump_dentry(self, dentry, prefix="", mount=None, path=None):
+        kpath = self.kpath
+        inode = read_int_from_memory(dentry + kpath.offset_d_inode)
+        name = kpath.get_dentry_name(dentry, "???")
+        if path is None:
+            path = kpath.decorate_pseudo_path(kpath.dentry_path(dentry), dentry) or "???"
+        self.out.append(prefix + "struct dentry {:#018x}".format(dentry))
+        self.out.append(prefix + "|- d_name {!r}".format(name))
+        self.out.append(prefix + "|- path {!r}".format(path))
+        if not self.is_inode(inode):
+            self.out.append(prefix + "`- d_inode {:#018x} (unreadable or negative dentry)".format(inode))
+            return
+        self.out.append(prefix + "`- d_inode")
+        self.dump_inode(inode, prefix + "   ", mount)
+        return
+
+    def dump_file(self, file):
+        kpath = self.kpath
+        vfsmnt = read_int_from_memory(file + kpath.offset_file_mnt)
+        dentry = read_int_from_memory(file + kpath.offset_file_dentry)
+        mount = vfsmnt - kpath.offset_mount_mnt
+        path = kpath.get_file_path(file) or "???"
+        self.out.append("struct file {:#018x}".format(file))
+        self.out.append("`- struct path f_path {:#018x}".format(file + kpath.offset_file_mnt))
+        self.out.append("   |- struct vfsmount {:#018x}".format(vfsmnt))
+        self.out.append("   `- dentry")
+        self.dump_dentry(dentry, "      ", mount, path)
+        return
+
+    @parse_args
+    @only_if_gdb_running
+    @only_if_specific_gdb_mode(mode=("qemu-system", "vmware", "kgdb"))
+    @only_if_specific_arch(arch=("x86_32", "x86_64", "ARM32", "ARM64"))
+    @only_if_in_kernel_or_kpti_disabled
+    def do_invoke(self, args):
+        self.quiet_info("Wait for memory scan")
+
+        ret = self.initialize()
+        if args.meta or not ret:
+            for func, line in self.meta:
+                func(line)
+        if not ret or args.meta:
+            return
+
+        fd_mode = args.pid is not None or args.fd is not None
+        if fd_mode:
+            if args.pid is None or args.fd is None:
+                err("--pid and --fd must be used together")
+                return
+            if args.address is not None:
+                err("ADDRESS cannot be used with --pid/--fd")
+                return
+            address = self.get_file_by_fd(args.pid, args.fd)
+            if address is None:
+                return
+            kind = "file"
+            self.quiet_info("pid {:d}, fd {:d}: struct file {:#x}".format(args.pid, args.fd, address))
+        else:
+            if args.address is None:
+                err("Specify ADDRESS or both --pid and --fd")
+                return
+            address = args.address
+            if not is_valid_addr(address):
+                err("Unreadable address: {:#x}".format(address))
+                return
+            kind = args.type
+            if kind == "auto":
+                kind = self.detect_type(address)
+                if kind is None:
+                    err("Could not tell what {:#x} points to; specify it with --type".format(address))
+                    return
+            self.quiet_info("Interpreted ADDRESS as struct {:s}".format(kind))
+
+        self.out = []
+        try:
+            if kind == "file" and self.is_file(address):
+                self.dump_file(address)
+            elif kind == "dentry" and self.kpath.is_dentry(address):
+                self.dump_dentry(address)
+            elif kind == "inode" and self.is_inode(address):
+                self.dump_inode(address, "")
+            else:
+                err("Could not interpret {:#x} as struct {:s}".format(address, kind))
+                return
+        except (gdb.MemoryError, OverflowError):
+            err("Memory read error while walking the VFS graph")
+            return
+        self.print_output(check_terminal_size=True)
+        return
+
+
+
+@register_command
+class KernelWorkqueueCommand(GenericCommand, BufferingOutput):
+    """Dump workqueue items and inspect embedded work_struct objects."""
+
+    _cmdline_ = "kworkqueue"
+    _category_ = "06-g. Qemu-system/KGDB Cooperation - Linux Advanced"
+
+    parser = argparse.ArgumentParser(prog=_cmdline_)
+    parser.add_argument("-hh", "--help-simple", action="store_true", help="show help without ASCII diagram.")
+    parser.add_argument("--object", type=AddressUtil.parse_address,
+                        help="the address of the object to inspect (e.g. the head of a heap object), "
+                             "scanned for an embedded work_struct/delayed_work.")
+    parser.add_argument("--size", type=AddressUtil.parse_address, default=None,
+                        help="the size of the range scanned by --object (default: 0x1000).")
+    parser.add_argument("--meta", action="store_true", help="display offset information.")
+    parser.add_argument("-n", "--no-pager", action="store_true", help="do not use the pager.")
+    parser.add_argument("-q", "--quiet", action="store_true", help="enable quiet mode.")
+    _syntax_ = parser.format_help()
+
+    _example_ = [
+        "{0:s}",
+        "{0:s} --object 0xffff888012340000",
+        "{0:s} --object 0xffff888012340000 --size 0x400",
+    ]
+    _example_ = "\n".join(_example_).format(_cmdline_)
+
+    _note_ = [
+        "Simplified workqueue structures (`==>` shows where each column comes from):",
+        "",
+        "                   +-workqueue_struct-+",
+        "+-workqueues-+     | pwqs             |--+",
+        "| list       |<--->| list             |<--->...",
+        "+------------+     | name             |  |      ==> `queue`",
+        "                   | ...              |  |",
+        "                   +------------------+  |",
+        "                     ^                   |",
+        "                     |                   |",
+        "                     |                   v",
+        "                     |       +-pool_workqueue-+",
+        "                     |       | pool           |---+",
+        "                     +-------| wq             |   |",
+        "                             | inactive_works |   |  ==> state `inactive`",
+        "                             +----------------+   |",
+        "                               ^                  |",
+        "       work_struct.data -------+                  |",
+        "       & WORK_STRUCT_PWQ_MASK (pwq)               |",
+        "                    +-work_struct-+               v",
+        "                    | data        |         +-worker_pool-+",
+        "                    | entry       |-------->| worklist    |  ==> state `pending`",
+        "                    | func        |         | busy_hash   |  ==> state `running`",
+        "                    +-------------+         | cpu         |  ==> `cpu`",
+        "                      ^                     +-------------+",
+        "                      |",
+        "                    +-delayed_work-+",
+        "                    | work         |",
+        "                    | timer        |<--- per-cpu timer wheel  ==> state `delayed`",
+        "                    | wq           |",
+        "                    +--------------+",
+        "",
+        "- `running` means the work is held in `worker.current_work`.",
+        "- When `WORK_STRUCT_PWQ` is set, `queue` and `cpu` are decoded from `work_struct.data`; off-queue work uses it differently.",
+        "- For `delayed` work, `cpu` is the CPU whose timer wheel holds the timer.",
+        "- `--object` scans `[object, object+size)` for initialized `work_struct`s, including unqueued `idle` work.",
+        "  `delayed_work` is recognized by its `delayed_work_timer_fn` timer when available.",
+        "  It does not need the workqueue list, though `queue` is then unknown.",
+        "- The running work is found from `worker_pool.busy_hash` (`global_cwq` before v3.6).",
+        "- `delayed` needs the `ktimer` layout; other states are listed without it.",
+        "- The member offsets come from the debug information (vmlinux or `ktypes-load`) when available.",
+    ]
+    _note_ = "\n".join(_note_)
+
+    BUSY_WORKER_HASH_SIZE = 64
+
+    def is_callback(self, address):
+        """Return True if `address` is the entry of a function in the kernel or module text."""
+        if not address or not is_valid_addr(address):
+            return False
+        if self.klayout.text_base <= address < self.klayout.text_end:
+            # a work function is a function entry, not an address in the middle of one
+            return not self.kallsyms_text or address in self.kallsyms_text
+        # the type of kallsyms alone is not enough (e.g., `workqueues` is `t` in some v6.14+ builds)
+        return any(start <= address < end for start, end in self.get_module_text_ranges())
+
+    def get_module_text_ranges(self):
+        if self.module_text_ranges is None:
+            self.module_text_ranges = [(start, end) for start, end, _module, _name in Kernel.modules().get_text_ranges()]
+        return self.module_text_ranges
+
+    def read_work(self, work, check_function=True):
+        try:
+            data = read_int_from_memory(work + self.offset_work_data)
+            function = read_int_from_memory(work + self.offset_work_func)
+            if check_function and not self.is_callback(function):
+                return None
+            entry = work + self.offset_work_entry
+            next_entry = read_int_from_memory(entry)
+            prev_entry = read_int_from_memory(entry + runtime.current_arch.ptrsize)
+        except gdb.MemoryError:
+            return None
+        return {
+            "work": work,
+            "data": data,
+            "function": function,
+            "next": next_entry,
+            "prev": prev_entry,
+        }
+
+    def find_name_offset(self, workqueues):
+
+        def has_names(offset, is_pointer):
+            # The window also covers the following objects, where SLAB places the older `events`,
+            # so the offset must give a name to every workqueue.
+            self.offset_wq_name = offset
+            self.name_is_pointer = is_pointer
+            return all(self.read_workqueue_name(workqueue) != "???" for workqueue in workqueues)
+
+        offset = GefUtil.offsetof("struct workqueue_struct", "name")
+        if offset is not None:
+            self.name_is_pointer = False
+            return offset
+
+        if Endian.is_little_endian():
+            byteorder = "little"
+        else:
+            byteorder = "big"
+        for workqueue in workqueues:
+            data = read_memory(workqueue, 0x800, safe=True)
+            if data is None:
+                continue
+            offset = data.find(b"events\x00")
+            if offset >= 0 and has_names(offset, False):
+                self.system_wq = workqueue
+                return offset
+
+            for offset in range(0, len(data) - runtime.current_arch.ptrsize + 1, runtime.current_arch.ptrsize):
+                name_address = int.from_bytes(data[offset:offset + runtime.current_arch.ptrsize], byteorder)
+                if not is_valid_addr(name_address):
+                    continue
+                if read_cstring_from_memory(name_address, safe=True) == "events" and has_names(offset, True):
+                    self.system_wq = workqueue
+                    return offset
+        return None
+
+    def read_workqueue_name(self, workqueue):
+        if self.offset_wq_name is None:
+            return "???"
+        try:
+            address = workqueue + self.offset_wq_name
+            if self.name_is_pointer:
+                address = read_int_from_memory(address)
+            name = read_cstring_from_memory(address)
+            if name and len(name) <= 256 and name.isprintable():
+                return name
+        except gdb.MemoryError:
+            pass
+        return "???"
+
+    def find_pwq_from_node(self, node, workqueue):
+        if self.offset_pwqs_node is not None:
+            candidate = AddressUtil.normalize_address(node - self.offset_pwqs_node)
+        else:
+            # pool_workqueue is aligned to 1 << WORK_STRUCT_PWQ_SHIFT (at least 256) for work_struct.data,
+            # and pwqs_node is within the first 256 bytes
+            candidate = node & ~0xff
+        owner = read_int_from_memory(candidate + self.offset_pwq_wq, safe=True)
+        pool = read_int_from_memory(candidate + self.offset_pwq_pool, safe=True)
+        if owner != workqueue or not pool or not is_valid_addr(pool):
+            return None
+        return candidate
+
+    def work_belongs_to_pool(self, work, pool):
+        """Return True if `work` is a queued work whose pool_workqueue belongs to `pool`."""
+        parsed = self.read_work(work)
+        if parsed is None or not parsed["data"] & 1: # WORK_STRUCT_PENDING
+            return False
+        if not parsed["data"] & 4: # WORK_STRUCT_PWQ (WORK_STRUCT_CWQ before v3.9)
+            return False
+        for mask in (0xff, 0x1ff):
+            pwq = parsed["data"] & ~mask
+            if read_int_from_memory(pwq + self.offset_pwq_pool, safe=True) == pool:
+                return True
+        return False
+
+    def is_worklist(self, head, pool):
+        """Return True if `head` is an empty list or a list of the works queued to `pool`."""
+        try:
+            if not is_double_link_list(head):
+                return False
+        except (gdb.MemoryError, OverflowError):
+            return False
+        works = list(itertools.islice(KernelListHead(head, self.offset_work_entry).iter_entries(), 8))
+        return all(self.work_belongs_to_pool(work, pool) for work in works)
+
+    def find_worklist(self, pool):
+        if self.offset_pool_worklist is not None:
+            return pool + self.offset_pool_worklist
+
+        if self.worklist_offset is None:
+            # worklist is the first list_head of worker_pool (global_cwq before v3.6) in every version.
+            # It is verified by the works linked there, since the idle workers also form a list.
+            pools = sorted({unit["pool"] for unit in self.units})
+            for offset in range(0, 0x180, runtime.current_arch.ptrsize):
+                if pools and all(self.is_worklist(p + offset, p) for p in pools):
+                    self.worklist_offset = offset
+                    self.meta.append((self.quiet_info, "offsetof(worker_pool, worklist): {:#x} (heuristic)".format(offset)))
+                    break
+            else:
+                self.worklist_offset = False
+                self.meta.append((self.quiet_warn, "offsetof(worker_pool, worklist): Not found"))
+        if self.worklist_offset is False:
+            return None
+        return pool + self.worklist_offset
+
+    def find_pool_cpu(self, pool, worklist):
+        if self.offset_pool_cpu is not None:
+            return read_int32_from_memory(pool + self.offset_pool_cpu, signed=True, safe=True)
+
+        # a per-cpu pool is in the per-cpu area of its cpu; an unbound one is not
+        resolved = Kernel.per_cpu().resolve(pool)
+        if resolved is not None and Kernel.per_cpu().is_smp:
+            return resolved[0]
+
+        end = worklist - pool
+        if self.kversion < "3.9":
+            return self.pool_cpu_hints.get(pool)
+
+        # v3.9 has cpu, id and flags before worklist; v3.10 adds node after cpu
+        if self.kversion < "3.10":
+            field_count = 3
+        else:
+            field_count = 4
+        ptrsize = runtime.current_arch.ptrsize
+        for offset in range(0, end, 4):
+            tail = end - offset - field_count * 4
+            if tail not in (0, ptrsize, align(ptrsize + 4, ptrsize), align(ptrsize + 8, ptrsize)):
+                continue
+            try:
+                values = [read_int32_from_memory(pool + offset + 4 * i, signed=True)
+                          for i in range(field_count)]
+            except gdb.MemoryError:
+                continue
+            cpu = values[0]
+            if field_count == 4:
+                node = values[1]
+            else:
+                node = -1
+            pool_id = values[-2]
+            flags = values[-1] & 0xffff_ffff
+            if (-1 <= cpu < self.max_cpu and -1 <= node < 0x1_0000 and
+                    0 <= pool_id < 0x10_0000 and flags < 0x10_0000):
+                return cpu
+        return None
+
+    def collect_old_units(self, workqueues):
+        percpu = Kernel.per_cpu()
+
+        units = []
+        for workqueue in workqueues:
+            try:
+                flags = read_int32_from_memory(workqueue + self.offset_wq_flags)
+                base = read_int_from_memory(workqueue + self.offset_wq_cpu_wq)
+            except gdb.MemoryError:
+                self.incomplete.append("workqueue {:#x} is unreadable".format(workqueue))
+                continue
+            # a WQ_UNBOUND workqueue holds one shared pool instead of a per-cpu one
+            for cpu, unit in enumerate([base] if flags & 2 else percpu.addrs_of(base)):
+                try:
+                    if read_int_from_memory(unit + self.offset_pwq_wq) != workqueue:
+                        continue
+                    pool = read_int_from_memory(unit + self.offset_pwq_pool)
+                except gdb.MemoryError:
+                    continue
+                if not is_valid_addr(pool):
+                    continue
+                if flags & 2:
+                    cpu_number = -1
+                else:
+                    cpu_number = cpu
+                units.append({
+                    "address": unit,
+                    "wq": workqueue,
+                    "name": self.read_workqueue_name(workqueue),
+                    "pool": pool,
+                    "cpu": cpu_number,
+                })
+                self.pool_cpu_hints.setdefault(pool, cpu_number)
+        return units
+
+    def collect_new_units(self, workqueues):
+        units = []
+        for workqueue in workqueues:
+            head = workqueue + self.offset_wq_pwqs
+            lh = KernelListHead(head)
+            for node in lh.iter_entries():
+                pwq = self.find_pwq_from_node(node, workqueue)
+                if pwq is None:
+                    continue
+                pool = read_int_from_memory(pwq + self.offset_pwq_pool, safe=True)
+                if pool is None:
+                    continue
+                units.append({
+                    "address": pwq,
+                    "wq": workqueue,
+                    "name": self.read_workqueue_name(workqueue),
+                    "pool": pool,
+                    "cpu": None,
+                })
+            if lh.broken:
+                self.incomplete.append("the pwqs list of {:#x} is broken at {:#x}".format(workqueue, lh.broken_at))
+        return units
+
+    def owner_for_data(self, data):
+        if not data & 4:
+            return None
+        for mask in (0xff, 0x1ff, 0x3ff):
+            address = data & ~mask
+            owner = self.units_by_address.get(address)
+            if owner is not None:
+                return owner
+        return None
+
+    def append_record(self, records, work, state, owner=None, pool=None, timer=None, expires=None, function=None):
+        parsed = self.read_work(work, check_function=function is None)
+        if parsed is None:
+            return
+        if function is not None:
+            parsed["function"] = function
+        if owner is None:
+            owner = self.owner_for_data(parsed["data"])
+        if owner is not None:
+            cpu = owner["cpu"]
+        else:
+            cpu = None
+        if cpu is None and pool is not None:
+            worklist = self.find_worklist(pool)
+            if worklist is not None:
+                cpu = self.find_pool_cpu(pool, worklist)
+        records[work] = {
+            **parsed,
+            "state": state,
+            "owner": owner,
+            "cpu": cpu,
+            "timer": timer,
+            "expires": expires,
+        }
+        return
+
+    def collect_list_records(self, records):
+        pools = {}
+        for unit in self.units:
+            pools.setdefault(unit["pool"], []).append(unit)
+
+        for pool in pools:
+            worklist = self.find_worklist(pool)
+            if worklist is None:
+                self.incomplete.append("the worklist of pool {:#x} is not found".format(pool))
+                continue
+            lh = KernelListHead(worklist, self.offset_work_entry)
+            for work in lh.iter_entries():
+                data = read_int_from_memory(work + self.offset_work_data, safe=True)
+                if data is None:
+                    continue
+                owner = self.owner_for_data(data)
+                self.append_record(records, work, "pending", owner, pool)
+            if lh.broken:
+                self.incomplete.append("the worklist of pool {:#x} is broken at {:#x}".format(pool, lh.broken_at))
+
+        # Throttled work is linked from pool_workqueue.delayed_works/inactive_works.
+        for unit in self.units:
+            heads = []
+            if self.offset_pwq_inactive is not None:
+                heads.append(unit["address"] + self.offset_pwq_inactive)
+            else:
+                for offset in range(runtime.current_arch.ptrsize * 2, 0x180, runtime.current_arch.ptrsize):
+                    head = unit["address"] + offset
+                    try:
+                        if is_double_link_list(head, min_len=1):
+                            heads.append(head)
+                    except gdb.MemoryError:
+                        continue
+            for head in heads:
+                for work in KernelListHead(head, self.offset_work_entry).iter_entries():
+                    parsed = self.read_work(work)
+                    if parsed is None or self.owner_for_data(parsed["data"]) is not unit:
+                        continue
+                    self.append_record(records, work, "inactive", unit, unit["pool"])
+        return
+
+    def iter_busy_workers(self, pool):
+        """Iterate the workers in the busy_hash of `pool`, each linked back through hentry.pprev."""
+        ptrsize = runtime.current_arch.ptrsize
+        if self.offset_pool_busy_hash is not None:
+            buckets = [pool + self.offset_pool_busy_hash + ptrsize * i for i in range(self.BUSY_WORKER_HASH_SIZE)]
+        else:
+            # busy_hash is in worker_pool since v3.9, and in global_cwq, which contains the pools, before that
+            if self.kversion < "3.9":
+                start = pool - 0x1000
+            else:
+                start = pool
+            data = read_memory(start, 0x2000, safe=True)
+            if data is None:
+                start = pool
+                data = read_memory(start, 0x1000, safe=True)
+                if data is None:
+                    self.incomplete.append("the busy_hash of pool {:#x} is unreadable".format(pool))
+                    return
+            words = slice_unpack(data, ptrsize)
+            buckets = [start + ptrsize * i for i, word in enumerate(words) if word and is_valid_addr(word)]
+
+        seen = set()
+        for bucket in buckets:
+            link = bucket
+            worker = read_int_from_memory(bucket, safe=True)
+            while worker and worker not in seen and is_valid_addr(worker):
+                if read_int_from_memory(worker + ptrsize, safe=True) != link: # hlist_node.pprev
+                    break
+                seen.add(worker)
+                yield worker
+                link = worker
+                worker = read_int_from_memory(worker, safe=True)
+        return
+
+    def read_running_work(self, worker, pools, pool):
+        """Return (current_work, current_pwq, the pool, the running function) of a busy worker, or None."""
+        work = read_int_from_memory(worker + self.offset_worker_current_work, safe=True)
+        if not work or not is_valid_addr(work):
+            return None
+        worker_layouts = [(self.offset_worker_current_func, self.offset_worker_current_pwq)]
+        if self.offset_worker_current_func is None and GefUtil.offsetof("worker", "current_cwq") is None:
+            # current_func (v3.9) is also backported to some v3.8.y
+            worker_layouts.insert(0, (runtime.current_arch.ptrsize * 3, runtime.current_arch.ptrsize * 4))
+        for offset_func, offset_pwq in worker_layouts:
+            pwq = read_int_from_memory(worker + offset_pwq, safe=True)
+            if not pwq or not is_valid_addr(pwq):
+                continue
+            # current_pwq links back to the pool (a global_cwq shares one busy_hash between its pools)
+            pwq_pool = read_int_from_memory(pwq + self.offset_pwq_pool, safe=True)
+            if pwq_pool not in pools or self.kversion >= "3.9" and pwq_pool != pool:
+                continue
+            if offset_func is not None:
+                function = read_int_from_memory(worker + offset_func, safe=True)
+            else:
+                function = read_int_from_memory(work + self.offset_work_func, safe=True)
+            if self.is_callback(function):
+                return work, pwq, pwq_pool, function
+        return None
+
+    def collect_running_records(self, records):
+        pools = {unit["pool"] for unit in self.units}
+        seen_workers = set()
+        for pool in pools:
+            for worker in self.iter_busy_workers(pool):
+                if worker in seen_workers:
+                    continue
+                # the window of a pool may cover the busy_hash of the next one
+                running = self.read_running_work(worker, pools, pool)
+                if running is None:
+                    continue
+                seen_workers.add(worker)
+                work, pwq, pwq_pool, function = running
+                owner = self.units_by_address.get(pwq)
+                if owner is None:
+                    wq = read_int_from_memory(pwq + self.offset_pwq_wq, safe=True)
+                    owner = self.workqueues_by_address.get(wq)
+                # current_func is what runs; the work may already be reinitialized or freed
+                self.append_record(records, work, "running", owner, pwq_pool, function=function)
+        return
+
+    def find_delayed_work(self, timer):
+        if self.offset_delayed_timer is not None:
+            work = timer - self.offset_delayed_timer
+            if self.read_work(work) is not None:
+                return work
+            return None
+
+        for offset in range(runtime.current_arch.ptrsize * 4, 0x200, runtime.current_arch.ptrsize):
+            work = timer - offset
+            parsed = self.read_work(work)
+            if parsed is not None and parsed["data"] & 1:
+                return work
+        return None
+
+    def find_delayed_owner(self, work, timer):
+        parsed = self.read_work(work)
+        if parsed is not None:
+            owner = self.owner_for_data(parsed["data"])
+            if owner is not None:
+                return owner
+
+        if self.offset_delayed_wq is not None:
+            try:
+                wq = read_int_from_memory(work + self.offset_delayed_wq)
+                return self.workqueues_by_address.get(wq)
+            except gdb.MemoryError:
+                return None
+
+        for offset in range(runtime.current_arch.ptrsize * 4, 0x180, runtime.current_arch.ptrsize):
+            wq = read_int_from_memory(timer + offset, safe=True)
+            if wq is None:
+                continue
+            owner = self.workqueues_by_address.get(wq)
+            if owner is not None:
+                return owner
+        return None
+
+    def collect_delayed_records(self, records):
+        if not self.delayed_timer_functions:
+            return
+        timer_command = runtime.CommandRegistry.instances.get("ktimer")
+        if timer_command is not None:
+            classic_timers = timer_command.get_classic_timers()
+        else:
+            classic_timers = None
+        if classic_timers is None:
+            self.incomplete.append("delayed works are not scanned since the timer wheel is not resolved")
+            return
+        self.incomplete.extend("the timer wheel: {:s}".format(reason) for reason in classic_timers["incomplete"])
+
+        for timer in classic_timers["timers"]:
+            if timer["function"] not in self.delayed_timer_functions:
+                continue
+            work = self.find_delayed_work(timer["timer"])
+            if work is None:
+                continue
+            owner = self.find_delayed_owner(work, timer["timer"])
+            self.append_record(records, work, "delayed", owner, None, timer["timer"], timer["expires"])
+            records[work]["cpu"] = timer["cpu"]
+        return
+
+    def scan_address_range(self, records, address, size):
+        end = AddressUtil.normalize_address(address + size)
+        for work in range(address, end, runtime.current_arch.ptrsize):
+            if work in records:
+                continue
+            parsed = self.read_work(work)
+            if parsed is None:
+                continue
+            owner = self.owner_for_data(parsed["data"])
+            linked = (parsed["next"] == work + self.offset_work_entry and
+                      parsed["prev"] == work + self.offset_work_entry)
+            pending = bool(parsed["data"] & 1)
+            if not pending and not linked:
+                continue
+
+            timer = None
+            expires = None
+            if pending:
+                state = "pending"
+            else:
+                state = "idle"
+            limit = min(end, work + 0x300)
+            for function_address in range(work + self.offset_work_func + runtime.current_arch.ptrsize,
+                                          limit, runtime.current_arch.ptrsize):
+                function = read_int_from_memory(function_address, safe=True)
+                if function is None:
+                    break
+                if function not in self.delayed_timer_functions:
+                    continue
+                candidate_timer = function_address - self.offset_timer_func
+                if candidate_timer <= work:
+                    continue
+                timer = candidate_timer
+                expires = read_int_from_memory(timer + self.offset_timer_expires, safe=True)
+                if expires is None:
+                    timer = None
+                    continue
+                owner = self.find_delayed_owner(work, timer) or owner
+                if pending and read_int_from_memory(timer + self.offset_timer_pending, safe=True):
+                    state = "delayed"
+                break
+            self.append_record(records, work, state, owner, None, timer, expires)
+        return
+
+    @Cache.cache_this_session(cache_None=False, per_inferior=True, until_new_objfile=True)
+    def resolve_layout(self):
+        """Return {name: (offset, source)} of the workqueue structures, preferring the type information.
+        An offset that is None is searched in memory at each call."""
+        kversion = Kernel.version()
+        ptrsize = runtime.current_arch.ptrsize
+        layout = {}
+
+        def member(name, candidates, fallback, fallback_source="fixed"):
+            label = "offsetof({:s}, {:s})".format(*candidates[0])
+            for type_name, member_name in candidates:
+                offset = GefUtil.offsetof(type_name, member_name)
+                if offset is not None:
+                    layout[name] = (offset, "debug info", "offsetof({:s}, {:s})".format(type_name, member_name))
+                    return
+            layout[name] = (fallback, fallback_source if fallback is not None else "searched", label)
+            return
+
+        if kversion >= "3.9":
+            pwq_type = "pool_workqueue"
+        else:
+            pwq_type = "cpu_workqueue_struct"
+        if kversion >= "3.6":
+            pool_type = "worker_pool"
+        else:
+            pool_type = "global_cwq"
+        member("offset_work_data", [("work_struct", "data")], 0)
+        member("offset_work_entry", [("work_struct", "entry")], ptrsize)
+        member("offset_work_func", [("work_struct", "func")], ptrsize * 3)
+        member("offset_wq_list", [("workqueue_struct", "list")], ptrsize * 2)
+        if kversion >= "3.10":
+            member("offset_wq_pwqs", [("workqueue_struct", "pwqs")], 0)
+            layout["offset_wq_flags"] = layout["offset_wq_cpu_wq"] = (None, "unused", None)
+        else:
+            layout["offset_wq_pwqs"] = (None, "unused", None)
+            member("offset_wq_flags", [("workqueue_struct", "flags")], 0)
+            member("offset_wq_cpu_wq", [("workqueue_struct", "pool_wq"), ("workqueue_struct", "cpu_wq")], ptrsize)
+        member("offset_pwq_pool", [(pwq_type, "pool"), (pwq_type, "gcwq")], 0)
+        member("offset_pwq_wq", [(pwq_type, "wq")], ptrsize)
+        if kversion >= "3.10":
+            member("offset_pwqs_node", [(pwq_type, "pwqs_node")], None, "aligned pool_workqueue")
+        else:
+            layout["offset_pwqs_node"] = (None, "unused", None)
+        # delayed_works is renamed to inactive_works in v5.15
+        member("offset_pwq_inactive", [(pwq_type, "inactive_works"), (pwq_type, "delayed_works")][::1 if kversion >= "5.15" else -1], None)
+        member("offset_pool_worklist", [(pool_type, "worklist")], None)
+        member("offset_pool_cpu", [(pool_type, "cpu")], None, "per-cpu area")
+        if kversion >= "3.9" or kversion < "3.6":
+            member("offset_pool_busy_hash", [(pool_type, "busy_hash")], None)
+        else:
+            layout["offset_pool_busy_hash"] = (None, "searched", "offsetof(global_cwq, busy_hash)")
+        member("offset_worker_current_work", [("worker", "current_work")], ptrsize * 2)
+        if kversion >= "3.9":
+            member("offset_worker_current_func", [("worker", "current_func")], ptrsize * 3)
+            member("offset_worker_current_pwq", [("worker", "current_pwq")], ptrsize * 4)
+        else:
+            layout["offset_worker_current_func"] = (None, "unused", None)
+            member("offset_worker_current_pwq", [("worker", "current_cwq")], ptrsize * 3)
+        member("offset_delayed_timer", [("delayed_work", "timer")], None)
+        member("offset_delayed_wq", [("delayed_work", "wq")], None)
+        if kversion < "4.2":
+            member("offset_timer_pending", [("timer_list", "entry.next")], 0)
+        else:
+            member("offset_timer_pending", [("timer_list", "entry.pprev")], ptrsize)
+        member("offset_timer_expires", [("timer_list", "expires")], ptrsize * 2)
+        # v3.0-v4.1 has `struct tvec_base *base` between `expires` and `function`;
+        # v4.2 dropped it when timer_list.entry became an hlist_node.
+        member("offset_timer_func", [("timer_list", "function")], ptrsize * (4 if kversion < "4.2" else 3))
+
+        workqueues = KernelAddressHeuristicFinder.get_workqueues()
+        layout["workqueues"] = (workqueues, None, None)
+        return layout
+
+    def initialize(self):
+        self.meta = []
+        self.incomplete = []
+        self.kversion = Kernel.version()
+        self.klayout = Kernel.layout()
+        cpu_offsets = Kernel.per_cpu().offsets
+        if cpu_offsets:
+            self.max_cpu = max(len(cpu_offsets), 1)
+        else:
+            self.max_cpu = 0x2000
+        self.pool_cpu_hints = {}
+        self.worklist_offset = None
+        self.module_text_ranges = None
+        kallsyms = Ksym.get_kallsyms()
+        if kallsyms:
+            self.kallsyms_text = {
+                address: name for address, name, symbol_type in kallsyms[0] if symbol_type.lower() in ("t", "w")
+            }
+        else:
+            self.kallsyms_text = {}
+
+        layout = self.resolve_layout()
+        for name, (value, source, label) in layout.items():
+            setattr(self, name, value)
+            if label is not None:
+                if value is not None:
+                    value = "{:#x}".format(value)
+                else:
+                    value = "-"
+                self.meta.append((self.quiet_info, "{:s}: {:s} ({:s})".format(label, value, source)))
+        self.delayed_timer_functions = set(Ksym.get_addrs("delayed_work_timer_fn") or [])
+
+        self.workqueues_by_address = {}
+        self.units = []
+        self.units_by_address = {}
+        self.system_wq = None
+        self.offset_wq_name = None
+        self.name_is_pointer = False
+        if self.workqueues is None:
+            self.meta.append((self.quiet_err, "workqueues: Not found"))
+            return None
+        self.meta.append((self.quiet_info, "workqueues: {:#x}".format(self.workqueues)))
+
+        lh = KernelListHead(self.workqueues, self.offset_wq_list)
+        workqueues = list(lh.iter_entries())
+        if lh.broken:
+            self.incomplete.append("the workqueues list is broken at {:#x}".format(lh.broken_at))
+        system_wq_ptr = Ksym.get_addr("system_wq")
+        if system_wq_ptr is not None:
+            self.system_wq = read_int_from_memory(system_wq_ptr, safe=True)
+        self.offset_wq_name = self.find_name_offset(workqueues)
+        if self.offset_wq_name is None:
+            self.meta.append((self.quiet_warn, "offsetof(workqueue_struct, name): Not found"))
+        else:
+            self.meta.append((self.quiet_info, "offsetof(workqueue_struct, name): {:#x}".format(
+                self.offset_wq_name,
+            )))
+
+        for workqueue in workqueues:
+            self.workqueues_by_address[workqueue] = {
+                "wq": workqueue,
+                "name": self.read_workqueue_name(workqueue),
+                "cpu": None,
+            }
+
+        if self.kversion < "3.10":
+            self.units = self.collect_old_units(workqueues)
+        else:
+            self.units = self.collect_new_units(workqueues)
+        self.units_by_address = {unit["address"]: unit for unit in self.units}
+
+        self.meta.append((self.quiet_info, "workqueue count: {:d}".format(len(workqueues))))
+        self.meta.append((self.quiet_info, "pool_workqueue/cpu_workqueue count: {:d}".format(len(self.units))))
+        self.meta.append((self.quiet_info, "worker_pool count: {:d}".format(len({unit["pool"] for unit in self.units}))))
+        return bool(workqueues)
+
+    def print_records(self, records, object_address=None):
+        width = AddressUtil.get_format_address_width()
+        work_width = max(width, len("work_struct"))
+        queue_width = max([24] + [len(record["owner"]["name"]) for record in records.values() if record["owner"] is not None])
+        if not self.args.quiet:
+            fmt = "{:<{ww}s}  {:<10s}  {:<5s}  {:<{qw}s}  {:<{w}s} {:s}"
+            legend = ["work_struct", "state", "cpu", "queue", "function", "symbol"]
+            self.out.append(GefUtil.make_legend(fmt.format(*legend, w=width, ww=work_width, qw=queue_width)))
+
+        state_order = {"running": 0, "pending": 1, "inactive": 2, "delayed": 3, "idle": 4}
+        for record in sorted(records.values(), key=lambda item: (
+                state_order.get(item["state"], 9), item["cpu"] if item["cpu"] is not None else 0x10000,
+                item["work"])):
+            owner = record["owner"]
+            if owner is not None:
+                queue = owner["name"]
+            else:
+                queue = "???"
+            if record["cpu"] is None or record["cpu"] < 0:
+                cpu = "-"
+            else:
+                cpu = str(record["cpu"])
+            line = "{:<{ww}s}  {:<10s}  {:<5s}  {:<{qw}s}  {:s}".format(
+                "{:#0{w}x}".format(record["work"], w=width), record["state"], cpu, queue,
+                Symbol.format(
+                    record["function"], missing="NO_SYMBOL", ksym="prefer", show_address=True, nocolor=True,
+                ),
+                ww=work_width, qw=queue_width,
+            ).rstrip()
+            extras = []
+            if object_address is not None:
+                extras.append("object+{:#x}".format(record["work"] - object_address))
+            if record["timer"] is not None:
+                extras.append("timer={:#x}".format(record["timer"]))
+            if record["expires"] is not None:
+                extras.append("expires={:#x}".format(record["expires"]))
+            if extras:
+                line += "  [" + ", ".join(extras) + "]"
+            self.out.append(line)
+        return
+
+    def collect_records(self):
+        records = {}
+        if self.units:
+            self.collect_list_records(records)
+            self.collect_running_records(records)
+        self.collect_delayed_records(records)
+        return records
+
+    @parse_args
+    @only_if_gdb_running
+    @only_if_specific_gdb_mode(mode=("qemu-system", "vmware", "kgdb"))
+    @only_if_specific_arch(arch=("x86_32", "x86_64", "ARM32", "ARM64", "RISCV32", "RISCV64"))
+    @only_if_in_kernel_or_kpti_disabled
+    def do_invoke(self, args):
+        kversion = Kernel.version()
+        if kversion is None:
+            err("Could not find Linux kernel")
+            return
+        if kversion < "3.0":
+            err("Unsupported before v3.0")
+            return
+        if args.size is None:
+            args.size = 0x1000
+        elif args.object is None:
+            err("--size needs --object")
+            return
+        if args.size <= 0:
+            err("--size must be positive")
+            return
+
+        self.quiet_info("Wait for memory scan")
+        ret = self.initialize()
+        # --object inspects the given range, so the workqueue list is optional for it
+        if not ret and (args.meta or args.object is None):
+            for func, line in self.meta:
+                func(line)
+            return
+
+        if args.object is not None:
+            records = {}
+            if ret:
+                records = self.collect_records()
+                end = AddressUtil.normalize_address(args.object + args.size)
+                records = {work: record for work, record in records.items() if args.object <= work < end}
+            self.scan_address_range(records, args.object, args.size)
+        else:
+            records = self.collect_records()
+
+        if args.meta:
+            for func, line in self.meta:
+                func(line)
+            self.quiet_info("record count: {:d}".format(len(records)))
+            for reason in self.incomplete:
+                self.quiet_warn("Incomplete: {:s}".format(reason))
+            return
+
+        self.out = []
+        self.print_records(records, args.object)
+        if not records:
+            self.quiet_info_add_out("No pending or running work items found")
+        for reason in self.incomplete:
+            self.warn_add_out("Incomplete: {:s}".format(reason))
         self.print_output(check_terminal_size=True)
         return

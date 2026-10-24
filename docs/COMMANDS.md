@@ -10545,6 +10545,173 @@ krefs -t 0x100 0xffff888012345600               # also catch the interior pointe
 - Use `kobj ADDRESS` to identify the referenced object.
 ```
 
+## kskb
+
+Parse a single sk_buff and show its buffer layout, refcount and fragment information.
+
+
+### Syntax
+
+```text
+usage: kskb [-h] [-hh] [-d] [--meta] [-n] [-q] [SKB_ADDR]
+
+positional arguments:
+  SKB_ADDR            a `struct sk_buff` address.
+
+options:
+  -h, --help          show this help message and exit
+  -hh, --help-simple  show help without ASCII diagram.
+  -d, --dump          hexdump the first 64 bytes of the linear packet data.
+  --meta              display offset information.
+  -n, --no-pager      do not use the pager.
+  -q, --quiet         show result only.
+```
+
+### Examples
+
+```gdb
+kskb 0xffff888012345000
+kskb -d 0xffff888012345000
+```
+
+### Notes
+
+```text
+Simplified sk_buff structure:
+
++-sk_buff----+
+| next, prev |  list linkage (rbnode/list in a union)
+| ...        |
+| len        |  total length (headlen + data_len)
+| data_len   |  bytes held in fragments (nonlinear)
+| ...        |
+| tail       |  offset of the end of packet data
+| end        |  offset of skb_shared_info
+| head       |  start of the allocated buffer
+| data       |  start of packet data
+| truesize   |
+| users      |  refcount
+| ...        |
++------------+
+
+head        data          tail          head+end
+|           |             |             |
+v           v             v             v
++-----------+-------------+-------------+------------------+
+|  headroom | packet data |  tailroom   | skb_shared_info  |
++-----------+-------------+-------------+------------------+
+|<-- data ->|             |             |
+|<-------- tail --------->|             |
+|<---------------- end ---------------->|
+
+skb_shared_info (at head + end) holds nr_frags, frag_list, frags[] ...
+On 64-bit, tail/end are u32 offsets from head; on 32-bit they are absolute pointers.
+The offsets are taken from the debug information if available, otherwise probed from the memory.
+frags[] is decoded only with the debug information.
+truesize is an accounting value (e.g., 2 for a local TCP pure ACK), not the buffer size.
+```
+
+## ksock
+
+Walk from a file descriptor (or a raw struct sock) through socket, sock and its skb queues.
+
+
+### Syntax
+
+```text
+usage: ksock [-h] [-hh] [-F FD] [-T TASK_FILTER] [-f COMM_FILTER] [-l] [-d] [--meta] [-n] [-q] [SOCK_ADDR]
+
+positional arguments:
+  SOCK_ADDR             a raw `struct sock` address to inspect directly.
+
+options:
+  -h, --help            show this help message and exit
+  -hh, --help-simple    show help without ASCII diagram.
+  -F, --fd FD           filter by this file descriptor number.
+  -T, --task-filter TASK_FILTER
+                        filter by specific task_struct address.
+  -f, --comm-filter COMM_FILTER
+                        comm string REGEXP filter.
+  -l, --list-skb        list each skb address in the queues.
+  -d, --dump            hexdump the first 64 bytes of each listed skb's linear packet data (implies --list-skb).
+  --meta                display offset information.
+  -n, --no-pager        do not use the pager.
+  -q, --quiet           show result only.
+```
+
+### Examples
+
+```gdb
+ksock -q
+ksock --fd 5
+ksock -d --fd 5
+ksock 0xffff888012345000
+```
+
+### Notes
+
+```text
+This command requires CONFIG_RANDSTRUCT=n unless vmlinux with debug information is loaded.
+
+Simplified socket structure:
+
++-file------+  +->+-socket----+  +->+-sock--------------------+
+| ...       |  |  | state     |  |  | (sock_common)           |
+| private   |--+  | type      |  |  |   skc_family            |
+| ...       |     | flags     |  |  |   skc_state             |
++-----------+     | file      |  |  |   skc_prot              |--->struct proto (name)
+                  | sk        |--+  | ...                     |
+                  | ops       |     | sk_receive_queue        |--->skb->skb->...
+                  | ...       |     | sk_write_queue          |--->skb->skb->...
+                  +-----------+     | sk_error_queue          |--->skb->skb->...
+                                    | sk_state_change         |
+                                    | sk_data_ready           |
+                                    | sk_write_space          |
+                                    | sk_error_report         |
+                                    | ...                     |
+                                    | sk_destruct             |
+                                    +-------------------------+
+
+The skc_state value is protocol-dependent; TCP_* names are shown only when the
+resolved protocol is TCP-like. The offsets are taken from the debug information if available,
+otherwise recovered heuristically because struct sock varies with the kernel version and configuration.
+The protocol is shown only when its `struct proto` is verified.
+
+Use `kskb ADDR` to inspect a single sk_buff in detail.
+```
+
+## ksyscalls
+
+Display syscall_table entries.
+
+- Alias: `kst`, `syscall-table-view`
+
+### Syntax
+
+```text
+usage: ksyscalls [-h] [-f FILTER] [-n] [-q]
+
+options:
+  -h, --help           show this help message and exit
+  -f, --filter FILTER  REGEXP syscall name filter.
+  -n, --no-pager       do not use the pager.
+  -q, --quiet          enable quiet mode.
+```
+
+### Examples
+
+```gdb
+ksyscalls
+ksyscalls --filter write
+```
+
+### Notes
+
+```text
+On x86, Linux v6.9 and later dispatch syscalls via switch statements.
+This command shows a table for readability; remaining syscall tables are used for tracing, not dispatch.
+```
+
 ## ksysctl
 
 Dump the sysctl parameters.
@@ -10617,11 +10784,14 @@ Dump the timer.
 ### Syntax
 
 ```text
-usage: ktimer [-h] [-hh] [-n] [-q]
+usage: ktimer [-h] [-hh] [--classic-only | --hr-only] [--meta] [-n] [-q]
 
 options:
   -h, --help          show this help message and exit
   -hh, --help-simple  show help without ASCII diagram.
+  --classic-only      dump only classic timers.
+  --hr-only           dump only high-resolution timers.
+  --meta              display offset information.
   -n, --no-pager      do not use the pager.
   -q, --quiet         enable quiet mode.
 ```
@@ -10631,63 +10801,176 @@ options:
 ```text
 Simplified timer structure (per-cpu):
 
-+-timer_bases[0]----+    +-timer_list--+    +-timer_list--+
-| ...               |    | entry       |    | entry       |
-| vectors[0]        |--->|   next      |--->|   next      |--->...
-| ...               |    |   pprev     |    |   pprev     |
-| vectors[512or576] |    | expires     |    | expires     |
-| ...               |    | function    |    | function    |
-+-timer_bases[1]----+    | ...         |    | ...         |
-| ...               |    +-------------+    +-------------+
-| vectors[0]        |
-| ...               |
-| vectors[512or576] |
-| ...               |
-+-------------------+
++-timer_bases[0]-----+    +-timer_list--+    +-timer_list--+
+| ...                |    | entry       |    | entry       |
+| vectors[0]         |--->|   next      |--->|   next      |--->...
+| ...                |    |   pprev     |    |   pprev     |
+| vectors[512or576]  |    | expires     |    | expires     |
+| ...                |    | function    |    | function    |
++-timer_bases[1]-----+    | ...         |    | ...         |
+| ...                |    +-------------+    +-------------+
+| vectors[0]         |
+| ...                |
+| vectors[512or576]  |
+| ...                |
++-timer_bases[2]-----+ <-- v6.10~
+| ...                |
++--------------------+
+
+Before v4.8, each cpu has one `tvec_base` (pointed by `tvec_bases` before v4.2) with 512 buckets
+(tv1 to tv5). They are `struct list_head` before v4.2, and `struct hlist_head` after.
 
 Simplified hrtimer structure (per-cpu):
 
-+-hrtimer_cpu_bases-+
-| ...               |
-| clock_bases[0]    |   +--->+-hrtimer------+
-|   ...             |   |    | node         |
-|   clockid         |   |    |   node       |
-|   ...             |   |    |     color    |
-|   active          |   |    |     right    |--->hrtimer
-|      rb_root      |   |    |     left     |--->hrtimer
-|        rb_root    |---+    |   expires    |
-|        ...        |        | ...          |
-|   get_time        |        | function     |
-|   ...             |        | ...          |
-| ...               |        +--------------+
-| clock_bases[8]    |
-|   ...             |
-+-------------------+
++-hrtimer_cpu_bases--+
+| ...                |
+| clock_bases[0]     |   +--->+-hrtimer-------+
+|   ...              |   |    | node          |
+|   clockid          |   |    |   node        |
+|   ...              |   |    |     color     |
+|   active           |   |    |     right     |--->hrtimer
+|      rb_root       |   |    |     left      |--->hrtimer
+|        rb_root     |---+    |   prev(v7.1~) |--->hrtimer
+|        ...         |        |   next(v7.1~) |--->hrtimer
+|   get_time(~v6.17) |        |   expires     |
+|   ...              |        | ...           |
+| ...                |        | function      |
+| clock_bases[8]     |        | ...           |
+|   ...              |        +---------------+
++--------------------+
+
+- Classic timers are sorted by `time_to_expired`, the signed difference from `jiffies` in unsigned long.
+- hrtimers are sorted by `expires`, since they are listed in the order of the rbtree.
+- The member offsets come from the debug information (vmlinux or `ktypes-load`) when available.
+  They are verified by `timer_base.cpu` and `hrtimer_clock_base.cpu_base` and `index`.
 ```
 
-## syscall-table-view
+## kvfs
 
-Display syscall_table entries.
+Display the VFS object graph of a file descriptor or VFS object.
 
-- Alias: `kst`
 
 ### Syntax
 
 ```text
-usage: syscall-table-view [-h] [-f FILTER] [-n] [-q]
+usage: kvfs [-h] [-hh] [-t {auto,file,dentry,inode}] [-p PID] [-f FD] [--meta] [-n] [-q] [ADDRESS]
+
+positional arguments:
+  ADDRESS               the address of struct file, dentry or inode.
 
 options:
-  -h, --help           show this help message and exit
-  -f, --filter FILTER  REGEXP filter.
-  -n, --no-pager       do not use the pager.
-  -q, --quiet          enable quiet mode.
+  -h, --help            show this help message and exit
+  -hh, --help-simple    show help without ASCII diagram.
+  -t, --type {auto,file,dentry,inode}
+                        the type of ADDRESS. (default: auto)
+  -p, --pid PID         select a file descriptor from this pid.
+  -f, --fd FD           select this file descriptor (requires --pid).
+  --meta                display offset information.
+  -n, --no-pager        do not use the pager.
+  -q, --quiet           enable quiet mode.
 ```
 
 ### Examples
 
 ```gdb
-syscall-table-view
-syscall-table-view --filter write
+kvfs --pid 1337 --fd 3
+kvfs 0xffff888003b0a000
+kvfs --type inode 0xffff888003b0a000
+```
+
+### Notes
+
+```text
+This command requires CONFIG_RANDSTRUCT=n unless vmlinux with debug information is loaded.
+
+ADDRESS is detected as struct file, dentry or inode unless --type is specified.
+The filesystem type and mount device are best-effort when debug information is unavailable.
+
+Simplified VFS object graph:
+
++-file-----+
+| ...      |
+| f_path   |
+|   mnt    |    +-dentry--+
+|   dentry |--->| d_name  |    +-inode-+
+| ...      |    | d_inode |--->| i_ino |    +-super_block-+
++----------+    +---------+    | i_sb  |--->| s_type      |
+                               +-------+    | s_dev       |
+                                            +-------------+
+```
+
+## kworkqueue
+
+Dump workqueue items and inspect embedded work_struct objects.
+
+
+### Syntax
+
+```text
+usage: kworkqueue [-h] [-hh] [--object OBJECT] [--size SIZE] [--meta] [-n] [-q]
+
+options:
+  -h, --help          show this help message and exit
+  -hh, --help-simple  show help without ASCII diagram.
+  --object OBJECT     the address of the object to inspect (e.g. the head of a heap object), scanned for an embedded work_struct/delayed_work.
+  --size SIZE         the size of the range scanned by --object (default: 0x1000).
+  --meta              display offset information.
+  -n, --no-pager      do not use the pager.
+  -q, --quiet         enable quiet mode.
+```
+
+### Examples
+
+```gdb
+kworkqueue
+kworkqueue --object 0xffff888012340000
+kworkqueue --object 0xffff888012340000 --size 0x400
+```
+
+### Notes
+
+```text
+Simplified workqueue structures (`==>` shows where each column comes from):
+
+                   +-workqueue_struct-+
++-workqueues-+     | pwqs             |--+
+| list       |<--->| list             |<--->...
++------------+     | name             |  |      ==> `queue`
+                   | ...              |  |
+                   +------------------+  |
+                     ^                   |
+                     |                   |
+                     |                   v
+                     |       +-pool_workqueue-+
+                     |       | pool           |---+
+                     +-------| wq             |   |
+                             | inactive_works |   |  ==> state `inactive`
+                             +----------------+   |
+                               ^                  |
+       work_struct.data -------+                  |
+       & WORK_STRUCT_PWQ_MASK (pwq)               |
+                    +-work_struct-+               v
+                    | data        |         +-worker_pool-+
+                    | entry       |-------->| worklist    |  ==> state `pending`
+                    | func        |         | busy_hash   |  ==> state `running`
+                    +-------------+         | cpu         |  ==> `cpu`
+                      ^                     +-------------+
+                      |
+                    +-delayed_work-+
+                    | work         |
+                    | timer        |<--- per-cpu timer wheel  ==> state `delayed`
+                    | wq           |
+                    +--------------+
+
+- `running` means the work is held in `worker.current_work`.
+- When `WORK_STRUCT_PWQ` is set, `queue` and `cpu` are decoded from `work_struct.data`; off-queue work uses it differently.
+- For `delayed` work, `cpu` is the CPU whose timer wheel holds the timer.
+- `--object` scans `[object, object+size)` for initialized `work_struct`s, including unqueued `idle` work.
+  `delayed_work` is recognized by its `delayed_work_timer_fn` timer when available.
+  It does not need the workqueue list, though `queue` is then unknown.
+- The running work is found from `worker_pool.busy_hash` (`global_cwq` before v3.6).
+- `delayed` needs the `ktimer` layout; other states are listed without it.
+- The member offsets come from the debug information (vmlinux or `ktypes-load`) when available.
 ```
 
 # 06-h. Qemu-system/KGDB Cooperation - Linux Allocator
