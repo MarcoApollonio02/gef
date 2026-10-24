@@ -272,6 +272,7 @@ class Instruction:
             if "<" not in operands_text and "<" not in comment:
                 if self.operands and self.operands[-1]:
                     from gef.commands.debugging.context import ContextCodeCommand
+                    from gef.core.symbols import Symbol
                     addr = ContextCodeCommand.get_branch_addr(self)
                     # Not using += is intentional; useless comments are discarded
                     comment = Symbol.get_symbol_string(addr).lstrip()

@@ -26,7 +26,7 @@ from gef.core import runtime
 from gef.core.address import AddressUtil
 from gef.core.color import Color, err, gef_print, info, titlify, warn
 from gef.core.instruction import Disasm, Instruction
-from gef.core.kernel import Kernel
+from gef.core.kernel import Kernel, Ksym
 from gef.core.memory import is_valid_addr, read_int32_from_memory, read_memory
 from gef.core.process import (
     Pid,
@@ -36,6 +36,7 @@ from gef.core.process import (
     is_arm32_cortex_m,
     is_arm64,
     is_in_kernel,
+    is_kgdb,
     is_loongarch64,
     is_mips32,
     is_mips64,
@@ -1407,7 +1408,8 @@ class StackRecoverCommand(GenericCommand, BufferingOutput):
             start = sp
 
         self.in_kernel = is_in_kernel()
-        # Ksym.get_kallsyms() is not ported: our tree has no Ksym resolver yet.
+        if self.in_kernel and not is_kgdb():
+            Ksym.get_kallsyms()
         self.pc_msb = AddressUtil.is_msb_on(pc)
         self.exec_sections = [s for s in ProcessMap.get_process_maps() if s.is_executable()]
         self.fp_register, self.fp_names, self.fp_offset = self.get_fp_register()

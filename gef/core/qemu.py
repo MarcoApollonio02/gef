@@ -14,7 +14,10 @@ referencing function/method.
 """
 import contextlib
 import gdb
+import json
 import re
+
+from gef.core import runtime
 
 from gef.core.address import AddressUtil
 from gef.core.cache import Cache
@@ -221,6 +224,7 @@ class QemuMonitor:
     def get_cpu_property(name):
         """Return the QOM property `name` of the first CPU that has it, decoded from the JSON of `monitor qom-get`.
         Return None if it is unavailable, e.g. QEMU before 5.1 has no qom-get in HMP."""
+        from gef.core.process import is_qemu_system
         if not is_qemu_system():
             return None
         try:
@@ -313,6 +317,7 @@ class QemuMonitor:
             return None
         if limit > 0xffff or offset + 15 > limit:
             return None
+        from gef.core.utils import GefUtil  # utils imports this module
         try:
             data = GefUtil.read_x86_descriptor_table(base + offset, 16)
         except gdb.error:
@@ -338,6 +343,7 @@ class QemuMonitor:
         QEMU crashes when the gdb stub reads the GICv2 of a multi-core machine or the Cortex-A9 global timer
         (they need the current CPU), and reading the GIC CPU interface may acknowledge an interrupt."""
         # memory may be read before the architecture is known; do not cache that answer
+        from gef.core.process import is_alive, is_arm32, is_arm64, is_qemu_system
         if not is_alive() or runtime.current_arch is None:
             return None
 
@@ -383,6 +389,7 @@ class QemuMonitor:
 
     @staticmethod
     def get_current_mmu_mode():
+        from gef.core.process import is_qemu_system, is_vmware
         if is_qemu_system():
             try:
                 response = gdb.execute("maintenance packet qqemu.PhyMemMode", to_string=True, from_tty=False)

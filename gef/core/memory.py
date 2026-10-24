@@ -178,8 +178,10 @@ class MemoryCache:
         the gdbstub. ARM64 keeps its kernel mappings in TTBR1_EL1, independently of the process-specific TTBR0_EL1, so it does
         not need an equivalent ``swapper_pg_dir`` retry either.
         """
+        from gef.core.kernel import Ksym
         from gef.core.process import is_arm32, is_qemu_system
         from gef.core.registers import get_register
+        from gef.core.symbols import Symbol
 
         if not is_arm32() or not is_qemu_system():
             return None
@@ -190,13 +192,17 @@ class MemoryCache:
             return None
 
         # Prefer GDB's symbol table because this fallback may itself be needed
-        # while kallsyms is being initialized. (Upstream also peeks at an already
-        # parsed kallsyms table here; our kallsyms state lives on the
-        # ksymaddr-remote command instance, so this falls through to TTBR1.)
-        try:
-            swapper = int(gdb.parse_and_eval("&swapper_pg_dir"))
-        except (gdb.error, OverflowError, ValueError):
-            swapper = None
+        # while kallsyms is being initialized.  Consult only an already parsed
+        # kallsyms table afterwards to avoid recursive scanning.
+        swapper = Symbol.resolve_address("swapper_pg_dir")
+        if swapper is None:
+            ret = Ksym.peek()
+            if ret is not None:
+                addresses = ret[1].get("swapper_pg_dir", [])
+                if addresses:
+                    swapper = addresses[0]
+                else:
+                    swapper = None
         if swapper is None:
             try:
                 ttbr1 = int(gdb.parse_and_eval("$TTBR1"))
@@ -867,6 +873,8 @@ def read_physmem(paddr, size, already_physmode=False):
         return out
 
     def kgdb_use_physmap(paddr, size):
+        from gef.core.kernel import KernelAddressHeuristicFinder  # kernel imports this module
+        from gef.core.process import is_arm64, is_x86_64
         # Use workaround value if provided. Useful if KGDB does not expose system registers.
         physmap = Config.get("gef.physmap_base_for_read_physmem_kgdb_work_around")
         if physmap == 0:
@@ -885,6 +893,7 @@ def read_physmem(paddr, size, already_physmode=False):
         return read_memory(vaddr, size, safe=True)
 
     def kdb_use_mdp(paddr, size):
+        from gef.core.utils import align
         # for KDB; not supported by KGDB
         # Note: `mdp` command can only handle aligned addresses.
         paddr_aligned = paddr & ~0xf
@@ -912,6 +921,7 @@ def read_physmem(paddr, size, already_physmode=False):
 
     # ----
 
+    from gef.core.process import is_kdb, is_kgdb, is_qemu_system, is_supported_physmode, is_vmware
     if size == 0:
         return b""
 

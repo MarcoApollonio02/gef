@@ -29,7 +29,7 @@ from gef.commands.base import (
 from gef.core import runtime
 from gef.core.address import AddressUtil, Permission
 from gef.core.cache import Cache
-from gef.core.color import Color, err, gef_print, ok, titlify, warn
+from gef.core.color import Color, err, gef_print, info, ok, titlify, warn
 from gef.core.config import Config
 from gef.core.events import EventHooking
 from gef.core.heap import GlibcHeapBinsDump

@@ -115,7 +115,7 @@ full checklist and an example). No registration needed — it is auto-discovered
 pytest tests/unit -q                    # or: .venv-dev/bin/python -m pytest tests/unit -q
 
 # boot smoke (load everything from the package, no monolith)
-gdb -q -nx -ex "source gef-bootstrap.py" -ex q           # expect: "GEF is ready", "Loaded 415 commands"
+gdb -q -nx -ex "source gef-bootstrap.py" -ex q           # expect: "GEF is ready", "Loaded 454 commands"
 
 # gdb-tier checks
 gdb -q -nx -x tests/gdb/test_phase1_checkpoint.py        # expect: PHASE1 CHECKPOINT PASS
