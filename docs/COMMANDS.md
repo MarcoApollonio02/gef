@@ -3923,37 +3923,6 @@ ucontext $rdx                 # the 3rd argument of a SA_SIGINFO handler, setcon
 ucontext -m 0x7fffffffd9e8    # struct sigcontext
 ```
 
-## walk-link-list
-
-Walk the link list.
-
-- Alias: `chain`
-
-### Syntax
-
-```text
-usage: walk-link-list [-h] [-o NEXT_OFFSET] [-A DUMP_BYTES_AFTER] [-B DUMP_BYTES_BEFORE] [--adjust-output ADJUST_OUTPUT] [-n] ADDRESS
-
-positional arguments:
-  ADDRESS               start address to walk.
-
-options:
-  -h, --help            show this help message and exit
-  -o NEXT_OFFSET        offset of the next(or prev) pointer in the target structure.
-  -A DUMP_BYTES_AFTER   dump bytes after link-list location.
-  -B DUMP_BYTES_BEFORE  dump bytes before link-list location.
-  --adjust-output ADJUST_OUTPUT
-                        displays the result of subtracting a specific value to the output.
-  -n, --no-pager        do not use the pager.
-```
-
-### Examples
-
-```gdb
-walk-link-list 0xffff9c60800597e0       # walk list_head.next
-walk-link-list -o 8 0xffff9c60800597e0  # walk list_head.prev
-```
-
 ## xc
 
 Dump address like x/x command, but with coloring at some intervals.
@@ -10899,6 +10868,279 @@ Simplified VFS object graph:
                                             +-------------+
 ```
 
+## kwalk
+
+The base command to dump the entries held by the well-known kernel data structures.
+
+
+### Syntax
+
+```text
+usage: kwalk [-h] [-hh] {list,rbtree,radix,xarray,maple} ...
+
+options:
+  -h, --help            show this help message and exit
+  -hh, --help-simple    show help without ASCII diagram.
+
+command:
+  {list,rbtree,radix,xarray,maple}
+```
+
+### Notes
+
+```text
+Which sub-command holds the index-to-pointer mapping depends on the kernel version:
+
+  ~v4.19: radix_tree -> `kwalk radix`
+  v4.20~: xarray     -> `kwalk xarray` (radix-tree API remains as a compatibility interface)
+  v6.1~ : maple_tree -> `kwalk maple`  (only where it replaced the rbtree or the xarray)
+
+`kwalk list` and `kwalk rbtree` work on any version, and also outside the kernel.
+
+Simplified structures:
+
++-list_head---+              +-rb_root-------------+
+| next        |--> entry     | rb_node             |--+
+| prev        |--> entry     +---------------------+  |
++-------------+                                       v
+                                   +-rb_node-------------+
+                                   | __rb_parent_color   |
+                                   | rb_right            |--> sub-tree
+                                   | rb_left             |--> sub-tree
+                                   +---------------------+
+
++-radix_tree_root(~v4.19)-+  +-xarray(v4.20~)-+
+| height (~v4.6)          |  | xa_lock        |
+| gfp_mask                |  | xa_flags       |
+| rnode                   |  | xa_head        |
++-------------------------+  +----------------+
+             |                        |
+             +------------+-----------+
+                          v
+           +-radix_tree_node / xa_node-+
+           | shift                     |
+           | offset                    |
+           | count                     |
+           | ...                       |
+           | slots[0]                  |--> entry
+           | slots[1]                  |--> entry or sub-node
+           | ...                       |
+           | slots[15 or 63]           |
+           +---------------------------+
+
++-maple_tree(v6.1~)-+  +-->+-maple_node------+
+| ma_lock           |  |   | ...             |
+| ma_flags          |  |   | mr64|ma64|alloc |
+| ma_root           |--+   |   ...           |
++-------------------+      |   slot[]        |--> entry or sub-node
+                           +-----------------+
+```
+
+## kwalk list
+
+Walk the link list.
+
+- Alias: `walk-link-list`, `chain`, `list-dump`
+
+### Syntax
+
+```text
+usage: kwalk list [-h] [-o NEXT_OFFSET] [-A DUMP_BYTES_AFTER] [-B DUMP_BYTES_BEFORE] [-C CONTAINER_OF] [-n] [-q] ADDRESS
+
+positional arguments:
+  ADDRESS               start address to walk.
+
+options:
+  -h, --help            show this help message and exit
+  -o NEXT_OFFSET        offset of the next(or prev) pointer in the target structure.
+  -A DUMP_BYTES_AFTER   dump bytes after link-list location.
+  -B DUMP_BYTES_BEFORE  dump bytes before link-list location.
+  -C, --container-of CONTAINER_OF
+                        also displays each entry minus this offset, like container_of().
+  -n, --no-pager        do not use the pager.
+  -q, --quiet           show result only.
+```
+
+### Examples
+
+```gdb
+kwalk list 0xffff9c60800597e0                      # walk list_head.next
+kwalk list -o 8 0xffff9c60800597e0                 # walk list_head.prev
+kwalk list --container-of 0x10 0xffff9c60800597e0  # also show each entry as container_of()
+```
+
+### Notes
+
+```text
+`-o` is the offset of the pointer to follow, so it is 0 for list_head.next,
+the pointer size for list_head.prev, and offsetof(the struct, next) for a
+singly linked list of the structs.
+ADDRESS is the starting node or head; the first displayed entry is the pointer
+read from ADDRESS+OFFSET, not ADDRESS itself. NULL and a returning sentinel head
+are therefore also shown as the final entry.
+```
+
+## kwalk maple
+
+Dump the entries of the maple tree.
+
+- Alias: `maple-dump`
+
+### Syntax
+
+```text
+usage: kwalk maple [-h] [-o ROOT_OFFSET] [-m MAX_OFFSET] [-C CONTAINER_OF] [-n] [-q] ADDRESS
+
+positional arguments:
+  ADDRESS               the address of the struct including the maple_tree.
+
+options:
+  -h, --help            show this help message and exit
+  -o, --root-offset ROOT_OFFSET
+                        offsetof(the struct, ma_root). it is searched if not given.
+  -m, --max-offset MAX_OFFSET
+                        the search range of offsetof(the struct, ma_root). (default: ptrsize*0x20)
+  -C, --container-of CONTAINER_OF
+                        also displays each entry minus this offset, like container_of().
+  -n, --no-pager        do not use the pager.
+  -q, --quiet           show result only.
+```
+
+### Examples
+
+```gdb
+kwalk maple 0xffff972801b78a00          # dump the vm_area_structs of mm_struct.mm_mt
+kwalk maple -o 0x48 0xffff972801b78a00  # skip searching offsetof(the struct, ma_root)
+```
+
+### Notes
+
+```text
+The maple_tree is introduced at v6.1 for mm_struct.mm_mt, and v6.5 for sparse_irqs.
+A tree holding a single entry stored directly in ma_root cannot be auto-detected;
+pass `--root-offset` for it. With the offset given, the single entry is shown correctly.
+```
+
+## kwalk radix
+
+Dump the entries of the radix tree.
+
+- Alias: `radix-dump`
+
+### Syntax
+
+```text
+usage: kwalk radix [-h] [-o RNODE_OFFSET] [-m MAX_OFFSET] [-C CONTAINER_OF] [-n] [-q] ADDRESS
+
+positional arguments:
+  ADDRESS               the address of the struct including the radix_tree_root.
+
+options:
+  -h, --help            show this help message and exit
+  -o, --rnode-offset RNODE_OFFSET
+                        offsetof(the struct, rnode). it is searched if not given.
+  -m, --max-offset MAX_OFFSET
+                        the search range of offsetof(the struct, rnode). (default: ptrsize*0x20)
+  -C, --container-of CONTAINER_OF
+                        also displays each entry minus this offset, like container_of().
+  -n, --no-pager        do not use the pager.
+  -q, --quiet           show result only.
+```
+
+### Examples
+
+```gdb
+kwalk radix 0xffffffff82640e60        # dump the entries of irq_desc_tree
+kwalk radix -o 8 0xffffffff82640e60   # skip searching offsetof(the struct, rnode)
+```
+
+### Notes
+
+```text
+The radix_tree_root is renamed to xarray at v4.20, so use `kwalk xarray` for v4.20 and later.
+A tree holding only one item keeps it in rnode without the tag, which is indistinguishable
+from any other pointer. Pass `--rnode-offset` explicitly for such a tree.
+```
+
+## kwalk rbtree
+
+Dump the nodes of the red-black tree.
+
+- Alias: `rbtree-dump`
+
+### Syntax
+
+```text
+usage: kwalk rbtree [-h] [-r] [-C CONTAINER_OF] [-n] [-q] ADDRESS
+
+positional arguments:
+  ADDRESS               the address of the struct rb_root (or rb_root_cached).
+
+options:
+  -h, --help            show this help message and exit
+  -r, --rb-node         treat ADDRESS as a struct rb_node instead of a struct rb_root.
+  -C, --container-of CONTAINER_OF
+                        also displays each entry minus this offset, like container_of().
+  -n, --no-pager        do not use the pager.
+  -q, --quiet           show result only.
+```
+
+### Examples
+
+```gdb
+kwalk rbtree 0xffff9c6081b3d7a0        # dump the rb_nodes under the rb_root
+kwalk rbtree -r 0xffff9c6081b3d7a8     # dump the rb_nodes under the rb_node
+```
+
+### Notes
+
+```text
+The entries are dumped in pre-order, not sorted by key.
+struct rb_root_cached starts with a struct rb_root, so pass its address as is.
+```
+
+## kwalk xarray
+
+Dump the entries of the xarray.
+
+- Alias: `xarray-dump`
+
+### Syntax
+
+```text
+usage: kwalk xarray [-h] [-o HEAD_OFFSET] [-m MAX_OFFSET] [-C CONTAINER_OF] [-n] [-q] ADDRESS
+
+positional arguments:
+  ADDRESS               the address of the struct including the xarray.
+
+options:
+  -h, --help            show this help message and exit
+  -o, --head-offset HEAD_OFFSET
+                        offsetof(the struct, xa_head). it is searched if not given.
+  -m, --max-offset MAX_OFFSET
+                        the search range of offsetof(the struct, xa_head). (default: ptrsize*0x20)
+  -C, --container-of CONTAINER_OF
+                        also displays each entry minus this offset, like container_of().
+  -n, --no-pager        do not use the pager.
+  -q, --quiet           show result only.
+```
+
+### Examples
+
+```gdb
+kwalk xarray 0xffffffff82640e60        # dump the entries of irq_desc_tree
+kwalk xarray -o 8 0xffffffff82640e60   # skip searching offsetof(the struct, xa_head)
+```
+
+### Notes
+
+```text
+The xarray is introduced at v4.20, so use `kwalk radix` for v4.19 and earlier.
+struct idr starts with a struct radix_tree_root (or xarray), so pass its address as is.
+An empty tree or one holding a single entry stored directly in xa_head cannot be
+auto-detected, because no internal node proves the offset; pass `--head-offset` for it.
+```
+
 ## kworkqueue
 
 Dump workqueue items and inspect embedded work_struct objects.
@@ -12053,6 +12295,50 @@ xsm /16xw --virt 0x783ae3d0  # secure memory ASLR is supported
 ```
 
 # 06-k. Qemu-system/KGDB Cooperation - Other
+## kdiff
+
+Compare kernel information at two points in time.
+
+
+### Syntax
+
+```text
+usage: kdiff [-h] {save,list,diff,clear} ...
+
+options:
+  -h, --help            show this help message and exit
+
+command:
+  {save,list,diff,clear}
+    save                append a snapshot.
+    list                list saved snapshots.
+    diff                compare snapshots or a snapshot with current state.
+    clear               delete saved snapshots.
+```
+
+### Examples
+
+```gdb
+kdiff save                         # append a snapshot
+kdiff list                         # list saved snapshots
+kdiff diff 0 2                     # compare two saved snapshots
+kdiff diff 2                       # compare snapshot 2 with current state
+kdiff diff                         # compare the latest snapshot with current state
+kdiff clear 0 1                    # delete snapshots 0 and 1
+kdiff clear all                    # delete all snapshots
+kdiff save -t task -t syscall      # select targets
+kdiff save -c 'kops file_operations 0xffffffff81000000'
+```
+
+### Notes
+
+```text
+Snapshots are kept in /tmp/gef/kdiff-UID until `kdiff clear` removes them.
+Compare snapshots taken from the same kernel instance.
+Without -t, task/module/sysctl/irq/syscall and, on x86, IDT/GDT are compared.
+Use -c to include address-specific tables such as `kops file_operations ADDRESS`.
+```
+
 ## ksearch-code-ptr
 
 Search the code pointer in kernel data area.

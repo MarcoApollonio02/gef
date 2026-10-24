@@ -14,6 +14,7 @@ import os
 import re
 import struct
 import subprocess
+import sys
 
 import gdb
 
@@ -34,7 +35,8 @@ from gef.core.color import Color, err, info, titlify, warn
 from gef.core.config import Config
 from gef.core.instruction import Disasm, get_insn, get_insn_next
 from gef.core.display import ProgressBar
-from gef.core.kernel import Kernel, KernelListHead, KernelNftables, KernelSlub, KernelTask, Ksym
+from gef.core.kernel import (Kernel, KernelListHead, KernelMapleTree, KernelNftables, KernelRBTree,
+                             KernelRadixTree, KernelSlub, KernelTask, KernelXArray, Ksym)
 from gef.core.memory import (
     hexdump,
     is_ascii_string,
@@ -54,6 +56,7 @@ from gef.core.memory import (
 )
 from gef.core.pagewalk import KernelAddressHeuristicFinder, KernelAddressHeuristicFinderUtil
 from gef.core.process import (
+    ProcessMap,
     get_pagesize,
     get_pagesize_mask_high,
     is_32bit,
@@ -16647,5 +16650,497 @@ class KernelWorkqueueCommand(GenericCommand, BufferingOutput):
             self.quiet_info_add_out("No pending or running work items found")
         for reason in self.incomplete:
             self.warn_add_out("Incomplete: {:s}".format(reason))
+        self.print_output(check_terminal_size=True)
+        return
+
+
+@register_command
+class KernelWalkCommand(GenericCommand, BufferingOutput):
+    """The base command to dump the entries held by the well-known kernel data structures."""
+
+    _cmdline_ = "kwalk"
+    _category_ = "06-g. Qemu-system/KGDB Cooperation - Linux Advanced"
+
+    parser = argparse.ArgumentParser(prog=_cmdline_)
+    parser.add_argument("-hh", "--help-simple", action="store_true", help="show help without ASCII diagram.")
+    if (sys.version_info.major, sys.version_info.minor) >= (3, 7):
+        subparsers = parser.add_subparsers(title="command", required=False)
+    else:
+        subparsers = parser.add_subparsers(title="command")
+    subparsers.add_parser("list")
+    subparsers.add_parser("rbtree")
+    subparsers.add_parser("radix")
+    subparsers.add_parser("xarray")
+    subparsers.add_parser("maple")
+    _syntax_ = parser.format_help()
+
+    _note_ = [
+        "Which sub-command holds the index-to-pointer mapping depends on the kernel version:",
+        "",
+        "  ~v4.19: radix_tree -> `kwalk radix`",
+        "  v4.20~: xarray     -> `kwalk xarray` (radix-tree API remains as a compatibility interface)",
+        "  v6.1~ : maple_tree -> `kwalk maple`  (only where it replaced the rbtree or the xarray)",
+        "",
+        "`kwalk list` and `kwalk rbtree` work on any version, and also outside the kernel.",
+        "",
+        "Simplified structures:",
+        "",
+        "+-list_head---+              +-rb_root-------------+",
+        "| next        |--> entry     | rb_node             |--+",
+        "| prev        |--> entry     +---------------------+  |",
+        "+-------------+                                       v",
+        "                                   +-rb_node-------------+",
+        "                                   | __rb_parent_color   |",
+        "                                   | rb_right            |--> sub-tree",
+        "                                   | rb_left             |--> sub-tree",
+        "                                   +---------------------+",
+        "",
+        "+-radix_tree_root(~v4.19)-+  +-xarray(v4.20~)-+",
+        "| height (~v4.6)          |  | xa_lock        |",
+        "| gfp_mask                |  | xa_flags       |",
+        "| rnode                   |  | xa_head        |",
+        "+-------------------------+  +----------------+",
+        "             |                        |",
+        "             +------------+-----------+",
+        "                          v",
+        "           +-radix_tree_node / xa_node-+",
+        "           | shift                     |",
+        "           | offset                    |",
+        "           | count                     |",
+        "           | ...                       |",
+        "           | slots[0]                  |--> entry",
+        "           | slots[1]                  |--> entry or sub-node",
+        "           | ...                       |",
+        "           | slots[15 or 63]           |",
+        "           +---------------------------+",
+        "",
+        "+-maple_tree(v6.1~)-+  +-->+-maple_node------+",
+        "| ma_lock           |  |   | ...             |",
+        "| ma_flags          |  |   | mr64|ma64|alloc |",
+        "| ma_root           |--+   |   ...           |",
+        "+-------------------+      |   slot[]        |--> entry or sub-node",
+        "                           +-----------------+",
+    ]
+    _note_ = "\n".join(_note_)
+
+    def __init__(self, *args, **kwargs):
+        prefix = kwargs.get("prefix", True)
+        complete = kwargs.get("complete", gdb.COMPLETE_NONE)
+        super().__init__(prefix=prefix, complete=complete)
+        return
+
+    @staticmethod
+    def add_common_arguments(parser):
+        """Add the arguments which are shared by all sub-commands."""
+        parser.add_argument("-C", "--container-of", type=AddressUtil.parse_address, default=0,
+                            help="also displays each entry minus this offset, like container_of().")
+        parser.add_argument("-n", "--no-pager", action="store_true", help="do not use the pager.")
+        parser.add_argument("-q", "--quiet", action="store_true", help="show result only.")
+        return parser
+
+    def add_entry_out(self, idx, entry):
+        """Append the resolved entry to self.out."""
+        la = ProcessMap.lookup(entry)
+        if self.args.container_of:
+            la_container = ProcessMap.lookup(entry - self.args.container_of)
+            self.out.append("[{:d}] -> {!s} (container: {!s})".format(idx, la, la_container))
+        else:
+            self.out.append("[{:d}] -> {!s}".format(idx, la))
+        return
+
+    def dump_entries(self, entries, broken=None):
+        """Append the resolved entries to self.out."""
+        entries = list(entries)
+        if broken:
+            for node, reason in broken.items():
+                self.err_add_out("Tree is broken at {:#x} ({:s}); results are incomplete".format(node, reason))
+            self.info_add_out("Partial entries: {:d}".format(len(entries)))
+        elif not entries:
+            self.info_add_out("No entry was found")
+            return
+        else:
+            self.quiet_info_add_out("Num of entries: {:d}".format(len(entries)))
+        for idx, entry in enumerate(entries, start=1):
+            self.add_entry_out(idx, entry)
+        return
+
+    @parse_args
+    @only_if_gdb_running
+    def do_invoke(self, args):
+        self.usage(simple=True)
+        return
+
+
+
+@register_command
+class KernelWalkListCommand(KernelWalkCommand):
+    """Walk the link list."""
+
+    _cmdline_ = "kwalk list"
+    _category_ = "06-g. Qemu-system/KGDB Cooperation - Linux Advanced"
+    _aliases_ = ["walk-link-list", "chain", "list-dump"]
+
+    parser = argparse.ArgumentParser(prog=_cmdline_)
+    parser.add_argument("-o", dest="next_offset", type=AddressUtil.parse_address, default=0,
+                        help="offset of the next(or prev) pointer in the target structure.")
+    parser.add_argument("-A", dest="dump_bytes_after", type=AddressUtil.parse_address, default=0,
+                        help="dump bytes after link-list location.")
+    parser.add_argument("-B", dest="dump_bytes_before", type=AddressUtil.parse_address, default=0,
+                        help="dump bytes before link-list location.")
+    parser.add_argument("address", metavar="ADDRESS", type=AddressUtil.parse_address,
+                        help="start address to walk.")
+    KernelWalkCommand.add_common_arguments(parser)
+    _syntax_ = parser.format_help()
+
+    _example_ = [
+        "{0:s} 0xffff9c60800597e0                      # walk list_head.next",
+        "{0:s} -o 8 0xffff9c60800597e0                 # walk list_head.prev",
+        "{0:s} --container-of 0x10 0xffff9c60800597e0  # also show each entry as container_of()",
+    ]
+    _example_ = "\n".join(_example_).format(_cmdline_)
+
+    _note_ = [
+        "`-o` is the offset of the pointer to follow, so it is 0 for list_head.next,",
+        "the pointer size for list_head.prev, and offsetof(the struct, next) for a",
+        "singly linked list of the structs.",
+        "ADDRESS is the starting node or head; the first displayed entry is the pointer",
+        "read from ADDRESS+OFFSET, not ADDRESS itself. NULL and a returning sentinel head",
+        "are therefore also shown as the final entry.",
+    ]
+    _note_ = "\n".join(_note_)
+
+    def __init__(self):
+        super().__init__(prefix=False, complete=gdb.COMPLETE_LOCATION)
+        return
+
+    def walk_link_list(self, head, offset):
+        indent = " " * 12
+        current = head
+        seen = {current}
+        idx = 1
+        while True:
+            flink = read_int_from_memory(AddressUtil.normalize_address(current + offset), safe=True)
+            if flink is None:
+                self.err_add_out("memory corrupted")
+                return
+            for start, size in ((current - self.args.dump_bytes_before, self.args.dump_bytes_before),
+                                (current, self.args.dump_bytes_after)):
+                if not size:
+                    continue
+                try:
+                    source = read_memory(start, size)
+                except gdb.error:
+                    self.err_add_out("unreadable dump range {:#x}-{:#x}".format(start, start + size))
+                    continue
+                dump = hexdump(source, base=start, unit=runtime.current_arch.ptrsize)
+                for line in dump.splitlines():
+                    self.out.append(indent + line)
+            self.add_entry_out(idx, flink)
+            if flink == 0:
+                break
+            if flink == head:
+                self.out[-1] += " (head)"
+                break
+            if flink in seen:
+                self.err_add_out("loop detected")
+                break
+            seen.add(flink)
+            current = flink
+            idx += 1
+        return
+
+    @parse_args
+    @only_if_gdb_running
+    def do_invoke(self, args):
+        if args.dump_bytes_before < 0 or args.dump_bytes_after < 0:
+            err("Dump size must be >= 0")
+            return
+        self.out = []
+        self.quiet_info_add_out("head address: {:#x}".format(args.address))
+        self.quiet_info_add_out("next pointer offset: {:#x}".format(args.next_offset))
+        self.walk_link_list(args.address, args.next_offset)
+        self.print_output()
+        return
+
+
+
+@register_command
+class KernelWalkRbtreeCommand(KernelWalkCommand):
+    """Dump the nodes of the red-black tree."""
+
+    _cmdline_ = "kwalk rbtree"
+    _category_ = "06-g. Qemu-system/KGDB Cooperation - Linux Advanced"
+    _aliases_ = ["rbtree-dump"]
+
+    parser = argparse.ArgumentParser(prog=_cmdline_)
+    parser.add_argument("address", metavar="ADDRESS", type=AddressUtil.parse_address,
+                        help="the address of the struct rb_root (or rb_root_cached).")
+    parser.add_argument("-r", "--rb-node", action="store_true",
+                        help="treat ADDRESS as a struct rb_node instead of a struct rb_root.")
+    KernelWalkCommand.add_common_arguments(parser)
+    _syntax_ = parser.format_help()
+
+    _example_ = [
+        "{0:s} 0xffff9c6081b3d7a0        # dump the rb_nodes under the rb_root",
+        "{0:s} -r 0xffff9c6081b3d7a8     # dump the rb_nodes under the rb_node",
+    ]
+    _example_ = "\n".join(_example_).format(_cmdline_)
+
+    _note_ = [
+        "The entries are dumped in pre-order, not sorted by key.",
+        "struct rb_root_cached starts with a struct rb_root, so pass its address as is.",
+    ]
+    _note_ = "\n".join(_note_)
+
+    def __init__(self):
+        super().__init__(prefix=False, complete=gdb.COMPLETE_LOCATION)
+        return
+
+    @parse_args
+    @only_if_gdb_running
+    def do_invoke(self, args):
+        if not is_valid_addr(args.address):
+            err("Invalid address")
+            return
+
+        rb = KernelRBTree(args.address)
+        try:
+            if args.rb_node:
+                nodes = rb.parse_node(args.address)
+            else:
+                nodes = rb.parse()
+        except gdb.MemoryError:
+            err("Memory error while walking the tree")
+            return
+
+        self.out = []
+        self.quiet_info_add_out("rb_{:s}: {:#x}".format("node" if args.rb_node else "root", args.address))
+        self.dump_entries(nodes, rb.broken)
+        self.print_output(check_terminal_size=True)
+        return
+
+
+
+@register_command
+class KernelWalkRadixTreeCommand(KernelWalkCommand):
+    """Dump the entries of the radix tree."""
+
+    _cmdline_ = "kwalk radix"
+    _category_ = "06-g. Qemu-system/KGDB Cooperation - Linux Advanced"
+    _aliases_ = ["radix-dump"]
+
+    parser = argparse.ArgumentParser(prog=_cmdline_)
+    parser.add_argument("address", metavar="ADDRESS", type=AddressUtil.parse_address,
+                        help="the address of the struct including the radix_tree_root.")
+    parser.add_argument("-o", "--rnode-offset", type=AddressUtil.parse_address,
+                        help="offsetof(the struct, rnode). it is searched if not given.")
+    parser.add_argument("-m", "--max-offset", type=AddressUtil.parse_address,
+                        help="the search range of offsetof(the struct, rnode). (default: ptrsize*0x20)")
+    KernelWalkCommand.add_common_arguments(parser)
+    _syntax_ = parser.format_help()
+
+    _example_ = [
+        "{0:s} 0xffffffff82640e60        # dump the entries of irq_desc_tree",
+        "{0:s} -o 8 0xffffffff82640e60   # skip searching offsetof(the struct, rnode)",
+    ]
+    _example_ = "\n".join(_example_).format(_cmdline_)
+
+    _note_ = [
+        "The radix_tree_root is renamed to xarray at v4.20, so use `kwalk xarray` for v4.20 and later.",
+        "A tree holding only one item keeps it in rnode without the tag, which is indistinguishable",
+        "from any other pointer. Pass `--rnode-offset` explicitly for such a tree.",
+    ]
+    _note_ = "\n".join(_note_)
+
+    def __init__(self):
+        super().__init__(prefix=False, complete=gdb.COMPLETE_LOCATION)
+        return
+
+    @parse_args
+    @only_if_gdb_running
+    @only_if_specific_gdb_mode(mode=("qemu-system", "vmware", "kgdb"))
+    @only_if_in_kernel_or_kpti_disabled
+    def do_invoke(self, args):
+        kversion = Kernel.version()
+        if kversion is None:
+            err("Could not find Linux kernel")
+            return
+        if kversion >= "4.20":
+            err("Unsupported since v4.20, use `kwalk xarray` instead")
+            return
+
+        if not is_valid_addr(args.address):
+            err("Invalid address")
+            return
+
+        max_offset = args.max_offset or runtime.current_arch.ptrsize * 0x20
+        rt = KernelRadixTree(args.address, args.rnode_offset)
+        try:
+            if rt.find_rnode_offset(max_offset) is None:
+                err("Could not find rnode. (maybe uninitialized?)")
+                return
+            entries = rt.parse()
+        except gdb.MemoryError:
+            err("Memory error while walking the tree")
+            return
+
+        self.out = []
+        self.quiet_info_add_out("offsetof(the struct, rnode): {:#x}".format(rt.rnode_offset))
+        self.quiet_info_add_out("rnode: {:#x}".format(rt.rnode))
+        if rt.height is not None:
+            self.quiet_info_add_out("height: {:d}".format(rt.height))
+        if rt.offset_slots is not None:
+            self.quiet_info_add_out("offsetof(radix_tree_node, count): {:#x}".format(rt.offset_count))
+            self.quiet_info_add_out("offsetof(radix_tree_node, slots): {:#x}".format(rt.offset_slots))
+            self.quiet_info_add_out("RADIX_TREE_MAP_SIZE: {:d}".format(rt.num_slots))
+        self.dump_entries(entries, rt.broken)
+        self.print_output(check_terminal_size=True)
+        return
+
+
+
+@register_command
+class KernelWalkXArrayCommand(KernelWalkCommand):
+    """Dump the entries of the xarray."""
+
+    _cmdline_ = "kwalk xarray"
+    _category_ = "06-g. Qemu-system/KGDB Cooperation - Linux Advanced"
+    _aliases_ = ["xarray-dump"]
+
+    parser = argparse.ArgumentParser(prog=_cmdline_)
+    parser.add_argument("address", metavar="ADDRESS", type=AddressUtil.parse_address,
+                        help="the address of the struct including the xarray.")
+    parser.add_argument("-o", "--head-offset", type=AddressUtil.parse_address,
+                        help="offsetof(the struct, xa_head). it is searched if not given.")
+    parser.add_argument("-m", "--max-offset", type=AddressUtil.parse_address,
+                        help="the search range of offsetof(the struct, xa_head). (default: ptrsize*0x20)")
+    KernelWalkCommand.add_common_arguments(parser)
+    _syntax_ = parser.format_help()
+
+    _example_ = [
+        "{0:s} 0xffffffff82640e60        # dump the entries of irq_desc_tree",
+        "{0:s} -o 8 0xffffffff82640e60   # skip searching offsetof(the struct, xa_head)",
+    ]
+    _example_ = "\n".join(_example_).format(_cmdline_)
+
+    _note_ = [
+        "The xarray is introduced at v4.20, so use `kwalk radix` for v4.19 and earlier.",
+        "struct idr starts with a struct radix_tree_root (or xarray), so pass its address as is.",
+        "An empty tree or one holding a single entry stored directly in xa_head cannot be",
+        "auto-detected, because no internal node proves the offset; pass `--head-offset` for it.",
+    ]
+    _note_ = "\n".join(_note_)
+
+    def __init__(self):
+        super().__init__(prefix=False, complete=gdb.COMPLETE_LOCATION)
+        return
+
+    @parse_args
+    @only_if_gdb_running
+    @only_if_specific_gdb_mode(mode=("qemu-system", "vmware", "kgdb"))
+    @only_if_in_kernel_or_kpti_disabled
+    def do_invoke(self, args):
+        kversion = Kernel.version()
+        if kversion is None:
+            err("Could not find Linux kernel")
+            return
+        if kversion < "4.20":
+            err("Unsupported before v4.20, use `kwalk radix` instead")
+            return
+
+        if not is_valid_addr(args.address):
+            err("Invalid address")
+            return
+
+        max_offset = args.max_offset or runtime.current_arch.ptrsize * 0x20
+        xa = KernelXArray(args.address, args.head_offset)
+        try:
+            if xa.find_head_offset(max_offset) is None:
+                err("Could not find xa_head. Pass --head-offset (required for an empty or single-entry tree) "
+                    "or a larger --max-offset.")
+                return
+            entries = xa.parse()
+        except gdb.MemoryError:
+            err("Memory error while walking the tree")
+            return
+
+        self.out = []
+        self.quiet_info_add_out("offsetof(the struct, xa_head): {:#x}".format(xa.head_offset))
+        self.dump_entries(entries, xa.broken)
+        self.print_output(check_terminal_size=True)
+        return
+
+
+
+@register_command
+class KernelWalkMapleTreeCommand(KernelWalkCommand):
+    """Dump the entries of the maple tree."""
+
+    _cmdline_ = "kwalk maple"
+    _category_ = "06-g. Qemu-system/KGDB Cooperation - Linux Advanced"
+    _aliases_ = ["maple-dump"]
+
+    parser = argparse.ArgumentParser(prog=_cmdline_)
+    parser.add_argument("address", metavar="ADDRESS", type=AddressUtil.parse_address,
+                        help="the address of the struct including the maple_tree.")
+    parser.add_argument("-o", "--root-offset", type=AddressUtil.parse_address,
+                        help="offsetof(the struct, ma_root). it is searched if not given.")
+    parser.add_argument("-m", "--max-offset", type=AddressUtil.parse_address,
+                        help="the search range of offsetof(the struct, ma_root). (default: ptrsize*0x20)")
+    KernelWalkCommand.add_common_arguments(parser)
+    _syntax_ = parser.format_help()
+
+    _example_ = [
+        "{0:s} 0xffff972801b78a00          # dump the vm_area_structs of mm_struct.mm_mt",
+        "{0:s} -o 0x48 0xffff972801b78a00  # skip searching offsetof(the struct, ma_root)",
+    ]
+    _example_ = "\n".join(_example_).format(_cmdline_)
+
+    _note_ = [
+        "The maple_tree is introduced at v6.1 for mm_struct.mm_mt, and v6.5 for sparse_irqs.",
+        "A tree holding a single entry stored directly in ma_root cannot be auto-detected;",
+        "pass `--root-offset` for it. With the offset given, the single entry is shown correctly.",
+    ]
+    _note_ = "\n".join(_note_)
+
+    def __init__(self):
+        super().__init__(prefix=False, complete=gdb.COMPLETE_LOCATION)
+        return
+
+    @parse_args
+    @only_if_gdb_running
+    @only_if_specific_gdb_mode(mode=("qemu-system", "vmware", "kgdb"))
+    @only_if_in_kernel_or_kpti_disabled
+    def do_invoke(self, args):
+        kversion = Kernel.version()
+        if kversion is None:
+            err("Could not find Linux kernel")
+            return
+        if kversion < "6.1":
+            err("Unsupported before v6.1")
+            return
+
+        if not is_valid_addr(args.address):
+            err("Invalid address")
+            return
+
+        max_offset = args.max_offset or runtime.current_arch.ptrsize * 0x20
+        mt = KernelMapleTree(args.address, args.root_offset)
+        try:
+            if mt.find_root_offset(max_offset) is None:
+                err("Could not find ma_root. Pass --root-offset (required for an empty or single-entry tree).")
+                return
+            entries = mt.parse()
+        except gdb.MemoryError:
+            err("Memory error while walking the tree")
+            return
+
+        self.out = []
+        self.quiet_info_add_out("offsetof(the struct, ma_root): {:#x}".format(mt.root_offset))
+        if mt.ma_root is not None and mt.ma_flags is not None:
+            self.quiet_info_add_out("ma_root: {:#x}, ma_flags: {:#x}, max_depth: {:d}".format(
+                mt.ma_root, mt.ma_flags, mt.max_depth,
+            ))
+        self.dump_entries(entries, mt.broken)
         self.print_output(check_terminal_size=True)
         return
