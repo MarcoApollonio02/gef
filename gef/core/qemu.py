@@ -212,6 +212,237 @@ class QemuMonitor:
     """A collection of utility functions that are related to qemu-monitor."""
 
     @staticmethod
+    @Cache.cache_until_next(per_inferior=True)
+    def get_physical_memory_ranges():
+        return [(start, end) for start, end, _, _ in QemuMonitor.get_mtree_regions("memory")]
+
+    @staticmethod
+    @Cache.cache_this_session(per_inferior=True)
+    def get_cpu_property(name):
+        """Return the QOM property `name` of the first CPU that has it, decoded from the JSON of `monitor qom-get`.
+        Return None if it is unavailable, e.g. QEMU before 5.1 has no qom-get in HMP."""
+        if not is_qemu_system():
+            return None
+        try:
+            res = gdb.execute("monitor info qom-tree", to_string=True)
+        except gdb.error:
+            return None
+        for obj in QemuMonitor.parse_qom_tree(res):
+            if not obj["type"].endswith("-cpu"):
+                continue
+            try:
+                value = gdb.execute("monitor qom-get {:s} {:s}".format(obj["path"], name), to_string=True)
+                return json.loads(value)
+            except (gdb.error, ValueError):
+                continue
+        return None
+
+    @staticmethod
+    def parse_qom_tree(output):
+        objects = []
+        parents = []
+        for line in output.splitlines():
+            match = re.match(r"^( *)/(.*) \(([^()]*)\)\s*$", line)
+            if match is None:
+                continue
+
+            indent = len(match.group(1))
+            while parents and parents[-1][0] >= indent:
+                parents.pop()
+            if parents:
+                parent_path = parents[-1][1]
+            else:
+                parent_path = ""
+            name = match.group(2)
+            path = "{:s}/{:s}".format(parent_path, name)
+            obj = {"name": name, "type": match.group(3), "path": path}
+            objects.append(obj)
+            parents.append((indent, path))
+        return objects
+
+    @staticmethod
+    @Cache.cache_until_next(per_cpu=True, per_inferior=True)
+    def get_x86_segments():
+        try:
+            res = gdb.execute("monitor info registers", to_string=True)
+        except gdb.error:
+            return {}
+        segments = {}
+        for name, selector, base, flags in re.findall(
+                r"^(CS|SS|DS|ES|FS|GS)\s*=\s*([0-9a-f]+)\s+([0-9a-f]+)\s+[0-9a-f]+\s+([0-9a-f]+)",
+                res, re.I | re.M):
+            segments[name.upper()] = (int(selector, 16), int(base, 16), int(flags, 16))
+        base, limit = QemuMonitor.parse_x86_descriptor_table_register(res, "GDT")
+        if base is not None:
+            segments["GDT"] = (base, limit)
+        ldt = QemuMonitor.parse_x86_system_segment(res, "LDT")
+        if ldt and not ldt["base_truncated"]:
+            segments["LDT"] = (ldt["base"], ldt["limit"])
+        cr0 = re.search(r"\bCR0=([0-9a-f]+)", res, re.I)
+        flags = re.search(r"\bEFL=([0-9a-f]+)", res, re.I)
+        vm86 = flags is not None and int(flags.group(1), 16) & (1 << 17)
+        segments["protected"] = bool(cr0 and int(cr0.group(1), 16) & 1 and not vm86)
+        return segments
+
+    @staticmethod
+    def parse_x86_descriptor_table_register(registers, name):
+        match = re.search(r"^{:s}\s*=\s*([0-9a-f]+)\s+([0-9a-f]+)".format(name), registers, re.I | re.M)
+        if not match:
+            return None, None
+        return int(match.group(1), 16), int(match.group(2), 16)
+
+    @staticmethod
+    def parse_x86_system_segment(registers, name):
+        match = re.search(
+            r"^{:s}\s*=\s*([0-9a-f]+)\s+([0-9a-f]+)\s+([0-9a-f]+)\s+([0-9a-f]+)".format(name),
+            registers, re.I | re.M,
+        )
+        if not match:
+            return None
+        selector, base, limit, flags = [int(value, 16) for value in match.groups()]
+        efer = re.search(r"\bEFER=([0-9a-f]+)", registers, re.I)
+        truncated = bool(selector & ~3 and efer and int(efer.group(1), 16) & (1 << 10)
+                         and len(match.group(2)) <= 8)
+        return {"selector": selector, "base": base, "limit": limit, "flags": flags, "base_truncated": truncated}
+
+    @staticmethod
+    def infer_x86_ldt_base(registers, ldtr):
+        base, limit = QemuMonitor.parse_x86_descriptor_table_register(registers, "GDT")
+        offset = ldtr["selector"] & ~7
+        if base is None or ldtr["selector"] & 4 or offset == 0:
+            return None
+        if limit > 0xffff or offset + 15 > limit:
+            return None
+        try:
+            data = GefUtil.read_x86_descriptor_table(base + offset, 16)
+        except gdb.error:
+            return None
+        if len(data) != 16:
+            return None
+        descriptor = int.from_bytes(data, "little")
+        flags = (descriptor >> 32) & 0x00ffff00
+        if (flags >> 8) & 0x1f != 2 or not flags & (1 << 15) or descriptor >> 96:
+            return None
+        limit = (descriptor & 0xffff) | ((descriptor >> 32) & 0xf0000)
+        if flags & (1 << 23):
+            limit = (limit << 12) | 0xfff
+        base = ((descriptor >> 16) & 0xffffff) | ((descriptor >> 32) & 0xff000000)
+        if base != ldtr["base"] or limit != ldtr["limit"] or flags != ldtr["flags"]:
+            return None
+        return base | (((descriptor >> 64) & 0xffffffff) << 32)
+
+    @staticmethod
+    @Cache.cache_this_session(cache_None=False)
+    def get_gic_addrs():
+        """Return physical addresses of ARM GIC(General Interrupt Controller) and the devices like it.
+        QEMU crashes when the gdb stub reads the GICv2 of a multi-core machine or the Cortex-A9 global timer
+        (they need the current CPU), and reading the GIC CPU interface may acknowledge an interrupt."""
+        # memory may be read before the architecture is known; do not cache that answer
+        if not is_alive() or runtime.current_arch is None:
+            return None
+
+        if not is_qemu_system():
+            return []
+
+        if not is_arm32() and not is_arm64():
+            return []
+
+        gic_list = []
+        for start, end, attr, name in QemuMonitor.get_mtree_regions():
+            # gef> monitor info mtree -f # these are physical addresses
+            #   0000000008000000-0000000008000fff (prio 0, i/o): gic_dist
+            #   0000000008010000-0000000008011fff (prio 0, i/o): gic_cpu
+            #   000000001e000200-000000001e00021f (prio 0, i/o): a9gtimer shared
+            if attr.endswith("i/o") and re.match(r"gic_(dist|cpu|viface|vcpu)|a9gtimer", name):
+                gic_list.append([start, end])
+        return gic_list
+
+    @staticmethod
+    def check_gic_address(addr, length=1, physical=False):
+        """Return True if [addr, addr + length) shares a 4KB page with get_gic_addrs().
+        A page is checked as a whole, because MemoryCache reads the other registers of the page too."""
+        if not QemuMonitor.get_gic_addrs():
+            return False
+        return any(QemuMonitor.is_gic_page(page, physical) for page in range(addr & ~0xfff, addr + length, 0x1000))
+
+    @staticmethod
+    @Cache.cache_this_session
+    def is_gic_page(page, physical):
+        # These devices are mapped at boot and kept mapped, so the answer is kept for the session.
+        paddr = page
+        if not physical:
+            try:
+                ret = gdb.execute("monitor gva2gpa {:#x}".format(page), to_string=True)
+            except gdb.error:
+                return False
+            r = re.search(r"gpa: (0x\S+)", ret)
+            if not r:
+                return False
+            paddr = int(r.group(1), 16) & ~0xfff
+        return any(s < paddr + 0x1000 and paddr < e for s, e in QemuMonitor.get_gic_addrs())
+
+    @staticmethod
+    def get_current_mmu_mode():
+        if is_qemu_system():
+            try:
+                response = gdb.execute("maintenance packet qqemu.PhyMemMode", to_string=True, from_tty=False)
+                if 'received: "0"' in response:
+                    MemoryCache.set_default_namespace("virtual")
+                    return "virt"
+                elif 'received: "1"' in response:
+                    MemoryCache.set_default_namespace("physical")
+                    return "phys"
+                else:
+                    return False
+            except gdb.error:
+                return False
+        elif is_vmware():
+            try:
+                MemoryCache.read_raw(0, 1)
+                MemoryCache.set_default_namespace("physical")
+                return "phys"
+            except gdb.MemoryError:
+                MemoryCache.set_default_namespace("virtual")
+                return "virt"
+        return None
+
+    @staticmethod
+    @contextlib.contextmanager
+    def use_mmu_mode(target_mode):
+        """Temporarily select QEMU/VMware virtual or physical memory mode."""
+        if target_mode not in ("virt", "phys"):
+            raise ValueError("Unsupported MMU mode: {!r}".format(target_mode))
+
+        original_mode = QemuMonitor.get_current_mmu_mode()
+        if original_mode is None:
+            # not QEMU-system/VMware: memory is always virtual
+            yield target_mode == "virt"
+            return
+        if original_mode not in ("virt", "phys"):
+            yield False
+            return
+        if original_mode == target_mode:
+            yield True
+            return
+
+        if target_mode == "phys":
+            switch_mode = enable_phys
+        else:
+            switch_mode = disable_phys
+        if original_mode == "phys":
+            restore_mode = enable_phys
+        else:
+            restore_mode = disable_phys
+        switched = switch_mode() is True
+        try:
+            yield switched
+        finally:
+            if switched and restore_mode() is not True:
+                QemuMonitor.get_current_mmu_mode()
+        return
+
+
+    @staticmethod
     @Cache.cache_this_session
     def get_gic_addrs():
         """Return physical addresses of ARM GIC(General Interrupt Controller)."""

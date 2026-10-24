@@ -797,4 +797,157 @@ def is_ascii_string(addr):
         return False
 
 
+def read_physmem(paddr, size, already_physmode=False):
+    """Return a `size` long byte array with the copy of the physical memory at `paddr`."""
+    # Function-local: gef.core.qemu and gef.core.process import this module.
+    from gef.core.process import Pid
+    from gef.core.qemu import QemuMonitor
+
+
+    def transparent_read(paddr, size):
+        try:
+            with QemuMonitor.use_mmu_mode("phys") as available:
+                if not available:
+                    return None
+                return MemoryCache.read_raw(paddr, size)
+        except Exception:
+            pass
+        return None
+
+    def qemu_system_proc_mem(paddr, size):
+        qemu_system_pid = Pid.get_pid()
+        if qemu_system_pid is None:
+            return None
+        ranges = QemuMonitor.get_physical_memory_ranges()
+        current = paddr
+        end = paddr + size
+        out = []
+        try:
+            with open("/proc/{:d}/mem".format(qemu_system_pid), "rb") as fd:
+                while current < end:
+                    region_end = next((stop for start, stop in ranges if start <= current < stop), None)
+                    if region_end is None:
+                        return None
+                    read_size = min(end, region_end) - current
+                    res = gdb.execute("monitor gpa2hva {:#x}".format(current), to_string=True)
+                    r = re.search("is (0x[0-9a-f]+)", res)
+                    if not r:
+                        return None
+                    fd.seek(int(r.group(1), 16))
+                    data = fd.read(read_size)
+                    if len(data) != read_size:
+                        return None
+                    out.append(data)
+                    current += read_size
+        except (gdb.error, OSError, ValueError, OverflowError):
+            return None
+        return b"".join(out)
+
+    def qemu_system_use_xp(paddr, size):
+        # for older than qemu 4.1.0
+        try:
+            res = gdb.execute("monitor xp/{:d}xb {:#x}".format(size, paddr), to_string=True)
+            """
+            gef> monitor xp/16xb 0
+            0000000000000000: 0x53 0xff 0x00 0xf0 0x53 0xff 0x00 0xf0
+            0000000000000008: 0xc3 0xe2 0x00 0xf0 0x53 0xff 0x00 0xf0
+            """
+        except gdb.error:
+            return None
+        out = b""
+        for line in res.splitlines():
+            if not line:
+                continue
+            data = line.split()[1:]
+            try:
+                out += bytes([int(x, 16) for x in data])
+            except ValueError:
+                # e.g., "Cannot access memory"
+                return None
+        return out
+
+    def kgdb_use_physmap(paddr, size):
+        # Use workaround value if provided. Useful if KGDB does not expose system registers.
+        physmap = Config.get("gef.physmap_base_for_read_physmem_kgdb_work_around")
+        if physmap == 0:
+            if is_arm64():
+                # On arm64, calculate physmap address based on PAGE_OFFSET and memstart_addr.
+                # This requires access to TCR_EL1 register to calculate PAGE_OFFSET.
+                physmap = KernelAddressHeuristicFinder.consts().physmap_base
+            elif is_x86_64():
+                physmap = KernelAddressHeuristicFinder.get_PAGE_OFFSET()
+            else:
+                return None
+            if physmap is None:
+                return None
+
+        vaddr = physmap + paddr
+        return read_memory(vaddr, size, safe=True)
+
+    def kdb_use_mdp(paddr, size):
+        # for KDB; not supported by KGDB
+        # Note: `mdp` command can only handle aligned addresses.
+        paddr_aligned = paddr & ~0xf
+        read_n_line = align(size + (paddr - paddr_aligned), 16) // 16
+        try:
+            res = gdb.execute("monitor mdp {:#x} {:d}".format(paddr_aligned, read_n_line), to_string=True)
+            """
+            gef> monitor mdp 0 2
+            phys 0x0000000000000000 f000ff53f000ff53 f000ff53f000e2c3   S...S.......S...
+            phys 0x0000000000000010 f000ff54f000ff53 f000ff53f0008488   S...T.......S...
+            """
+        except gdb.error:
+            return None
+        out = b""
+        for line in res.splitlines():
+            if not line:
+                continue
+            if line.endswith("zero suppressed"):
+                start, end = AddressUtil.parse_string_range(line.split(" ")[0])
+                zlen = (end + 1) - start
+                out += b"\x00" * zlen
+                continue
+            out += b"".join([bytes.fromhex(x)[::-1] for x in line.split()[2:4]])
+        return out[paddr & 0xf:][:size]
+
+    # ----
+
+    if size == 0:
+        return b""
+
+    # every fallback below (e.g., `monitor xp`) also crashes QEMU on these devices
+    if QemuMonitor.check_gic_address(paddr, size, physical=True):
+        return None
+
+    if already_physmode:
+        try:
+            return MemoryCache.read_raw(paddr, size)
+        except gdb.MemoryError:
+            pass
+
+    if is_qemu_system():
+        out = qemu_system_proc_mem(paddr, size)
+        if out is not None and len(out) == size:
+            return out
+        if is_supported_physmode():
+            out = transparent_read(paddr, size)
+            if out is not None and len(out) == size:
+                return out
+        out = qemu_system_use_xp(paddr, size)
+        if out is not None and len(out) == size:
+            return out
+        return None
+
+    if is_vmware():
+        return transparent_read(paddr, size)
+
+    if is_kgdb():
+        out = kgdb_use_physmap(paddr, size) # fast path
+        if out:
+            return out
+        if is_kdb():
+            return kdb_use_mdp(paddr, size) # slow path
+
+    return None
+
 
