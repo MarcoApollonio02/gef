@@ -7,8 +7,12 @@ kbpf, kipcs, kdevio, kdmabuf, kirq, knetdev). Auto-discovered by gef.bootstrap
 via pkgutil.walk_packages.
 """
 import argparse
+import bisect
+import collections
+import itertools
 import os
 import re
+import struct
 import subprocess
 
 import gdb
@@ -29,7 +33,8 @@ from gef.core.cache import Cache
 from gef.core.color import Color, err, info, titlify, warn
 from gef.core.config import Config
 from gef.core.instruction import Disasm, get_insn, get_insn_next
-from gef.core.kernel import Kernel, Ksym
+from gef.core.display import ProgressBar
+from gef.core.kernel import Kernel, KernelListHead, KernelNftables, KernelSlub, KernelTask, Ksym
 from gef.core.memory import (
     is_ascii_string,
     is_double_link_list,
@@ -43,10 +48,12 @@ from gef.core.memory import (
     read_int_from_memory,
     read_memory,
     u16,
+    u32,
     u64,
 )
-from gef.core.pagewalk import KernelAddressHeuristicFinder
+from gef.core.pagewalk import KernelAddressHeuristicFinder, KernelAddressHeuristicFinderUtil
 from gef.core.process import (
+    get_pagesize,
     get_pagesize_mask_high,
     is_32bit,
     is_64bit,
@@ -57,6 +64,8 @@ from gef.core.process import (
     is_kgdb,
     is_m68k,
     is_qemu_system,
+    is_riscv32,
+    is_riscv64,
     is_sparc32,
     is_sparc32plus,
     is_sparc64,
@@ -68,7 +77,8 @@ from gef.core.registers import to_unsigned_long
 from gef.core.strings import String
 from gef.core.symbols import Symbol
 from gef.core.syscall import Syscall
-from gef.core.utils import GEF_TEMP_DIR, GefUtil, align, align_to_ptrsize, slicer, switch_to_intel_syntax
+from gef.core.utils import (GEF_TEMP_DIR, GefUtil, align, align_to_ptrsize, slicer, slice_unpack,
+                            switch_to_intel_syntax)
 
 
 @register_command
@@ -9328,3 +9338,4866 @@ class KernelDmesgModernRing(KernelDmesgRing):
         if not reached_head:
             partial = True
         return partial
+
+
+@register_command
+class KernelIoUringCommand(GenericCommand, BufferingOutput):
+    """Display the kernel-side io_uring object graph."""
+
+    _cmdline_ = "kio-uring"
+    _category_ = "06-g. Qemu-system/KGDB Cooperation - Linux Advanced"
+
+    parser = argparse.ArgumentParser(prog=_cmdline_)
+    parser.add_argument("address", nargs="?", metavar="ADDRESS", type=AddressUtil.parse_address,
+                        help="the address of struct io_ring_ctx, io_kiocb or file.")
+    parser.add_argument("-t", "--type", choices=["auto", "ctx", "request", "file"], default="auto",
+                        help="the type of ADDRESS. (default: %(default)s)")
+    parser.add_argument("-p", "--pid", type=int, help="select rings owned by this pid.")
+    parser.add_argument("-f", "--fd", type=int, help="select this ring fd (requires --pid).")
+    parser.add_argument("--no-requests", action="store_true", help="do not walk pending request lists.")
+    parser.add_argument("--meta", action="store_true", help="display layout and discovery information.")
+    parser.add_argument("-n", "--no-pager", action="store_true", help="do not use the pager.")
+    parser.add_argument("-v", "--verbose", action="store_true", help="show request flags and user_data.")
+    parser.add_argument("-q", "--quiet", action="store_true", help="show result only.")
+    _syntax_ = parser.format_help()
+
+    _example_ = [
+        "{0:s}",
+        "{0:s} --pid 1337 --fd 4",
+        "{0:s} --type ctx 0xffff888012340000",
+        "{0:s} --type request 0xffff888056780000 -v",
+    ]
+    _example_ = "\n".join(_example_).format(_cmdline_)
+
+    _note_ = [
+        "`iouring-dump` dumps userland io_uring mappings; this command follows kernel objects.",
+        "io_uring first appeared in Linux v5.1. Older kernels are detected without scanning.",
+        "DWARF is used when available. Without it, ring discovery uses open fd paths and validated ring metadata.",
+        "ADDRESS with `--type ctx` or `--type request` needs neither the task list nor the VFS layout.",
+        "Live request lists are transient and may be incomplete while another CPU is running.",
+        "",
+        "Kernel object graph:",
+        "",
+        "task_struct",
+        "  +-- files -> fdtable[fd] -> file (anon_inode:[io_uring])",
+        "  |                             +-- private_data -> io_ring_ctx",
+        "  +-- io_uring -> io_uring_task",
+        "                    +-- last ---------------------> io_ring_ctx",
+        "                    +-- registered_rings[] -------> file",
+        "                    +-- io_wq --------------------> io-wq workers",
+        "",
+        "io_ring_ctx",
+        "  +-- rings ----------------------> io_rings (SQ / CQ)",
+        "  +-- file table -----------------> file / io_rsrc_node",
+        "  +-- buffer table ---------------> io_mapped_ubuf / io_rsrc_node",
+        "  +-- iopoll/timeout/defer lists -> io_kiocb",
+        "  |                                   +-- opcode / state / refs",
+        "  |                                   +-- file / buffer node",
+        "  |                                   +-- callback / linked request",
+        "  +-- submitter / sq thread ------> task_struct",
+    ]
+    _note_ = "\n".join(_note_)
+
+    MAX_FDS = 0x10000
+    MAX_RESOURCES = 0x10000
+    MAX_REQUESTS = 0x10000
+
+    OPCODES = [
+        "NOP", "READV", "WRITEV", "FSYNC", "READ_FIXED", "WRITE_FIXED", "POLL_ADD",
+        "POLL_REMOVE", "SYNC_FILE_RANGE", "SENDMSG", "RECVMSG", "TIMEOUT", "TIMEOUT_REMOVE",
+        "ACCEPT", "ASYNC_CANCEL", "LINK_TIMEOUT", "CONNECT", "FALLOCATE", "OPENAT", "CLOSE",
+        "FILES_UPDATE", "STATX", "READ", "WRITE", "FADVISE", "MADVISE", "SEND", "RECV",
+        "OPENAT2", "EPOLL_CTL", "SPLICE", "PROVIDE_BUFFERS", "REMOVE_BUFFERS", "TEE",
+        "SHUTDOWN", "RENAMEAT", "UNLINKAT", "MKDIRAT", "SYMLINKAT", "LINKAT", "MSG_RING",
+        "FSETXATTR", "SETXATTR", "FGETXATTR", "GETXATTR", "SOCKET", "URING_CMD", "SEND_ZC",
+        "SENDMSG_ZC", "READ_MULTISHOT", "WAITID", "FUTEX_WAIT", "FUTEX_WAKE", "FUTEX_WAITV",
+        "FIXED_FD_INSTALL", "FTRUNCATE", "BIND", "LISTEN", "RECV_ZC", "EPOLL_WAIT",
+        "READV_FIXED", "WRITEV_FIXED", "PIPE", "NOP128", "URING_CMD128",
+    ]
+
+    def eval_value(self, type_name, address, member):
+        try:
+            return gdb.parse_and_eval("(({:s} *){:#x})->{:s}".format(type_name, address, member))
+        except (gdb.error, RuntimeError):
+            return None
+
+    def eval_unsigned(self, type_name, address, member):
+        value = self.eval_value(type_name, address, member)
+        if value is None:
+            return None
+        try:
+            value_type = value.type.strip_typedefs()
+            if value_type.code in (gdb.TYPE_CODE_PTR, gdb.TYPE_CODE_ARRAY):
+                return to_unsigned_long(value)
+            return int(value) & ((1 << (value_type.sizeof * 8)) - 1)
+        except (gdb.error, RuntimeError, TypeError):
+            return None
+
+    def eval_first(self, type_name, address, members):
+        for member in members:
+            value = self.eval_unsigned(type_name, address, member)
+            if value is not None:
+                return value, member
+        return None, None
+
+    @staticmethod
+    def is_ring_path(path):
+        return path == "anon_inode:[io_uring]" or path == "[io_uring]" or path.endswith(":[io_uring]")
+
+    @staticmethod
+    def is_power_of_two(value):
+        return value != 0 and value & (value - 1) == 0
+
+    # struct io_uring { u32 head ____cacheline_aligned_in_smp; u32 tail ____cacheline_aligned_in_smp; }
+    # places head/tail at each cacheline (32/64/128 bytes, in u32 units here) on CONFIG_SMP=y,
+    # or back to back on CONFIG_SMP=n and v7.0 or later.
+    RING_STRIDES = (1, 8, 16, 32)
+
+    def read_ring_words(self, ring):
+        # the rings are mapped to the userland, so they start at a page boundary
+        if not is_valid_addr(ring) or ring & 0xfff:
+            return None
+        data = read_memory(ring, 0x300, safe=True)
+        if data is None:
+            return None
+        try:
+            return slice_unpack(data, 4)
+        except struct.error:
+            return None
+
+    @staticmethod
+    def is_ring_padding(words, stride, count):
+        """Return True if the padding between `count` cacheline aligned u32 fields is zero."""
+        return all(words[i] == 0 for i in range(stride * count) if i % stride)
+
+    def ring_memory_layout(self, rings):
+        """Recognize and decode the combined io_rings (v5.4~) in memory."""
+        words = self.read_ring_words(rings)
+        if words is None:
+            return None
+        for stride in self.RING_STRIDES:
+            # sq.head, sq.tail, cq.head and cq.tail are followed by the masks and the entries
+            index = stride * 4
+            sq_mask, cq_mask, sq_entries, cq_entries = words[index:index + 4]
+            if not self.is_power_of_two(sq_entries) or not self.is_power_of_two(cq_entries):
+                continue
+            # the CQ is never smaller than the SQ (twice as large by default)
+            if sq_entries > 0x100000 or cq_entries > 0x200000 or cq_entries < sq_entries:
+                continue
+            if sq_mask + 1 != sq_entries or cq_mask + 1 != cq_entries:
+                continue
+            if not self.is_ring_padding(words, stride, 4):
+                continue
+            sq_head, sq_tail, cq_head, cq_tail = (words[stride * i] for i in range(4))
+            if (sq_tail - sq_head) & 0xffff_ffff > sq_entries or (cq_tail - cq_head) & 0xffff_ffff > cq_entries:
+                continue
+            result = {
+                "address": rings, "heuristic": True,
+                "sq_head": sq_head, "sq_tail": sq_tail, "cq_head": cq_head, "cq_tail": cq_tail,
+                "sq_mask": sq_mask, "cq_mask": cq_mask,
+                "sq_entries": sq_entries, "cq_entries": cq_entries,
+                "dropped": words[index + 4], "sq_flags": words[index + 5],
+                "cq_flags": None, "overflow": None,
+            }
+            if self.kversion >= "5.8":
+                result["cq_flags"] = words[index + 6]
+                result["overflow"] = words[index + 7]
+            else:
+                result["overflow"] = words[index + 6]
+            return result
+        return None
+
+    def single_ring_layout(self, ring):
+        """Recognize and decode io_sq_ring or io_cq_ring (v5.1~v5.3), each having its own head and tail."""
+        words = self.read_ring_words(ring)
+        if words is None:
+            return None
+        for stride in self.RING_STRIDES:
+            index = stride * 2
+            mask, entries = words[index:index + 2]
+            if not self.is_power_of_two(entries) or entries > 0x200000 or mask + 1 != entries:
+                continue
+            if not self.is_ring_padding(words, stride, 2):
+                continue
+            head, tail = words[0], words[stride]
+            if (tail - head) & 0xffff_ffff > entries:
+                continue
+            # io_sq_ring has dropped and flags, and io_cq_ring has overflow after them
+            return {"address": ring, "head": head, "tail": tail, "mask": mask, "entries": entries,
+                    "extra": words[index + 2:index + 4]}
+        return None
+
+    def find_rings_heuristic(self, ctx):
+        """Return the ring metadata found from the pointers in io_ring_ctx, or None."""
+        if not is_valid_addr(ctx) or ctx & (runtime.current_arch.ptrsize - 1):
+            return None
+        pointers = read_memory(ctx, 0x400, safe=True)
+        if pointers is None:
+            return None
+        try:
+            pointers = slice_unpack(pointers, runtime.current_arch.ptrsize)
+        except struct.error:
+            return None
+        singles = []
+        for pointer in pointers:
+            layout = self.ring_memory_layout(pointer)
+            if layout is not None:
+                return layout
+            if self.kversion < "5.4" and pointer not in [x["address"] for x in singles]:
+                layout = self.single_ring_layout(pointer)
+                if layout is not None:
+                    singles.append(layout)
+        # io_ring_ctx has sq_ring before cq_ring
+        pairs = [(sq, cq) for i, sq in enumerate(singles) for cq in singles[i + 1:] if cq["entries"] >= sq["entries"]]
+        if not pairs:
+            return None
+        sq, cq = pairs[0]
+        return {
+            "address": sq["address"], "cq_address": cq["address"], "heuristic": True,
+            "sq_head": sq["head"], "sq_tail": sq["tail"], "cq_head": cq["head"], "cq_tail": cq["tail"],
+            "sq_mask": sq["mask"], "cq_mask": cq["mask"], "sq_entries": sq["entries"], "cq_entries": cq["entries"],
+            "dropped": sq["extra"][0], "sq_flags": sq["extra"][1], "cq_flags": None, "overflow": cq["extra"][0],
+        }
+
+    def context_score(self, ctx):
+        if not is_valid_addr(ctx) or ctx & (runtime.current_arch.ptrsize - 1):
+            return 0
+        rings = self.eval_unsigned("struct io_ring_ctx", ctx, "rings")
+        if rings is not None and is_valid_addr(rings):
+            if self.ring_stats(ctx) is not None:
+                return 10
+            return 0
+        sq_ring = self.eval_unsigned("struct io_ring_ctx", ctx, "sq_ring")
+        cq_ring = self.eval_unsigned("struct io_ring_ctx", ctx, "cq_ring")
+        if is_valid_addr(sq_ring) and is_valid_addr(cq_ring):
+            if self.ring_stats(ctx) is not None:
+                return 10
+            return 0
+        if self.find_rings_heuristic(ctx) is not None:
+            return 3
+        return 0
+
+    def context_from_file(self, file):
+        ctx = self.eval_unsigned("struct file", file, "private_data")
+        if ctx is not None and self.context_score(ctx):
+            return ctx, "debug information"
+
+        # struct file is randomized in old kernels and was reordered in v6.5/v7.0.
+        # Restrict the fallback to a known io_uring fd, then validate the target as a ring context.
+        pointers = read_memory(file, 0x200, safe=True)
+        if pointers is None:
+            return None, None
+        try:
+            pointers = slice_unpack(pointers, runtime.current_arch.ptrsize)
+        except struct.error:
+            return None, None
+        candidates = []
+        for index, pointer in enumerate(pointers):
+            score = self.context_score(pointer)
+            if score:
+                candidates.append((score, index, pointer))
+        if not candidates:
+            return None, None
+        score, index, ctx = max(candidates)
+        return ctx, "validated file member +{:#x}".format(index * runtime.current_arch.ptrsize)
+
+    def get_task_command(self):
+        """Return the task resolver initialized for the fd scan, or None. It is resolved on first use,
+        so a ctx/request given by ADDRESS does not depend on the task layout."""
+        if self.task_command is False:
+            self.task_command = Kernel.task()
+            task_ready = self.task_command.initialize(files=True)
+            self.meta.extend(Kernel.export_meta(self, self.task_command.meta))
+            if not task_ready:
+                self.task_command = None
+            if self.task_command is not None and (self.task_command.offset_files is None or self.task_command.offset_fdt is None):
+                self.meta.append((self.quiet_err, "Could not find task_struct->files->fdt"))
+                self.task_command = None
+        return self.task_command
+
+    def get_kpath(self):
+        """Return the VFS resolver, or None. It is resolved on first use like get_task_command()."""
+        if self.kpath is False:
+            self.kpath = Kernel.path()
+            if not self.kpath.initialized:
+                self.meta.append((self.quiet_err, "Could not resolve the VFS object layout"))
+                self.kpath = None
+        return self.kpath
+
+    def task_info(self, task):
+        command = self.get_task_command()
+        if command is None:
+            return None, "???"
+        try:
+            pid = read_int32_from_memory(task + command.offset_pid)
+            comm = read_cstring_from_memory(task + command.offset_comm) or "???"
+        except (gdb.MemoryError, OverflowError):
+            return None, "???"
+        return pid, comm
+
+    def task_label(self, task):
+        if not is_valid_addr(task):
+            return "{:#x}".format(task or 0)
+        pid, comm = self.task_info(task)
+        if pid is None:
+            return "{:#x}".format(task)
+        return "{:#x} {:s}[{:d}]".format(task, comm, pid)
+
+    def iter_task_files(self, task):
+        command = self.get_task_command()
+        try:
+            files = read_int_from_memory(task + command.offset_files)
+            fdt = read_int_from_memory(files + command.offset_fdt)
+            max_fds = read_int32_from_memory(fdt)
+            array = read_int_from_memory(fdt + runtime.current_arch.ptrsize)
+        except (gdb.MemoryError, OverflowError):
+            return
+        if not is_valid_addr(array) or max_fds <= 0:
+            return
+        for fd in range(min(max_fds, self.MAX_FDS)):
+            file = read_int_from_memory(array + runtime.current_arch.ptrsize * fd, safe=True)
+            if file:
+                yield fd, file
+        return
+
+    def find_ring_files(self):
+        command = self.get_task_command()
+        kpath = self.get_kpath()
+        if command is None or kpath is None:
+            return None
+        tasks = KernelTask.get_task_list(command.init_task, command.offset_tasks)
+        rings = []
+        for task in tasks:
+            pid, comm = self.task_info(task)
+            if pid is None or self.args.pid is not None and pid != self.args.pid:
+                continue
+            for fd, file in self.iter_task_files(task):
+                if self.args.fd is not None and fd != self.args.fd:
+                    continue
+                try:
+                    path = kpath.get_file_path(file)
+                except (gdb.MemoryError, OverflowError, RuntimeError):
+                    continue
+                if not self.is_ring_path(path):
+                    continue
+                ctx, source = self.context_from_file(file)
+                rings.append({
+                    "task": task, "pid": pid, "comm": comm, "fd": fd, "file": file,
+                    "path": path, "ctx": ctx, "ctx_source": source,
+                })
+        return rings
+
+    def path_for_file(self, file):
+        if not is_valid_addr(file) or self.get_kpath() is None:
+            return ""
+        try:
+            return self.kpath.get_file_path(file)
+        except (gdb.MemoryError, OverflowError, RuntimeError):
+            return ""
+
+    def ring_stats(self, ctx):
+        rings = self.eval_unsigned("struct io_ring_ctx", ctx, "rings")
+        if rings is not None and is_valid_addr(rings):
+            names = ["sq.head", "sq.tail", "cq.head", "cq.tail", "sq_ring_mask", "cq_ring_mask",
+                     "sq_ring_entries", "cq_ring_entries", "sq_dropped", "sq_flags.counter",
+                     "sq_flags", "cq_flags", "cq_overflow"]
+            values = {}
+            for name in names:
+                value = self.eval_unsigned("struct io_rings", rings, name)
+                if value is not None:
+                    values[name] = value
+            sq_flags = values.get("sq_flags.counter", values.get("sq_flags"))
+            return {
+                "address": rings,
+                "sq_head": values.get("sq.head"), "sq_tail": values.get("sq.tail"),
+                "cq_head": values.get("cq.head"), "cq_tail": values.get("cq.tail"),
+                "sq_mask": values.get("sq_ring_mask"), "cq_mask": values.get("cq_ring_mask"),
+                "sq_entries": values.get("sq_ring_entries"), "cq_entries": values.get("cq_ring_entries"),
+                "dropped": values.get("sq_dropped"), "sq_flags": sq_flags,
+                "cq_flags": values.get("cq_flags"), "overflow": values.get("cq_overflow"),
+            }
+
+        sq = self.eval_unsigned("struct io_ring_ctx", ctx, "sq_ring")
+        cq = self.eval_unsigned("struct io_ring_ctx", ctx, "cq_ring")
+        if is_valid_addr(sq) and is_valid_addr(cq):
+            return {
+                "address": sq,
+                "sq_head": self.eval_unsigned("struct io_sq_ring", sq, "r.head"),
+                "sq_tail": self.eval_unsigned("struct io_sq_ring", sq, "r.tail"),
+                "cq_head": self.eval_unsigned("struct io_cq_ring", cq, "r.head"),
+                "cq_tail": self.eval_unsigned("struct io_cq_ring", cq, "r.tail"),
+                "sq_mask": self.eval_unsigned("struct io_sq_ring", sq, "ring_mask"),
+                "cq_mask": self.eval_unsigned("struct io_cq_ring", cq, "ring_mask"),
+                "sq_entries": self.eval_unsigned("struct io_sq_ring", sq, "ring_entries"),
+                "cq_entries": self.eval_unsigned("struct io_cq_ring", cq, "ring_entries"),
+                "dropped": self.eval_unsigned("struct io_sq_ring", sq, "dropped"),
+                "sq_flags": self.eval_unsigned("struct io_sq_ring", sq, "flags"),
+                "cq_flags": None, "overflow": self.eval_unsigned("struct io_cq_ring", cq, "overflow"),
+                "cq_address": cq,
+            }
+
+        return self.find_rings_heuristic(ctx)
+
+    def format_optional(self, value):
+        if value is None:
+            return "?"
+        return "{:#x}".format(value)
+
+    def resource_nodes(self, ctx, table):
+        nr = self.eval_unsigned("struct io_ring_ctx", ctx, table + ".nr")
+        nodes = self.eval_unsigned("struct io_ring_ctx", ctx, table + ".nodes")
+        if nr is None or nodes is None:
+            return None
+        result = []
+        for index in range(min(nr, self.MAX_RESOURCES)):
+            node = read_int_from_memory(nodes + index * runtime.current_arch.ptrsize, safe=True)
+            result.append(node or 0)
+        return nr, nodes, result
+
+    def dump_registered_files(self, ctx):
+        files = []
+        total = None
+        source = None
+
+        resources = self.resource_nodes(ctx, "file_table.data")
+        if resources is not None:
+            total, root, nodes = resources
+            source = "file_table.data.nodes={:#x}".format(root)
+            for index, node in enumerate(nodes):
+                if node:
+                    file = self.eval_unsigned("struct io_rsrc_node", node, "file_ptr")
+                else:
+                    file = 0
+                files.append((index, (file or 0) & ~3, node))
+        else:
+            total, _count_member = self.eval_first("struct io_ring_ctx", ctx, ["nr_user_files", "file_table.data.nr"])
+            if total is not None:
+                candidates = [
+                    ("file_table.files", "struct io_fixed_file", "file_ptr"),
+                    ("file_data->table", None, None),
+                    ("user_files", None, None),
+                ]
+                for member, element_type, element_member in candidates:
+                    base = self.eval_unsigned("struct io_ring_ctx", ctx, member)
+                    if base is None:
+                        continue
+                    source = member + "={:#x}".format(base)
+                    if not base:
+                        break
+                    two_level = False
+                    if element_type:
+                        table_type = self.eval_value("struct io_ring_ctx", ctx, member).type.strip_typedefs()
+                        two_level = table_type.target().strip_typedefs().code == gdb.TYPE_CODE_PTR
+                    for index in range(min(total, self.MAX_RESOURCES)):
+                        if element_type:
+                            if two_level:
+                                block = read_int_from_memory(base + (index >> 9) * runtime.current_arch.ptrsize, safe=True)
+                                if block:
+                                    slot = block + (index & 511) * runtime.current_arch.ptrsize
+                                else:
+                                    slot = 0
+                            else:
+                                slot = base + index * runtime.current_arch.ptrsize
+                            if slot:
+                                file = self.eval_unsigned(element_type, slot, element_member)
+                            else:
+                                file = 0
+                            mask = ~(runtime.current_arch.ptrsize - 1)
+                        else:
+                            if member != "user_files":
+                                block_member = "file_data->table[{:d}].files".format(index >> 9)
+                                block = self.eval_unsigned("struct io_ring_ctx", ctx, block_member)
+                                if block:
+                                    slot = block + (index & 511) * runtime.current_arch.ptrsize
+                                else:
+                                    slot = 0
+                            else:
+                                slot = base + index * runtime.current_arch.ptrsize
+                            if slot:
+                                file = read_int_from_memory(slot, safe=True)
+                            else:
+                                file = 0
+                            mask = -1
+                        files.append((index, (file or 0) & mask, None))
+                    break
+
+        if total is None:
+            self.out.append("  registered files : unavailable (layout information is required)")
+            return
+        self.out.append("  registered files : {:d} ({:s})".format(total, source or "no table"))
+        for index, file, node in files:
+            if not file:
+                continue
+            if node:
+                suffix = " node={:#x}".format(node)
+            else:
+                suffix = ""
+            path = self.path_for_file(file)
+            self.out.append("    [{:<4d}] file={:#x}{:s} {:s}".format(index, file, suffix, path).rstrip())
+        if total > self.MAX_RESOURCES:
+            self.warn_add_out("Registered file table truncated at {:d} entries".format(self.MAX_RESOURCES))
+        return
+
+    def buffer_description(self, buffer):
+        if not is_valid_addr(buffer):
+            return "buffer={:#x}".format(buffer or 0)
+        ubuf = self.eval_unsigned("struct io_mapped_ubuf", buffer, "ubuf")
+        length, member = self.eval_first("struct io_mapped_ubuf", buffer, ["len", "ubuf_end"])
+        if member == "ubuf_end" and ubuf is not None and length is not None:
+            length -= ubuf
+        nr_bvecs = self.eval_unsigned("struct io_mapped_ubuf", buffer, "nr_bvecs")
+        return "buffer={:#x} addr={:s} len={:s} nr_bvecs={:s}".format(
+            buffer, self.format_optional(ubuf), self.format_optional(length), self.format_optional(nr_bvecs),
+        )
+
+    def dump_registered_buffers(self, ctx):
+        buffers = []
+        total = None
+        source = None
+        resources = self.resource_nodes(ctx, "buf_table")
+        if resources is not None:
+            total, root, nodes = resources
+            source = "buf_table.nodes={:#x}".format(root)
+            for index, node in enumerate(nodes):
+                if node:
+                    buffer = self.eval_unsigned("struct io_rsrc_node", node, "buf")
+                else:
+                    buffer = 0
+                buffers.append((index, buffer or 0, node))
+        else:
+            total = self.eval_unsigned("struct io_ring_ctx", ctx, "nr_user_bufs")
+            base = self.eval_unsigned("struct io_ring_ctx", ctx, "user_bufs")
+            if total is not None and base is not None:
+                source = "user_bufs={:#x}".format(base)
+                pointer_array = self.kversion >= "5.13"
+                element_size = GefUtil.type_size("struct io_mapped_ubuf")
+                for index in range(min(total, self.MAX_RESOURCES)):
+                    if pointer_array:
+                        buffer = read_int_from_memory(base + index * runtime.current_arch.ptrsize, safe=True)
+                    elif element_size is not None:
+                        buffer = base + index * element_size
+                    else:
+                        buffer = 0
+                    buffers.append((index, buffer or 0, None))
+
+        if total is None:
+            self.out.append("  registered bufs  : unavailable (layout information is required)")
+            return
+        self.out.append("  registered bufs  : {:d} ({:s})".format(total, source or "no table"))
+        for index, buffer, node in buffers:
+            if not buffer:
+                continue
+            if node:
+                suffix = " node={:#x}".format(node)
+            else:
+                suffix = ""
+            self.out.append("    [{:<4d}] {:s}{:s}".format(index, self.buffer_description(buffer), suffix))
+        if total > self.MAX_RESOURCES:
+            self.warn_add_out("Registered buffer table truncated at {:d} entries".format(self.MAX_RESOURCES))
+        return
+
+    def request_context(self, request):
+        return self.eval_unsigned("struct io_kiocb", request, "ctx")
+
+    def walk_request_list(self, ctx, ctx_member, req_member, state):
+        head_offset = GefUtil.offsetof("struct io_ring_ctx", ctx_member)
+        req_offset = GefUtil.offsetof("struct io_kiocb", req_member)
+        if head_offset is None or req_offset is None:
+            return []
+        head = ctx + head_offset
+        requests = []
+        try:
+            for request in KernelListHead(head, req_offset).iter_entries():
+                if len(requests) >= self.MAX_REQUESTS:
+                    break
+                if self.request_context(request) != ctx:
+                    break
+                requests.append((request, state))
+        except (gdb.MemoryError, OverflowError):
+            pass
+        return requests
+
+    def walk_request_slist(self, ctx, ctx_member, req_member, state):
+        first = self.eval_unsigned("struct io_ring_ctx", ctx, ctx_member + ".first")
+        req_offset = GefUtil.offsetof("struct io_kiocb", req_member)
+        if first is None or req_offset is None:
+            return []
+        requests = []
+        seen = set()
+        node = first
+        while node and node not in seen and len(requests) < self.MAX_REQUESTS:
+            seen.add(node)
+            request = node - req_offset
+            if self.request_context(request) != ctx:
+                break
+            requests.append((request, state))
+            node = read_int_from_memory(node, safe=True)
+        return requests
+
+    def walk_request_container_list(self, ctx, ctx_member, container_type, list_member, request_member, state):
+        head_offset = GefUtil.offsetof("struct io_ring_ctx", ctx_member)
+        list_offset = GefUtil.offsetof(container_type, list_member)
+        if head_offset is None or list_offset is None:
+            return []
+        requests = []
+        try:
+            for container in KernelListHead(ctx + head_offset, list_offset).iter_entries():
+                if len(requests) >= self.MAX_REQUESTS:
+                    break
+                if request_member is None:
+                    request = container
+                else:
+                    request = self.eval_unsigned(container_type, container, request_member)
+                if not request or self.request_context(request) != ctx:
+                    break
+                requests.append((request, state))
+        except (gdb.MemoryError, OverflowError):
+            pass
+        return requests
+
+    def collect_requests(self, ctx):
+        found = []
+        if self.kversion < "5.5":
+            for field, state in [("defer_list", "deferred"), ("timeout_list", "timeout"),
+                                 ("poll_list", "poll"), ("cancel_list", "cancel")]:
+                found += self.walk_request_list(ctx, field, "list", state)
+        elif self.kversion < "5.16":
+            found += self.walk_request_list(ctx, "iopoll_list", "inflight_entry", "iopoll")
+            found += self.walk_request_list(ctx, "inflight_list", "inflight_entry", "inflight")
+            if self.kversion < "5.9":
+                found += self.walk_request_list(ctx, "defer_list", "list", "deferred")
+                found += self.walk_request_list(ctx, "timeout_list", "list", "timeout")
+        elif self.kversion < "7.0":
+            found += self.walk_request_slist(ctx, "iopoll_list", "comp_list", "iopoll")
+        else:
+            found += self.walk_request_list(ctx, "iopoll_list", "iopoll_node", "iopoll")
+
+        if self.kversion >= "5.9":
+            found += self.walk_request_container_list(ctx, "defer_list", "struct io_defer_entry", "list", "req", "deferred")
+            for field, state in [("timeout_list", "timeout"), ("ltimeout_list", "linked-timeout")]:
+                found += self.walk_request_container_list(ctx, field, "struct io_timeout", "list", None, state)
+
+        requests = []
+        seen = set()
+        for request, state in found:
+            if request in seen:
+                continue
+            seen.add(request)
+            requests.append((request, state))
+            link = self.eval_unsigned("struct io_kiocb", request, "link")
+            while link and link not in seen and len(requests) < self.MAX_REQUESTS:
+                if self.request_context(link) != ctx:
+                    break
+                seen.add(link)
+                requests.append((link, "linked"))
+                link = self.eval_unsigned("struct io_kiocb", link, "link")
+        return requests
+
+    def opcode_name(self, opcode):
+        if opcode is None:
+            return "?"
+        if opcode < len(self.OPCODES):
+            return self.OPCODES[opcode]
+        return "OP_{:d}".format(opcode)
+
+    def request_info(self, request, state):
+        opcode, opcode_member = self.eval_first("struct io_kiocb", request, ["opcode", "submit.sqe->opcode"])
+        file = self.eval_unsigned("struct io_kiocb", request, "file")
+        buffer, buffer_member = self.eval_first("struct io_kiocb", request, ["imu", "kbuf", "buf_node"])
+        refs, refs_member = self.eval_first("struct io_kiocb", request, ["refs.counter", "refs.refs.counter", "refs"])
+        flags = self.eval_unsigned("struct io_kiocb", request, "flags")
+        user_data, user_member = self.eval_first("struct io_kiocb", request, ["cqe.user_data", "user_data", "submit.sqe.user_data"])
+        callback, callback_member = self.eval_first(
+            "struct io_kiocb", request, ["io_task_work.func", "task_work.func", "work.func"],
+        )
+        if callback is None:
+            callback_text = "?"
+        else:
+            callback_text = Symbol.format(callback, show_address=True, nocolor=True)
+        return {
+            "address": request, "state": state, "opcode": opcode, "file": file,
+            "buffer": buffer, "buffer_member": buffer_member, "refs": refs,
+            "refs_member": refs_member, "flags": flags, "user_data": user_data,
+            "user_member": user_member, "opcode_member": opcode_member,
+            "callback": callback_text, "callback_member": callback_member,
+        }
+
+    def dump_requests(self, requests):
+        self.out.append("  requests         : {:d}".format(len(requests)))
+        if not requests:
+            return
+        fmt = "    {:18s} {:10s} {:20s} {:18s} {:18s} {:7s} {:s}"
+        self.out.append(GefUtil.make_legend(fmt.format("io_kiocb", "state", "opcode", "file", "buffer", "refs", "callback")))
+        for request, state in requests:
+            info = self.request_info(request, state)
+            if info["opcode"] is not None:
+                opcode = "{:d}:{:s}".format(info["opcode"], self.opcode_name(info["opcode"]))
+            else:
+                opcode = "?"
+            self.out.append(fmt.format(
+                "{:#x}".format(request), state, opcode,
+                self.format_optional(info["file"]), self.format_optional(info["buffer"]),
+                "?" if info["refs"] is None else str(info["refs"]), info["callback"],
+            ))
+            if self.args.verbose:
+                path = self.path_for_file(info["file"])
+                self.out.append("      flags={:s} user_data={:s} file_path={:s}".format(
+                    self.format_optional(info["flags"]), self.format_optional(info["user_data"]), path or "?",
+                ))
+        return
+
+    def dump_workers(self, ctx, owners):
+        workers = []
+        for member in ["submitter_task", "sqo_task", "sqo_thread", "sq_data.thread"]:
+            task = self.eval_unsigned("struct io_ring_ctx", ctx, member)
+            if task:
+                workers.append((member, task))
+        io_wq = self.eval_unsigned("struct io_ring_ctx", ctx, "io_wq")
+        if io_wq:
+            self.out.append("  io_wq            : {:#x} (ctx)".format(io_wq))
+
+        seen_tasks = set()
+        for owner in owners:
+            task = owner.get("task")
+            if not task or task in seen_tasks:
+                continue
+            seen_tasks.add(task)
+            tctx = self.eval_unsigned("struct task_struct", task, "io_uring")
+            if not tctx:
+                continue
+            task_wq = self.eval_unsigned("struct io_uring_task", tctx, "io_wq")
+            last = self.eval_unsigned("struct io_uring_task", tctx, "last")
+            self.out.append("  task io_uring    : {:#x} owner={:s} last={:s} io_wq={:s}".format(
+                tctx, self.task_label(task), self.format_optional(last), self.format_optional(task_wq),
+            ))
+            for index in range(16):
+                ring_file = self.eval_unsigned("struct io_uring_task", tctx, "registered_rings[{:d}]".format(index))
+                if ring_file:
+                    self.out.append("    registered_rings[{:<2d}]={:#x}".format(index, ring_file))
+
+        for member, task in workers:
+            self.out.append("  {:16s}: {:s}".format(member, self.task_label(task)))
+        return
+
+    def dump_context(self, ctx, owners):
+        self.out.append(titlify("struct io_ring_ctx {:#x}".format(ctx)))
+        for owner in owners:
+            if owner.get("file") and owner.get("task") is None:
+                # the file given by ADDRESS; its owner task is not searched
+                self.out.append("  file             : {:#x} {:s}".format(owner["file"], owner.get("path", "")).rstrip())
+            elif owner.get("file"):
+                self.out.append("  owner            : {:s}[{:d}] task={:#x} fd={:d} file={:#x} {:s}".format(
+                    owner.get("comm", "???"), owner.get("pid", -1), owner.get("task", 0), owner.get("fd", -1),
+                    owner["file"], owner.get("path", ""),
+                ).rstrip())
+            if owner.get("file") and owner.get("ctx_source"):
+                self.out.append("  private_data     : {:s}".format(owner["ctx_source"]))
+
+        flags = self.eval_unsigned("struct io_ring_ctx", ctx, "flags")
+        int_flags = self.eval_unsigned("struct io_ring_ctx", ctx, "int_flags")
+        self.out.append("  flags            : {:s}{:s}".format(
+            self.format_optional(flags),
+            " int_flags={:s}".format(self.format_optional(int_flags)) if int_flags is not None else "",
+        ))
+
+        stats = self.ring_stats(ctx)
+        if stats is None:
+            self.out.append("  rings            : unavailable")
+        else:
+            if stats.get("cq_address"):
+                cq_address = " cq={:#x}".format(stats["cq_address"])
+            else:
+                cq_address = ""
+            if stats.get("heuristic"):
+                source = " (validated memory layout)"
+            else:
+                source = ""
+            self.out.append("  rings            : {:#x}{:s}{:s}".format(stats["address"], cq_address, source))
+            self.out.append("    SQ head={:s} tail={:s} mask={:s} entries={:s} dropped={:s} flags={:s}".format(
+                self.format_optional(stats.get("sq_head")), self.format_optional(stats.get("sq_tail")),
+                self.format_optional(stats.get("sq_mask")), self.format_optional(stats.get("sq_entries")),
+                self.format_optional(stats.get("dropped")), self.format_optional(stats.get("sq_flags")),
+            ))
+            self.out.append("    CQ head={:s} tail={:s} mask={:s} entries={:s} overflow={:s} flags={:s}".format(
+                self.format_optional(stats.get("cq_head")), self.format_optional(stats.get("cq_tail")),
+                self.format_optional(stats.get("cq_mask")), self.format_optional(stats.get("cq_entries")),
+                self.format_optional(stats.get("overflow")), self.format_optional(stats.get("cq_flags")),
+            ))
+
+        self.dump_workers(ctx, owners)
+        self.dump_registered_files(ctx)
+        self.dump_registered_buffers(ctx)
+        if not self.args.no_requests:
+            if GefUtil.type_size("struct io_ring_ctx") is None or GefUtil.type_size("struct io_kiocb") is None:
+                self.out.append("  requests         : unavailable (layout information is required)")
+            else:
+                self.dump_requests(self.collect_requests(ctx))
+        return
+
+    def detect_address_type(self, address):
+        if self.context_score(address):
+            return "ctx"
+        if self.request_context(address) and self.context_score(self.request_context(address)):
+            return "request"
+        if self.is_ring_path(self.path_for_file(address)):
+            return "file"
+        return None
+
+    def print_meta(self):
+        self.quiet_info("kernel version: {!s}".format(self.kversion))
+        for type_name in ["struct file", "struct io_ring_ctx", "struct io_kiocb", "struct io_uring_task",
+                          "struct io_mapped_ubuf", "struct io_rsrc_node"]:
+            size = GefUtil.type_size(type_name)
+            self.quiet_info("sizeof({:s}): {:s}".format(
+                type_name.replace("struct ", ""),
+                "unavailable" if size is None else "{:#x}".format(size),
+            ))
+        for type_name, member in [
+            ("struct file", "private_data"), ("struct io_ring_ctx", "rings"),
+            ("struct io_ring_ctx", "file_table"), ("struct io_ring_ctx", "buf_table"),
+            ("struct io_ring_ctx", "nr_user_files"), ("struct io_ring_ctx", "nr_user_bufs"),
+            ("struct io_kiocb", "opcode"), ("struct io_kiocb", "ctx"),
+            ("struct task_struct", "io_uring"),
+        ]:
+            offset = GefUtil.offsetof(type_name, member)
+            self.quiet_info("offsetof({:s}, {:s}): {:s}".format(
+                type_name.replace("struct ", ""), member,
+                "unavailable" if offset is None else "{:#x}".format(offset),
+            ))
+        return
+
+    def initialize(self):
+        self.meta = []
+        self.kversion = Kernel.version()
+        if self.kversion is None:
+            self.meta.append((self.quiet_err, "Could not find Linux kernel"))
+            return None
+        # the task list and the VFS are needed only to find the rings from the fds
+        self.task_command = False
+        self.kpath = False
+        return True
+
+    @parse_args
+    @only_if_gdb_running
+    @only_if_specific_gdb_mode(mode=("qemu-system", "vmware", "kgdb"))
+    @only_if_specific_arch(arch=("x86_32", "x86_64", "ARM32", "ARM64", "RISCV32", "RISCV64"))
+    @only_if_in_kernel_or_kpti_disabled
+    def do_invoke(self, args):
+        self.args = args
+        if args.fd is not None and args.pid is None:
+            err("--fd requires --pid")
+            return
+        if args.fd is not None and args.fd < 0:
+            err("FD must not be negative")
+            return
+        self.quiet_info("Wait for memory scan")
+        if not self.initialize():
+            for func, line in self.meta:
+                func(line)
+            self.quiet_err("Failed to initialize")
+            return
+        if self.kversion < "5.1":
+            self.quiet_warn("This kernel predates io_uring, which first appeared in mainline v5.1")
+            return
+        if args.meta:
+            fd_scan = self.get_task_command() is not None and self.get_kpath() is not None
+            for func, line in self.meta:
+                func(line)
+            self.print_meta()
+            self.quiet_info("ring discovery from fds: {:s}".format("available" if fd_scan else "unavailable"))
+            return
+
+        self.out = []
+        if args.address is not None:
+            if args.type != "auto":
+                address_type = args.type
+            else:
+                address_type = self.detect_address_type(args.address)
+            if address_type == "request":
+                ctx = self.request_context(args.address)
+                if not self.context_score(ctx):
+                    self.err_add_out("Could not validate request->ctx for {:#x}".format(args.address))
+                else:
+                    self.dump_context(ctx, [])
+                    self.dump_requests([(args.address, "selected")])
+            elif address_type == "file":
+                path = self.path_for_file(args.address)
+                ctx, source = self.context_from_file(args.address)
+                if self.kpath is None:
+                    for func, line in self.meta:
+                        func(line)
+                    self.err_add_out("An io_uring file cannot be verified without the VFS object layout")
+                elif not self.is_ring_path(path) or ctx is None:
+                    self.err_add_out("Could not interpret {:#x} as an io_uring file".format(args.address))
+                else:
+                    self.dump_context(ctx, [{"file": args.address, "path": path, "ctx_source": source}])
+            elif address_type == "ctx":
+                if not self.context_score(args.address):
+                    self.err_add_out("Could not validate io_ring_ctx at {:#x}".format(args.address))
+                else:
+                    self.dump_context(args.address, [])
+            else:
+                self.err_add_out("Could not identify {:#x} as io_ring_ctx, io_kiocb or io_uring file".format(args.address))
+            self.print_output(check_terminal_size=True)
+            return
+
+        ring_files = self.find_ring_files()
+        if ring_files is None:
+            for func, line in self.meta:
+                func(line)
+            self.quiet_err("Failed to initialize the fd scan (ADDRESS with --type ctx/request does not need it)")
+            return
+        contexts = collections.OrderedDict()
+        unresolved = []
+        for owner in ring_files:
+            if owner["ctx"] is None:
+                unresolved.append(owner)
+            else:
+                contexts.setdefault(owner["ctx"], []).append(owner)
+        for ctx, owners in contexts.items():
+            self.dump_context(ctx, owners)
+        for owner in unresolved:
+            self.warn_add_out("Found {:s}[{:d}] fd={:d} file={:#x}, but file->private_data could not be resolved".format(
+                owner["comm"], owner["pid"], owner["fd"], owner["file"],
+            ))
+        if not ring_files:
+            self.warn_add_out("No open io_uring file descriptors found")
+        self.print_output(check_terminal_size=True)
+        return
+
+
+
+@register_command
+class KernelLsmCommand(GenericCommand, BufferingOutput):
+    """Dump the registered Linux Security Module hooks."""
+
+    _cmdline_ = "klsm"
+    _category_ = "06-g. Qemu-system/KGDB Cooperation - Linux Advanced"
+
+    parser = argparse.ArgumentParser(prog=_cmdline_)
+    parser.add_argument("hook", metavar="HOOK", nargs="*", help="the hook point name, or a part of it. (e.g., file_open)")
+    parser.add_argument("-hh", "--help-simple", action="store_true", help="show help without ASCII diagram.")
+    parser.add_argument("-a", "--all", action="store_true", help="also show the hook points that have no callback.")
+    parser.add_argument("--task", action="store_true", help="show the LSM security blobs of each task instead of the hooks.")
+    parser.add_argument("-p", "--pid", type=lambda x: int(x, 0), help="with --task, filter by task pid.")
+    parser.add_argument("-T", "--task-filter", action="append", type=AddressUtil.parse_address, default=[],
+                        help="with --task, filter by specific task_struct address.")
+    parser.add_argument("-f", "--filter", action="append", type=re.compile, default=[], help="with --task, comm string REGEXP filter.")
+    parser.add_argument("-v", "--verbose", action="store_true", help="with --task, decode the blobs of the open files of each task too.")
+    parser.add_argument("--meta", action="store_true", help="display offset information.")
+    parser.add_argument("-n", "--no-pager", action="store_true", help="do not use the pager.")
+    parser.add_argument("-q", "--quiet", action="store_true", help="show result only.")
+    _syntax_ = parser.format_help()
+
+    _example_ = [
+        "{0:s}                   # list every hook point that has a callback",
+        "{0:s} file_open         # list the callbacks of the hook points matching `file_open`",
+        "{0:s} -a                # list every hook point including the empty ones",
+        "{0:s} --task            # list the security blob and the LSM labels of each task",
+        "{0:s} --task -p 1337    # decode the blobs of the task, its cred and its open files and inodes",
+    ]
+    _example_ = "\n".join(_example_).format(_cmdline_)
+
+    _note_ = [
+        "The layout of the LSM framework changed twice, and all three are supported:",
+        "",
+        "  ~v4.1  : a single `struct security_operations` pointed to by `security_ops`",
+        "  v4.2~  : `security_hook_heads`, an array of the lists of `struct security_hook_list`",
+        "  v6.12~ : one static call slot per (hook point, LSM), `__SCK__lsm_static_call_*`",
+        "",
+        "+-security_ops(~v4.1)-+",
+        "| name[]              |",
+        "| ptrace_access_check |--> callback",
+        "| ptrace_traceme      |--> callback",
+        "| ...                 |",
+        "+---------------------+",
+        "",
+        "+-security_hook_heads(v4.2~)-+     +-security_hook_list--+",
+        "| ptrace_access_check        |---->| list                |--> next hook_list",
+        "| ptrace_traceme             |     | head                |--> the head at the left",
+        "| ...                        |     | hook                |--> callback",
+        '+----------------------------+     | lsm (v4.12~)        |--> "selinux"',
+        "                                   +---------------------+",
+        "",
+        "+-__SCK__lsm_static_call_<hook>_<N>(v6.12~)-+",
+        "| func                                      |--> callback",
+        "+-------------------------------------------+",
+        "",
+        "Before v6.12, hook point names are recovered from each `security_*` dispatcher and",
+        "the head or member offset it references. A head that no dispatcher pointed at is",
+        "shown as `hook[NN]`. On v6.12 and later, names are read from generated static-call",
+        "symbols such as `__SCK__lsm_static_call_<hook>_<N>`.",
+        "",
+        "When CONFIG_KALLSYMS_ALL=n removes these data symbols, x86 decodes the trampolines",
+        "`__SCT__lsm_static_call_<hook>_<N>` (text symbols), and the other architectures take",
+        "the keys each `security_*` dispatcher loads. The latter names a hook point after its",
+        "dispatcher and misses the ones no dispatcher calls (e.g., inode_free_security_rcu).",
+        "",
+        "`--task` follows the security blobs instead. Until v5.0 the active major LSM owns each",
+        "blob as a whole. From v5.1 the LSMs share one blob per object, and the offset of each",
+        "part is read from `<lsm>_blob_sizes`; without the symbol it is guessed from the samples.",
+        "",
+        "+-task_struct-+                    +-cred-----+     +-file-------+    +-inode------+",
+        "| security    |--> blob (v5.1~)    | ...      |     | ...        |    | i_sb       |",
+        "| cred        |------------------->| security |-+   | f_security |-+  | i_mapping  |",
+        "+-------------+                    +----------+ |   +------------+ |  | i_security |-+",
+        "                                                |                  |  +------------+ |",
+        "   +-blob--------------+ <----------------------+------------------+-----------------+",
+        "   | part of LSM A     | <-- offset from <lsmA>_blob_sizes.lbs_*",
+        "   | part of LSM B     | <-- offset from <lsmB>_blob_sizes.lbs_*",
+        "   +-------------------+",
+        "",
+        "SELinux, Smack, AppArmor, TOMOYO and Landlock parts are decoded. This mode requires",
+        "CONFIG_RANDSTRUCT=n unless vmlinux with debug information is loaded.",
+    ]
+    _note_ = "\n".join(_note_)
+
+    SCK_PREFIX = "__SCK__lsm_static_call_"
+    SCT_PREFIX = "__SCT__lsm_static_call_"
+
+    # the prefixes the hook callbacks of each LSM use, tried from the longest one
+    LSM_PREFIXES = (
+        ("apparmor", "apparmor_"), ("apparmor", "aa_"),
+        ("bpf", "bpf_lsm_"),
+        ("capability", "cap_"),
+        ("evm", "evm_"),
+        ("ima", "ima_"),
+        ("integrity", "integrity_"),
+        ("ipe", "ipe_"),
+        ("landlock", "landlock_"), ("landlock", "hook_"),
+        ("loadpin", "loadpin_"),
+        ("lockdown", "lockdown_"),
+        ("safesetid", "safesetid_"),
+        ("selinux", "selinux_"),
+        ("smack", "smack_"), ("smack", "smk_"),
+        ("tomoyo", "tomoyo_"),
+        ("yama", "yama_"),
+    )
+
+    @staticmethod
+    def format_addr(value):
+        return Color.colorify(AddressUtil.format_address(value), "bold blue")
+
+    def read_cstring(self, addr, size=32):
+        """Read a NUL-terminated ASCII string, or return '' if it is not one."""
+        if not addr or not is_valid_addr(addr):
+            return ""
+        data = read_memory(addr, size, safe=True)
+        if data is None:
+            return ""
+        data = data.split(b"\0")[0]
+        if not data or not all(0x20 <= c < 0x7f for c in bytearray(data)):
+            return ""
+        return String.bytes2str(data)
+
+    def read_lsm_name(self, addr):
+        """Decode either an old `char *lsm` or a new `struct lsm_id *lsmid`."""
+        if not addr or not is_valid_addr(addr):
+            return ""
+
+        # struct lsm_id { const char *name; u64 id; }.  Resolve `name` from
+        # DWARF when present, while retaining offset zero as the ABI fallback.
+        offsets = [0]
+        dwarf_offset = GefUtil.offsetof("lsm_id", "name")
+        if dwarf_offset is not None and dwarf_offset not in offsets:
+            offsets.insert(0, dwarf_offset)
+        for offset in offsets:
+            name_ptr = read_int_from_memory(addr + offset, safe=True)
+            if name_ptr is None:
+                continue
+            name = self.read_cstring(name_ptr, 32)
+            if re.fullmatch(r"[a-z][a-z0-9_]{1,31}", name):
+                return name
+
+        # v4.12-era security_hook_list stored the string pointer directly.
+        name = self.read_cstring(addr, 32)
+        if re.fullmatch(r"[a-z][a-z0-9_]{1,31}", name):
+            return name
+        return ""
+
+    def is_kernel_text(self, addr):
+        if not addr:
+            return False
+        layout = self.klayout
+        if layout is None or not layout.text_base or not layout.text_end:
+            return False
+        if layout.text_base <= addr < layout.text_end:
+            return True
+        # a module may register hooks too
+        consts = KernelAddressHeuristicFinder.consts()
+        if consts is None or not consts.MODULES_VADDR:
+            return False
+        return consts.MODULES_VADDR <= addr < consts.MODULES_END
+
+    def extract_data_refs(self, res):
+        """Return the addresses of the globals the disassembled code refers to."""
+        lea_rip = r"lea\s+\w+,\s*\[rip[+-]0x\w+\].*#\s*(0x\w+)"
+        if is_x86_64():
+            g = itertools.chain(
+                KernelAddressHeuristicFinderUtil.x64_qword_ptr_rip_base(res),
+                KernelAddressHeuristicFinderUtil.common_addr_gen(res, lea_rip, 0, False, False),
+                # a kCFI build materializes the head with `mov reg, imm64` instead
+                KernelAddressHeuristicFinderUtil.x64_x86_mov_reg_const(res),
+            )
+        elif is_x86_32():
+            g = itertools.chain(
+                KernelAddressHeuristicFinderUtil.x86_ds_absolute(res),
+                KernelAddressHeuristicFinderUtil.x64_x86_mov_reg_const(res),
+            )
+        elif is_arm64():
+            g = itertools.chain(
+                KernelAddressHeuristicFinderUtil.aarch64_adrp_ldr(res, allow_add=True),
+                KernelAddressHeuristicFinderUtil.aarch64_adrp_add(res),
+            )
+        elif is_arm32():
+            g = itertools.chain(
+                KernelAddressHeuristicFinderUtil.arm32_movw_movt_ldr(res),
+                KernelAddressHeuristicFinderUtil.arm32_movw_movt(res),
+                KernelAddressHeuristicFinderUtil.arm32_ldr_pc_relative_ldr(res),
+                KernelAddressHeuristicFinderUtil.arm32_ldr_pc_relative(res),
+            )
+        elif is_riscv32() or is_riscv64():
+            # gcc may materialize the address of the whole array and load a head at an offset from it,
+            # so take the loaded heads before the addresses themselves
+            g = itertools.chain(
+                KernelAddressHeuristicFinderUtil.riscv_auipc_gen(res, False, True, 0, False, False, word_only=True, follow_addi=True),
+                KernelAddressHeuristicFinderUtil.riscv_auipc_addi(res),
+            )
+        else:
+            return []
+        # `get_kernel_image_range()` stops at the RW range gef could detect, and the array
+        # sits past it on many builds, so only reject what cannot be a head at all.
+        refs = []
+        for x in g:
+            if x is None or x % runtime.current_arch.ptrsize:
+                continue
+            if not KernelAddressHeuristicFinderUtil.is_kernel_space(x) or self.is_kernel_text(x):
+                continue
+            if x not in refs:
+                refs.append(x)
+        return refs
+
+    def extract_call_displacement(self, res):
+        """Return the member offset of the indirect call the dispatcher makes, or None."""
+        if is_x86():
+            m = re.search(r"call\s+(?:[QD]WORD PTR\s+)?\[\w+(?:\+(0x\w+))?\]", res)
+            if m:
+                if m.group(1):
+                    return int(m.group(1), 16)
+                return 0
+            return None
+        if is_arm64() or is_arm32():
+            loaded = {}
+            for line in res.splitlines():
+                m = re.search(r"ldr\s+(\w+),\s*\[\w+(?:,\s*#(\d+))?\]", line)
+                if m:
+                    if m.group(2):
+                        loaded[m.group(1)] = int(m.group(2), 0)
+                    else:
+                        loaded[m.group(1)] = 0
+                    continue
+                m = re.search(r"bl[rx]\s+(\w+)", line)
+                if m and m.group(1) in loaded:
+                    return loaded[m.group(1)]
+            return None
+        return None
+
+    def iter_dispatchers(self, count=None):
+        """Yield (hook name, disassembly) of each `security_*` function."""
+        ret = Ksym.get_kallsyms()
+        if ret is None:
+            return
+        kallsyms, _kallsyms_map = ret
+        if count is None:
+            # RVC halves most instructions, and the head is often loaded after a call that allocates something
+            if is_riscv32() or is_riscv64():
+                count = 64
+            else:
+                count = 40
+        seen = set()
+        for addr, name, typ in sorted(kallsyms):
+            if typ.lower() not in ("t", "w"):
+                continue
+            if not name.startswith("security_") or "." in name:
+                continue
+            hook = name[len("security_"):]
+            if not hook or hook in seen:
+                continue
+            seen.add(hook)
+            try:
+                res = KernelAddressHeuristicFinderUtil.disassemble_until_next_symbol(addr, count)
+            except gdb.error:
+                continue
+            yield hook, res
+        return
+
+    @staticmethod
+    def hook_name_from_callback(func_name, lsm):
+        """Guess the hook point name from the name of one of its callbacks."""
+        if not func_name:
+            return None
+        prefixes = []
+        if lsm:
+            prefixes.append("{:s}_".format(lsm))
+            prefixes += [p for name, p in KernelLsmCommand.LSM_PREFIXES if name == lsm]
+        prefixes += [p for _name, p in KernelLsmCommand.LSM_PREFIXES]
+        for prefix in sorted(set(prefixes), key=len, reverse=True):
+            if func_name.startswith(prefix) and len(func_name) > len(prefix):
+                return func_name[len(prefix):]
+        return None
+
+    #
+    # v6.12 or later: one static call slot per (hook point, LSM)
+    #
+
+    def collect_static_calls(self):
+        """Return {hook name: [(slot, key address, callback), ...]} built from the static call keys."""
+        ret = Ksym.get_kallsyms()
+        if ret is None:
+            return {}
+        kallsyms, _kallsyms_map = ret
+        hooks = {}
+        for addr, name, _typ in kallsyms:
+            if not name.startswith(self.SCK_PREFIX):
+                continue
+            hook, _sep, slot = name[len(self.SCK_PREFIX):].rpartition("_")
+            if not hook or not slot.isdigit():
+                continue
+            func = read_int_from_memory(addr, safe=True)
+            if func is None:
+                continue
+            hooks.setdefault(hook, []).append((int(slot), addr, func))
+        for entries in hooks.values():
+            entries.sort()
+        return hooks
+
+    def collect_static_call_trampolines(self):
+        """Return {hook name: [(slot, trampoline address, callback), ...]} decoded from the trampolines.
+        CONFIG_HAVE_STATIC_CALL (x86) generates a text symbol `__SCT__lsm_static_call_<hook>_<N>` for each slot,
+        which remains even if CONFIG_KALLSYMS_ALL=n. static_call_update() rewrites it into `jmp callback`,
+        or `ret` (or a jump to the return thunk) for an empty slot."""
+        if not is_x86():
+            return {}
+        ret = Ksym.get_kallsyms()
+        if ret is None:
+            return {}
+        kallsyms, _kallsyms_map = ret
+        hooks = {}
+        for addr, name, _typ in kallsyms:
+            if not name.startswith(self.SCT_PREFIX):
+                continue
+            hook, _sep, slot = name[len(self.SCT_PREFIX):].rpartition("_")
+            if not hook or not slot.isdigit():
+                continue
+            code = read_memory(addr, 5, safe=True)
+            if code is None:
+                continue
+            func = 0
+            if code[0] == 0xe9: # jmp rel32
+                target = AddressUtil.normalize_address(addr + 5 + struct.unpack("<i", code[1:5])[0])
+                if (self.is_kernel_text(target)
+                        and "return_thunk" not in Symbol.format(target, ksym="prefer", bracket="")):
+                    func = target
+            hooks.setdefault(hook, []).append((int(slot), addr, func))
+        for entries in hooks.values():
+            entries.sort()
+        return hooks
+
+    def trace_dispatcher_refs(self, res):
+        """Return (the addresses of the globals whose value is called in the slot order, every global address
+        materialized) in the disassembled dispatcher of ARM32, ARM64 or RISC-V, e.g. `adrp x21;
+        add x21, x21, #lo; ldr x1, [x21, #off]; blr x1`. The base registers are tracked through the listing
+        in address order.
+        The call of each slot sits in an out-of-line block, and neither the block order nor the key address
+        order is the slot order. The main flow checks the slots in order and branches to the blocks
+        (a patched jump label, or `ldr; cmp; bgt` without CONFIG_JUMP_LABEL), so the calls are sorted by
+        the first branch into their block. The calls that no branch reaches follow in the code order."""
+        if is_arm64():
+            patterns = {
+                "base": r"adrp\s+(x\d+),\s*(0x[0-9a-f]+)",
+                "add": r"add\s+(x\d+),\s*(x\d+),\s*#(0x[0-9a-f]+|\d+)$",
+                "load": r"ldr\s+(x\d+),\s*\[(x\d+)(?:,\s*#(-?(?:0x[0-9a-f]+|\d+)))?\](?:\s*//.*)?$",
+                "icall": r"blr\s+(x\d+)",
+                "call": r"bl\s",
+                "branch": r"(?:b|b\.\w+|cbn?z\s+\w+,|tbn?z\s+\w+,\s*#\d+,)\s*(0x[0-9a-f]+)",
+                "jump": r"b\s",
+                "return": r"ret\b|br\s",
+            }
+            no_write = r"st\w*|cmp|cmn|tst|cbn?z|tbn?z|b|b\.\w+|br|blr|bl|ret|nop|ccmp|prfm|hint|bti|pac\w*|aut\w*"
+        elif is_arm32():
+            patterns = {
+                "movw": r"movw\s+(\w+),.*@\s*(0x[0-9a-f]+)",
+                "movt": r"movt\s+(\w+),.*@\s*(0x[0-9a-f]+)",
+                "literal": r"ldr\s+(\w+),\s*\[pc,\s*#-?\d+\]\s*@\s*(0x[0-9a-f]+)",
+                "add": r"add\s+(\w+),\s*(\w+),\s*#(\d+)",
+                "load": r"ldr\s+(\w+),\s*\[(\w+)(?:,\s*#(-?\d+))?\](?:\s*@.*)?$",
+                "icall": r"blx\s+(\w+)",
+                "call": r"bl\s",
+                "branch": r"b(?:[a-z]{2})?\s+(0x[0-9a-f]+)",
+                "jump": r"b\s",
+                "return": r"bx\s+lr|(?:ldm\w*|pop)\s+.*\bpc\}",
+            }
+            no_write = r"str\w*|stm\w*|push|cmp|cmn|tst|teq|b|b[a-z]{2}|bx|blx|bl|nop"
+        elif is_riscv32() or is_riscv64():
+            patterns = {
+                "auipc": r"auipc\s+(\w+),\s*(0x[0-9a-f]+|\d+)",
+                "add": r"addi\s+(\w+),\s*(\w+),\s*(-?\d+)",
+                "load": r"(?:ld|lw)\s+(\w+),\s*(-?\d+)\((\w+)\)",
+                "icall": r"jalr\s+(?:\w+,\s*(?:0)?\()?(\w+)\)?$",
+                "call": r"(?:jal|call|tail)\s|jalr\s+-?\d+\(",
+                "branch": r"(?:j|b\w+\s+\w+,(?:\s*\w+,)?)\s*(0x[0-9a-f]+)",
+                "jump": r"j\s",
+                "return": r"ret\b|jr\s",
+            }
+            no_write = r"s[bhwd]|b\w*|j|jr|jalr|ret|fence\S*|nop|wfi"
+        else:
+            return [], []
+
+        bases = {}
+        loaded = {}
+        called = []
+        branches = []
+        materialized = []
+        # the registers at each branch are taken to its target, which is reached after an epilogue in the listing
+        pending = {}
+        dead = False
+        for line in res.splitlines():
+            m = re.match(r"\s*(?:=>\s*)?(0x[0-9a-f]+)(?:\s+<[^>]*>)?:\s*(\S+)\s*(.*)", line)
+            if not m:
+                continue
+            pc, mnemonic = int(m.group(1), 16), m.group(2)
+            insn = "{:s} {:s}".format(mnemonic, m.group(3).strip())
+            if pc in pending:
+                if dead:
+                    bases, loaded = dict(pending[pc][0]), dict(pending[pc][1])
+                else:
+                    bases, loaded = dict(pending[pc][0], **bases), dict(pending[pc][1], **loaded)
+            dead = False
+            written = None
+            m = re.match(patterns["branch"], insn)
+            if m:
+                target = int(m.group(1), 16)
+                branches.append((pc, target))
+                pending.setdefault(target, (dict(bases), dict(loaded)))
+                dead = bool(re.match(patterns["jump"], insn))
+                continue
+            if re.match(patterns["return"], insn):
+                dead = True
+                continue
+            # A call does not forget the caller-saved registers, since the blocks after it are often
+            # reached by branches with those registers restored (e.g. `ldrd r2, [r11, #-28]` on ARM32).
+            m = re.match(patterns["icall"], insn)
+            if m:
+                if m.group(1) in loaded:
+                    called.append((pc, loaded[m.group(1)]))
+                continue
+            if re.match(patterns["call"], insn):
+                continue
+            if "base" in patterns and re.match(patterns["base"], insn):
+                m = re.match(patterns["base"], insn)
+                bases[m.group(1)] = int(m.group(2), 16)
+                loaded.pop(m.group(1), None)
+                materialized.append(bases[m.group(1)])
+                continue
+            if "auipc" in patterns and re.match(patterns["auipc"], insn):
+                m = re.match(patterns["auipc"], insn)
+                hi20 = int(m.group(2), 0) & 0xfffff
+                if hi20 & 0x80000:
+                    hi20 -= 0x100000
+                bases[m.group(1)] = AddressUtil.normalize_address(pc + (hi20 << 12))
+                loaded.pop(m.group(1), None)
+                continue
+            if "movw" in patterns:
+                m = re.match(patterns["movw"], insn)
+                if m:
+                    bases[m.group(1)] = int(m.group(2), 16)
+                    loaded.pop(m.group(1), None)
+                    continue
+                m = re.match(patterns["movt"], insn)
+                if m and m.group(1) in bases:
+                    bases[m.group(1)] = (bases[m.group(1)] & 0xffff) | (int(m.group(2), 16) << 16)
+                    materialized.append(bases[m.group(1)])
+                    continue
+                m = re.match(patterns["literal"], insn)
+                if m:
+                    value = read_int_from_memory(int(m.group(2), 16), safe=True)
+                    if value is not None:
+                        bases[m.group(1)] = value
+                        loaded.pop(m.group(1), None)
+                        materialized.append(value)
+                        continue
+            m = re.match(patterns["add"], insn)
+            if m and m.group(2) in bases:
+                bases[m.group(1)] = AddressUtil.normalize_address(bases[m.group(2)] + int(m.group(3), 0))
+                loaded.pop(m.group(1), None)
+                materialized.append(bases[m.group(1)])
+                continue
+            m = re.match(patterns["load"], insn)
+            if m:
+                if is_riscv32() or is_riscv64():
+                    dst, offset, base = m.group(1), m.group(2), m.group(3)
+                else:
+                    dst, base, offset = m.group(1), m.group(2), m.group(3)
+                if base in bases:
+                    addr = AddressUtil.normalize_address(bases[base] + int(offset or "0", 0))
+                    materialized.append(addr)
+                    bases.pop(dst, None)
+                    loaded[dst] = addr
+                    continue
+            # any other instruction overwrites its first operand
+            if not re.fullmatch(no_write, mnemonic):
+                m = re.match(r"\S+\s+(\w+)", insn)
+                if m:
+                    written = re.sub(r"^w(\d+)$", r"x\1", m.group(1))
+                    bases.pop(written, None)
+                    loaded.pop(written, None)
+
+        # the block of a call is the few instructions before it
+        first_branch = {}
+        for pc, target in sorted(branches):
+            for call_pc, key in called:
+                if 0 <= call_pc - target <= 0x40:
+                    first_branch.setdefault(key, pc)
+                    break
+        keys = list(dict.fromkeys(key for _pc, key in called))
+        keys.sort(key=lambda x: (x not in first_branch, first_branch.get(x, 0)))
+        return keys, list(dict.fromkeys(materialized))
+
+    # the hook points whose dispatcher has another name, which the static call keys are named after
+    DISPATCHER_HOOK_NAMES = {
+        "bprm_check": "bprm_check_security",
+        "file_alloc": "file_alloc_security", "file_free": "file_free_security",
+        "inode_alloc": "inode_alloc_security", "inode_free": "inode_free_security",
+        "sb_alloc": "sb_alloc_security", "sb_free": "sb_free_security",
+        "msg_msg_alloc": "msg_msg_alloc_security", "msg_msg_free": "msg_msg_free_security",
+        "msg_queue_alloc": "msg_queue_alloc_security", "msg_queue_free": "msg_queue_free_security",
+        "shm_alloc": "shm_alloc_security", "shm_free": "shm_free_security",
+        "sem_alloc": "sem_alloc_security", "sem_free": "sem_free_security",
+        "sk_alloc": "sk_alloc_security", "sk_free": "sk_free_security", "sk_clone": "sk_clone_security",
+        "sock_rcv_skb": "socket_sock_rcv_skb",
+        "prepare_creds": "cred_prepare", "transfer_creds": "cred_transfer",
+        "settime64": "settime", "free_mnt_opts": "sb_free_mnt_opts", "create_user_ns": "userns_create",
+        "vm_enough_memory_mm": "vm_enough_memory",
+        "xfrm_policy_alloc": "xfrm_policy_alloc_security", "xfrm_policy_free": "xfrm_policy_free_security",
+        "xfrm_policy_delete": "xfrm_policy_delete_security", "xfrm_state_free": "xfrm_state_free_security",
+        "xfrm_state_delete": "xfrm_state_delete_security",
+    }
+
+    def collect_static_call_dispatchers(self):
+        """Return {hook name: [(slot, key address, callback), ...]} built from the keys the dispatchers load.
+        Without CONFIG_HAVE_STATIC_CALL, a static call loads `key.func` and calls it, so a dispatcher calls
+        through every key of its hook point, and the keys of a hook point are adjacent. A few dispatchers iterate
+        `static_calls_table.<hook>[]` (struct lsm_static_call {key, trampoline, hl, active}) instead, which
+        holds the keys in the slot order.
+        Some dispatchers call another hook point too (e.g. inode_xattr_skipcap from security_inode_setxattr()),
+        so a key belongs to the dispatcher that refers to the fewest keys, and a dispatcher that owns several
+        hook points is split by the number of slots."""
+        ptrsize = runtime.current_arch.ptrsize
+        refs = {}
+        table_refs = {}
+        for hook, res in self.iter_dispatchers(count=400):
+            hook = self.DISPATCHER_HOOK_NAMES.get(hook, hook)
+            called, materialized = self.trace_dispatcher_refs(res)
+            keys = []
+            for addr in called:
+                value = read_int_from_memory(addr, safe=True)
+                if value is not None and (value == 0 or self.is_kernel_text(value)):
+                    keys.append(addr)
+            for addr in materialized:
+                value = read_int_from_memory(addr, safe=True)
+                if value and not self.is_kernel_text(value) and is_valid_addr(value):
+                    table_refs.setdefault(hook, []).append(addr)
+            refs[hook] = keys
+
+        counts = collections.Counter(len(keys) for keys in refs.values() if keys)
+        if not counts:
+            return {}
+        nr_slots = counts.most_common(1)[0][0]
+
+        stride = ptrsize * 4
+        for hook, candidates in table_refs.items():
+            for addr in candidates:
+                try:
+                    entries = [slice_unpack(read_memory(addr + stride * i, stride), ptrsize) for i in range(nr_slots)]
+                    keys = [key for key, _trampoline, _hl, _active in entries]
+                    funcs = [read_int_from_memory(key) for key in keys]
+                except (gdb.MemoryError, OverflowError):
+                    continue
+                # the trampoline is NULL without CONFIG_HAVE_STATIC_CALL, and every slot has its static key
+                if any(trampoline or not is_valid_addr(active) for _key, trampoline, _hl, active in entries):
+                    continue
+                # the keys of a hook point are adjacent, while other variables may be between them
+                if len(set(keys)) != nr_slots or max(keys) - min(keys) >= stride * nr_slots:
+                    continue
+                if any(func and not self.is_kernel_text(func) for func in funcs):
+                    continue
+                refs[hook] = list(dict.fromkeys(refs[hook] + keys))
+
+        owners = {}
+        for hook, keys in sorted(refs.items(), key=lambda x: (len(x[1]), len(x[0]), x[0])):
+            for key in keys:
+                owners.setdefault(key, hook)
+
+        hooks = {}
+        for hook, keys in sorted(refs.items()):
+            keys = [key for key in keys if owners[key] == hook]
+            if not keys:
+                continue
+            # the keys of each hook point are adjacent, while the slot order is the order in `refs`
+            groups = [keys]
+            if len(keys) > nr_slots and len(keys) % nr_slots == 0:
+                by_address = sorted(keys)
+                groups = [sorted(by_address[i:i + nr_slots], key=keys.index) for i in range(0, len(keys), nr_slots)]
+            unnamed = []
+            for group in groups:
+                # the slots are filled from the first one, so the empty keys follow
+                funcs = {key: read_int_from_memory(key) for key in group}
+                group = sorted(group, key=lambda x: not funcs[x])
+                entries = [(slot, key, funcs[key]) for slot, key in enumerate(group)]
+                guessed = None
+                if len(groups) > 1 and funcs[group[0]]:
+                    name = Symbol.format(funcs[group[0]], ksym="prefer", bracket="")
+                    guessed = self.hook_name_from_callback(name, None)
+                if guessed and guessed != hook:
+                    hooks.setdefault(guessed + " (guessed)", entries)
+                else:
+                    unnamed.append(entries)
+            # the one that has callbacks is its own hook point among the ones that cannot be named
+            unnamed.sort(key=lambda x: -sum(1 for _slot, _key, func in x if func))
+            for i, entries in enumerate(unnamed):
+                hooks.setdefault(hook if i == 0 else "{:s} (another hook point {:d})".format(hook, i), entries)
+        return hooks
+
+    def dump_static_calls(self):
+        sources = [
+            ("the static call keys", self.collect_static_calls),
+            ("the static call trampolines", self.collect_static_call_trampolines),
+            ("the keys the dispatchers load", self.collect_static_call_dispatchers),
+        ]
+        hooks = source = None
+        for name, collect in sources:
+            hooks = collect()
+            if hooks:
+                source = name
+                break
+        if not hooks:
+            self.err_add_out("Could not find the static calls of the hook points")
+            return
+        self.quiet_info_add_out("LSM framework: static calls (v6.12 or later)")
+        self.quiet_info_add_out("Static calls resolved from: {:s}".format(source))
+        self.quiet_info_add_out("Number of the hook points: {:d}".format(len(hooks)))
+        if source == "the static call trampolines":
+            where = "trampoline"
+        else:
+            where = "key"
+
+        resolved = {}
+        lsms = set()
+        for hook, entries in hooks.items():
+            callbacks = []
+            for slot, addr, func in entries:
+                if not func:
+                    continue
+                name = Symbol.format(func, ksym="prefer", bracket="")
+                callbacks.append((slot, addr, func, name))
+                lsm = self.lsm_of_callback(name)
+                if lsm:
+                    lsms.add(lsm)
+            resolved[hook] = callbacks
+        self.dump_lsm_list(lsms)
+
+        for hook in sorted(resolved):
+            callbacks = resolved[hook]
+            if not callbacks and not self.args.all:
+                continue
+            if not self.match_filter(hook):
+                continue
+            self.out.append("{:s} ({:d} callback{:s})".format(hook, len(callbacks), "" if len(callbacks) == 1 else "s"))
+            for slot, addr, func, name in callbacks:
+                line = "    {:s} <{:s}>".format(self.format_addr(func), name or "NO_SYMBOL")
+                lsm = self.lsm_of_callback(name)
+                if lsm:
+                    line += " [{:s}]".format(lsm)
+                if self.args.meta:
+                    line += "  (slot {:d}, {:s} {:s})".format(slot, where, self.format_addr(addr))
+                self.out.append(line)
+        return
+
+    def lsm_of_callback(self, name):
+        """Guess which LSM a callback belongs to from its name, or None if it is unknown."""
+        if not name:
+            return None
+        for lsm, prefix in sorted(self.LSM_PREFIXES, key=lambda x: len(x[1]), reverse=True):
+            if name.startswith(prefix):
+                return lsm
+        return None
+
+    #
+    # v4.2 - v6.11: security_hook_heads, an array of the lists of struct security_hook_list
+    #
+
+    def walk_head(self, head, is_list_head, off_head):
+        """Return the `struct security_hook_list`s linked from the head, or None if it is not a valid list.
+        Every node must link back to the previous link and to the head, and hold a kernel text callback,
+        so that a neighboring variable or a kmem_cache is never taken as a hook list."""
+        ptrsize = runtime.current_arch.ptrsize
+        first = read_int_from_memory(head, safe=True)
+        if first is None:
+            return None
+        if is_list_head:
+            last = read_int_from_memory(head + ptrsize, safe=True)
+        if is_list_head:
+            end = head
+        else:
+            end = 0
+        nodes = []
+        prev = head
+        current = first
+        while current != end:
+            if current in nodes or len(nodes) >= 64 or not is_valid_addr(current):
+                return None
+            # `list.prev` of list_head, or `list.pprev` of hlist_node that is the address of the previous `next`
+            back = read_int_from_memory(current + ptrsize, safe=True)
+            owner = read_int_from_memory(current + off_head * ptrsize, safe=True)
+            func = read_int_from_memory(current + (off_head + 1) * ptrsize, safe=True)
+            if back != prev or owner != head or not self.is_kernel_text(func):
+                return None
+            nodes.append(current)
+            prev = current
+            current = read_int_from_memory(current, safe=True)
+            if current is None:
+                return None
+        if is_list_head and last != prev:
+            return None
+        return nodes
+
+    def find_node_offsets(self, anchors):
+        """Return offsetof(security_hook_list, head) in pointers, or None."""
+        for off in range(1, 7):
+            ok = 0
+            for head, node in anchors:
+                try:
+                    if read_int_from_memory(node + off * runtime.current_arch.ptrsize) != head:
+                        break
+                    if not self.is_kernel_text(read_int_from_memory(node + (off + 1) * runtime.current_arch.ptrsize)):
+                        break
+                except gdb.MemoryError:
+                    break
+                ok += 1
+            if ok and ok == len(anchors):
+                return off
+        return None
+
+    def collect_hook_head_refs(self):
+        """Return {hook name: [candidate address, ...]} from the dispatchers' disassembly."""
+        refs = {}
+        for hook, res in self.iter_dispatchers():
+            candidates = self.extract_data_refs(res)
+            if candidates:
+                refs[hook] = candidates
+        return refs
+
+    def find_head_anchors(self, refs):
+        """Return [(head, node), ...] of the candidates that really hold a security_hook_list."""
+        ptrsize = runtime.current_arch.ptrsize
+        anchors = []
+        for candidates in refs.values():
+            for head in candidates:
+                if head % ptrsize:
+                    continue
+                node = read_int_from_memory(head, safe=True)
+                if node is None:
+                    continue
+                if not node or node == head or not is_valid_addr(node):
+                    continue
+                for off in range(1, 7):
+                    try:
+                        if read_int_from_memory(node + off * ptrsize) != head:
+                            continue
+                        if not self.is_kernel_text(read_int_from_memory(node + (off + 1) * ptrsize)):
+                            continue
+                    except gdb.MemoryError:
+                        break
+                    anchors.append((head, node))
+                    break
+        return anchors
+
+    def get_hook_heads_type(self):
+        """Return (sizeof(struct security_hook_heads), {member offset: name}) from the debug type, or (None, {})."""
+        struct_type = GefUtil.cached_lookup_type("struct security_hook_heads")
+        if struct_type is None or not struct_type.sizeof:
+            return None, {}
+        return struct_type.sizeof, {f.bitpos // 8: f.name for f in struct_type.fields()}
+
+    def get_head_array_base(self, refs, anchors, member_names):
+        """Return the address of the security_hook_heads array, or None if it is unknown."""
+        base = Ksym.get_addr("security_hook_heads")
+        if base is not None or not member_names:
+            return base
+        # The debug type tells the offset of each member, so the confirmed heads referred to by the dispatcher
+        # of the same name locate the array.
+        offset_by_name = {name: offset for offset, name in member_names.items()}
+        heads = {h for h, _n in anchors}
+        votes = {}
+        for hook, candidates in refs.items():
+            offset = offset_by_name.get(hook)
+            if offset is None:
+                continue
+            for head in candidates:
+                if head in heads:
+                    votes[head - offset] = votes.get(head - offset, 0) + 1
+        if not votes:
+            return None
+        return max(votes.items(), key=lambda kv: kv[1])[0]
+
+    def get_head_array_range(self, refs, anchors, stride, is_valid_head, is_empty_head, base, sizeof):
+        """Return [start, end) of the security_hook_heads array."""
+        if base is not None and sizeof:
+            return base, base + sizeof
+        heads = sorted({h for h, _n in anchors})
+        if not heads:
+            return None, None
+        lo, hi = heads[0], heads[-1] + stride
+        if base is not None and base <= lo:
+            # The next symbol bounds the array, but a variable that follows it can lack a symbol.
+            ret = Ksym.get_kallsyms()
+            if ret:
+                kallsyms, _kallsyms_map = ret
+            else:
+                kallsyms, _kallsyms_map = ([], {})
+            end = min([a for a, _n, _t in kallsyms if a > base], default=None)
+            if end is not None and hi <= end:
+                lo = base
+                while hi < end and is_valid_head(hi):
+                    hi += stride
+                # the alignment padding before the next variable looks like empty heads
+                referred = {x for candidates in refs.values() for x in candidates}
+                while hi - stride > heads[-1] and hi - stride not in referred and is_empty_head(hi - stride):
+                    hi -= stride
+                return lo, hi
+
+        # Without the symbol the range comes from the heads that were confirmed to hold a hook list, which misses the empty ones
+        # at both ends. Widen it to the heads the dispatchers referred to, as long as every head up to there is a valid list.
+        # A dispatcher that already refers to a head in the range may also refer to a neighbor of the array (e.g. `lsm_inode_cache`
+        # of security_inode_alloc()), so only the dispatchers that have none are used.
+        margin = stride * 0x80
+        changed = True
+        while changed:
+            changed = False
+            for candidates in refs.values():
+                if any(lo <= x < hi for x in candidates):
+                    continue
+                for x in sorted(candidates, key=lambda x: min(abs(x - lo), abs(x - hi))):
+                    if (x - lo) % stride:
+                        continue
+                    if lo - margin <= x < lo:
+                        slots = range(x, lo, stride)
+                    elif hi <= x < hi + margin:
+                        slots = range(hi, x + stride, stride)
+                    else:
+                        continue
+                    if all(is_valid_head(s) for s in slots):
+                        lo, hi = min(lo, x), max(hi, x + stride)
+                        changed = True
+                        break
+        return lo, hi
+
+    def dump_hook_heads(self):
+        ptrsize = runtime.current_arch.ptrsize
+        refs = self.collect_hook_head_refs()
+        anchors = self.find_head_anchors(refs)
+        # both `struct list_head list` and `struct hlist_node list` take two pointers
+        off_head = self.find_node_offsets(anchors) or 2
+
+        # v4.11 turned each head from a `struct list_head` into a `struct hlist_head`, which halves the stride.
+        # The distance between the confirmed heads shows it directly, so trust that when there are enough of them.
+        kversion = Kernel.version()
+        if kversion and kversion < "4.11":
+            stride = ptrsize * 2
+        else:
+            stride = ptrsize
+        heads = sorted({h for h, _n in anchors})
+        gaps = [b - a for a, b in zip(heads, heads[1:]) if b > a]
+        if len(gaps) >= 8:
+            if min(gaps) >= ptrsize * 2:
+                stride = ptrsize * 2
+            else:
+                stride = ptrsize
+        is_list_head = stride == ptrsize * 2
+
+        walked = {}
+
+        def walk(head):
+            if head not in walked:
+                walked[head] = self.walk_head(head, is_list_head, off_head)
+            return walked[head]
+
+        sizeof, member_names = self.get_hook_heads_type()
+        base = self.get_head_array_base(refs, anchors, member_names)
+        start, end = self.get_head_array_range(refs, anchors, stride, lambda x: walk(x) is not None, lambda x: walk(x) == [], base, sizeof)
+        if start is None:
+            self.err_add_out("Could not find `security_hook_heads`")
+            return
+
+        # A dispatcher may call another hook point first (e.g. inode_xattr_skipcap from security_inode_setxattr() and
+        # security_inode_removexattr() on v6.10~), so a head that only one dispatcher refers to is taken first.
+        # A wrapper such as security_capable_noaudit() refers to the head of another hook point, and the shortest name
+        # is the canonical one among the dispatchers that refer to the head first.
+        heads_by_hook = {}
+        for hook, candidates in refs.items():
+            heads_by_hook[hook] = [x for x in candidates if start <= x < end and (x - start) % stride == 0 and walk(x) is not None]
+        users = collections.Counter(x for heads in heads_by_hook.values() for x in set(heads))
+        name_by_head = {}
+        hooks = sorted(heads_by_hook, key=lambda x: (len(x), x))
+        for hook in hooks:
+            head = next((x for x in heads_by_hook[hook] if users[x] == 1), None)
+            if head is not None:
+                name_by_head[head] = hook
+        # the head a dispatcher refers to first is its own one rather than the ones it refers to later
+        named = set(name_by_head.values())
+        for rank in range(max((len(x) for x in heads_by_hook.values()), default=0)):
+            for hook in hooks:
+                if hook in named or rank >= len(heads_by_hook[hook]):
+                    continue
+                head = heads_by_hook[hook][rank]
+                if head not in name_by_head:
+                    name_by_head[head] = hook
+                    named.add(hook)
+        if base == start and sizeof:
+            for offset, name in member_names.items():
+                name_by_head[start + offset] = name
+
+        self.quiet_info_add_out("LSM framework: security_hook_heads (v4.2 - v6.11)")
+        self.quiet_info_add_out("security_hook_heads: {:s}-{:s}".format(self.format_addr(start), self.format_addr(end)))
+        self.quiet_info_add_out("Number of the recovered hook point names: {:d}".format(len(name_by_head)))
+        if self.args.meta:
+            self.quiet_info_add_out("offsetof(security_hook_list, head): {:#x}".format(off_head * ptrsize))
+
+        if self.args.meta:
+            self.quiet_info_add_out("sizeof(each head): {:#x} ({:s})".format(stride, "list_head" if is_list_head else "hlist_head"))
+
+        chains = []
+        nodes_seen = set()
+        for i in range((end - start) // stride):
+            head = start + i * stride
+            nodes = walk(head)
+            nodes_seen.update(nodes or [])
+            chains.append((i, head, nodes))
+
+        # the `lsm` member was added at v4.12, which widens `struct security_hook_list`.
+        # Each LSM registers its hooks from one static array, so the distance between the neighboring nodes is the size of the struct.
+        sorted_nodes = sorted(nodes_seen)
+        gaps = [b - a for a, b in zip(sorted_nodes, sorted_nodes[1:]) if b > a]
+        if gaps:
+            node_size = min(gaps)
+        else:
+            node_size = None
+        has_lsm = node_size is not None and node_size >= (off_head + 3) * ptrsize
+        if self.args.meta and node_size is not None:
+            self.quiet_info_add_out("sizeof(security_hook_list): {:#x}{:s}".format(node_size, "" if has_lsm else " (no `lsm` member)"))
+
+        rows = []
+        lsms = set()
+        for i, head, nodes in chains:
+            callbacks = []
+            for node in nodes or []:
+                try:
+                    func = read_int_from_memory(node + (off_head + 1) * ptrsize)
+                    # Probe the owner slot even when neighboring-node distances could not prove that the member exists
+                    # (for example, a list with only one callback).
+                    # Old layouts simply fail the strict string/lsm_id validation in read_lsm_name().
+                    lsm = self.read_lsm_name(read_int_from_memory(node + (off_head + 2) * ptrsize))
+                except gdb.MemoryError:
+                    continue
+                if not re.fullmatch(r"[a-z][a-z0-9_]{1,15}", lsm):
+                    lsm = ""
+                name = Symbol.format(func, ksym="prefer", bracket="")
+                if not lsm:
+                    lsm = self.lsm_of_callback(name) or ""
+                if lsm:
+                    lsms.add(lsm)
+                callbacks.append((node, func, name, lsm))
+            name = name_by_head.get(head)
+            if name is None and callbacks:
+                name = self.hook_name_from_callback(callbacks[0][2], callbacks[0][3])
+                if name:
+                    name += " (guessed)"
+            rows.append((i, head, name, nodes is None, callbacks))
+        self.dump_lsm_list(lsms)
+
+        for i, head, name, broken, callbacks in rows:
+            if not callbacks and not broken and not self.args.all:
+                continue
+            label = name or "hook[{:d}]".format(i)
+            if not self.match_filter(label):
+                continue
+            if broken:
+                line = "{:s} (broken list)".format(label)
+            else:
+                line = "{:s} ({:d} callback{:s})".format(label, len(callbacks), "" if len(callbacks) == 1 else "s")
+            if self.args.meta:
+                line += "  (head {:s})".format(self.format_addr(head))
+            self.out.append(line)
+            for node, func, func_name, lsm in callbacks:
+                line = "    {:s} <{:s}>".format(self.format_addr(func), func_name or "NO_SYMBOL")
+                if lsm:
+                    line += " [{:s}]".format(lsm)
+                if self.args.meta:
+                    line += "  (hook_list {:s})".format(self.format_addr(node))
+                self.out.append(line)
+        return
+
+    #
+    # v4.1 or earlier: a single struct security_operations
+    #
+
+    def find_security_ops(self):
+        """Return (the address of `security_ops`, its value, {hook name: member offset})."""
+        members = {}
+        candidates = []
+        for hook, res in self.iter_dispatchers():
+            disp = self.extract_call_displacement(res)
+            for addr in self.extract_data_refs(res):
+                candidates.append(addr)
+                if disp is not None:
+                    members.setdefault(hook, (addr, disp))
+                break
+
+        addr = Ksym.get_addr("security_ops")
+        if addr is None:
+            counter = {}
+            for x in candidates:
+                counter[x] = counter.get(x, 0) + 1
+            for x, _count in sorted(counter.items(), key=lambda kv: -kv[1]):
+                if self.validate_security_ops(x):
+                    addr = x
+                    break
+        if addr is None:
+            return None, None, {}
+        ops = read_int_from_memory(addr, safe=True)
+        if ops is None:
+            return addr, None, {}
+        offsets = {hook: disp for hook, (base, disp) in members.items() if base == addr}
+        return addr, ops, offsets
+
+    def validate_security_ops(self, addr):
+        """Return True if `addr` holds a pointer to a plausible `struct security_operations`."""
+        ptrsize = runtime.current_arch.ptrsize
+        ops = read_int_from_memory(addr, safe=True)
+        if ops is None:
+            return False
+        if not ops or not is_valid_addr(ops):
+            return False
+        if not self.read_cstring(ops, 16):
+            return False
+        text = 0
+        for i in range(2, 16):
+            func = read_int_from_memory(ops + i * ptrsize, safe=True)
+            if func is None:
+                return False
+            if self.is_kernel_text(func):
+                text += 1
+        return text >= 4
+
+    def dump_security_ops(self):
+        ptrsize = runtime.current_arch.ptrsize
+        addr, ops, offsets = self.find_security_ops()
+        if addr is None or not ops:
+            self.err_add_out("Could not find `security_ops`; this kernel may be CONFIG_SECURITY=n")
+            return
+
+        lsm = self.read_cstring(ops, 16)
+        self.quiet_info_add_out("LSM framework: security_ops (v4.1 or earlier)")
+        self.quiet_info_add_out("security_ops: {:s} -> {:s}{:s}".format(
+            self.format_addr(addr), self.format_addr(ops),
+            " " + Symbol.format(ops, ksym="prefer", missing="NO_SYMBOL"),
+        ))
+        self.dump_lsm_list({lsm} if lsm else set())
+
+        # the largest member the dispatchers touch is the tightest bound on the struct;
+        # the next symbol only bounds it when the struct itself has a symbol
+        limit = None
+        if offsets:
+            limit = max(offsets.values()) // ptrsize + 1
+        elif Ksym.get_name(ops) is not None:
+            ret = Ksym.get_kallsyms()
+            if ret is not None:
+                kallsyms, _kallsyms_map = ret
+                end = min([a for a, _n, _t in kallsyms if a > ops], default=None)
+                if end is not None and ops < end:
+                    limit = (end - ops) // ptrsize
+
+        # several dispatchers can share one member (security_capable / _capable_noaudit),
+        # and the shorter name is the canonical one
+        name_by_offset = {}
+        for hook, disp in sorted(offsets.items(), key=lambda kv: (len(kv[0]), kv[0]), reverse=True):
+            name_by_offset[disp] = hook
+        rows = []
+        miss = 0
+        i = 0
+        while limit is None or i < limit:
+            if limit is None and ((rows and miss >= 16) or i >= 0x200):
+                break
+            func = read_int_from_memory(ops + i * ptrsize, safe=True)
+            if func is None:
+                break
+            if self.is_kernel_text(func):
+                miss = 0
+                func_name = Symbol.format(func, ksym="prefer", bracket="")
+                name = name_by_offset.get(i * ptrsize)
+                if name is None:
+                    name = self.hook_name_from_callback(func_name, lsm)
+                    if name:
+                        name += " (guessed)"
+                # the capability hooks are chained into the struct of the active LSM
+                rows.append((i * ptrsize, func, func_name, name, self.lsm_of_callback(func_name) or lsm))
+            else:
+                miss += 1
+            i += 1
+
+        self.quiet_info_add_out("Number of the registered hooks: {:d}".format(len(rows)))
+        for disp, func, func_name, name, hook_lsm in rows:
+            label = name or "hook[{:#x}]".format(disp)
+            if not self.match_filter(label):
+                continue
+            line = "{:s}".format(label)
+            if self.args.meta:
+                line += " (+{:#x})".format(disp)
+            self.out.append(line)
+            self.out.append("    {:s} <{:s}>{:s}".format(
+                self.format_addr(func), func_name or "NO_SYMBOL", " [{:s}]".format(hook_lsm) if hook_lsm else "",
+            ))
+        return
+
+    #
+    # --task: the security blobs of task_struct, cred, file and inode
+    #
+
+    # the index of each member of `struct lsm_blob_sizes` (v5.1 or later), which holds ints
+    BLOB_SIZES_INDEX = (
+        ("7.1", {"cred": 0, "file": 1, "inode": 4, "task": 11}),
+        ("6.12", {"cred": 0, "file": 1, "inode": 3, "task": 10}),
+        ("5.13", {"cred": 0, "file": 1, "inode": 2, "task": 6}),
+        ("5.1", {"cred": 0, "file": 1, "inode": 2, "task": 5}),
+    )
+
+    # the kinds of blobs each LSM keeps, as [since, until) of the kernel version
+    BLOB_USERS = {
+        "selinux": {"cred": (None, None), "file": (None, None), "inode": (None, None), "task": ("6.18", None)},
+        "smack": {"cred": (None, None), "file": (None, None), "inode": (None, None)},
+        "apparmor": {"cred": (None, None), "file": (None, None), "task": ("5.1", None)},
+        "tomoyo": {"cred": (None, "5.1"), "task": ("5.1", None)},
+        "landlock": {"cred": ("5.13", None), "file": ("6.2", None), "inode": ("5.13", None)},
+        "bpf": {"inode": ("5.10", None), "task": ("5.11", None)},
+        "integrity": {"inode": ("6.9", None)},
+        "ima": {"inode": ("6.9", None)},
+        "evm": {"inode": ("6.9", None)},
+        "ipe": {"inode": ("6.12", None)},
+    }
+
+    # the parts of the blobs that decode_blob() understands
+    DECODABLE_BLOBS = {
+        "selinux": ("cred", "task", "file", "inode"),
+        "smack": ("cred", "file", "inode"),
+        "apparmor": ("cred", "task", "file"),
+        "tomoyo": ("cred", "task"),
+        "landlock": ("cred",),
+    }
+    # the parts that are valid with NULL pointers, which cannot be located by decoding
+    WEAK_BLOBS = (("landlock", "cred"), ("apparmor", "task"))
+
+    def is_blob_user(self, lsm, kind):
+        version_range = self.BLOB_USERS.get(lsm, {}).get(kind)
+        if version_range is None:
+            return False
+        since, until = version_range
+        kversion = Kernel.version()
+        if since is not None and kversion < since:
+            return False
+        if until is not None and kversion >= until:
+            return False
+        return True
+
+    def trace_arg_accesses(self, res):
+        """Return ([offsets stored zero], [offsets loaded]) of the pointer-sized members accessed through the first argument.
+        A register that holds the argument plus a constant is followed too, because a member far from the head is
+        reached by adding the upper part of the offset first (e.g. `lui a0, 0x1; add s1, s1, a0; sd zero, -1384(s1)`)."""
+        branch = r"b(?:\.\w+|eq|ne|cs|cc|hs|lo|mi|pl|vs|vc|hi|ls|ge|lt|gt|le|al)?"
+        if is_x86():
+            if is_x86_64():
+                width = "QWORD"
+            else:
+                width = "DWORD"
+            mem = width + r" PTR \[(?P<base>\w+)(?P<disp>[+-]0x\w+)?\]"
+            # -mregparm=3 on x86_32
+            if is_x86_64():
+                arg, clobbered = ("rdi", "rax rcx rdx rsi rdi r8 r9 r10 r11")
+            else:
+                arg, clobbered = ("eax", "eax ecx edx")
+            rules = [
+                ("store", r"(?:mov|and)\s+" + mem + r",(?P<src>\w+)"),
+                ("call", r"call.*"),
+                ("probe", r"(?:cmp|test)\s+\w+," + mem),
+                ("skip", r"(?:j\w+|cmp|test|push|nop\w*|ret\w*|bt)(?:\s.*)?|\S+\s+\w+ PTR .*"),
+                ("load", r"(?:mov|add)\s+(?P<dst>\w+)," + mem),
+                ("move", r"mov\s+(?P<dst>\w+),(?P<src>\w+)"),
+                # `lea esi,[esi+eiz*1+0x0]` is a multi-byte nop
+                ("add", r"lea\s+(?P<dst>\w+),(?:ds:)?\[(?P<src>\w+)(?:\+eiz\*1)?(?P<imm>[+-]0x\w+)?\]"),
+                ("add", r"add\s+(?P<dst>(?P<src>\w+)),(?P<imm>0x\w+)"),
+                ("zero", r"xor\s+(?P<dst>\w+),(?P=dst)"),
+            ]
+        elif is_arm64() or is_arm32():
+            mem = r"\s+(?P<{:s}>\w+),\s*\[(?P<base>\w+)(?:,\s*#(?P<disp>-?\w+))?\]"
+            if is_arm64():
+                arg, clobbered = ("x0", " ".join("x{:d}".format(i) for i in range(19)) + " x30")
+            else:
+                arg, clobbered = ("r0", "r0 r1 r2 r3 ip lr")
+            rules = [
+                ("store", r"(?:str|stur)(?:\.w)?" + mem.format("src")),
+                ("call", r"(?:bl|blx|blr)\s.*"),
+                ("skip", r"(?:st\w*|push|cmp|cmn|tst|teq|" + branch + r"|cbn?z|tbn?z|ret|nop|bx\w*|dmb|dsb|isb|pld\w*)(?:\.[wn])?(?:\s.*)?"),
+                ("load", r"(?:ldr|ldur)(?:\.w)?" + mem.format("dst")),
+                ("move", r"movs?(?:\.w)?\s+(?P<dst>\w+),\s*(?P<src>[a-z]\w*)"),
+                ("const", r"movs?(?:\.w)?\s+(?P<dst>\w+),\s*#(?P<imm>\w+)"),
+                ("add", r"adds?(?:\.w)?\s+(?P<dst>\w+),\s*(?P<src>\w+),\s*#(?P<imm>\w+)(?:,\s*lsl\s*#(?P<shift>\d+))?"),
+            ]
+        elif is_riscv32() or is_riscv64():
+            if is_64bit():
+                size = "d"
+            else:
+                size = "w"
+            mem = r",(?P<disp>-?\d+)\((?P<base>\w+)\)"
+            arg = "a0"
+            clobbered = "ra " + " ".join("a{:d}".format(i) for i in range(8)) + " " + " ".join("t{:d}".format(i) for i in range(7))
+            rules = [
+                ("store", r"s" + size + r"\s+(?P<src>\w+)" + mem),
+                ("call", r"(?:jal|jalr|call|tail)(?:\s.*)?"),
+                ("skip", r"(?:c\.)?(?:f?s[bhwdq]|b\w+|j|jr|ret|fence\S*|nop|wfi)(?:\s.*)?"),
+                ("load", r"l" + size + r"\s+(?P<dst>\w+)" + mem),
+                ("move", r"mv\s+(?P<dst>\w+),(?P<src>\w+)"),
+                ("const", r"li\s+(?P<dst>\w+),(?P<imm>-?\w+)"),
+                ("const", r"lui\s+(?P<dst>\w+),(?P<imm>\w+)(?P<shift>)"),
+                ("add", r"addi\s+(?P<dst>\w+),(?P<src>\w+),(?P<imm>-?\w+)"),
+                ("add", r"add\s+(?P<dst>\w+),(?P<src>\w+),(?P<reg>\w+)"),
+            ]
+        else:
+            return [], []
+
+        def norm(reg):
+            # x86_64: the 32-bit name of a register refers to the same one
+            if reg and is_x86_64():
+                reg = re.sub(r"^e([abcd]x|[sd]i|[sb]p)$", r"r\1", reg)
+                reg = re.sub(r"^(r\d+)d$", r"\1", reg)
+            return reg
+
+        def imm(x):
+            try:
+                return int(x, 0)
+            except (TypeError, ValueError):
+                return None
+
+        clobbered = clobbered.split()
+        aliases = {arg: 0} # register -> the argument plus this delta
+        consts = {} # register -> value (zero, or the upper part of an offset)
+        stores, loads = [], []
+        for line in res.splitlines():
+            m = re.match(r"\s*(?:=>\s*)?0x[0-9a-f]+(?:\s+<[^>]*>)?:\s*(.*)", line)
+            if not m:
+                continue
+            insn = re.split(r"\s+(?:#|;|//|@)\s", m.group(1))[0].strip()
+            kind, g = None, {}
+            for _kind, regex in rules:
+                m = re.fullmatch(regex, insn)
+                if m:
+                    kind = _kind
+                    g = {k: norm(v) for k, v in m.groupdict().items()}
+                    break
+            else:
+                kind = None
+            if kind == "store":
+                src = g["src"]
+                # a pointer-sized store only; ARM64 has `w` registers for 32-bit
+                if g["base"] in aliases and not src.startswith("w") and (src in ("xzr", "zero") or imm(src) == 0 or consts.get(src) == 0):
+                    stores.append(aliases[g["base"]] + (imm(g["disp"]) or 0))
+                continue
+            if kind == "call":
+                for reg in clobbered:
+                    aliases.pop(reg, None)
+                    consts.pop(reg, None)
+                continue
+            if kind in ("load", "probe") and g["base"] in aliases and not g.get("dst", "").startswith("w"):
+                loads.append(aliases[g["base"]] + (imm(g["disp"]) or 0))
+            if kind in ("skip", "probe"):
+                continue
+            if kind is None:
+                m = re.match(r"\S+\s+(\w+)", insn)
+                g = {"dst": norm(m.group(1)) if m else None}
+            dst = g["dst"]
+            alias = aliases.get(g.get("src"))
+            if kind == "add" and alias is None and g.get("reg") in aliases:
+                # `add rd, rs1, rs2` is commutative
+                g["src"], g["reg"] = g["reg"], g["src"]
+                alias = aliases[g["src"]]
+            aliases.pop(dst, None)
+            consts.pop(dst, None)
+            if kind == "move" and alias is not None:
+                aliases[dst] = alias
+            elif kind == "add" and alias is not None and imm(g.get("imm")) is not None:
+                aliases[dst] = alias + (imm(g["imm"]) << int(g.get("shift") or 0))
+            elif kind == "add" and alias is not None and g.get("reg") in consts:
+                aliases[dst] = alias + consts[g["reg"]]
+            elif kind == "zero":
+                consts[dst] = 0
+            elif kind == "const" and imm(g["imm"]) is not None:
+                consts[dst] = imm(g["imm"]) << (12 if g.get("shift") == "" else 0)
+        return stores, loads
+
+    def find_arg_member_offset(self, func_names):
+        """Return the offset of the member a function clears through its first argument (e.g. `task->security = NULL`
+        in security_task_free()), or the one it reads if it clears nothing."""
+        for name in func_names:
+            addr = Ksym.get_addr(name)
+            if addr is None:
+                continue
+            try:
+                res = KernelAddressHeuristicFinderUtil.disassemble_until_next_symbol(addr, 80)
+            except gdb.error:
+                continue
+            stores, loads = self.trace_arg_accesses(res)
+            for offset in stores + loads:
+                if 0 < offset < 0x4000 and offset % runtime.current_arch.ptrsize == 0:
+                    return offset
+        return None
+
+    def is_blob_value(self, value):
+        return value == 0 or (value % runtime.current_arch.ptrsize == 0 and is_valid_addr(value))
+
+    def resolve_member_offset(self, type_name, member, objects, funcs=(), fallback=None):
+        """Return offsetof(type, member) from the debug type, from what `funcs` access through the first argument, or
+        `fallback`, if the member of every object is NULL or a valid address."""
+        offset = GefUtil.offsetof(type_name, member)
+        if offset is None:
+            offset = self.find_arg_member_offset(funcs)
+        if offset is None:
+            offset = fallback
+        if offset is None or not objects:
+            return None
+        # an object freed while listing is unreadable, so it is not an evidence either way
+        values = [read_int_from_memory(x + offset, safe=True) for x in objects]
+        values = [x for x in values if x is not None]
+        if not values or not all(self.is_blob_value(x) for x in values):
+            return None
+        return offset
+
+    def resolve_security_offsets(self, lsms, creds, files):
+        """Return {kind: offsetof(object, security)}; a kind that could not be found is omitted."""
+        kversion = Kernel.version()
+        offsets = {}
+        # KernelCred finds it from `user_ns`, which cred has had since v3.5
+        offsets["cred"] = self.task_command.kcred.offset_security
+        if offsets["cred"] is None:
+            funcs = ["{:s}_cred_free".format(lsm) for lsm in sorted(lsms)] + ["security_cred_free"]
+            offsets["cred"] = self.resolve_member_offset("struct cred", "security", creds, funcs)
+        # it has existed since v4.12, but nothing used it before v5.1
+        if kversion >= "5.1":
+            funcs = ["security_task_free"]
+        else:
+            funcs = []
+        offsets["task"] = self.resolve_member_offset("struct task_struct", "security", self.task_addrs, funcs)
+        if files:
+            # the LSM freed its own blob until v5.0, while some distro kernels backported the v5.1 way
+            if kversion < "5.1":
+                funcs = ["{:s}_file_free_security".format(lsm) for lsm in sorted(lsms)]
+            else:
+                funcs = []
+            offsets["file"] = self.resolve_member_offset("struct file", "f_security", files, funcs + ["security_file_free"])
+            # `i_security` follows `i_sb` and `i_mapping`
+            offset_i_sb = getattr(self.task_command.kpath, "offset_i_sb", None)
+            if offset_i_sb is None:
+                fallback = None
+            else:
+                fallback = offset_i_sb + runtime.current_arch.ptrsize * 2
+            inodes = [x for x in (self.get_file_inode(file) for file in files) if x]
+            offsets["inode"] = self.resolve_member_offset("struct inode", "i_security", inodes, fallback=fallback)
+        return {kind: offset for kind, offset in offsets.items() if offset is not None}
+
+    def get_blob_sizes_offset(self, lsm, kind):
+        """Return the offset of the part `lsm` owns in the blob of `kind`, read from `<lsm>_blob_sizes`, or None."""
+        sym = {"bpf": "bpf_lsm_blob_sizes", "ipe": "ipe_blobs"}.get(lsm, "{:s}_blob_sizes".format(lsm))
+        addr = Ksym.get_addr(sym)
+        if addr is None:
+            return None
+        offset = GefUtil.offsetof("struct lsm_blob_sizes", "lbs_{:s}".format(kind))
+        if offset is None:
+            kversion = Kernel.version()
+            for version, index in self.BLOB_SIZES_INDEX:
+                if kversion >= version:
+                    offset = index[kind] * 4
+                    break
+        if offset is None:
+            return None
+        value = read_int32_from_memory(addr + offset, safe=True)
+        # lsm_set_blob_size() aligns each part to a pointer
+        if value is None or value >= 0x1000 or value % runtime.current_arch.ptrsize:
+            return None
+        return value
+
+    def resolve_blob_layout(self, lsms, samples):
+        """Return {kind: [(lsm, offset, how), ...]}, the part each active LSM owns in the blob of each kind.
+        Until v5.0 the major LSM owns the whole blob (offset 0). From v5.1 one blob is shared by the LSMs, and
+        the offset of each part is read from `<lsm>_blob_sizes`. Without the symbol, the only user owns the head
+        of the blob, and otherwise the offset where the part decodes on most samples is taken (guessed)."""
+        kversion = Kernel.version()
+        layout = {}
+        for kind, values in samples.items():
+            users = [lsm for lsm in sorted(lsms) if self.is_blob_user(lsm, kind)]
+            entries = []
+            for lsm in users:
+                if lsm not in self.DECODABLE_BLOBS:
+                    continue
+                if kversion < "5.1":
+                    entries.append((lsm, 0, "whole"))
+                    continue
+                # a new member of `struct lsm_blob_sizes` shifts the index, so check the offset with the samples
+                decodable = kind in self.DECODABLE_BLOBS[lsm]
+                offset = self.get_blob_sizes_offset(lsm, kind)
+                if offset is not None:
+                    if not decodable or self.count_decodable(lsm, kind, offset, values) * 2 >= len([x for x in values if x[0]]):
+                        entries.append((lsm, offset, "{:s}_blob_sizes".format(lsm)))
+                        continue
+                if len(users) == 1:
+                    # the inode blob starts with a `struct rcu_head` to free it
+                    if kind == "inode":
+                        offset = runtime.current_arch.ptrsize * 2
+                    else:
+                        offset = 0
+                    if not decodable or self.count_decodable(lsm, kind, offset, values) * 2 >= len([x for x in values if x[0]]):
+                        entries.append((lsm, offset, "only user"))
+                        continue
+                    # a distro kernel may put its own data at the head (e.g. the display LSM slot of Ubuntu)
+                    offset = self.guess_blob_offset(lsm, kind, values, allow_weak=True)
+                else:
+                    if decodable:
+                        offset = self.guess_blob_offset(lsm, kind, values)
+                    else:
+                        offset = None
+                entries.append((lsm, offset, "guessed"))
+            # the part of the LSM initialized first starts at the head of the blob
+            if kind == "inode" and kversion >= "5.1":
+                base = runtime.current_arch.ptrsize * 2
+            else:
+                base = 0
+            unknown = [i for i, (_lsm, offset, _how) in enumerate(entries) if offset is None]
+            if len(unknown) == 1 and len(entries) == len(users) and all(offset != base for _lsm, offset, _how in entries):
+                entries[unknown[0]] = (entries[unknown[0]][0], base, "guessed")
+            layout[kind] = entries
+        return layout
+
+    def count_decodable(self, lsm, kind, offset, samples):
+        return sum(1 for blob, obj in samples if blob and self.decode_blob(lsm, kind, blob + offset, obj) is not None)
+
+    def guess_blob_offset(self, lsm, kind, samples, allow_weak=False):
+        """Return the lowest offset where the part decodes on the majority of the samples. The same part of the next object
+        in the slab also decodes beyond the end of the blob, and so does a later member that looks like the first one."""
+        if (lsm, kind) in self.WEAK_BLOBS and not allow_weak:
+            return None
+        blobs = [(blob, obj) for blob, obj in samples if blob]
+        if not blobs:
+            return None
+        for offset in range(0, 0x80, runtime.current_arch.ptrsize):
+            if self.count_decodable(lsm, kind, offset, blobs) * 2 > len(blobs):
+                return offset
+        return None
+
+    def read_label(self, addr, pattern=r"[\x21-\x7e][\x20-\x7e]*"):
+        """Read the string at `addr` if it looks like a label."""
+        # do not cross the page, which may be unmapped
+        name = self.read_cstring(addr, min(0x100, get_pagesize() - addr % get_pagesize()))
+        if name and re.fullmatch(pattern, name):
+            return name
+        return ""
+
+    def apparmor_label_name(self, label):
+        """Return the name of an `aa_label` (v4.13~) or an `aa_profile` (~v4.12)."""
+        if not label or not is_valid_addr(label):
+            return ""
+        # the refcount, rb_node, rcu_head and proxy come before `hname` of aa_label, and `name` is the first member of aa_profile
+        for i in range(12):
+            ptr = read_int_from_memory(label + i * runtime.current_arch.ptrsize, safe=True)
+            if ptr is None:
+                break
+            if ptr and is_valid_addr(ptr):
+                name = self.read_label(ptr)
+                if len(name) >= 2:
+                    return name
+        return ""
+
+    def smack_label_name(self, skp):
+        """Return the label of a `struct smack_known`, or of a label string of old kernels."""
+        if not skp or not is_valid_addr(skp):
+            return ""
+        # smk_known follows `struct list_head list` and `struct hlist_node smk_hashed`
+        ptr = read_int_from_memory(skp + runtime.current_arch.ptrsize * 4, safe=True)
+        if ptr and is_valid_addr(ptr):
+            name = self.read_label(ptr, r"[\x21-\x7e]{1,255}")
+            if name:
+                return name
+        return self.read_label(skp, r"[\x21-\x7e]{1,255}")
+
+    def tomoyo_domain_name(self, domain):
+        """Return the name of a `struct tomoyo_domain_info`, found through `domainname`."""
+        if not domain or not is_valid_addr(domain):
+            return ""
+        # domainname follows `list` and `acl_info_list[]`
+        for i in range(2, 10):
+            path_info = read_int_from_memory(domain + i * runtime.current_arch.ptrsize, safe=True)
+            if not path_info or not is_valid_addr(path_info):
+                continue
+            ptr = read_int_from_memory(path_info, safe=True)
+            if ptr and is_valid_addr(ptr):
+                name = self.read_label(ptr, r"<[\x20-\x7e]+")
+                if name:
+                    return name
+        return ""
+
+    def format_label_ptr(self, ptr, name):
+        if not ptr:
+            return "0x0"
+        return "{:s}{:s}".format(AddressUtil.format_address(ptr), " ({:s})".format(name) if name else "")
+
+    def decode_blob(self, lsm, kind, part, obj):
+        """Return (summary, detail) of the part of the blob `lsm` owns, or None if it does not look like one.
+        `part` is the address of the part, and `obj` is the object that owns the blob."""
+        kversion = Kernel.version()
+        ptrsize = runtime.current_arch.ptrsize
+        stacked = kversion >= "5.1"
+        if not part or not is_valid_addr(part):
+            return None
+
+        def sids(names, offset=0):
+            """Return the u32 SIDs at `part + offset` and their detail, or (None, "") if one is not a SID."""
+            type_name = "struct {:s}_security_struct".format(kind)
+            offsets = [GefUtil.offsetof(type_name, name) for name in names]
+            if None in offsets:
+                if GefUtil.type_size(type_name):
+                    return None, ""
+                configs = runtime.CommandRegistry.instances["kconfig"].get_configs()
+                if not configs or any(configs.get(key) == "y" for key in ("CONFIG_RANDSTRUCT", "CONFIG_GCC_PLUGIN_RANDSTRUCT")):
+                    return None, ""
+                offsets = [offset + i * 4 for i in range(len(names))]
+            values = [read_int32_from_memory(part + offset, safe=True) for offset in offsets]
+            if not all(x is not None and x < 0x100000 for x in values):
+                return None, ""
+            return values, " ".join("{:s}={:d}".format(n, x) for n, x in zip(names, values))
+
+        def labels(names, resolve, ptrs=None, optional=False):
+            """Return the label of the first pointer and the detail of all, or None if the first is not labeled
+            (if `optional`, if a non-NULL one is not labeled). `ptrs` defaults to the pointers at `part`."""
+            if ptrs is None:
+                ptrs = [read_int_from_memory(part + i * ptrsize, safe=True) for i in range(len(names))]
+            if not all(x is not None and self.is_blob_value(x) for x in ptrs):
+                return None
+            resolved = [resolve(x) if x else "" for x in ptrs]
+            if optional:
+                unlabeled = any(x and not y for x, y in zip(ptrs, resolved))
+            else:
+                unlabeled = not resolved[0]
+            if unlabeled:
+                return None
+            return resolved[0], " ".join("{:s}={:s}".format(n, self.format_label_ptr(x, y)) for n, x, y in zip(names, ptrs, resolved))
+
+        if lsm == "selinux":
+            if kind == "cred":
+                values, detail = sids(["osid", "sid", "exec_sid", "create_sid", "keycreate_sid", "sockcreate_sid"])
+                if values and values[0] and values[1]:
+                    return "sid={:d}".format(values[1]), detail
+            elif kind == "task":
+                values, detail = sids(["avdcache.sid", "avdcache.seqno"])
+                if values:
+                    return "", detail
+            elif kind == "file":
+                # isid is 0 for a file that was not opened through a path (e.g. a pipe)
+                values, detail = sids(["sid", "fown_sid", "isid", "pseqno"])
+                if values and values[0] and values[1]:
+                    return "sid={:d}".format(values[0]), detail
+            elif kind == "inode" and read_int_from_memory(part, safe=True) == obj:
+                # inode, list, task_sid, sid, sclass, initialized
+                values, detail = sids(["task_sid", "sid"], ptrsize * 3)
+                sclass = read_int16_from_memory(part + ptrsize * 3 + 8, safe=True)
+                initialized = read_int8_from_memory(part + ptrsize * 3 + 10, safe=True)
+                if values and sclass is not None and initialized is not None:
+                    detail = "inode={:s} {:s} sclass={:d} initialized={:d}".format(AddressUtil.format_address(obj), detail, sclass, initialized)
+                    return "sid={:d}".format(values[1]), detail
+
+        elif lsm == "apparmor":
+            if kind == "cred":
+                # a pointer to the label (v5.1~), the label itself (v4.17~), or the first member of struct aa_task_ctx (~v4.16)
+                if not stacked and kversion >= "4.17":
+                    ptrs = [part]
+                else:
+                    ptrs = None
+                return labels(["label"], self.apparmor_label_name, ptrs)
+            if kind == "task":
+                ret = labels(["nnp", "onexec", "previous"], self.apparmor_label_name, optional=True)
+                return ret and ("", ret[1])
+            if kind == "file" and kversion < "4.13":
+                allow = read_int16_from_memory(part, safe=True)
+                if allow is not None:
+                    return "", "allow={:#x}".format(allow)
+            elif kind == "file":
+                # the label follows a spinlock, which grows after SPINLOCK_MAGIC with CONFIG_DEBUG_SPINLOCK
+                for i in (range(2, 12) if read_int32_from_memory(part + 4, safe=True) == 0xdead4ead else [1]):
+                    ret = labels(["label"], self.apparmor_label_name, [read_int_from_memory(part + i * ptrsize, safe=True)])
+                    if ret is not None:
+                        return ret
+
+        elif lsm == "smack":
+            if kind == "cred":
+                return labels(["smk_task", "smk_forked"], self.smack_label_name)
+            if kind == "inode":
+                return labels(["smk_inode", "smk_task", "smk_mmap"], self.smack_label_name)
+            if kind == "file":
+                return labels(["smk_file"], self.smack_label_name, None if stacked else [part])
+
+        elif lsm == "tomoyo":
+            if kind == "cred" and not stacked:
+                return labels(["domain"], self.tomoyo_domain_name, [part])
+            if kind == "task" and stacked:
+                return labels(["domain_info", "old_domain_info"], self.tomoyo_domain_name)
+
+        elif lsm == "landlock" and kind == "cred":
+            domain = read_int_from_memory(part, safe=True)
+            if domain is not None and self.is_blob_value(domain):
+                return "domain={:#x}".format(domain) if domain else "", "domain={:s}".format(self.format_label_ptr(domain, ""))
+        return None
+
+    def get_task_files(self, task, limit=0x400):
+        """Return [(fd, file), ...] of the task."""
+        task_command = self.task_command
+        ptrsize = runtime.current_arch.ptrsize
+        files = read_int_from_memory(task + task_command.offset_files, safe=True)
+        if not files or not is_valid_addr(files):
+            return []
+        fdt = read_int_from_memory(files + task_command.offset_fdt, safe=True)
+        if not fdt or not is_valid_addr(fdt):
+            return []
+        max_fds = read_int32_from_memory(fdt, safe=True)
+        array = read_int_from_memory(fdt + ptrsize, safe=True)
+        if not max_fds or not array or not is_valid_addr(array):
+            return []
+        ret = []
+        for fd in range(min(max_fds, 0x10000)):
+            file = read_int_from_memory(array + fd * ptrsize, safe=True)
+            if file is None:
+                break
+            if file and is_valid_addr(file):
+                ret.append((fd, file))
+                if len(ret) >= limit:
+                    break
+        return ret
+
+    def get_file_inode(self, file):
+        task_command = self.task_command
+        dentry = read_int_from_memory(file + task_command.offset_dentry, safe=True)
+        if not dentry or not is_valid_addr(dentry):
+            return None
+        inode = read_int_from_memory(dentry + task_command.offset_d_inode, safe=True)
+        if not inode or not is_valid_addr(inode):
+            return None
+        return inode
+
+    def detect_lsms(self, kversion):
+        """Return the set of the active LSMs, recovered from the registered hooks."""
+        saved_out = self.out
+        self.out = []
+        self.detected_lsms = set()
+        try:
+            self.dump_hooks(kversion)
+        finally:
+            self.out = saved_out
+        return self.detected_lsms
+
+    def format_parts(self, kind, obj, blob, indent):
+        lines = []
+        for lsm, offset, _how in self.blob_layout.get(kind, []) if blob else []:
+            decodable = kind in self.DECODABLE_BLOBS.get(lsm, ())
+            if offset is None:
+                if decodable:
+                    lines.append("{:s}[{:s} +?] (unknown offset)".format(indent, lsm))
+                continue
+            label = "{:s}[{:s} +{:#x}]".format(indent, lsm, offset)
+            decoded = self.decode_blob(lsm, kind, blob + offset, obj)
+            if decoded is not None:
+                lines.append("{:s} {:s}".format(label, decoded[1]))
+                continue
+            words = [read_int_from_memory(blob + offset + i * runtime.current_arch.ptrsize, safe=True) for i in range(2)]
+            raw = " ".join("?" if x is None else AddressUtil.format_address(x) for x in words)
+            lines.append("{:s} {:s} {:s}".format(label, "(could not decode)" if decodable else "raw:", raw))
+        return lines
+
+    def get_labels(self, task, cred, cred_blob, task_blob):
+        """Return the short labels of a task, decoded from the blobs of its cred and task_struct."""
+        labels = []
+        for kind, obj, blob in [("cred", cred, cred_blob), ("task", task, task_blob)]:
+            for lsm, offset, _how in self.blob_layout.get(kind, []) if blob else []:
+                if offset is None:
+                    decoded = None
+                else:
+                    decoded = self.decode_blob(lsm, kind, blob + offset, obj)
+                if decoded and decoded[0]:
+                    labels.append("{:s}:{:s}".format(lsm, decoded[0]))
+        return labels
+
+    def dump_task_detail(self, entry):
+        task, pid, comm, cred, cred_blob, task_blob = entry
+        offsets = self.security_offsets
+        self.out.append('task: {:s} (pid: {:d}, comm: "{:s}")'.format(AddressUtil.format_address(task), pid, comm))
+        self.out.append("    cred->security  {:s} (cred: {:s})".format(AddressUtil.format_address(cred_blob or 0), AddressUtil.format_address(cred)))
+        self.out.extend(self.format_parts("cred", cred, cred_blob, " " * 8))
+        if "task" in offsets:
+            self.out.append("    task->security  {:s}".format(AddressUtil.format_address(task_blob or 0)))
+            self.out.extend(self.format_parts("task", task, task_blob, " " * 8))
+        if "file" in offsets or "inode" in offsets:
+            for fd, file in self.get_task_files(task):
+                inode = self.get_file_inode(file)
+                self.out.append("    fd {:<3d} {:s} (file: {:s}, inode: {:s})".format(
+                    fd, self.task_command.kpath.get_file_path(file), AddressUtil.format_address(file), AddressUtil.format_address(inode or 0),
+                ))
+                for kind, member, obj in [("file", "f_security", file), ("inode", "i_security", inode)]:
+                    if kind in offsets and obj:
+                        blob = read_int_from_memory(obj + offsets[kind], safe=True)
+                        self.out.append("        {:s}  {:s}".format(member, AddressUtil.format_address(blob or 0)))
+                        self.out.extend(self.format_parts(kind, obj, blob, " " * 12))
+        self.out.append("")
+        return
+
+    def dump_task_table(self, entries):
+        width = 2 + runtime.current_arch.ptrsize * 2
+        fmt = "{:%ds} {:>7s} {:16s} {:%ds} {:%ds} {:s}" % (width, width, width)
+        if not self.args.quiet:
+            legend = ["task", "pid", "comm", "cred->security", "task->security", "labels"]
+            self.out.append(GefUtil.make_legend(fmt.format(*legend)))
+        for task, pid, comm, cred, cred_blob, task_blob in entries:
+            if "task" not in self.security_offsets:
+                task_blob_str = "-"
+            else:
+                task_blob_str = AddressUtil.format_address(task_blob or 0)
+            self.out.append(fmt.format(
+                AddressUtil.format_address(task), str(pid), comm, AddressUtil.format_address(cred_blob or 0), task_blob_str,
+                " ".join(self.get_labels(task, cred, cred_blob, task_blob)),
+            ))
+        return
+
+    def dump_task_blobs(self, kversion):
+        args = self.args
+        detail = bool(args.verbose or args.pid is not None or args.task_filter or args.filter)
+        self.meta = []
+        task_command = Kernel.task()
+        task_ready = task_command.initialize(files=detail)
+        self.meta.extend(Kernel.export_meta(self, task_command.meta))
+        if not task_ready:
+            task_command = None
+        if args.meta or task_command is None:
+            for func, line in self.meta:
+                func(line)
+        if task_command is None:
+            return
+        self.task_command = task_command
+        self.task_addrs = KernelTask.get_task_list(task_command.init_task, task_command.offset_tasks)
+        lsms = self.detect_lsms(kversion)
+
+        tasks = []
+        for task in self.task_addrs:
+            pid = read_int32_from_memory(task + task_command.offset_pid, safe=True)
+            comm = read_cstring_from_memory(task + task_command.offset_comm, safe=True)
+            cred = read_int_from_memory(task + task_command.offset_cred, safe=True)
+            if pid is not None and comm is not None and cred and is_valid_addr(cred):
+                tasks.append((task, pid, comm, cred))
+        files = []
+        if detail and getattr(task_command, "kpath", None) is not None:
+            files = [file for task in tasks for _fd, file in self.get_task_files(task[0])][:0x400]
+        self.security_offsets = offsets = self.resolve_security_offsets(lsms, [x[3] for x in tasks], files)
+        if "cred" not in offsets:
+            self.err_add_out("Could not find cred->security; this kernel may be CONFIG_SECURITY=n")
+            return
+
+        def read_blob(kind, obj):
+            if kind in offsets:
+                return read_int_from_memory(obj + offsets[kind], safe=True)
+            return None
+
+        entries = [(task, pid, comm, cred, read_blob("cred", cred), read_blob("task", task)) for task, pid, comm, cred in tasks]
+        inodes = [x for x in dict.fromkeys(self.get_file_inode(file) for file in files) if x]
+        samples = {"cred": [(e[4], e[3]) for e in entries], "task": [(e[5], e[0]) for e in entries]}
+        samples.update({"file": [(read_blob("file", x), x) for x in files], "inode": [(read_blob("inode", x), x) for x in inodes]})
+        self.blob_layout = self.resolve_blob_layout(lsms, {kind: v for kind, v in samples.items() if kind in offsets})
+
+        self.dump_lsm_list(lsms)
+        members = {"task": "task_struct, security", "cred": "cred, security", "file": "file, f_security", "inode": "inode, i_security"}
+        for kind in ("task", "cred", "file", "inode"):
+            if args.meta and kind in offsets:
+                self.quiet_info_add_out("offsetof({:s}): {:#x}".format(members[kind], offsets[kind]))
+        for kind in ("task", "cred", "file", "inode"):
+            parts = self.blob_layout.get(kind)
+            if parts:
+                layout = ", ".join("{:s} {:s} ({:s})".format(
+                    lsm, "+?" if offset is None else "+{:#x}".format(offset), how) for lsm, offset, how in parts)
+                self.quiet_info_add_out("The {:s} blob: {:s}".format(kind, layout))
+
+        selected = [e for e in entries if (args.pid is None or e[1] == args.pid) and (not args.task_filter or e[0] in args.task_filter)
+                    and GefUtil.matches_regex(e[2], args.filter)]
+        if not selected:
+            self.err_add_out("No task matched")
+            return
+        if detail:
+            for entry in selected:
+                self.dump_task_detail(entry)
+        else:
+            self.dump_task_table(selected)
+        return
+
+    def dump_lsm_list(self, lsms):
+        self.detected_lsms = set(lsms)
+        if lsms:
+            self.quiet_info_add_out("LSMs detected or inferred from hooks: {:s}".format(", ".join(sorted(lsms))))
+        return
+
+    def match_filter(self, name):
+        if not self.args.hook:
+            return True
+        return any(h in name for h in self.args.hook)
+
+    def dump_hooks(self, kversion):
+        if Ksym.get_addrs(self.SCK_PREFIX, match="prefix"):
+            self.dump_static_calls()
+        elif not self.has_lsm_framework():
+            self.err_add_out("No LSM dispatcher was found; this kernel may be CONFIG_SECURITY=n")
+        elif kversion >= "6.12":
+            self.dump_static_calls()
+        elif kversion >= "4.2":
+            self.dump_hook_heads()
+        else:
+            self.dump_security_ops()
+        return
+
+    def has_lsm_framework(self):
+        """Return True if this kernel looks like CONFIG_SECURITY=y.
+        A kernel built without it keeps only a handful of `security_*` stubs, while the
+        framework brings one dispatcher per hook point."""
+        ret = Ksym.get_kallsyms()
+        if ret is None:
+            return True
+        kallsyms, _kallsyms_map = ret
+        count = sum(1 for _a, name, typ in kallsyms
+                    if name.startswith("security_") and typ.lower() in ("t", "w"))
+        return count >= 16
+
+    @parse_args
+    @only_if_gdb_running
+    @only_if_specific_gdb_mode(mode=("qemu-system", "vmware", "kgdb"))
+    @only_if_specific_arch(arch=("x86_32", "x86_64", "ARM32", "ARM64", "RISCV32", "RISCV64"))
+    @only_if_in_kernel_or_kpti_disabled
+    @switch_to_intel_syntax
+    def do_invoke(self, args):
+        # the kernel version and the memory layout are resolved below and both are slow,
+        # so tell the user before anything starts
+        self.out = []
+        self.quiet_info("Wait for memory scan")
+
+        kversion = Kernel.version()
+        if kversion is None:
+            err("Could not find Linux kernel")
+            return
+
+        self.klayout = Kernel.layout()
+
+        if args.task:
+            self.dump_task_blobs(kversion)
+        else:
+            self.dump_hooks(kversion)
+
+        self.print_output(check_terminal_size=True)
+        return
+
+
+
+@register_command
+class KernelMountCommand(GenericCommand, BufferingOutput):
+    """Dump the mount tree of each mount namespace."""
+
+    _cmdline_ = "kmount"
+    _category_ = "06-g. Qemu-system/KGDB Cooperation - Linux Advanced"
+
+    parser = argparse.ArgumentParser(prog=_cmdline_)
+    parser.add_argument("-hh", "--help-simple", action="store_true", help="show help without ASCII diagram.")
+    parser.add_argument("-p", "--pid", type=int, help="dump the mount namespace of this pid.")
+    parser.add_argument("-T", "--task", type=AddressUtil.parse_address, help="dump the mount namespace of this task_struct.")
+    parser.add_argument("-a", "--all", action="store_true", help="dump every mount namespace.")
+    parser.add_argument("-t", "--tasks", action="store_true", help="list the tasks of each mount namespace.")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="also show mnt_id, peer_group, mnt_master and propagation.")
+    parser.add_argument("--meta", action="store_true", help="display offset information.")
+    parser.add_argument("-n", "--no-pager", action="store_true", help="do not use the pager.")
+    parser.add_argument("-q", "--quiet", action="store_true", help="enable quiet mode.")
+    _syntax_ = parser.format_help()
+
+    _example_ = [
+        "{0:s}",
+        "{0:s} --pid 1337",
+        "{0:s} --all --tasks",
+    ]
+    _example_ = "\n".join(_example_).format(_cmdline_)
+
+    _note_ = [
+        "This command requires CONFIG_RANDSTRUCT=n unless vmlinux with debug information is loaded.",
+        "",
+        "- Walks `mnt_mounts/mnt_child`, so all mounts in the namespace are shown, including bind mounts sharing a `super_block`.",
+        "  `kfilesystems` instead shows filesystem types and all their `super_block`s, mounted or not.",
+        "- Mount namespaces are inferred from mounts reachable through tasks, so namespaces with no task are invisible.",
+        "- Without `--pid/--task`, the whole namespace is shown with absolute paths.",
+        "  With either option, output is rooted at `task->fs->root`; unreachable mounts are marked `outside-root`.",
+        "",
+        "Simplified mount tree structure:",
+        "",
+        "+-task_struct--+     +-fs_struct-+     +-path----+",
+        "| ...          |     | ...       |     | mnt     |--+",
+        "| fs           |---->| root      |---->| dentry  |  |",
+        "| ...          |     | pwd       |     +---------+  |",
+        "+--------------+     +-----------+                  |",
+        "                                                    |",
+        "    +-----------------------------------------------+",
+        "    |",
+        "    v",
+        "+-mount----------+<-+     +-mount----------+<-+     +-mount----------+",
+        "| mnt_parent     |--+<----| mnt_parent     |  +<----| mnt_parent     |",
+        "| mnt_mountpoint |     +--| mnt_mountpoint |     +--| mnt_mountpoint |",
+        "| mnt (vfsmount) |     |  | mnt (vfsmount) |     |  | mnt (vfsmount) |",
+        "|   mnt_root     |     |  |   mnt_root     |     |  |   mnt_root     |",
+        "|   mnt_sb       |-+   |  |   mnt_sb       |     |  |   mnt_sb       |",
+        "|   mnt_flags    | |   |  |   mnt_flags    |     |  |   mnt_flags    |",
+        "| mnt_mounts     |-|-+ |  | mnt_mounts     |--+  |  | mnt_mounts     |",
+        "| mnt_child      | | +-|->| mnt_child      |  +--|->| mnt_child      |",
+        "| mnt_devname    | |   |  | mnt_devname    |     |  | mnt_devname    |",
+        "+----------------+ |   |  +----------------+     |  +----------------+",
+        "                   |   +-->dentry                +-->dentry",
+        "                   v",
+        "            +-super_block-+     +-file_system_type-+",
+        '            | ...         |     | name             |-->"ext4"',
+        "            | s_type      |---->| ...              |",
+        "            | ...         |     +------------------+",
+        "            +-------------+",
+    ]
+    _note_ = "\n".join(_note_)
+
+    # include/linux/mount.h
+    MNT_FLAGS = [
+        (0x00_0001, "nosuid"),
+        (0x00_0002, "nodev"),
+        (0x00_0004, "noexec"),
+        (0x00_0008, "noatime"),
+        (0x00_0010, "nodiratime"),
+        (0x00_0020, "relatime"),
+        (0x00_0080, "nosymfollow", "5.10"),
+        (0x00_0100, "shrinkable"),
+        (0x00_0200, "write_hold"),
+        (0x00_4000, "internal"),
+        (0x04_0000, "lock_atime", "3.17"),
+        (0x08_0000, "lock_noexec", "3.17"),
+        (0x10_0000, "lock_nosuid", "3.17"),
+        (0x20_0000, "lock_nodev", "3.17"),
+        (0x40_0000, "lock_readonly", "3.17"),
+        (0x80_0000, "locked", "3.17"),
+        (0x100_0000, "doomed"),
+        (0x200_0000, "sync_umount"),
+        (0x800_0000, "umount", "3.18"),
+        (0x1000_0000, "onrb"),
+    ]
+    MNT_READONLY = 0x40
+
+    def initialize(self):
+        self.meta = []
+
+        kversion = Kernel.version()
+        if kversion is None:
+            self.meta.append((self.quiet_err, "Could not find Linux kernel"))
+            return None
+        self.kversion = kversion
+
+        task_command = Kernel.task()
+        task_ready = task_command.initialize(files=kversion < "3.3", namespaces=True,
+                                             threads=self.args.pid is not None)
+        self.meta.extend(Kernel.export_meta(self, task_command.meta))
+        if not task_ready:
+            task_command = None
+        if task_command is None:
+            return None
+        self.task_command = task_command
+        self.offset_nsproxy = getattr(task_command, "offset_nsproxy", None)
+
+        self.kfs = None
+        if "3.3" <= kversion:
+            self.kfs = Kernel.file_system()
+            kfs_ret = self.kfs.initialize()
+            self.meta.extend(Kernel.export_meta(self, self.kfs.meta, demote_err=True))
+            if not kfs_ret:
+                self.meta.append((
+                    self.quiet_warn, "Could not resolve the super_block layout; fstype and devname are not shown",
+                ))
+                self.kfs = None
+
+        self.kpath = Kernel.path()
+        if not self.kpath.initialized:
+            self.meta.append((self.quiet_err, "Could not resolve the struct dentry layout"))
+            return None
+
+        if task_command.offset_files is None:
+            self.meta.append((self.quiet_err, "Could not find task_struct->files"))
+            return None
+        self.offset_fs = self.kpath.get_offset_task_fs(task_command.offset_files)
+        if self.offset_fs is None:
+            self.meta.append((self.quiet_err, "Could not find task_struct->fs"))
+            return None
+        self.meta.append((self.quiet_info, "offsetof(task_struct, fs): {:#x}".format(self.offset_fs)))
+
+        self.namespaces = self.collect_namespaces()
+        if not self.namespaces:
+            self.meta.append((self.quiet_err, "Could not find any mount namespace"))
+            return None
+        self.meta.append((self.quiet_info, "Number of mount namespaces: {:d}".format(len(self.namespaces))))
+
+        root_mount = list(self.namespaces.keys())[0]
+        self.offset_mnt_flags = self.kpath.get_offset_mnt_flags(root_mount)
+        if self.offset_mnt_flags is None:
+            self.meta.append((self.quiet_warn, "Could not find mount->mnt.mnt_flags"))
+            self.mnt_onrb_present = False
+        else:
+            self.meta.append((self.quiet_info, "offsetof(mount, mnt.mnt_flags): {:#x}".format(self.offset_mnt_flags)))
+            # MNT_ONRB accompanied the namespace rbtree from v6.8, but it was
+            # later removed and that removal was backported to stable trees.
+            # Every namespace root collected above is attached, so its live bit
+            # is a better discriminator than the release string.
+            self.mnt_onrb_present = False
+            for mount in self.namespaces:
+                flags = read_int32_from_memory(mount + self.offset_mnt_flags, safe=True)
+                if flags is None:
+                    continue
+                if flags & 0x1000_0000:
+                    self.mnt_onrb_present = True
+                    break
+            self.meta.append((self.quiet_info, "MNT_ONRB: {:s} (live mount flags)".format(
+                "present" if self.mnt_onrb_present else "absent",
+            )))
+
+        if kversion < "3.3":
+            self.offset_s_type = GefUtil.offsetof("super_block", "s_type")
+            if self.offset_s_type is None:
+                loff_t_align = 8 if is_64bit() or is_arm32() else 4
+                self.offset_s_type = align(runtime.current_arch.ptrsize * 3 + 8, loff_t_align) + 8
+            self.meta.append((self.quiet_info, "offsetof(super_block, s_type): {:#x}".format(self.offset_s_type)))
+
+            self.offset_mnt_devname = GefUtil.offsetof("vfsmount", "mnt_devname")
+            if self.offset_mnt_devname is None and self.offset_mnt_flags is not None:
+                base = align(self.offset_mnt_flags + 4, runtime.current_arch.ptrsize)
+                candidates = (base, align(self.offset_mnt_flags + 8, runtime.current_arch.ptrsize) + runtime.current_arch.ptrsize)
+                mounts = [mount for mount, _ in self.walk_tree(root_mount)][:16]
+                scores = []
+                for offset in candidates:
+                    score = 0
+                    for mount in mounts:
+                        name_ptr = read_int_from_memory(mount + offset, safe=True)
+                        if not is_valid_addr(name_ptr):
+                            continue
+                        name = read_cstring_from_memory(name_ptr, max_length=64, safe=True)
+                        if name and all(0x20 <= ord(char) < 0x7f for char in name):
+                            score += 1
+                    scores.append(score)
+                if max(scores) > 0 and scores.count(max(scores)) == 1:
+                    self.offset_mnt_devname = candidates[scores.index(max(scores))]
+            if self.offset_mnt_devname is not None:
+                self.meta.append((self.quiet_info, "offsetof(vfsmount, mnt_devname): {:#x}".format(self.offset_mnt_devname)))
+            else:
+                self.meta.append((self.quiet_warn, "Could not find vfsmount->mnt_devname"))
+
+        self.offset_mnt_t_flags = GefUtil.offsetof("mount", "mnt_t_flags")
+        self.offset_mnt_master = GefUtil.offsetof("mount", "mnt_master")
+        self.offset_mnt_group_id = GefUtil.offsetof("mount", "mnt_group_id")
+        self.offset_mnt_id = GefUtil.offsetof("mount", "mnt_id")
+        self.offset_mnt_share = GefUtil.offsetof("mount", "mnt_share")
+        self.offset_mnt_slave = GefUtil.offsetof("mount", "mnt_slave")
+        for member, offset in (
+            ("mnt_t_flags", self.offset_mnt_t_flags),
+            ("mnt_master", self.offset_mnt_master),
+            ("mnt_group_id", self.offset_mnt_group_id),
+            ("mnt_id", self.offset_mnt_id),
+            ("mnt_share", self.offset_mnt_share),
+            ("mnt_slave", self.offset_mnt_slave),
+        ):
+            if offset is not None:
+                self.meta.append((self.quiet_info, "offsetof(mount, {:s}): {:#x}".format(member, offset)))
+
+        if self.offset_mnt_t_flags is not None:
+            self.propagation_flag_source = "mnt_t_flags (debug information)"
+            self.mnt_slave_is_hlist = True
+        elif kversion < "6.17":
+            self.propagation_flag_source = "mnt_flags (version fallback)"
+            self.mnt_slave_is_hlist = False
+        else:
+            self.propagation_flag_source = "mnt_group_id/mnt_share/mnt_slave (version fallback)"
+            self.mnt_slave_is_hlist = True
+        self.meta.append((self.quiet_info, "Mount propagation source: {:s}".format(self.propagation_flag_source)))
+        return True
+
+    def get_mnt_ns(self, task):
+        """Return task->nsproxy->mnt_ns using the current base + 3 * ptrsize layout assumption."""
+        if self.offset_nsproxy is None:
+            return None
+        try:
+            nsproxy = read_int_from_memory(task + self.offset_nsproxy)
+            if not is_valid_addr(nsproxy):
+                return None
+            mnt_ns = read_int_from_memory(nsproxy + runtime.current_arch.ptrsize * 3)
+        except (gdb.MemoryError, OverflowError):
+            return None
+        if not is_valid_addr(mnt_ns):
+            return None
+        return mnt_ns
+
+    def collect_namespaces(self):
+        """Group every task by the root mount of the mount namespace it belongs to."""
+        kpath = self.kpath
+        task_command = self.task_command
+        namespaces = collections.OrderedDict()
+        for task in KernelTask.get_task_list(task_command.init_task, task_command.offset_tasks):
+            root = kpath.get_task_root(task, self.offset_fs)
+            if root is None:
+                continue
+            root_mount = kpath.get_root_mount(root[0] - kpath.offset_mount_mnt)
+            if root_mount not in namespaces:
+                namespaces[root_mount] = {"mnt_ns": self.get_mnt_ns(task), "tasks": []}
+            namespaces[root_mount]["tasks"].append(task)
+
+        if not namespaces and self.kfs is not None and self.kfs.sample_mount is not None:
+            # no task->fs->root was readable, but a mount found via super_block still gives the tree
+            root_mount = kpath.get_root_mount(self.kfs.sample_mount)
+            namespaces[root_mount] = {"mnt_ns": None, "tasks": []}
+        return namespaces
+
+    def get_task_by_pid(self, pid):
+        task_command = self.task_command
+        task_addrs = KernelTask.get_task_list(task_command.init_task, task_command.offset_tasks)
+        if task_command.enabled.get("threads"):
+            task_addrs = task_command.add_lwp_task(task_addrs)
+        for task in task_addrs:
+            if read_int32_from_memory(task + task_command.offset_pid) == pid:
+                return task
+        return None
+
+    def resolve_target(self):
+        """Return (ok, [(namespace root mount, tree root mount), ...], root).
+        `root` is the (vfsmount, dentry) pair the pathnames stop at, or None when they are absolute.
+        With --pid/--task the tree starts at the mount of task->fs->root instead of the namespace
+        root. Mounts outside that root may also be returned and are marked `outside-root`."""
+        args = self.args
+        kpath = self.kpath
+
+        if args.pid is None and args.task is None:
+            root_mounts = list(self.namespaces.keys())
+            if not args.all:
+                root_mounts = root_mounts[:1]
+            return True, [(root_mount, root_mount) for root_mount in root_mounts], None
+
+        task = args.task
+        if task is None:
+            task = self.get_task_by_pid(args.pid)
+            if task is None:
+                err("Could not find the task of pid {:d}".format(args.pid))
+                return False, [], None
+
+        root = kpath.get_task_root(task, self.offset_fs)
+        if root is None:
+            err("Could not find task->fs->root of {:#x}".format(task))
+            return False, [], None
+        tree_root = root[0] - kpath.offset_mount_mnt
+        return True, [(kpath.get_root_mount(tree_root), tree_root)], root
+
+    def get_children(self, mount):
+        kpath = self.kpath
+        head = mount + kpath.offset_mount_mnt_mounts
+        if not is_double_link_list(head):
+            return []
+        children = []
+        for child in KernelListHead(head, kpath.offset_mount_mnt_child).iter_entries():
+            if is_valid_addr(child):
+                children.append(child)
+        return children
+
+    def walk_tree(self, root_mount, max_mounts=0x20000):
+        """Yield (mount, tree prefix) over the whole tree under `root_mount`, depth first."""
+        kpath = self.kpath
+        if kpath.get_offset_mnt_mounts(root_mount) is None:
+            yield root_mount, ""
+            return
+
+        seen = set()
+        stack = [(root_mount, "", True, True)]
+        while stack:
+            mount, prefix, is_last, is_root = stack.pop()
+            if mount in seen:
+                continue
+            if len(seen) >= max_mounts:
+                self.err_add_out("Mount tree truncated after {:d} mounts".format(max_mounts))
+                break
+            seen.add(mount)
+            if is_root:
+                mark, child_prefix = "", ""
+            else:
+                mark = prefix + ("`- " if is_last else "|- ")
+                child_prefix = prefix + ("   " if is_last else "|  ")
+            yield mount, mark
+            children = self.get_children(mount)
+            for i, child in enumerate(reversed(children)):
+                stack.append((child, child_prefix, i == 0, False))
+        return
+
+    def get_mnt_flags(self, mount):
+        if self.offset_mnt_flags is None:
+            return None
+        return read_int32_from_memory(mount + self.offset_mnt_flags, safe=True)
+
+    def get_mount_list_node_status(self, mount, offset, hlist=False):
+        if offset is None:
+            return None
+        node = mount + offset
+        next_entry = read_int_from_memory(node, safe=True)
+        prev_entry = read_int_from_memory(node + runtime.current_arch.ptrsize, safe=True)
+        if next_entry is None or prev_entry is None:
+            return None
+        if hlist:
+            if prev_entry == 0:
+                return False
+            if not is_valid_addr(prev_entry):
+                return None
+            first = read_int_from_memory(prev_entry, safe=True)
+            if first is None:
+                return None
+            return first == node
+        if not is_valid_addr(next_entry) or not is_valid_addr(prev_entry):
+            return None
+        if read_int_from_memory(next_entry + runtime.current_arch.ptrsize, safe=True) != node:
+            return None
+        if read_int_from_memory(prev_entry, safe=True) != node:
+            return None
+        return next_entry != node
+
+    def get_mnt_propagation_str(self, mount):
+        flags = self.get_mnt_flags(mount)
+        t_flags = None
+        if self.offset_mnt_t_flags is not None:
+            t_flags = read_int32_from_memory(mount + self.offset_mnt_t_flags, safe=True)
+
+        shared_flag = None
+        unbindable = None
+        if t_flags is not None:
+            shared_flag = bool(t_flags & 1)
+            unbindable = bool(t_flags & 2)
+        elif self.kversion < "6.17" and flags is not None:
+            shared_flag = bool(flags & 0x1000)
+            unbindable = bool(flags & 0x2000)
+
+        shared_list = self.get_mount_list_node_status(mount, self.offset_mnt_share)
+        shared = shared_flag
+        if shared is None and self.offset_mnt_group_id is not None:
+            group_id = read_int32_from_memory(mount + self.offset_mnt_group_id, safe=True)
+            if group_id is not None:
+                shared = bool(group_id)
+        if shared is None and shared_list is True:
+            shared = True
+        mismatch = shared is False and shared_list is True
+
+        master = None
+        if self.offset_mnt_master is not None:
+            master = read_int_from_memory(mount + self.offset_mnt_master, safe=True)
+            if master == 0:
+                master = False
+            elif master is not None:
+                if is_valid_addr(master):
+                    master = True
+                else:
+                    master = None
+        slave_list = self.get_mount_list_node_status(mount, self.offset_mnt_slave, self.mnt_slave_is_hlist)
+        slave = master
+        if slave is None:
+            slave = slave_list
+        if master is not None and slave_list is not None and master != slave_list:
+            mismatch = True
+
+        if shared is False and slave is False and unbindable is None:
+            state = "private,?unbindable"
+        else:
+            states = []
+            for value, name in ((shared, "shared"), (slave, "slave"), (unbindable, "unbindable")):
+                if value is True:
+                    states.append(name)
+                elif value is None:
+                    states.append("?" + name)
+            if not states:
+                state = "private"
+            else:
+                state = ",".join(states)
+        if mismatch:
+            state += " (list mismatch)"
+        return state
+
+    def get_mnt_flags_str(self, mount):
+        flags = self.get_mnt_flags(mount)
+        if flags is None:
+            return "???"
+        names = ["ro" if flags & self.MNT_READONLY else "rw"]
+        for entry in self.MNT_FLAGS:
+            bit, name = entry[0], entry[1]
+            if len(entry) > 2 and self.kversion < entry[2]:
+                continue
+            if name == "onrb" and not self.mnt_onrb_present:
+                continue
+            if flags & bit:
+                names.append(name)
+        if self.offset_mnt_t_flags is not None:
+            t_flags = read_int32_from_memory(mount + self.offset_mnt_t_flags, safe=True)
+            if t_flags is not None:
+                if t_flags & 4:
+                    names.append("marked")
+                if t_flags & 8:
+                    names.append("umount_candidate")
+        elif self.kversion < "6.17" and flags & 0x0400_0000:
+            names.append("marked")
+        return ",".join(names)
+
+    def get_mount_row(self, mount, mark, root):
+        kpath = self.kpath
+        vfsmnt = mount + kpath.offset_mount_mnt
+        try:
+            mnt_root = read_int_from_memory(vfsmnt + kpath.offset_vfsmount_mnt_root)
+            super_block = read_int_from_memory(vfsmnt + kpath.offset_vfsmount_mnt_sb)
+        except (gdb.MemoryError, OverflowError):
+            self.warn_add_out("Unreadable mount: {:#x}".format(mount))
+            return None
+
+        fstype = None
+        devname = None
+        if self.kfs is not None:
+            fstype = self.kfs.get_fstype_name(super_block)
+            devname = self.kfs.get_dev_name(mount)
+        elif self.kversion < "3.3":
+            fst = read_int_from_memory(super_block + self.offset_s_type, safe=True)
+            if is_valid_addr(fst):
+                name_ptr = read_int_from_memory(fst, safe=True)
+                if is_valid_addr(name_ptr):
+                    fstype = read_cstring_from_memory(name_ptr, max_length=64, safe=True)
+            if self.offset_mnt_devname is not None:
+                name_ptr = read_int_from_memory(vfsmnt + self.offset_mnt_devname, safe=True)
+                if is_valid_addr(name_ptr):
+                    devname = read_cstring_from_memory(name_ptr, max_length=64, safe=True)
+
+        path_info = kpath.get_mount_path(mount, root)
+        path = path_info.path or "???"
+        if path_info.status != "normal":
+            path += " ({:s})".format(path_info.status)
+
+        row = [
+            "{:#018x}".format(mount), "{:#018x}".format(vfsmnt), "{:#018x}".format(mnt_root), "{:#018x}".format(super_block),
+            fstype or "???", devname or "???", mark + path, self.get_mnt_flags_str(mount),
+        ]
+        if not self.args.verbose:
+            return row
+
+        mount_id = None
+        if self.offset_mnt_id is not None:
+            mount_id = read_int32_from_memory(
+                mount + self.offset_mnt_id, safe=True, signed=True,
+            )
+        group_id = None
+        if self.offset_mnt_group_id is not None:
+            group_id = read_int32_from_memory(
+                mount + self.offset_mnt_group_id, safe=True, signed=True,
+            )
+        master = None
+        if self.offset_mnt_master is not None:
+            master = read_int_from_memory(mount + self.offset_mnt_master, safe=True)
+        if mount_id is None:
+            mount_id = "?"
+        else:
+            mount_id = str(mount_id)
+        if group_id is None:
+            group_id = "?"
+        else:
+            group_id = str(group_id)
+        if master is None:
+            master = "?"
+        elif master == 0:
+            master = "none"
+        elif is_valid_addr(master):
+            master = "{:#x}".format(master)
+        else:
+            master = "?"
+        row += [mount_id, group_id, master, self.get_mnt_propagation_str(mount)]
+        return row
+
+    def dump_namespace(self, root_mount, tree_root, root):
+        info = self.namespaces.get(root_mount, {"mnt_ns": None, "tasks": []})
+        if info["mnt_ns"] is not None:
+            title = "mount namespace {:#x}".format(info["mnt_ns"])
+        else:
+            title = "mount namespace of root mount {:#x}".format(root_mount)
+        self.out.append(titlify(title))
+
+        task_command = self.task_command
+        tasks = info["tasks"]
+        if tasks:
+            # the idle task heads the list, but it says nothing about who owns the namespace
+            sample = tasks[0]
+            for task in tasks:
+                if read_int32_from_memory(task + task_command.offset_pid) != 0:
+                    sample = task
+                    break
+            comm = read_cstring_from_memory(sample + task_command.offset_comm)
+            self.quiet_info_add_out('root mount: {:#018x}, tasks: {:d} (e.g. "{:s}")'.format(root_mount, len(tasks), comm))
+            if self.args.tasks:
+                for task in tasks:
+                    pid = read_int32_from_memory(task + task_command.offset_pid)
+                    comm = read_cstring_from_memory(task + task_command.offset_comm)
+                    self.out.append('  task: {:#018x} (pid: {:d}, comm: "{:s}")'.format(task, pid, comm))
+        else:
+            self.quiet_info_add_out("root mount: {:#018x}, tasks: 0".format(root_mount))
+
+        if tree_root != root_mount:
+            self.quiet_info_add_out("the tree starts at the mount of task->fs->root: {:#018x}".format(tree_root))
+
+        legend = ["mount", "vfsmount", "mnt_root", "super_block", "fstype", "devname", "mount_point", "mnt_flags"]
+        if self.args.verbose:
+            legend += ["mnt_id", "peer_group", "mnt_master", "propagation"]
+        rows = []
+        for mount, mark in self.walk_tree(tree_root):
+            row = self.get_mount_row(mount, mark, root)
+            if row is not None:
+                rows.append(row)
+        widths = [max(len(row[i]) for row in [legend] + rows) for i in range(len(legend))]
+        fmt = " ".join("{{:{:d}s}}".format(width) for width in widths)
+        if not self.args.quiet:
+            self.out.append(GefUtil.make_legend(fmt.format(*legend)))
+        for row in rows:
+            self.out.append(fmt.format(*row).rstrip())
+        return
+
+    @parse_args
+    @only_if_gdb_running
+    @only_if_specific_gdb_mode(mode=("qemu-system", "vmware", "kgdb"))
+    @only_if_specific_arch(arch=("x86_32", "x86_64", "ARM32", "ARM64", "RISCV32", "RISCV64"))
+    @only_if_in_kernel_or_kpti_disabled
+    def do_invoke(self, args):
+        self.quiet_info("Wait for memory scan")
+
+        ret = self.initialize()
+        if args.meta or not ret:
+            for func, line in self.meta:
+                func(line)
+        if not ret:
+            return
+
+        if args.meta:
+            return
+
+        ok, targets, root = self.resolve_target()
+        if not ok:
+            return
+
+        if args.pid is None and args.task is None and len(self.namespaces) > len(targets):
+            self.quiet_info("{:d} more mount namespaces exist; use --all".format(len(self.namespaces) - len(targets)))
+
+        self.out = []
+        for i, (root_mount, tree_root) in enumerate(targets):
+            if i > 0:
+                self.out.append("")
+            self.dump_namespace(root_mount, tree_root, root)
+        self.print_output(check_terminal_size=True)
+        return
+
+
+
+@register_command
+class KernelNftablesCommand(GenericCommand, BufferingOutput):
+    """Dump the nftables (netfilter) object graph."""
+
+    _cmdline_ = "knft"
+    _category_ = "06-g. Qemu-system/KGDB Cooperation - Linux Advanced"
+
+    parser = argparse.ArgumentParser(prog=_cmdline_)
+    parser.add_argument("address", metavar="ADDRESS", nargs="?", type=AddressUtil.parse_address,
+                        help="reverse-lookup: report an exact/containing known nftables object, or the nearest known object.")
+    parser.add_argument("-hh", "--help-simple", action="store_true", help="show help without ASCII diagram.")
+    parser.add_argument("-R", "--no-rules", action="store_true", help="do not decode or render rules and expressions.")
+    parser.add_argument("-E", "--no-elements", action="store_true", help="do not decode or render set elements.")
+    parser.add_argument("-F", "--family", help="only show tables of this family (inet, ip, ip6, arp, bridge, netdev).")
+    parser.add_argument("-T", "--table", metavar="NAME", help="only show tables with this name.")
+    parser.add_argument("-k", "--kind", action="append", choices=["chain", "set", "object", "flowtable"],
+                        help="only show this kind of table child. It can be specified multiple times.")
+    parser.add_argument("-N", "--name", help="only show chains, sets, objects and flowtables with this name.")
+    parser.add_argument("-H", "--handle", type=AddressUtil.parse_address,
+                        help="only show the rule with this handle (implies `-k chain`).")
+    parser.add_argument("--net", type=AddressUtil.parse_address,
+                        help="only show the network namespace with this struct net address or ns inode number.")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="show object attributes, hooks and expression contents (mostly needs type information).")
+    parser.add_argument("--meta", action="store_true", help="display discovery information.")
+    parser.add_argument("-n", "--no-pager", action="store_true", help="do not use the pager.")
+    parser.add_argument("-q", "--quiet", action="store_true", help="show result only.")
+    _syntax_ = parser.format_help()
+
+    _example_ = [
+        "{0:s}                          # dump the whole nftables object graph",
+        "{0:s} -R                       # dump the graph without rules and expressions",
+        "{0:s} -E                       # dump the graph without set elements",
+        "{0:s} -F inet -T filter -k set # show only the sets of the inet table `filter`",
+        "{0:s} -T filter -N input -v    # show chain `input` with attributes, hook and expressions",
+        "{0:s} -T filter -H 12 -v       # show rule handle 12 and its decoded expressions",
+        "{0:s} --net 4026531840         # show only the network namespace net:[4026531840]",
+        "{0:s} 0xffff888012345600       # find which nftables object owns this address",
+    ]
+    _example_ = "\n".join(_example_).format(_cmdline_)
+
+    _note_ = [
+        "Walks table -> chain -> rule -> expr and table -> set -> element / object / flowtable.",
+        "The mainline location of the table list changed over time:",
+        "",
+        "  v3.13~v4.15 : net.nft.af_info -> nft_af_info.tables (one list per family)",
+        "  v4.16~v5.12 : net.nft.tables (one list for every family)",
+        "  v5.13~      : net_generic(net, nf_tables_net_id) -> nftables_pernet.tables",
+        "",
+        "nftables first appeared in mainline v3.13. Older kernels have no nftables object graph.",
+        "",
+        "+-nftables_pernet-+   +-nft_table---+   +-nft_chain--+   +-nft_rule_blob-+",
+        "| tables          |-->| list        |   | blob_gen_0 |-->| size          |",
+        "| ...             |   | chains      |-->| list       |   | data[]        |",
+        "+-----------------+   | sets        |   | name       |   +-------+-------+",
+        "                      | objects     |   +------------+           |  (one nft_rule_dp per rule)",
+        "                      | flowtables  |                            v",
+        "                      | name        |                     +-nft_rule_dp-+",
+        "                      +-------------+                     | is_last     |",
+        "                                                          | dlen,handle |",
+        "                                                          | data[]      |--> +-nft_expr-+",
+        "                                                          +-------------+    | ops      |--> type->name",
+        "                                                                             +----------+",
+        "",
+        "On v4.16 and later, chains / sets / objects / flowtables hang off nft_table as four",
+        "consecutive list_head fields; legacy tables have the lists available in that kernel release.",
+        "Table discovery first validates this list topology and child->table back-references, then",
+        "uses rule/expression decoding only for the actual chains instead of for every table candidate.",
+        "",
+        "Rule headers, blob fields, set extensions and backend layouts prefer kernel type information.",
+        "Stripped targets use versioned layout fallbacks; --meta reports the selected source and offsets.",
+        "Broken walks keep validated entries where possible and mark the output as partial.",
+        "nftables names may be up to 255 bytes; identifier-like names are preferred only as a heuristic",
+        "and are not a kernel validity rule. The datapath representation changed from linked nft_rule objects before",
+        "v5.17 to a contiguous nft_rule_blob in mainline v5.17 and later; the control-plane rule list",
+        "still exists on newer kernels, and both representations are understood where applicable.",
+        "",
+        "Filters are applied after the table list is discovered; only the selected chains and sets are",
+        "decoded. With -v, the table handle/flags/genmask/owner come from the validated nft_table layout",
+        "and the rule genmask/userdata from the rule header even on stripped kernels. The chain, base",
+        "chain hook, set, object and flowtable attributes and the expression private data are printed",
+        "only when type information (e.g., vmlinux and nf_tables.ko debug info) is loaded.",
+    ]
+    _note_ = "\n".join(_note_)
+
+    FAMILY_NAMES = {"inet": 1, "ip": 2, "ipv4": 2, "arp": 3, "netdev": 5, "bridge": 7, "ip6": 10, "ipv6": 10}
+
+    TABLE_FLAGS = {0x1: "dormant", 0x2: "owner", 0x4: "persist"}
+    CHAIN_FLAGS = {0x1: "base", 0x2: "hw-offload", 0x4: "binding"}
+    SET_FLAGS = {
+        0x1: "anonymous", 0x2: "constant", 0x4: "interval", 0x8: "map", 0x10: "timeout",
+        0x20: "eval", 0x40: "object", 0x80: "concat", 0x100: "expr",
+    }
+    FLOWTABLE_FLAGS = {0x1: "hw-offload", 0x2: "counter"}
+    SET_POLICIES = {0: "performance", 1: "memory"}
+    CHAIN_POLICIES = {0: "drop", 1: "accept"}
+    OBJECT_TYPES = {
+        1: "counter", 2: "quota", 3: "ct helper", 4: "limit", 5: "connlimit", 6: "tunnel",
+        7: "ct timeout", 8: "secmark", 9: "ct expectation", 10: "synproxy",
+    }
+    HOOK_NAMES = {
+        None: ("prerouting", "input", "forward", "output", "postrouting", "ingress"),
+        3: ("input", "output", "forward"),
+        5: ("ingress", "egress"),
+    }
+    SET_UDATA = {
+        0: "keybyteorder", 1: "databyteorder", 2: "merge_elements", 3: "key_typeof", 4: "data_typeof",
+        5: "expr", 6: "data_interval", 7: "comment",
+    }
+
+    def table_selected(self, table):
+        if self.family_filter is not None and table["family"] != self.family_filter:
+            return False
+        return self.args.table is None or table["name"] == self.args.table
+
+    def kind_selected(self, kind):
+        if self.args.handle is not None:
+            return kind == "chains"
+        if not self.args.kind:
+            return True
+        return kind[:-1] in self.args.kind
+
+    def get_table_children(self, table, net):
+        # Apply the child filters before any set element is decoded; rules are decoded only for
+        # chains whose name matched.
+        children = []
+        for kind in ("chains", "sets", "objects", "flowtables"):
+            if kind not in table["kinds"] or not self.kind_selected(kind):
+                continue
+            for entry in table["kinds"][kind]["entries"]:
+                name = self.knft.entry_name(entry, kind, table=table["address"])
+                if self.args.name is not None and name != self.args.name:
+                    continue
+                rules, status = None, None
+                if kind == "chains" and not self.args.no_rules:
+                    rules, status = self.knft.rules.chain_rules(entry, net)
+                    if self.args.handle is not None and not any(rule["handle"] == self.args.handle for rule in rules or []):
+                        continue
+                children.append({
+                    "kind": kind,
+                    "address": entry,
+                    "name": name,
+                    "rules": rules,
+                    "status": status,
+                })
+        return children
+
+    def get_object_ranges(self, net, label, nftables):
+        # Type information provides exact object ranges; stripped targets retain exact/nearest semantics.
+        nodes = []
+        for table in nftables["tables"]:
+            if not self.table_selected(table):
+                continue
+            table_start, table_end = self.knft.table_range(table)
+            nodes.append({
+                "address": table_start, "end": table_end,
+                "description": 'table "{:s}" ({:s})'.format(table["name"], label or "net {:#x}".format(net)),
+            })
+            for kind, child_list in table["kinds"].items():
+                if not self.kind_selected(kind):
+                    continue
+                for entry in child_list["entries"]:
+                    name = self.knft.entry_name(entry, kind, table=table["address"])
+                    if self.args.name is not None and name != self.args.name:
+                        continue
+                    object_start, object_end = self.knft.entry_object_range(entry, kind)
+                    nodes.append({
+                        "address": object_start, "end": object_end,
+                        "description": '{:s} "{:s}" in table "{:s}"'.format(kind[:-1], name, table["name"]),
+                    })
+                    if kind == "chains":
+                        base_range = self.knft.rules.base_chain_range(entry)
+                        if base_range is not None:
+                            nodes.append({
+                                "address": base_range[0], "end": base_range[1],
+                                "description": 'base chain "{:s}" in table "{:s}"'.format(name, table["name"]),
+                            })
+                    if kind == "sets" and not self.args.no_elements:
+                        info = self.knft.sets.parse_set(entry)
+                        for element in info["elements"]:
+                            key = "0x" + element["key"].hex()
+                            nodes.append({
+                                "address": element["address"], "end": element["end"],
+                                "description": 'set element key={:s} in set "{:s}"'.format(key, name),
+                            })
+                    if kind != "chains" or self.args.no_rules:
+                        continue
+
+                    blob_range = self.knft.rules.chain_blob_range(entry, net)
+                    if blob_range is not None:
+                        nodes.append({"address": blob_range[0], "end": blob_range[1],
+                                      "description": 'rule blob of chain "{:s}"'.format(name)})
+                    rules, status = self.knft.rules.chain_rules(entry, net)
+                    if status and "control-plane" in status:
+                        source = "control-plane "
+                    else:
+                        source = ""
+                    for rule in rules or []:
+                        if self.args.handle is not None and rule["handle"] != self.args.handle:
+                            continue
+                        nodes.append({"address": rule["address"], "end": rule["end"],
+                                      "description": '{:s}rule handle={:d} in chain "{:s}"'.format(
+                                          source, rule["handle"], name)})
+                        for expr in rule["exprs"]:
+                            nodes.append({"address": expr["address"], "end": expr["end"],
+                                          "description": '{:s}expression "{:s}" in rule handle={:d} of chain "{:s}"'.format(
+                                              source, expr["name"], rule["handle"], name)})
+        return nodes
+
+    @staticmethod
+    def flags_str(value, names):
+        if value is None:
+            return None
+        parts, rest = GefUtil.flags_to_names(value, sorted(names.items()))
+        if rest:
+            parts.append("{:#x}".format(rest))
+        return "{:#x}".format(value) + ("({:s})".format(",".join(parts)) if parts else "")
+
+    @staticmethod
+    def attrs_str(attrs):
+        return " ".join("{:s}={}".format(key, value) for key, value in attrs if value is not None)
+
+    def hook_name(self, family, hooknum):
+        if hooknum is None:
+            return None
+        names = self.HOOK_NAMES.get(family, self.HOOK_NAMES[None])
+        if 0 <= hooknum < len(names):
+            return "{:s}({:d})".format(names[hooknum], hooknum)
+        return str(hooknum)
+
+    @staticmethod
+    def udata_string(data, names=None):
+        # libnftnl stores userdata as {u8 type, u8 len, value[len]} records; type 0 is a comment
+        # except for sets.
+        if names is None:
+            names = {0: "comment"}
+        items = []
+        pos = 0
+        while pos + 2 <= len(data):
+            kind, length = data[pos], data[pos + 1]
+            value = data[pos + 2:pos + 2 + length]
+            if len(value) != length:
+                break
+            name = names.get(kind)
+            if value.endswith(b"\0"):
+                text = value[:-1]
+            else:
+                text = value
+            if name == "comment" and text and all(0x20 <= char < 0x7f for char in text):
+                items.append('comment="{:s}"'.format(text.decode()))
+            elif name is not None and length == 4:
+                items.append("{:s}={:d}".format(name, u32(value)))
+            else:
+                items.append("{:s}=0x{:s}".format(name or "udata[{:d}]".format(kind), value.hex()))
+            pos += 2 + length
+        if pos != len(data) or not items:
+            return "udata=0x" + data.hex()
+        return " ".join(items)
+
+    def table_detail(self, table, nftables):
+        attrs = self.knft.get_table_attrs(table, nftables)
+        if attrs is None:
+            return None
+        text = self.attrs_str([
+            ("handle", attrs["handle"]),
+            ("flags", self.flags_str(attrs["flags"], self.TABLE_FLAGS)),
+            ("genmask", attrs["genmask"]),
+            ("nlpid", attrs["nlpid"]),
+        ])
+        if attrs["udata"]:
+            text += " " + self.udata_string(attrs["udata"])
+        return text
+
+    def chain_detail(self, entry, family):
+        attrs = self.knft.rules.get_chain_attrs(entry)
+        if attrs is None:
+            return []
+        text = self.attrs_str([
+            ("handle", attrs["handle"]),
+            ("use", attrs["use"]),
+            ("level", attrs["level"]),
+            ("flags", self.flags_str(attrs["flags"], self.CHAIN_FLAGS)),
+            ("bound", attrs["bound"]),
+            ("genmask", attrs["genmask"]),
+        ])
+        if attrs["udata"]:
+            text += " " + self.udata_string(attrs["udata"])
+        lines = [text]
+
+        hook = attrs["hook"]
+        if hook is None:
+            return lines
+        text = self.attrs_str([
+            ("type", hook["type"]),
+            ("hook", self.hook_name(family, hook["hooknum"])),
+            ("priority", hook["priority"]),
+            ("policy", self.CHAIN_POLICIES.get(hook["policy"], hook["policy"])),
+            ("base-chain", Color.colorify_hex(hook["base_chain"], "blue")),
+        ])
+        if hook["devices"]:
+            text += " devices={:s}".format(",".join(hook["devices"]))
+        lines.append("hook: " + text)
+        return lines
+
+    def set_detail(self, entry):
+        attrs = self.knft.sets.get_set_attrs(entry)
+        if attrs is None:
+            return []
+        concat = None
+        if attrs["concat"] is not None:
+            concat = ",".join(str(length) for length in attrs["concat"]) or None
+        text = self.attrs_str([
+            ("handle", attrs["handle"]),
+            ("flags", self.flags_str(attrs["flags"], self.SET_FLAGS)),
+            ("ktype", attrs["ktype"]),
+            ("klen", attrs["klen"]),
+            ("dtype", None if attrs["dtype"] is None else "{:#x}".format(attrs["dtype"])),
+            ("dlen", attrs["dlen"]),
+            ("objtype", attrs["objtype"]),
+            ("policy", self.SET_POLICIES.get(attrs["policy"], attrs["policy"])),
+            ("size", attrs["size"]),
+            ("timeout", attrs["timeout"]),
+            ("gc_int", attrs["gc_int"]),
+            ("use", attrs["use"]),
+            ("nelems", attrs["nelems"]),
+            ("genmask", attrs["genmask"]),
+            ("concat", concat),
+        ])
+        if attrs["udata"]:
+            text += " " + self.udata_string(attrs["udata"], self.SET_UDATA)
+        lines = [text]
+        for expr in attrs["exprs"]:
+            lines += self.expr_detail(expr)
+        return lines
+
+    def object_detail(self, entry):
+        attrs = self.knft.get_object_attrs(entry)
+        if attrs is None:
+            return []
+        text = self.attrs_str([
+            ("handle", attrs["handle"]),
+            ("type", self.OBJECT_TYPES.get(attrs["type"], attrs["type"])),
+            ("use", attrs["use"]),
+            ("genmask", attrs["genmask"]),
+        ])
+        if attrs["udata"]:
+            text += " " + self.udata_string(attrs["udata"])
+        return [text]
+
+    def flowtable_detail(self, entry):
+        attrs = self.knft.get_flowtable_attrs(entry)
+        if attrs is None:
+            return []
+        text = self.attrs_str([
+            ("handle", attrs["handle"]),
+            ("use", attrs["use"]),
+            ("flags", self.flags_str(attrs["flags"], self.FLOWTABLE_FLAGS)),
+            ("genmask", attrs["genmask"]),
+            ("hook", self.hook_name(5, attrs["hooknum"])),
+            ("priority", attrs["priority"]),
+        ])
+        if attrs["devices"]:
+            text += " devices={:s}".format(",".join(attrs["devices"]))
+        return [text]
+
+    def rule_detail(self, rule):
+        attrs = self.knft.rules.get_rule_attrs(rule)
+        if attrs is None:
+            return None
+        text = self.attrs_str([("genmask", attrs["genmask"])])
+        if attrs["udata"]:
+            text += " " + self.udata_string(attrs["udata"])
+        return text
+
+    def expr_detail(self, expr):
+        if expr["end"] is None:
+            return ["expr ? {:s}".format(Color.colorify_hex(expr["address"], "blue"))]
+        size = expr["end"] - expr["address"]
+        lines = ["expr {:s} {:s} size={:#x}".format(expr["name"], Color.colorify_hex(expr["address"], "blue"), size)]
+        xt = expr["xt"]
+        if xt is not None:
+            info_text = "?"
+            if xt["info"] is not None:
+                info_text = "0x" + xt["info"].hex() + ("..." if xt["size"] > len(xt["info"]) else "")
+            lines[0] += " {:s} {:s} rev={} size={:#x} info={:s}".format(
+                xt["type"], xt["name"], xt["revision"], xt["size"], info_text)
+            return lines
+        if expr["value"] is None:
+            return lines
+        try:
+            lines[0] += " {:s} {:s}".format(expr["type_name"].split()[1], expr["value"].format_string(
+                pretty_structs=False, pretty_arrays=False, array_indexes=False))
+        except gdb.error:
+            return lines
+        for nested in expr["nested"]:
+            lines += ["  " + line for line in self.expr_detail(nested)]
+        return lines
+
+    def dump_meta(self, nets):
+        for func, line in self.meta:
+            func(line)
+        for net, label in nets:
+            nftables = self.knft.parse_tables(net)
+            meta = self.knft.get_net_meta(net, label, nftables, elements=not self.args.no_elements)
+            for func, line in Kernel.export_meta(self, meta):
+                func(line)
+        return
+
+    def dump_table(self, table, prefix, children):
+        for index, child in enumerate(children):
+            kind = child["kind"]
+            entry = child["address"]
+            name = child["name"]
+            rules = child["rules"]
+            status = child["status"]
+            entry_last = index == len(children) - 1
+            if entry_last:
+                connector = "`- "
+            else:
+                connector = "|- "
+            if entry_last:
+                extension = "   "
+            else:
+                extension = "|  "
+            if kind == "chains":
+                if rules is None:
+                    rules_text = ""
+                elif status and "limit" in status:
+                    rules_text = " rules>={:d} [scan limit]".format(len(rules))
+                else:
+                    rules_text = " rules={:d}".format(len(rules))
+                    if status and "broken" in status:
+                        rules_text += " [corrupt]"
+                if status and "control-plane" in status:
+                    rules_text += " [control-plane; active datapath unavailable]"
+                self.out.append(prefix + connector + "chain {:s} {:s}{:s}".format(
+                    Color.colorify(name, "bold green"), Color.colorify_hex(entry, "blue"), rules_text))
+                if self.args.handle is not None:
+                    rules = [rule for rule in rules if rule["handle"] == self.args.handle]
+                control = None
+                if self.args.verbose:
+                    for line in self.chain_detail(entry, table["family"]):
+                        self.out.append(prefix + extension + ("|  " if rules else "   ") + line)
+                    if rules:
+                        control = self.knft.rules.control_rules(entry) or {}
+                for rule_index, rule in enumerate(rules or []):
+                    names = [expr["name"] for expr in rule["exprs"]]
+                    rule_last = rule_index == len(rules) - 1
+                    if rule_last:
+                        rule_connector = "`- "
+                    else:
+                        rule_connector = "|- "
+                    if names:
+                        suffix = " [{:s}]".format(", ".join(names))
+                    else:
+                        suffix = ""
+                    self.out.append(prefix + extension + rule_connector + "rule handle={:d}".format(rule["handle"]) + suffix)
+                    if control is None:
+                        continue
+                    detail_lines = []
+                    if rule["handle"] in control:
+                        text = self.rule_detail(control[rule["handle"]])
+                        if text:
+                            detail_lines.append(text)
+                    for expr in rule["exprs"]:
+                        expr_info = self.knft.rules.get_expr_info(expr["address"], expr["end"], expr["name"])
+                        detail_lines += self.expr_detail(expr_info)
+                    for line in detail_lines:
+                        self.out.append(prefix + extension + ("   " if rule_last else "|  ") + "   " + line)
+            elif kind == "sets":
+                info = self.knft.sets.parse_set(entry, elements=not self.args.no_elements)
+                expected = info["nelems"]
+                count = len(info["elements"])
+                if info["status"] == "disabled":
+                    element_text = ""
+                elif expected is not None and expected != count:
+                    element_text = " elements={:d}/{:d}".format(count, expected)
+                else:
+                    element_text = " elements={:d}".format(count)
+                if info["status"] not in ("ok", "empty", "disabled"):
+                    element_text += " [{:s}]".format(info["status"])
+                if info["backend"]:
+                    backend_text = " type={:s}".format(info["backend"])
+                else:
+                    backend_text = ""
+                self.out.append(prefix + connector + "set {:s} {:s}{:s}{:s}".format(
+                    Color.colorify(name, "bold green"), Color.colorify_hex(entry, "blue"), backend_text, element_text))
+                if self.args.verbose:
+                    for line in self.set_detail(entry):
+                        self.out.append(prefix + extension + ("|  " if info["elements"] else "   ") + line)
+                for element_index, element in enumerate(info["elements"]):
+                    element_last = element_index == len(info["elements"]) - 1
+                    if element_last:
+                        element_conn = "`- "
+                    else:
+                        element_conn = "|- "
+                    key = "0x" + element["key"].hex()
+                    if element["key_end"] is not None:
+                        key += "-0x" + element["key_end"].hex()
+                    suffix = ""
+                    if element["data"] is not None:
+                        suffix += " data=0x" + element["data"].hex()
+                    if element["flags"] is not None and element["flags"] & 1:
+                        suffix += " [interval-end]"
+                    self.out.append(prefix + extension + element_conn + "element {:s} key={:s}{:s}".format(
+                        Color.colorify_hex(element["address"], "blue"), key, suffix))
+            else:
+                self.out.append(prefix + connector + "{:s} {:s} {:s}".format(
+                    kind[:-1], Color.colorify(name, "bold green"), Color.colorify_hex(entry, "blue")))
+                if self.args.verbose:
+                    if kind == "objects":
+                        detail_lines = self.object_detail(entry)
+                    elif kind == "flowtables":
+                        detail_lines = self.flowtable_detail(entry)
+                    else:
+                        detail_lines = []
+                    for line in detail_lines:
+                        self.out.append(prefix + extension + "   " + line)
+        return
+
+    def dump_net(self, net, label, nftables):
+        header = "net {:s}".format(Color.colorify_hex(net, "blue"))
+        if label:
+            header += " ({:s})".format(label)
+        if self.args.verbose:
+            inum = self.knft.net_inum(net)
+            if inum is not None:
+                header += " inum={:d}".format(inum)
+
+        selected = []
+        for table in nftables["tables"]:
+            if not self.table_selected(table):
+                continue
+            children = self.get_table_children(table, net)
+            if self.child_filter and not children:
+                continue
+            selected.append((table, children))
+        if not selected:
+            return
+
+        self.out.append(header)
+        for table_index, (table, children) in enumerate(selected):
+            table_last = table_index == len(selected) - 1
+            if table_last:
+                table_connector = "`- "
+            else:
+                table_connector = "|- "
+            if table_last:
+                text = "  "
+            else:
+                text = "| "
+            meta = []
+            if table["family"] is not None:
+                meta.append(KernelNftables.FAMILIES.get(table["family"], "family{:d}".format(table["family"])))
+            if table["use"] is not None:
+                meta.append("use={:d}".format(table["use"]))
+            if meta:
+                suffix = " [{:s}]".format(" ".join(meta))
+            else:
+                suffix = ""
+            self.out.append("{:s}table {:s} {:s}".format(
+                table_connector, Color.colorify(table["name"], "bold"), Color.colorify_hex(table["address"], "blue")) + suffix)
+            if self.args.verbose:
+                detail = self.table_detail(table, nftables)
+                if detail:
+                    self.out.append(text + ("|  " if children else "   ") + detail)
+            self.dump_table(table, text, children)
+        return
+
+    def dump_reverse_lookup(self, addr, all_nodes):
+        exact = [node for node in all_nodes if node["address"] == addr]
+        if exact:
+            for node in exact:
+                self.out.append("{:s} is {:s}".format(Color.colorify_hex(addr, "blue"), node["description"]))
+            return
+
+        containing = [node for node in all_nodes if node["end"] is not None and node["address"] <= addr < node["end"]]
+        if containing:
+            node = max(containing, key=lambda node: node["address"])
+            start, desc = node["address"], node["description"]
+            self.out.append("{:s} is +{:#x} into {:s} ({:s})".format(
+                Color.colorify_hex(addr, "blue"), addr - start, desc, Color.colorify_hex(start, "blue")))
+            return
+
+        below = [node for node in all_nodes if node["address"] <= addr]
+        if not below:
+            self.err_add_out("{:#x} does not match any known nftables object".format(addr))
+            return
+        node = max(below, key=lambda node: node["address"])
+        start, desc = node["address"], node["description"]
+        self.out.append("{:s}: nearest known nftables object below is {:s} at {:s} (+{:#x})".format(
+            Color.colorify_hex(addr, "blue"), desc, Color.colorify_hex(start, "blue"), addr - start,
+        ))
+        return
+
+    def dump(self, nets):
+        all_nodes = []
+        for net, label in nets:
+            nftables = self.knft.parse_tables(net)
+            if nftables is None or not nftables["tables"]:
+                continue
+            if self.args.address is None:
+                self.dump_net(net, label, nftables)
+            else:
+                all_nodes += self.get_object_ranges(net, label, nftables)
+
+        if self.args.address is not None:
+            self.dump_reverse_lookup(self.args.address, all_nodes)
+        elif self.out:
+            return
+        elif self.family_filter is not None or self.args.table is not None or self.child_filter:
+            self.warn_add_out("No nftables object matched the filter")
+        else:
+            self.warn_add_out("No nftables tables found (is CONFIG_NF_TABLES enabled and any table created?)")
+            if self.knft.kversion < "3.13":
+                self.warn_add_out("This kernel predates nftables, which first appeared in mainline v3.13")
+        return
+
+    def setup(self, args):
+        self.args = args
+        self.family_filter = None
+        if args.family is not None:
+            self.family_filter = self.FAMILY_NAMES.get(args.family.lower())
+            if self.family_filter is None:
+                err("Unknown family: {:s} (choose from {:s})".format(args.family, ", ".join(self.FAMILY_NAMES)))
+                return
+        if args.handle is not None:
+            args.no_rules = False
+        self.child_filter = bool(args.kind) or args.name is not None or args.handle is not None
+        return True
+
+    def initialize(self):
+        self.knft = Kernel.nftables()
+        ret = self.knft.initialize()
+        self.meta = Kernel.export_meta(self, self.knft.meta)
+        return ret
+
+    @parse_args
+    @only_if_gdb_running
+    @only_if_specific_gdb_mode(mode=("qemu-system", "vmware", "kgdb"))
+    @only_if_specific_arch(arch=("x86_32", "x86_64", "ARM32", "ARM64", "RISCV32", "RISCV64"))
+    @only_if_in_kernel_or_kpti_disabled
+    def do_invoke(self, args):
+        if not self.setup(args):
+            return
+        self.quiet_info("Wait for memory scan")
+
+        ret = self.initialize()
+        if not ret:
+            for func, line in self.meta:
+                func(line)
+            return
+
+        nets = self.knft.nets
+        if args.net is not None:
+            nets = [(net, label) for net, label in nets if net == args.net or self.knft.net_inum(net) == args.net]
+            if not nets:
+                err("Could not find the network namespace {:#x} ({:d})".format(args.net, args.net))
+                return
+        if args.verbose and GefUtil.cached_lookup_type("struct nft_chain") is None:
+            self.quiet_info("No nftables type information; "
+                            "chain/set/object/flowtable attributes and expression contents are omitted")
+
+        self.out = []
+        if args.meta:
+            self.dump_meta(nets)
+        else:
+            self.dump(nets)
+        if self.knft.partial_reasons:
+            self.warn_add_out("Partial result: {:s}".format(", ".join(sorted(self.knft.partial_reasons))))
+        self.print_output(check_terminal_size=not args.meta)
+        return
+
+
+
+@register_command
+class KernelPathCommand(GenericCommand, BufferingOutput):
+    """Reconstruct the pathname of a dentry, path, file or mount."""
+
+    _cmdline_ = "kpath"
+    _category_ = "06-g. Qemu-system/KGDB Cooperation - Linux Advanced"
+
+    parser = argparse.ArgumentParser(prog=_cmdline_)
+    parser.add_argument("-hh", "--help-simple", action="store_true", help="show help without ASCII diagram.")
+    parser.add_argument("address", metavar="ADDRESS", type=AddressUtil.parse_address,
+                        help="the address of struct dentry, path, file, mount or vfsmount.")
+    parser.add_argument("-t", "--type", choices=["auto", "dentry", "path", "file", "mount", "vfsmount"],
+                        default="auto", help="the type of ADDRESS. (default: %(default)s)")
+    parser.add_argument("-p", "--pid", type=int, help="resolve the path as the task of this pid sees it.")
+    parser.add_argument("-T", "--task", type=AddressUtil.parse_address, help="resolve the path as this task_struct sees it.")
+    parser.add_argument("-a", "--all", action="store_true", help="print every mount the dentry is reachable through.")
+    parser.add_argument("--meta", action="store_true", help="display offset information.")
+    parser.add_argument("-n", "--no-pager", action="store_true", help="do not use the pager.")
+    parser.add_argument("-q", "--quiet", action="store_true", help="enable quiet mode.")
+    _syntax_ = parser.format_help()
+
+    _example_ = [
+        "{0:s} 0xffff888003b0a000",
+        "{0:s} --pid 1 0xffff888003b0a000",
+        "{0:s} --all 0xffff888003b0a000",
+    ]
+    _example_ = "\n".join(_example_).format(_cmdline_)
+
+    _note_ = [
+        "This command requires CONFIG_RANDSTRUCT=n unless vmlinux with debug information is loaded.",
+        "",
+        "- Without `--pid/--task`, paths are resolved to the mount-namespace root.",
+        "  With either option, resolution stops at `task->fs->root`; `outside-root` means the target lies outside it.",
+        "- A bare dentry has no mount information. If multiple mounts match, `ambiguous` is shown; use `--all` to list them.",
+        "- The target mount namespace is searched first, then other namespaces reachable through scanned tasks.",
+        "  `no-mount` means no matching reachable mount was found, which is normal for pseudo-filesystems or unmounted mounts.",
+        "- Only a bare dentry and `--pid/--task` need the task list. The other types are resolved from the object alone.",
+        "",
+        "Simplified path structure:",
+        "",
+        "+-file-----------+     +-path----+",
+        "| ...            |     | mnt     |--+",
+        "| f_path         |---->| dentry  |--|--+",
+        "| ...            |     +---------+  |  |",
+        "+----------------+                  |  |",
+        "                                    |  |",
+        "    +-------------------------------+  |",
+        "    |                                  |",
+        "    v                                  v",
+        "+-mount----------+<-+     +----------->+-dentry-----+",
+        "| mnt_hash       |  |     |            | ...        |",
+        "| mnt_parent     |--+     |            | d_parent   |-->dentry",
+        "| mnt_mountpoint |--------+            | ...        |",
+        "| mnt (vfsmount) |                     | d_name     |",
+        '|   mnt_root     |-------------------->|   name     |-->"foo"',
+        "|   mnt_sb       |-->super_block       | d_inode    |-->inode",
+        "| ...            |                     | d_iname    |",
+        "| mnt_mounts     |--+                  +------------+",
+        "| mnt_child      |  |",
+        "+----------------+  +-->child mounts",
+    ]
+    _note_ = "\n".join(_note_)
+
+    def initialize(self):
+        self.meta = []
+        self.task_command = None
+        self.task_tried = False
+        self.offset_fs = None
+        self.root_mount = None
+
+        kversion = Kernel.version()
+        if kversion is None:
+            self.meta.append((self.quiet_err, "Could not find Linux kernel"))
+            return None
+
+        self.kpath = Kernel.path()
+        if not self.initialize_layout(kversion):
+            return None
+
+        if self.args.meta:
+            self.initialize_tasks()
+        return True
+
+    def get_seed_dentry(self, address, kind):
+        """Return the dentry the object of `kind` refers to, used to resolve the dentry layout."""
+        kpath = self.kpath
+        if kind == "dentry":
+            return address
+        if kind == "path":
+            return read_int_from_memory(address + runtime.current_arch.ptrsize)
+        if kind == "mount":
+            address += kpath.offset_mount_mnt
+        return read_int_from_memory(address + kpath.offset_vfsmount_mnt_root)
+
+    def initialize_layout(self, kversion):
+        kpath = self.kpath
+        if kpath.initialized:
+            self.meta.extend(Kernel.export_meta(self, kpath.meta))
+            return True
+
+        # plan 1: the root dentry of a registered filesystem, which needs no task
+        if "3.3" <= kversion:
+            kfs = Kernel.file_system()
+            if kfs.initialize() and kpath.initialized:
+                self.meta.extend(Kernel.export_meta(self, kpath.meta))
+                self.meta.append((self.quiet_info, "dentry (sample): the root of a mount in file_systems"))
+                return True
+
+        # plan 2: the object given with --type
+        kind = self.args.type
+        if kind != "auto" and kpath.ensure_mount_offsets():
+            try:
+                if kind == "file":
+                    ret = kpath.initialize(file=self.args.address)
+                else:
+                    ret = kpath.initialize(dentry=self.get_seed_dentry(self.args.address, kind))
+            except (gdb.MemoryError, OverflowError, RuntimeError):
+                ret = None
+            if ret:
+                self.meta.extend(Kernel.export_meta(self, kpath.meta))
+                self.meta.append((self.quiet_info, "{:s} (sample): {:#x}".format(kind, self.args.address)))
+                return True
+
+        # plan 3: the open files of the tasks
+        task_command = Kernel.task()
+        task_ready = task_command.initialize(files=True, threads=self.args.pid is not None)
+        self.meta.extend(Kernel.export_meta(self, task_command.meta))
+        if not task_ready:
+            task_command = None
+        if task_command is not None and kpath.initialized:
+            self.task_command = task_command
+            return True
+
+        self.meta.append((self.quiet_err, "Could not resolve the struct dentry layout"))
+        if kind == "auto":
+            self.meta.append((self.quiet_err, "Specifying the type with --type may help"))
+        return None
+
+    def initialize_tasks(self):
+        """Resolve what walking the tasks needs. Only a bare dentry and --pid/--task need it."""
+        if self.task_tried:
+            return self.offset_fs is not None
+        self.task_tried = True
+
+        task_command = self.task_command
+        if task_command is None:
+            task_command = Kernel.task()
+            task_ready = task_command.initialize(threads=self.args.pid is not None)
+            self.meta.extend(Kernel.export_meta(self, task_command.meta))
+            if not task_ready:
+                task_command = None
+            if task_command is None:
+                return None
+
+        # task_struct->fs sits just before task_struct->files, which init_task is enough to find
+        try:
+            offset_files = task_command.get_offset_files(task_command.offset_comm)
+        except (gdb.MemoryError, OverflowError):
+            offset_files = None
+        if offset_files is None:
+            self.meta.append((self.quiet_err, "Could not find task_struct->files"))
+            return None
+        offset_fs = self.kpath.get_offset_task_fs(offset_files)
+        if offset_fs is None:
+            self.meta.append((self.quiet_err, "Could not find task_struct->fs"))
+            return None
+        self.meta.append((self.quiet_info, "offsetof(task_struct, fs): {:#x}".format(offset_fs)))
+
+        init_root = self.kpath.get_task_root(task_command.init_task, offset_fs)
+        if init_root is None:
+            self.meta.append((self.quiet_warn, "Could not find init_task->fs->root"))
+        else:
+            self.root_mount = self.kpath.get_root_mount(init_root[0] - self.kpath.offset_mount_mnt)
+            self.meta.append((self.quiet_info, "root mount: {:#x}".format(self.root_mount)))
+        self.task_command = task_command
+        self.offset_fs = offset_fs
+        return True
+
+    def get_task_by_pid(self, pid):
+        task_command = self.task_command
+        task_addrs = KernelTask.get_task_list(task_command.init_task, task_command.offset_tasks)
+        if task_command.enabled.get("threads"):
+            task_addrs = task_command.add_lwp_task(task_addrs)
+        for task in task_addrs:
+            if read_int32_from_memory(task + task_command.offset_pid, safe=True) == pid:
+                return task
+        return None
+
+    def resolve_root(self):
+        """Return (ok, root, task). `root` is None when the path must be resolved absolutely."""
+        args = self.args
+        if args.pid is None and args.task is None:
+            return True, None, None
+
+        n = len(self.meta)
+        if not self.initialize_tasks():
+            for func, line in self.meta[n:]:
+                func(line)
+            err("Could not resolve task_struct->fs->root, which --pid/--task needs")
+            return False, None, None
+
+        task = args.task
+        if task is None:
+            task = self.get_task_by_pid(args.pid)
+            if task is None:
+                err("Could not find the task of pid {:d}".format(args.pid))
+                return False, None, None
+
+        root = self.kpath.get_task_root(task, self.offset_fs)
+        if root is None:
+            err("Could not find task->fs->root of {:#x}".format(task))
+            return False, None, None
+        return True, root, task
+
+    def detect_type(self, address):
+        kpath = self.kpath
+        if kpath.is_mount(address):
+            return "mount"
+        if kpath.is_vfsmount(address):
+            return "vfsmount"
+        if kpath.is_path(address):
+            return "path"
+        # f_path.dentry and f_op of a file can pass as d_parent and d_name.name of a dentry,
+        # so the stricter check of a file, whose f_path must hold both objects, goes first
+        if self.resolve_targets(address, "file"):
+            return "file"
+        if kpath.is_dentry(address):
+            return "dentry"
+        return None
+
+    def get_primary_root(self, task_root):
+        """Return the root mount of the mount namespace the answer is asked about."""
+        kpath = self.kpath
+        if task_root is not None:
+            return [kpath.get_root_mount(task_root[0] - kpath.offset_mount_mnt)]
+        if self.root_mount is not None:
+            return [self.root_mount]
+        return []
+
+    def get_other_roots(self, primary):
+        """Return the root mount of every other mount namespace that has a task."""
+        kpath = self.kpath
+        others = []
+        task_command = self.task_command
+        for task in KernelTask.get_task_list(task_command.init_task, task_command.offset_tasks):
+            root = kpath.get_task_root(task, self.offset_fs)
+            if root is None:
+                continue
+            mount = kpath.get_root_mount(root[0] - kpath.offset_mount_mnt)
+            if mount not in primary and mount not in others:
+                others.append(mount)
+        return others
+
+    def search_mounts_for_dentry(self, index, root_mounts, visited):
+        kpath = self.kpath
+        candidates = []
+        for root_mount in root_mounts:
+            for mount in kpath.iter_mounts(root_mount):
+                if mount in visited:
+                    continue
+                visited.add(mount)
+                vfsmnt = mount + kpath.offset_mount_mnt
+                mnt_root = read_int_from_memory(vfsmnt + kpath.offset_vfsmount_mnt_root, safe=True)
+                if mnt_root is None:
+                    continue
+                if mnt_root in index:
+                    # the discovery order breaks ties, so the nearest mount of the nearest namespace wins
+                    candidates.append((index[mnt_root], len(candidates), vfsmnt))
+        candidates.sort()
+        return [vfsmnt for _, _, vfsmnt in candidates]
+
+    def find_mounts_for_dentry(self, dentry, task_root):
+        """Return every (vfsmount, dentry) the dentry can be reached through, the nearest mount first.
+        Only the target mount namespace is searched first. The other namespaces are searched
+        just when that finds nothing, so that a container private mount does not shadow the
+        answer the user is asking about."""
+        kpath = self.kpath
+
+        if not self.initialize_tasks():
+            return []
+
+        chain = []
+        seen = set()
+        current = dentry
+        while is_valid_addr(current) and current not in seen:
+            seen.add(current)
+            chain.append(current)
+            parent = read_int_from_memory(current + kpath.offset_d_parent, safe=True)
+            if parent is None:
+                break
+            if parent == current:
+                break
+            current = parent
+        index = {d: i for i, d in enumerate(chain)}
+
+        primary = self.get_primary_root(task_root)
+        visited = set()
+        found = self.search_mounts_for_dentry(index, primary, visited)
+        if not found:
+            found = self.search_mounts_for_dentry(index, self.get_other_roots(primary), visited)
+        return [(vfsmnt, dentry) for vfsmnt in found]
+
+    def resolve_targets(self, address, kind, task_root=None):
+        kpath = self.kpath
+        ptrsize = runtime.current_arch.ptrsize
+
+        try:
+            if kind == "path":
+                vfsmnt = read_int_from_memory(address)
+                dentry = read_int_from_memory(address + ptrsize)
+            elif kind == "file":
+                return self.resolve_file(address)
+            elif kind in ("mount", "vfsmount"):
+                if kind == "mount":
+                    vfsmnt = address + kpath.offset_mount_mnt
+                else:
+                    vfsmnt = address
+                dentry = read_int_from_memory(vfsmnt + kpath.offset_vfsmount_mnt_root)
+            else:
+                return self.find_mounts_for_dentry(address, task_root)
+        except (gdb.MemoryError, OverflowError, RuntimeError):
+            return []
+
+        # an explicit type is trusted even if the parent of the dentry is unreadable, which the walk reports
+        if not kpath.is_vfsmount(vfsmnt) or not kpath.is_dentry(dentry, strict=self.args.type == "auto"):
+            return []
+        return [(vfsmnt, dentry)]
+
+    def resolve_file(self, file):
+        kpath = self.kpath
+        probing = kpath.offset_file_mnt is None
+        n = len(kpath.meta)
+        try:
+            if not probing or kpath.initialize_file_offsets(file):
+                vfsmnt = read_int_from_memory(file + kpath.offset_file_mnt)
+                dentry = read_int_from_memory(file + kpath.offset_file_dentry)
+                strict = probing or self.args.type == "auto"
+                if kpath.is_vfsmount(vfsmnt) and kpath.is_dentry(dentry, strict=strict):
+                    return [(vfsmnt, dentry)]
+        except (gdb.MemoryError, OverflowError, RuntimeError):
+            pass
+        if probing:
+            # the offsets were guessed from this object, which turned out not to be a file
+            kpath.offset_file_mnt = None
+            kpath.offset_file_dentry = None
+            del kpath.meta[n:]
+        return []
+
+    def dump(self, targets, root):
+        kpath = self.kpath
+
+        if not self.args.quiet:
+            fmt = "{:18s} {:18s} {:18s} {:12s} {:s}"
+            legend = ["dentry", "mount", "vfsmount", "status", "path"]
+            self.out.append(GefUtil.make_legend(fmt.format(*legend)))
+
+        for vfsmnt, dentry in targets:
+            path_info = kpath.prepend_path(dentry, vfsmnt, root)
+            status = path_info.status
+            if len(targets) > 1 and status == "normal":
+                status = "ambiguous"
+            path = kpath.decorate_path(path_info, dentry) or "???"
+            if kpath.is_unlinked(dentry):
+                path += " (deleted)"
+            self.out.append("{:#018x} {:#018x} {:#018x} {:12s} {:s}".format(dentry, vfsmnt - kpath.offset_mount_mnt, vfsmnt, status, path))
+            if not self.args.all and len(targets) > 1:
+                self.quiet_info_add_out("{:d} more mounts can reach this dentry; use --all".format(len(targets) - 1))
+                break
+        return
+
+    def dump_without_mount(self, dentry):
+        if not self.args.quiet:
+            fmt = "{:18s} {:18s} {:18s} {:12s} {:s}"
+            legend = ["dentry", "mount", "vfsmount", "status", "path"]
+            self.out.append(GefUtil.make_legend(fmt.format(*legend)))
+        path_info = self.kpath.get_dentry_path_info(dentry)
+        path = self.kpath.decorate_path(path_info, dentry) or "???"
+        if self.kpath.is_unlinked(dentry):
+            path += " (deleted)"
+        self.out.append("{:#018x} {:18s} {:18s} {:12s} {:s}".format(dentry, "-", "-", path_info.status, path))
+        return
+
+    @parse_args
+    @only_if_gdb_running
+    @only_if_specific_gdb_mode(mode=("qemu-system", "vmware", "kgdb"))
+    @only_if_specific_arch(arch=("x86_32", "x86_64", "ARM32", "ARM64", "RISCV32", "RISCV64"))
+    @only_if_in_kernel_or_kpti_disabled
+    def do_invoke(self, args):
+        self.quiet_info("Wait for memory scan")
+
+        ret = self.initialize()
+        if args.meta or not ret:
+            for func, line in self.meta:
+                func(line)
+        if not ret:
+            return
+
+        if args.meta:
+            return
+
+        if not is_valid_addr(args.address):
+            err("Unreadable address: {:#x}".format(args.address))
+            return
+
+        ok, root, _task = self.resolve_root()
+        if not ok:
+            return
+
+        kind = args.type
+        if kind == "auto":
+            kind = self.detect_type(args.address)
+            if kind is None:
+                err("Could not tell what {:#x} points to; specify it with --type".format(args.address))
+                return
+        self.quiet_info("Interpreted ADDRESS as struct {:s}".format(kind))
+
+        targets = self.resolve_targets(args.address, kind, root)
+
+        self.out = []
+        if not targets:
+            if kind == "dentry":
+                if self.offset_fs is None:
+                    self.quiet_warn("Could not walk the tasks, so no mount was searched (see --meta)")
+                else:
+                    self.quiet_warn("Could not find a mount holding this dentry")
+                self.dump_without_mount(args.address)
+            else:
+                err("Could not interpret {:#x} as struct {:s}".format(args.address, kind))
+                return
+        else:
+            self.dump(targets, root)
+        self.print_output(check_terminal_size=True)
+        return
+
+
+
+@register_command
+class KernelRefsCommand(GenericCommand, BufferingOutput):
+    """Search the kernel pointers that reference the specified address."""
+
+    _cmdline_ = "krefs"
+    _category_ = "06-g. Qemu-system/KGDB Cooperation - Linux Advanced"
+
+    @staticmethod
+    def parse_range(text):
+        """Parse `START-END` or `START+SIZE` into (start, size)."""
+        for sep in ("-", "+"):
+            lhs, found, rhs = text.partition(sep)
+            if not found:
+                continue
+            start = AddressUtil.parse_address(lhs)
+            value = AddressUtil.parse_address(rhs)
+            if sep == "-":
+                size = value - start
+            else:
+                size = value
+            if size <= 0:
+                raise ValueError("empty range: {:s}".format(text))
+            return start, size
+        raise ValueError("invalid range: {:s}".format(text))
+
+    parser = argparse.ArgumentParser(prog=_cmdline_)
+    parser.add_argument("address", metavar="ADDRESS", type=AddressUtil.parse_address, help="the address which the found pointers refer to.")
+    parser.add_argument("-d", "--data", action="store_true", help="scan the static data of the kernel image. (default if no area is given)")
+    parser.add_argument("-p", "--percpu", action="store_true", help="scan the per-cpu areas.")
+    parser.add_argument("-c", "--cache", action="append", default=[], help="scan the slab pages of this kmem_cache.")
+    parser.add_argument("-o", "--object", action="append", type=AddressUtil.parse_address, default=[],
+                        help="scan the slab object that contains this address. (e.g., a task_struct)")
+    parser.add_argument("-r", "--range", action="append", type=parse_range.__func__, default=[],
+                        help="scan this address range. (START-END or START+SIZE)")
+    parser.add_argument("-M", "--kernel-writable", "--physmap", dest="physmap", action="store_true",
+                        help="scan every writable kernel mapping. (--physmap is a legacy alias; very slow)")
+    parser.add_argument("-t", "--tolerance", type=AddressUtil.parse_address, default=0,
+                        help="also report the pointers into [ADDRESS, ADDRESS+TOLERANCE].")
+    parser.add_argument("-l", "--limit", type=lambda x: int(x, 0), default=0x100,
+                        help="stop after this many hits. 0 means unlimited. (default: %(default)s)")
+    parser.add_argument("--no-owner", action="store_true", help="do not resolve the owner of each hit.")
+    parser.add_argument("-n", "--no-pager", action="store_true", help="do not use the pager.")
+    parser.add_argument("-q", "--quiet", action="store_true", help="show result only.")
+    _syntax_ = parser.format_help()
+
+    _example_ = [
+        "{0:s} 0xffff888012345600                        # scan the static data of the kernel image",
+        "{0:s} -p 0xffff888012345600                     # scan the per-cpu areas too",
+        "{0:s} -c filp 0xffff888012345600                # scan the slab pages of the filp cache",
+        "{0:s} -o 0xffff888045670000 0xffff888012345600  # scan one slab object (e.g. a task_struct)",
+        "{0:s} -r 0xffff888012340000+0x1000 0xffff888012345600",
+        "{0:s} -t 0x100 0xffff888012345600               # also catch the interior pointers",
+    ]
+    _example_ = "\n".join(_example_).format(_cmdline_)
+
+    _note_ = [
+        "- Full-memory scans are too slow over a gdb stub, so the default search is limited to kernel static data,",
+        "  where global object references commonly live.",
+        "- Hits are annotated with their likely context: the preceding kallsyms symbol, per-cpu variable and CPU,",
+        "  or slab cache and object boundary. Kallsyms ownership is only a heuristic.",
+        "- Only pointer-size-aligned raw pointers are found; encoded, tagged, XORed, mangled, or unaligned pointers are missed.",
+        "- `-c` scans the slab pages reachable from the per-cpu and per-node lists and the sheaves.",
+        "  SLUB links no full slab without CONFIG_SLUB_DEBUG, and SLOB has no slab page owned by a cache.",
+        "- Overlapping virtual ranges are scanned once. Physical aliases are reported at each virtual address.",
+        "- The slab cache of a hit is resolved on x86 and ARM only.",
+        "- Use `kobj ADDRESS` to identify the referenced object.",
+    ]
+    _note_ = "\n".join(_note_)
+
+    def get_image_symbols(self):
+        """Return the kallsyms entries as a sorted ([addr, ...], [name, ...])."""
+        if self.image_symbols is not None:
+            return self.image_symbols
+        ret = Ksym.get_kallsyms()
+        if ret is None:
+            self.image_symbols = [], []
+            return self.image_symbols
+        kallsyms, _kallsyms_map = ret
+        entries = sorted({(a, n) for a, n, _typ in kallsyms})
+        self.image_symbols = [a for a, _n in entries], [n for _a, n in entries]
+        return self.image_symbols
+
+    def lookup_image_symbol(self, addr):
+        """Return the nearest preceding kallsyms symbol as `name+0x..`, or ''."""
+        addrs, names = self.get_image_symbols()
+        if not addrs:
+            return ""
+        i = bisect.bisect_right(addrs, addr) - 1
+        if i < 0:
+            return ""
+        sym_addr, name = addrs[i], names[i]
+        if addr == sym_addr:
+            return name
+        # a kernel without CONFIG_KALLSYMS_ALL has no data symbol at all, so the nearest
+        # preceding one can be megabytes away and means nothing
+        if addr - sym_addr > 0x20000:
+            return ""
+        return "{:s}+{:#x}".format(name, addr - sym_addr)
+
+    def collect_cache_ranges(self, name):
+        """Return the slab page ranges of the kmem_cache `name`."""
+        pagesize = KernelAddressHeuristicFinder.consts().PAGE_SIZE
+        allocator, kmem_caches = Kernel.get_slab_caches([name])
+        if kmem_caches is None:
+            self.err_add_out("Could not parse the kmem_caches (allocator: {!s})".format(allocator))
+            return []
+        if not kmem_caches:
+            self.err_add_out("The cache `{:s}` was not found".format(name))
+            return []
+        if allocator == "SLOB":
+            self.err_add_out("SLOB has no slab page owned by a kmem_cache")
+            return []
+
+        kmem_cache = kmem_caches[0]
+        pages = []
+        if allocator == "SLUB":
+            for kmem_cache_cpu in kmem_cache.get("kmem_cache_cpu", {}).values():
+                pages += [kmem_cache_cpu["active_page"]] + kmem_cache_cpu["partial_pages"]
+            for page_list in kmem_cache.get("nodes_partial", []) + kmem_cache.get("nodes_full", []):
+                pages += page_list
+            pages = [(p.get("virt_addr"), p.get("num_pages")) for p in pages]
+            # v6.18~: a sheaf holds freed objects whose slab no list may reach
+            for chunk in KernelSlub.get_sheaf_objects(kmem_cache):
+                if not isinstance(chunk, int) or not chunk:
+                    continue
+                if any(vaddr and num_pages and vaddr <= chunk < vaddr + num_pages * pagesize for vaddr, num_pages in pages):
+                    continue
+                obj = Kernel.get_slab_object(chunk)
+                if obj and obj["name"] == name:
+                    pages.append((obj["base"], obj["num_pages"]))
+                else:
+                    pages.append((chunk & -pagesize, 1))
+        elif allocator == "SLUB_TINY":
+            for page_list in kmem_cache["nodes"]:
+                pages += [(p.get("virt_addr"), p.get("num_pages")) for p in page_list]
+        elif allocator == "SLAB":
+            for slabs_list in kmem_cache["nodes"]:
+                for page_list in slabs_list.values():
+                    pages += [(p.get("s_mem_base"), kmem_cache["pagesperslab"]) for p in page_list]
+
+        seen = set()
+        for vaddr, num_pages in pages:
+            if vaddr and num_pages and 0 < num_pages <= 0x1000:
+                seen.update(range(vaddr, vaddr + num_pages * pagesize, pagesize))
+        ranges = []
+        for vaddr in sorted(seen):
+            if ranges and ranges[-1][0] + ranges[-1][1] == vaddr:
+                ranges[-1] = (ranges[-1][0], ranges[-1][1] + pagesize, ranges[-1][2])
+            else:
+                ranges.append((vaddr, pagesize, "slab:{:s}".format(name)))
+        if not ranges:
+            self.err_add_out("No slab page was found for the cache `{:s}`".format(name))
+        return ranges
+
+    def collect_object_range(self, addr):
+        """Return the range of the slab object that contains `addr`."""
+        obj = Kernel.get_slab_object(addr)
+        if obj is None or obj["object_base"] is None:
+            self.err_add_out("{:#x} is not in a slab object".format(addr))
+            return []
+        return [(obj["object_base"], obj["chunk_size"], "object:{:s}".format(obj["name"]))]
+
+    def collect_physmap_ranges(self):
+        """Return every writable kernel mapping."""
+        klayout = Kernel.layout()
+        if not klayout.maps:
+            self.err_add_out("Could not resolve the kernel memory map")
+            return []
+        ranges = []
+        for entry in klayout.maps:
+            if not entry.is_writable():
+                continue
+            ranges.append((entry.vstart, entry.vsize, "mapped"))
+        return ranges
+
+    def collect_ranges(self):
+        """Return the [(start, size, label), ...] to scan."""
+        args = self.args
+        ranges = []
+
+        if args.data or not (args.percpu or args.cache or args.object or args.range or args.physmap):
+            klayout = Kernel.layout()
+            found = False
+            if klayout.ro_base and klayout.ro_size:
+                ranges.append((klayout.ro_base, klayout.ro_size, "kernel .rodata"))
+                found = True
+            if klayout.rw_base and klayout.rw_size:
+                ranges.append((klayout.rw_base, klayout.rw_size, "kernel .data/.bss"))
+                found = True
+            if not found:
+                self.err_add_out("Could not resolve the kernel memory map")
+
+        if args.percpu:
+            units = Kernel.per_cpu().unit_ranges()
+            for cpu, (start, end) in enumerate(units):
+                ranges.append((start, end - start, "per-cpu cpu{:d}".format(cpu)))
+            if not units:
+                self.err_add_out("Could not resolve the per-cpu areas")
+
+        for name in args.cache:
+            ranges += self.collect_cache_ranges(name)
+
+        for addr in args.object:
+            ranges += self.collect_object_range(addr)
+
+        for start, size in args.range:
+            ranges.append((start, size, "user range"))
+
+        if args.physmap:
+            ranges += self.collect_physmap_ranges()
+
+        unique_ranges = []
+        for start, size, label in ranges:
+            fragments = [(start, start + size)]
+            for previous_range in unique_ranges:
+                previous = previous_range[0]
+                previous_end = previous + previous_range[1]
+                remaining = []
+                for first, last in fragments:
+                    if last <= previous or previous_end <= first:
+                        remaining.append((first, last))
+                    else:
+                        if first < previous:
+                            remaining.append((first, previous))
+                        if previous_end < last:
+                            remaining.append((previous_end, last))
+                fragments = remaining
+                if not fragments:
+                    break
+            unique_ranges.extend((first, last - first, label) for first, last in fragments)
+        return unique_ranges
+
+    def scan_block(self, addr, data, label):
+        """Yield the pointers inside `data` that hit the target."""
+        ptrsize = runtime.current_arch.ptrsize
+        for i, value in enumerate(slice_unpack(data, ptrsize)):
+            if self.lo <= value <= self.hi:
+                yield addr + i * ptrsize, value, label
+        return
+
+    def scan_range(self, start, size, label, bar):
+        """Yield (location, value, label) of the pointers inside [start, start+size)."""
+        ptrsize = runtime.current_arch.ptrsize
+        page = get_pagesize()
+        if start % ptrsize:
+            pos = align(start, ptrsize)
+        else:
+            pos = start
+        end = start + size
+        while pos < end:
+            n = min(0x10000, end - pos)
+            n -= n % ptrsize
+            if n <= 0:
+                break
+            data = read_memory(pos, n, safe=True)
+            if data is None:
+                # A range may begin in the middle of a page.  Bound each retry at
+                # the next page boundary; otherwise an unreadable following page
+                # makes us discard the readable tail of the current one as well.
+                sub = pos
+                block_end = pos + n
+                while sub < block_end:
+                    next_page = (sub & ~(page - 1)) + page
+                    m = min(next_page - sub, block_end - sub)
+                    m -= m % ptrsize
+                    if m > 0:
+                        data = read_memory(sub, m, safe=True)
+                        if data is not None:
+                            for hit in self.scan_block(sub, data, label):
+                                yield hit
+                    sub = next_page
+                bar.update(n)
+                pos += n
+                continue
+            for hit in self.scan_block(pos, data, label):
+                yield hit
+            bar.update(n)
+            pos += n
+        return
+
+    def resolve_owner(self, addr):
+        """Return a short description of what holds the pointer at `addr`."""
+        if self.args.no_owner:
+            return ""
+
+        image = KernelAddressHeuristicFinderUtil.get_kernel_image_range()
+        if image and image[0] <= addr < image[1]:
+            name = self.lookup_image_symbol(addr)
+            if name:
+                return "<{:s}>".format(name)
+            return ""
+
+        pc = Kernel.per_cpu()
+        ret = pc.resolve(addr)
+        if ret is not None:
+            cpu, _static_addr, sym = ret
+            if sym is None:
+                return "cpu{:d} (dynamic per-cpu)".format(cpu)
+            return "cpu{:d} <{:s}+{:#x}>".format(cpu, sym[0], sym[1])
+
+        obj = Kernel.get_slab_object(addr)
+        if obj is not None:
+            if obj["object_base"] is None:
+                return "cache: {:s}".format(obj["name"])
+            return "cache: {:s}  object: {:#x}+{:#x}".format(obj["name"], obj["object_base"], obj["offset"])
+        return ""
+
+    @parse_args
+    @only_if_gdb_running
+    @only_if_specific_gdb_mode(mode=("qemu-system", "vmware", "kgdb"))
+    @only_if_in_kernel_or_kpti_disabled
+    def do_invoke(self, args):
+        if args.tolerance < 0:
+            err("The tolerance must not be negative")
+            return
+
+        self.image_symbols = None
+        self.lo = args.address
+        self.hi = args.address + args.tolerance
+        self.out = []
+        # resolving the kernel version and the scan areas already takes a while
+        self.quiet_info("Wait for memory scan")
+
+        if Kernel.version() is None:
+            err("Could not find Linux kernel")
+            return
+
+        ranges = self.collect_ranges()
+        if not ranges:
+            self.print_output()
+            return
+
+        total = sum(size for _start, size, _label in ranges)
+        self.quiet_info_add_out("Target: {:#x}{:s}".format(args.address, "-{:#x}".format(self.hi) if args.tolerance else ""))
+        for start, size, label in ranges:
+            self.quiet_info_add_out("Scan area: {:<18s} {:#x}-{:#x}".format(label, start, start + size))
+
+        hits = []
+        truncated = False
+        bar = ProgressBar(total=total, disable=args.quiet)
+        try:
+            for start, size, label in ranges:
+                for hit in self.scan_range(start, size, label, bar):
+                    if args.limit and len(hits) >= args.limit:
+                        truncated = True
+                        break
+                    hits.append(hit)
+                if truncated:
+                    break
+        finally:
+            bar.close()
+
+        if not hits:
+            self.info_add_out("No reference was found")
+            self.print_output(check_terminal_size=True)
+            return
+
+        self.quiet_info_add_out("Number of references: {:d}{:s}".format(len(hits), " (truncated by --limit)" if truncated else ""))
+        for addr, value, label in hits:
+            owner = self.resolve_owner(addr)
+            line = "{:s} -> {:s}  [{:s}]".format(AddressUtil.format_address(addr), AddressUtil.format_address(value), label)
+            if owner:
+                line += "  " + owner
+            self.out.append(line)
+
+        self.print_output(check_terminal_size=True)
+        return

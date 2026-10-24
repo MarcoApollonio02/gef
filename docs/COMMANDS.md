@@ -9752,6 +9752,71 @@ Simplified file_systems structure:
                                                      +--------------+
 ```
 
+## kio-uring
+
+Display the kernel-side io_uring object graph.
+
+
+### Syntax
+
+```text
+usage: kio-uring [-h] [-t {auto,ctx,request,file}] [-p PID] [-f FD] [--no-requests] [--meta] [-n] [-v] [-q] [ADDRESS]
+
+positional arguments:
+  ADDRESS               the address of struct io_ring_ctx, io_kiocb or file.
+
+options:
+  -h, --help            show this help message and exit
+  -t, --type {auto,ctx,request,file}
+                        the type of ADDRESS. (default: auto)
+  -p, --pid PID         select rings owned by this pid.
+  -f, --fd FD           select this ring fd (requires --pid).
+  --no-requests         do not walk pending request lists.
+  --meta                display layout and discovery information.
+  -n, --no-pager        do not use the pager.
+  -v, --verbose         show request flags and user_data.
+  -q, --quiet           show result only.
+```
+
+### Examples
+
+```gdb
+kio-uring
+kio-uring --pid 1337 --fd 4
+kio-uring --type ctx 0xffff888012340000
+kio-uring --type request 0xffff888056780000 -v
+```
+
+### Notes
+
+```text
+`iouring-dump` dumps userland io_uring mappings; this command follows kernel objects.
+io_uring first appeared in Linux v5.1. Older kernels are detected without scanning.
+DWARF is used when available. Without it, ring discovery uses open fd paths and validated ring metadata.
+ADDRESS with `--type ctx` or `--type request` needs neither the task list nor the VFS layout.
+Live request lists are transient and may be incomplete while another CPU is running.
+
+Kernel object graph:
+
+task_struct
+  +-- files -> fdtable[fd] -> file (anon_inode:[io_uring])
+  |                             +-- private_data -> io_ring_ctx
+  +-- io_uring -> io_uring_task
+                    +-- last ---------------------> io_ring_ctx
+                    +-- registered_rings[] -------> file
+                    +-- io_wq --------------------> io-wq workers
+
+io_ring_ctx
+  +-- rings ----------------------> io_rings (SQ / CQ)
+  +-- file table -----------------> file / io_rsrc_node
+  +-- buffer table ---------------> io_mapped_ubuf / io_rsrc_node
+  +-- iopoll/timeout/defer lists -> io_kiocb
+  |                                   +-- opcode / state / refs
+  |                                   +-- file / buffer node
+  |                                   +-- callback / linked request
+  +-- submitter / sq thread ------> task_struct
+```
+
 ## kipcs
 
 Dump IPCs information (System V semaphore, message queue and shared memory).
@@ -9841,6 +9906,99 @@ Simplified irq structure:
                            +-----------------+
 ```
 
+## klsm
+
+Dump the registered Linux Security Module hooks.
+
+
+### Syntax
+
+```text
+usage: klsm [-h] [-hh] [-a] [--task] [-p PID] [-T TASK_FILTER] [-f FILTER] [-v] [--meta] [-n] [-q] [HOOK ...]
+
+positional arguments:
+  HOOK                  the hook point name, or a part of it. (e.g., file_open)
+
+options:
+  -h, --help            show this help message and exit
+  -hh, --help-simple    show help without ASCII diagram.
+  -a, --all             also show the hook points that have no callback.
+  --task                show the LSM security blobs of each task instead of the hooks.
+  -p, --pid PID         with --task, filter by task pid.
+  -T, --task-filter TASK_FILTER
+                        with --task, filter by specific task_struct address.
+  -f, --filter FILTER   with --task, comm string REGEXP filter.
+  -v, --verbose         with --task, decode the blobs of the open files of each task too.
+  --meta                display offset information.
+  -n, --no-pager        do not use the pager.
+  -q, --quiet           show result only.
+```
+
+### Examples
+
+```gdb
+klsm                   # list every hook point that has a callback
+klsm file_open         # list the callbacks of the hook points matching `file_open`
+klsm -a                # list every hook point including the empty ones
+klsm --task            # list the security blob and the LSM labels of each task
+klsm --task -p 1337    # decode the blobs of the task, its cred and its open files and inodes
+```
+
+### Notes
+
+```text
+The layout of the LSM framework changed twice, and all three are supported:
+
+  ~v4.1  : a single `struct security_operations` pointed to by `security_ops`
+  v4.2~  : `security_hook_heads`, an array of the lists of `struct security_hook_list`
+  v6.12~ : one static call slot per (hook point, LSM), `__SCK__lsm_static_call_*`
+
++-security_ops(~v4.1)-+
+| name[]              |
+| ptrace_access_check |--> callback
+| ptrace_traceme      |--> callback
+| ...                 |
++---------------------+
+
++-security_hook_heads(v4.2~)-+     +-security_hook_list--+
+| ptrace_access_check        |---->| list                |--> next hook_list
+| ptrace_traceme             |     | head                |--> the head at the left
+| ...                        |     | hook                |--> callback
++----------------------------+     | lsm (v4.12~)        |--> "selinux"
+                                   +---------------------+
+
++-__SCK__lsm_static_call_<hook>_<N>(v6.12~)-+
+| func                                      |--> callback
++-------------------------------------------+
+
+Before v6.12, hook point names are recovered from each `security_*` dispatcher and
+the head or member offset it references. A head that no dispatcher pointed at is
+shown as `hook[NN]`. On v6.12 and later, names are read from generated static-call
+symbols such as `__SCK__lsm_static_call_<hook>_<N>`.
+
+When CONFIG_KALLSYMS_ALL=n removes these data symbols, x86 decodes the trampolines
+`__SCT__lsm_static_call_<hook>_<N>` (text symbols), and the other architectures take
+the keys each `security_*` dispatcher loads. The latter names a hook point after its
+dispatcher and misses the ones no dispatcher calls (e.g., inode_free_security_rcu).
+
+`--task` follows the security blobs instead. Until v5.0 the active major LSM owns each
+blob as a whole. From v5.1 the LSMs share one blob per object, and the offset of each
+part is read from `<lsm>_blob_sizes`; without the symbol it is guessed from the samples.
+
++-task_struct-+                    +-cred-----+     +-file-------+    +-inode------+
+| security    |--> blob (v5.1~)    | ...      |     | ...        |    | i_sb       |
+| cred        |------------------->| security |-+   | f_security |-+  | i_mapping  |
++-------------+                    +----------+ |   +------------+ |  | i_security |-+
+                                                |                  |  +------------+ |
+   +-blob--------------+ <----------------------+------------------+-----------------+
+   | part of LSM A     | <-- offset from <lsmA>_blob_sizes.lbs_*
+   | part of LSM B     | <-- offset from <lsmB>_blob_sizes.lbs_*
+   +-------------------+
+
+SELinux, Smack, AppArmor, TOMOYO and Landlock parts are decoded. This mode requires
+CONFIG_RANDSTRUCT=n unless vmlinux with debug information is loaded.
+```
+
 ## kmod
 
 Display kernel module list.
@@ -9908,6 +10066,79 @@ Notes for -a option:
   e.g., `p 'virtio_net.__this_module'`
 ```
 
+## kmount
+
+Dump the mount tree of each mount namespace.
+
+
+### Syntax
+
+```text
+usage: kmount [-h] [-hh] [-p PID] [-T TASK] [-a] [-t] [-v] [--meta] [-n] [-q]
+
+options:
+  -h, --help          show this help message and exit
+  -hh, --help-simple  show help without ASCII diagram.
+  -p, --pid PID       dump the mount namespace of this pid.
+  -T, --task TASK     dump the mount namespace of this task_struct.
+  -a, --all           dump every mount namespace.
+  -t, --tasks         list the tasks of each mount namespace.
+  -v, --verbose       also show mnt_id, peer_group, mnt_master and propagation.
+  --meta              display offset information.
+  -n, --no-pager      do not use the pager.
+  -q, --quiet         enable quiet mode.
+```
+
+### Examples
+
+```gdb
+kmount
+kmount --pid 1337
+kmount --all --tasks
+```
+
+### Notes
+
+```text
+This command requires CONFIG_RANDSTRUCT=n unless vmlinux with debug information is loaded.
+
+- Walks `mnt_mounts/mnt_child`, so all mounts in the namespace are shown, including bind mounts sharing a `super_block`.
+  `kfilesystems` instead shows filesystem types and all their `super_block`s, mounted or not.
+- Mount namespaces are inferred from mounts reachable through tasks, so namespaces with no task are invisible.
+- Without `--pid/--task`, the whole namespace is shown with absolute paths.
+  With either option, output is rooted at `task->fs->root`; unreachable mounts are marked `outside-root`.
+
+Simplified mount tree structure:
+
++-task_struct--+     +-fs_struct-+     +-path----+
+| ...          |     | ...       |     | mnt     |--+
+| fs           |---->| root      |---->| dentry  |  |
+| ...          |     | pwd       |     +---------+  |
++--------------+     +-----------+                  |
+                                                    |
+    +-----------------------------------------------+
+    |
+    v
++-mount----------+<-+     +-mount----------+<-+     +-mount----------+
+| mnt_parent     |--+<----| mnt_parent     |  +<----| mnt_parent     |
+| mnt_mountpoint |     +--| mnt_mountpoint |     +--| mnt_mountpoint |
+| mnt (vfsmount) |     |  | mnt (vfsmount) |     |  | mnt (vfsmount) |
+|   mnt_root     |     |  |   mnt_root     |     |  |   mnt_root     |
+|   mnt_sb       |-+   |  |   mnt_sb       |     |  |   mnt_sb       |
+|   mnt_flags    | |   |  |   mnt_flags    |     |  |   mnt_flags    |
+| mnt_mounts     |-|-+ |  | mnt_mounts     |--+  |  | mnt_mounts     |
+| mnt_child      | | +-|->| mnt_child      |  +--|->| mnt_child      |
+| mnt_devname    | |   |  | mnt_devname    |     |  | mnt_devname    |
++----------------+ |   |  +----------------+     |  +----------------+
+                   |   +-->dentry                +-->dentry
+                   v
+            +-super_block-+     +-file_system_type-+
+            | ...         |     | name             |-->"ext4"
+            | s_type      |---->| ...              |
+            | ...         |     +------------------+
+            +-------------+
+```
+
 ## knetdev
 
 Dump net device information.
@@ -9937,6 +10168,95 @@ Simplified net_device structure:
 | dev_base_head |--->| dev_list          |--->| dev_list          |--->...
 | ...           |    | ...               |    | ...               |
 +---------------+    +-------------------+    +-------------------+
+```
+
+## knft
+
+Dump the nftables (netfilter) object graph.
+
+
+### Syntax
+
+```text
+usage: knft [-h] [-hh] [-R] [-E] [-F FAMILY] [-T NAME] [-k {chain,set,object,flowtable}] [-N NAME] [-H HANDLE] [--net NET] [-v] [--meta] [-n] [-q] [ADDRESS]
+
+positional arguments:
+  ADDRESS               reverse-lookup: report an exact/containing known nftables object, or the nearest known object.
+
+options:
+  -h, --help            show this help message and exit
+  -hh, --help-simple    show help without ASCII diagram.
+  -R, --no-rules        do not decode or render rules and expressions.
+  -E, --no-elements     do not decode or render set elements.
+  -F, --family FAMILY   only show tables of this family (inet, ip, ip6, arp, bridge, netdev).
+  -T, --table NAME      only show tables with this name.
+  -k, --kind {chain,set,object,flowtable}
+                        only show this kind of table child. It can be specified multiple times.
+  -N, --name NAME       only show chains, sets, objects and flowtables with this name.
+  -H, --handle HANDLE   only show the rule with this handle (implies `-k chain`).
+  --net NET             only show the network namespace with this struct net address or ns inode number.
+  -v, --verbose         show object attributes, hooks and expression contents (mostly needs type information).
+  --meta                display discovery information.
+  -n, --no-pager        do not use the pager.
+  -q, --quiet           show result only.
+```
+
+### Examples
+
+```gdb
+knft                          # dump the whole nftables object graph
+knft -R                       # dump the graph without rules and expressions
+knft -E                       # dump the graph without set elements
+knft -F inet -T filter -k set # show only the sets of the inet table `filter`
+knft -T filter -N input -v    # show chain `input` with attributes, hook and expressions
+knft -T filter -H 12 -v       # show rule handle 12 and its decoded expressions
+knft --net 4026531840         # show only the network namespace net:[4026531840]
+knft 0xffff888012345600       # find which nftables object owns this address
+```
+
+### Notes
+
+```text
+Walks table -> chain -> rule -> expr and table -> set -> element / object / flowtable.
+The mainline location of the table list changed over time:
+
+  v3.13~v4.15 : net.nft.af_info -> nft_af_info.tables (one list per family)
+  v4.16~v5.12 : net.nft.tables (one list for every family)
+  v5.13~      : net_generic(net, nf_tables_net_id) -> nftables_pernet.tables
+
+nftables first appeared in mainline v3.13. Older kernels have no nftables object graph.
+
++-nftables_pernet-+   +-nft_table---+   +-nft_chain--+   +-nft_rule_blob-+
+| tables          |-->| list        |   | blob_gen_0 |-->| size          |
+| ...             |   | chains      |-->| list       |   | data[]        |
++-----------------+   | sets        |   | name       |   +-------+-------+
+                      | objects     |   +------------+           |  (one nft_rule_dp per rule)
+                      | flowtables  |                            v
+                      | name        |                     +-nft_rule_dp-+
+                      +-------------+                     | is_last     |
+                                                          | dlen,handle |
+                                                          | data[]      |--> +-nft_expr-+
+                                                          +-------------+    | ops      |--> type->name
+                                                                             +----------+
+
+On v4.16 and later, chains / sets / objects / flowtables hang off nft_table as four
+consecutive list_head fields; legacy tables have the lists available in that kernel release.
+Table discovery first validates this list topology and child->table back-references, then
+uses rule/expression decoding only for the actual chains instead of for every table candidate.
+
+Rule headers, blob fields, set extensions and backend layouts prefer kernel type information.
+Stripped targets use versioned layout fallbacks; --meta reports the selected source and offsets.
+Broken walks keep validated entries where possible and mark the output as partial.
+nftables names may be up to 255 bytes; identifier-like names are preferred only as a heuristic
+and are not a kernel validity rule. The datapath representation changed from linked nft_rule objects before
+v5.17 to a contiguous nft_rule_blob in mainline v5.17 and later; the control-plane rule list
+still exists on newer kernels, and both representations are understood where applicable.
+
+Filters are applied after the table list is discovered; only the selected chains and sets are
+decoded. With -v, the table handle/flags/genmask/owner come from the validated nft_table layout
+and the rule genmask/userdata from the rule header even on stripped kernels. The chain, base
+chain hook, set, object and flowtable attributes and the expression private data are printed
+only when type information (e.g., vmlinux and nf_tables.ko debug info) is loaded.
 ```
 
 ## kops
@@ -9985,6 +10305,76 @@ Supported structure:
   proc_ops, regulator_ops, seq_operations, smp_operations,
   super_operations, tty_ldisc_ops, tty_operations, tty_port_operations,
   ucsi_operations, vm_operations_struct,
+```
+
+## kpath
+
+Reconstruct the pathname of a dentry, path, file or mount.
+
+
+### Syntax
+
+```text
+usage: kpath [-h] [-hh] [-t {auto,dentry,path,file,mount,vfsmount}] [-p PID] [-T TASK] [-a] [--meta] [-n] [-q] ADDRESS
+
+positional arguments:
+  ADDRESS               the address of struct dentry, path, file, mount or vfsmount.
+
+options:
+  -h, --help            show this help message and exit
+  -hh, --help-simple    show help without ASCII diagram.
+  -t, --type {auto,dentry,path,file,mount,vfsmount}
+                        the type of ADDRESS. (default: auto)
+  -p, --pid PID         resolve the path as the task of this pid sees it.
+  -T, --task TASK       resolve the path as this task_struct sees it.
+  -a, --all             print every mount the dentry is reachable through.
+  --meta                display offset information.
+  -n, --no-pager        do not use the pager.
+  -q, --quiet           enable quiet mode.
+```
+
+### Examples
+
+```gdb
+kpath 0xffff888003b0a000
+kpath --pid 1 0xffff888003b0a000
+kpath --all 0xffff888003b0a000
+```
+
+### Notes
+
+```text
+This command requires CONFIG_RANDSTRUCT=n unless vmlinux with debug information is loaded.
+
+- Without `--pid/--task`, paths are resolved to the mount-namespace root.
+  With either option, resolution stops at `task->fs->root`; `outside-root` means the target lies outside it.
+- A bare dentry has no mount information. If multiple mounts match, `ambiguous` is shown; use `--all` to list them.
+- The target mount namespace is searched first, then other namespaces reachable through scanned tasks.
+  `no-mount` means no matching reachable mount was found, which is normal for pseudo-filesystems or unmounted mounts.
+- Only a bare dentry and `--pid/--task` need the task list. The other types are resolved from the object alone.
+
+Simplified path structure:
+
++-file-----------+     +-path----+
+| ...            |     | mnt     |--+
+| f_path         |---->| dentry  |--|--+
+| ...            |     +---------+  |  |
++----------------+                  |  |
+                                    |  |
+    +-------------------------------+  |
+    |                                  |
+    v                                  v
++-mount----------+<-+     +----------->+-dentry-----+
+| mnt_hash       |  |     |            | ...        |
+| mnt_parent     |--+     |            | d_parent   |-->dentry
+| mnt_mountpoint |--------+            | ...        |
+| mnt (vfsmount) |                     | d_name     |
+|   mnt_root     |-------------------->|   name     |-->"foo"
+|   mnt_sb       |-->super_block       | d_inode    |-->inode
+| ...            |                     | d_iname    |
+| mnt_mounts     |--+                  +------------+
+| mnt_child      |  |
++----------------+  +-->child mounts
 ```
 
 ## kpcidev
@@ -10097,6 +10487,62 @@ Simplified pipe structure:
                                       +------------------------+     +-------------+
                                                                      | ...         |
                                                                      +-------------+
+```
+
+## krefs
+
+Search the kernel pointers that reference the specified address.
+
+
+### Syntax
+
+```text
+usage: krefs [-h] [-d] [-p] [-c CACHE] [-o OBJECT] [-r RANGE] [-M] [-t TOLERANCE] [-l LIMIT] [--no-owner] [-n] [-q] ADDRESS
+
+positional arguments:
+  ADDRESS               the address which the found pointers refer to.
+
+options:
+  -h, --help            show this help message and exit
+  -d, --data            scan the static data of the kernel image. (default if no area is given)
+  -p, --percpu          scan the per-cpu areas.
+  -c, --cache CACHE     scan the slab pages of this kmem_cache.
+  -o, --object OBJECT   scan the slab object that contains this address. (e.g., a task_struct)
+  -r, --range RANGE     scan this address range. (START-END or START+SIZE)
+  -M, --kernel-writable, --physmap
+                        scan every writable kernel mapping. (--physmap is a legacy alias; very slow)
+  -t, --tolerance TOLERANCE
+                        also report the pointers into [ADDRESS, ADDRESS+TOLERANCE].
+  -l, --limit LIMIT     stop after this many hits. 0 means unlimited. (default: 256)
+  --no-owner            do not resolve the owner of each hit.
+  -n, --no-pager        do not use the pager.
+  -q, --quiet           show result only.
+```
+
+### Examples
+
+```gdb
+krefs 0xffff888012345600                        # scan the static data of the kernel image
+krefs -p 0xffff888012345600                     # scan the per-cpu areas too
+krefs -c filp 0xffff888012345600                # scan the slab pages of the filp cache
+krefs -o 0xffff888045670000 0xffff888012345600  # scan one slab object (e.g. a task_struct)
+krefs -r 0xffff888012340000+0x1000 0xffff888012345600
+krefs -t 0x100 0xffff888012345600               # also catch the interior pointers
+```
+
+### Notes
+
+```text
+- Full-memory scans are too slow over a gdb stub, so the default search is limited to kernel static data,
+  where global object references commonly live.
+- Hits are annotated with their likely context: the preceding kallsyms symbol, per-cpu variable and CPU,
+  or slab cache and object boundary. Kallsyms ownership is only a heuristic.
+- Only pointer-size-aligned raw pointers are found; encoded, tagged, XORed, mangled, or unaligned pointers are missed.
+- `-c` scans the slab pages reachable from the per-cpu and per-node lists and the sheaves.
+  SLUB links no full slab without CONFIG_SLUB_DEBUG, and SLOB has no slab page owned by a cache.
+- Overlapping virtual ranges are scanned once. Physical aliases are reported at each virtual address.
+- The slab cache of a hit is resolved on x86 and ARM only.
+- Use `kobj ADDRESS` to identify the referenced object.
 ```
 
 ## ksysctl
