@@ -2820,6 +2820,45 @@ options:
 ```
 
 # 02-e. Process Information - Complex Structure Information
+## cpp-vtable
+
+Dump C++ virtual tables and RTTI from an object or base subobject.
+
+
+### Syntax
+
+```text
+usage: cpp-vtable [-h] [-c COUNT] [-n] ADDRESS
+
+positional arguments:
+  ADDRESS            the address of a C++ object or polymorphic base subobject.
+
+options:
+  -h, --help         show this help message and exit
+  -c, --count COUNT  maximum number of virtual function entries per table. (default: 64)
+  -n, --no-pager     do not use the pager.
+```
+
+### Examples
+
+```gdb
+cpp-vtable 0x55555556b2a0
+cpp-vtable '&object'
+cpp-vtable '(Base2 *)&object' -c 8
+```
+
+### Notes
+
+```text
+Uses the Itanium C++ ABI with pointer-sized virtual function entries (Linux GCC/Clang).
+No debug information is required; RTTI is decoded from target memory.
+Stripped functions are shown by address; class names are recovered from RTTI.
+Relative vtables and function descriptors are unsupported.
+RTTI supplies inheritance and secondary tables, including virtual base offsets.
+Without RTTI, only the specified subobject's table is displayed.
+Function enumeration stops at non-code entries or --count; the ABI stores no table length.
+```
+
 ## dtor-dump
 
 Display registered destructor functions.
@@ -3100,6 +3139,33 @@ options:
   -n, --no-pager  do not use the pager.
 ```
 
+## unwind-info
+
+Show the effective DWARF unwind rules at the current or specified PC.
+
+
+### Syntax
+
+```text
+usage: unwind-info [-h] [-v] [PC]
+
+positional arguments:
+  PC             the program counter to inspect. (default: current_arch.pc)
+
+options:
+  -h, --help     show this help message and exit
+  -v, --verbose  decode the selected CIE and FDE.
+```
+
+### Examples
+
+```gdb
+unwind-info
+unwind-info $pc
+unwind-info -v $pc
+unwind-info 0x55555555529a
+```
+
 # 02-f. Process Information - Security
 ## aslr
 
@@ -3270,6 +3336,22 @@ usage: search-mangled-ptr [-h] [-v]
 options:
   -h, --help     show this help message and exit
   -v, --verbose  shows the section currently being searched.
+```
+
+## sighands
+
+Display the signal dispositions of the current process.
+
+- Alias: `sigactions`
+
+### Syntax
+
+```text
+usage: sighands [-h] [-n]
+
+options:
+  -h, --help      show this help message and exit
+  -n, --no-pager  do not use the pager.
 ```
 
 # 02-g. Process Information - Symbol
@@ -3678,6 +3760,32 @@ hexdump-flexible "2Q2I2H2B" $rsp 4  # "Show qword*2, dword*2, short*2, byte*2" f
 hexdump-flexible "4Q-2Q" $rsp 4     # "Show qword*4 and skip qword*2" from $rsp and repeat 4 times
 ```
 
+## jmpbuf
+
+Display the registers saved in a jmp_buf or sigjmp_buf of glibc, with PTR_MANGLE decoded.
+
+
+### Syntax
+
+```text
+usage: jmpbuf [-h] [-f] LOCATION
+
+positional arguments:
+  LOCATION              the address of jmp_buf or sigjmp_buf.
+
+options:
+  -h, --help            show this help message and exit
+  -f, --force-heuristic
+                        do not use symbols to detect PTR_MANGLE
+```
+
+### Examples
+
+```gdb
+jmpbuf &env                 # jmp_buf env; / sigjmp_buf env;
+jmpbuf $rdi                 # the 1st argument of setjmp, longjmp, siglongjmp, etc.
+```
+
 ## json
 
 The base command to pretty print for JSON.
@@ -3759,6 +3867,32 @@ positional arguments:
 options:
   -h, --help      show this help message and exit
   -n, --no-pager  do not use the pager.
+```
+
+## ucontext
+
+Display the register state saved in a ucontext_t or mcontext_t.
+
+
+### Syntax
+
+```text
+usage: ucontext [-h] [-m] [-n] LOCATION
+
+positional arguments:
+  LOCATION        the address of ucontext_t (or mcontext_t if -m is specified).
+
+options:
+  -h, --help      show this help message and exit
+  -m, --mcontext  interpret LOCATION as mcontext_t (e.g. &uc->uc_mcontext, struct sigcontext).
+  -n, --no-pager  do not use the pager.
+```
+
+### Examples
+
+```gdb
+ucontext $rdx                 # the 3rd argument of a SA_SIGINFO handler, setcontext, etc.
+ucontext -m 0x7fffffffd9e8    # struct sigcontext
 ```
 
 ## walk-link-list
@@ -10754,6 +10888,77 @@ options:
 convert value 0xdeadbeef
 convert value "\\x41\\x42\\x43\\x44" -v
 convert value --hex "41 42 43 44" -v
+```
+
+## cpp-demangle
+
+Demangle C++ names by the Itanium C++ ABI.
+
+
+### Syntax
+
+```text
+usage: cpp-demangle [-h] [-t] NAME [NAME ...]
+
+positional arguments:
+  NAME        the mangled name to demangle.
+
+options:
+  -h, --help  show this help message and exit
+  -t, --type  demangle types such as RTTI names (e.g., `St9exception`).
+```
+
+### Examples
+
+```gdb
+cpp-demangle _ZNK2ns3Foo3barEiPKc
+cpp-demangle _ZTV3Foo _ZTI3Foo
+cpp-demangle -t N2ns3FooE
+```
+
+### Notes
+
+```text
+Uses the demangler of GDB (`demangle -l c++`).
+```
+
+## cpp-mangle
+
+Mangle a C++ name by the Itanium C++ ABI.
+
+
+### Syntax
+
+```text
+usage: cpp-mangle [-h] [-t] NAME [NAME ...]
+
+positional arguments:
+  NAME        the demangled name to mangle.
+
+options:
+  -h, --help  show this help message and exit
+  -t, --type  mangle a type (the form of RTTI names) instead of a function or variable.
+```
+
+### Examples
+
+```gdb
+cpp-mangle 'ns::Foo::bar(int, char const*) const'
+cpp-mangle 'std::vector<int, std::allocator<int> >::push_back(int const&)'
+cpp-mangle 'vtable for ns::Foo'
+cpp-mangle -t 'ns::Foo*'
+```
+
+### Notes
+
+```text
+Uses the Itanium C++ ABI (Linux GCC/Clang). NAME is written in the form printed by `cpp-demangle`.
+Typedefs and default template arguments are not expanded (e.g., write std::basic_string<...> instead of std::string).
+Constructors and destructors are encoded as the complete object variants (C1/D1).
+An operator with one parameter in a scope is treated as a binary member operator.
+Template parameter references (T_), parameter packs and internal linkage are not recovered from the demangled form,
+so function templates and such symbols may differ from the compiler output.
+Lambdas, unnamed types and expressions in template arguments are unsupported.
 ```
 
 ## u2d

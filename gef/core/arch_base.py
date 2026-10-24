@@ -205,6 +205,9 @@ class Architecture:
     def get_tls(self):
         pass
 
+    def get_canary_offset(self):
+        return None
+
     @abc.abstractmethod
     def decode_cookie(self, value, cookie):
         pass

@@ -90,9 +90,10 @@ def cperf(f): # noqa
 
 
 
-def get_libc_version(verbose=False):
+def get_libc_version(verbose=False, silent=False):
     """Detect and return the glibc version as a tuple, using cache, configuration,
     process maps, or system fallback."""
+
     from gef.core.process import Path, ProcessMap, is_container_attach, is_qemu_user, is_remote_debug
 
     RE_LIBC_PATH = re.compile(r"libc6?[-_](\d+)\.(\d+)\.so")
@@ -110,31 +111,9 @@ def get_libc_version(verbose=False):
             if "libc" not in section.path:
                 continue
 
-            if is_container_attach():
-                real_libc_path = Path.append_proc_root(section.path)
-                if not os.path.exists(real_libc_path):
-                    continue
-                data = open(real_libc_path, "rb").read()
-
-            elif is_remote_debug():
-                if is_qemu_user():
-                    data = None
-                    for maps in ProcessMap.get_process_maps(outer=True):
-                        if os.path.basename(maps.path) != os.path.basename(section.path):
-                            continue
-                        if maps.size != section.size:
-                            continue
-                        real_libc_path = maps.path
-                        data = open(real_libc_path, "rb").read()
-                        break
-                else:
-                    data = Path.read_remote_file(section.path)
-                if not data:
-                    continue
-            else:
-                if not os.path.exists(section.path):
-                    continue
-                data = open(section.path, "rb").read()
+            data, _ = GefUtil.read_mapped_file(section)
+            if not data:
+                continue
 
             r = RE_GLIBC_VERSION.search(data)
             if r:
@@ -171,19 +150,19 @@ def get_libc_version(verbose=False):
         return libc_version
 
     # resolve from system libc
-    if not is_container_attach():
+    if not is_remote_debug() and not is_container_attach():
         libc_version = get_system_libc_version()
         if libc_version is not None:
             if verbose:
                 info("Resolve from system libc")
             return libc_version
 
+    if silent:
+        return None
+
     err("The libc version could not be determined.")
     err("Please specify it with the following command: `gef config libc.assume_version (2,39)`")
-    raise
-
-
-
+    raise RuntimeError("The libc version could not be determined")
 
 
 def slicer(data, n):
@@ -622,6 +601,57 @@ class GefUtil:
         if key not in GefUtil.namedtuple_classes:
             GefUtil.namedtuple_classes[key] = collections.namedtuple(name, dic.keys())
         return GefUtil.namedtuple_classes[key](*dic.values())
+
+    @staticmethod
+    def flags_to_names(value, table):
+        """Return the names whose masks are set in value, and the set bits that no mask covers.
+        The table is a dict or pairs of mask and name.
+        """
+        if isinstance(table, dict):
+            table = table.items()
+        names = []
+        unknown = value
+        for mask, name in table:
+            if value & mask:
+                names.append(name)
+            unknown &= ~mask
+        return names, unknown
+
+    @staticmethod
+    def read_mapped_file(section):
+        """Return the content of the file mapped to `section` and the path actually read, or (None, None)."""
+        from gef.core.process import Path, ProcessMap, is_container_attach, is_pin, is_qemu_user, is_remote_debug, is_wine
+
+        if is_qemu_user():
+            outer_maps = ProcessMap.get_process_maps(outer=True)
+            paths = [m.path for m in outer_maps if m.path == section.path]
+            paths += [m.path for m in outer_maps if GefUtil.is_same_filename(m.path, section.path)]
+            if not paths:
+                return None, None
+            path = paths[0]
+        elif is_remote_debug() and not is_pin() and not is_wine():
+            data = Path.read_remote_file(section.path)
+            if not data:
+                return None, None
+            return data, section.path
+        else:
+            path = section.path
+
+        if is_container_attach():
+            path = Path.append_proc_root(path)
+        if path is None:
+            return None, None
+        try:
+            return open(path, "rb").read(), path
+        except OSError:
+            return None, None
+
+    @staticmethod
+    def is_same_filename(a, b):
+        try:
+            return os.path.samefile(a, b)
+        except OSError:
+            return False
 
     @staticmethod
     def make_legend(msg):

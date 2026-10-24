@@ -12,6 +12,7 @@ import struct
 import gdb
 
 from gef.commands.base import (
+    ContextManager,
     BufferingOutput,
     GenericCommand,
     exclude_specific_arch,
@@ -31,14 +32,17 @@ from gef.core.cache import Cache
 from gef.core.color import Color, err, gef_print, info, ok, titlify, warn
 from gef.core.config import Config
 from gef.core.elf import Checksec, Elf
-from gef.core.exec import ExecAsm
+from gef.core.exec import ExecAsm, ExecSyscall
+from gef.core.syscall import Syscall
 from gef.core.instruction import get_insn
-from gef.core.memory import is_valid_addr, read_int_from_memory, read_memory, u32, u64
+from gef.core.memory import is_valid_addr, read_int_from_memory, read_memory, u32, u64, write_memory
 from gef.core.process import (
+    LinuxSignal,
     Path,
     Pid,
     ProcessMap,
     get_pagesize,
+    is_64bit,
     is_alive,
     is_arm32,
     is_arm32_cortex_m,
@@ -57,7 +61,7 @@ from gef.core.process import (
     is_x86_64,
 )
 from gef.core.symbols import Symbol
-from gef.core.utils import GefUtil, slice_unpack
+from gef.core.utils import GefUtil, slice_unpack, u2i, align_to_ptrsize, get_libc_version
 
 @register_command
 class CanaryCommand(GenericCommand):
@@ -144,6 +148,143 @@ class CanaryCommand(GenericCommand):
     @require_arch_set
     def do_invoke(self, args):
         self.dump_canary()
+        return
+
+
+@register_command
+class SignalHandlersCommand(GenericCommand, BufferingOutput):
+    """Display the signal dispositions of the current process."""
+
+    _cmdline_ = "sighands"
+    _category_ = "02-f. Process Information - Security"
+    _aliases_ = ["sigactions"]
+
+    parser = argparse.ArgumentParser(prog=_cmdline_)
+    parser.add_argument("-n", "--no-pager", action="store_true", help="do not use the pager.")
+    _syntax_ = parser.format_help()
+
+    @staticmethod
+    def get_rt_sigaction_number():
+        syscall_table = Syscall.get_syscall_table()
+        if syscall_table is None:
+            return None
+        for entry in syscall_table.nr_table.values():
+            if is_x86_64() and entry.nr >= 0x4000_0000:
+                continue
+            if entry.name == "rt_sigaction":
+                return entry.nr
+        return None
+
+    @staticmethod
+    def get_libc():
+        """Return the inferior's libc ("glibc" or "musl"), or None if it is unknown."""
+        for objfile in gdb.objfiles():
+            name = os.path.basename(objfile.filename or "")
+            if re.fullmatch(r"libc\.so\.6|libc-2\.\d+\.so", name):
+                return "glibc"
+            if re.fullmatch(r"(?:ld-musl|libc\.musl)-\w+\.so\.1", name):
+                return "musl"
+        if is_alive():
+            if Symbol.resolve_address("__init_libc") and Symbol.resolve_address("__libc"):
+                return "musl"
+            if is_x86_64():
+                try:
+                    tls = runtime.current_arch.get_tls()
+                    if tls is not None and read_int_from_memory(tls + 0x30) == gdb.selected_thread().ptid[1]:
+                        return "musl"
+                except (gdb.error, gdb.MemoryError, AttributeError):
+                    pass
+        return None
+
+    @staticmethod
+    def get_layout():
+        if is_64bit():
+            return {"size": 32, "handler": 0, "flags": 8, "restorer": 16, "mask": 24}
+        return {"size": 20, "handler": 0, "flags": 4, "restorer": 8, "mask": 12}
+
+    @staticmethod
+    def unpack_word(data, offset):
+        size = runtime.current_arch.ptrsize
+        unpack = GefUtil.get_unpack(size)
+        return unpack(data[offset:offset + size])
+
+    def query(self, syscall_number, signal_number, address, layout):
+        write_memory(address, b"\x00" * layout["size"])
+        state = ExecSyscall(syscall_number, [signal_number, 0, address, 8]).exec_code()
+        result = state["reg"][runtime.current_arch.return_register]
+        result = u2i(result, runtime.current_arch.ptrsize * 8)
+        if result != 0:
+            return result, None
+
+        data = read_memory(address, layout["size"])
+        action = {name: self.unpack_word(data, offset) for name, offset in layout.items() if name != "size"}
+        if runtime.current_arch.ptrsize == 4:
+            action["mask"] = u64(data[layout["mask"]:layout["mask"] + 8])
+        return 0, action
+
+    @staticmethod
+    def format_handler(handler):
+        if handler == 0:
+            return "SIG_DFL"
+        if handler == 1:
+            return "SIG_IGN"
+        symbol = Symbol.format(handler)
+        value = AddressUtil.format_address(handler, long_fmt=True)
+        return "{:s} {:s}".format(value, symbol).rstrip()
+
+    @parse_args
+    @only_if_gdb_running
+    @exclude_specific_gdb_mode(mode=("qemu-system", "kgdb", "vmware", "rr", "wine"))
+    @only_if_specific_arch(arch=("x86_32", "x86_64", "ARM32", "ARM64"))
+    @require_arch_set
+    def do_invoke(self, args):
+        syscall_number = self.get_rt_sigaction_number()
+        if syscall_number is None:
+            err("Could not find the rt_sigaction system call")
+            return
+
+        layout = self.get_layout()
+        address = runtime.current_arch.sp
+        with ContextManager.temporary_memory(address, length=layout["size"], safe=True) as backup:
+            if backup is None:
+                err("Could not reserve scratch space on the inferior stack")
+                return
+
+            actions = []
+            with ContextManager.gdb_parameter("suppress-cli-notifications", "on", ignore_error=True):
+                for signal_number in range(1, 65):
+                    result, action = self.query(syscall_number, signal_number, address, layout)
+                    if result == -22 and signal_number in (9, 19): # SIGKILL and SIGSTOP cannot be queried.
+                        action = {"handler": 0, "flags": 0, "restorer": 0, "mask": 0}
+                    elif result != 0:
+                        err("rt_sigaction({:d}) failed with errno {:d}".format(signal_number, -result))
+                        return
+                    actions.append((signal_number, action))
+
+        libc = self.get_libc()
+        names = {number: name for number, name in LinuxSignal.NAMES.items() if number < 32}
+        names.update(LinuxSignal.LIBC_NAMES.get(libc, {}))
+
+        rows = []
+        for signal_number, action in actions:
+            rows.append((
+                str(signal_number), names.get(signal_number, "SIG{:d}".format(signal_number)),
+                self.format_handler(action["handler"]), LinuxSignal.format_flags(action["flags"]),
+                LinuxSignal.format_mask(action["mask"], names),
+            ))
+
+        handler_width = max(30, max(len(Color.remove_color(row[2])) for row in rows))
+        fmt = "{:<3s} {:<14s} {:s}{:s} {:<42s} {:s}"
+        header = fmt.format("Num", "Signal", "Handler", " " * (handler_width - len("Handler")), "Flags", "Mask")
+        if libc:
+            title = "Signal dispositions ({:s})".format(libc)
+        else:
+            title = "Signal dispositions"
+        self.out = [titlify(title), GefUtil.make_legend(header)]
+        for number, name, handler, flags, mask in rows:
+            padding = " " * (handler_width - len(Color.remove_color(handler)))
+            self.out.append(fmt.format(number, name, handler, padding, flags, mask).rstrip())
+        self.print_output(check_terminal_size=True)
         return
 
 
@@ -358,38 +499,221 @@ class PtrDemangleCommand(GenericCommand):
     _syntax_ = parser.format_help()
 
     @staticmethod
+    def get_relro_range(base):
+        elf = Elf.get_elf(base)
+        if elf is None:
+            return None
+        phdr = elf.get_phdr(Elf.Phdr.PT_GNU_RELRO)
+        if phdr is None:
+            return None
+
+        if elf.e_type == Elf.ET_DYN:
+            load_bias = base
+        else:
+            load_bias = 0
+        start = align_to_ptrsize(load_bias + phdr.p_vaddr)
+        end = align_to_ptrsize(load_bias + phdr.p_vaddr + phdr.p_memsz)
+        if start + runtime.current_arch.ptrsize > end:
+            return None
+        return start, end
+
+    @staticmethod
+    def get_cookie_from_rtld_relro(libc_version):
+        # Find _dl_argv and nearby guard variables in rtld RELRO when available.
+        try:
+            auxv = Auxv.get_auxiliary_values()
+            if not auxv or not auxv.get("AT_BASE"):
+                return None
+            relro = PtrDemangleCommand.get_relro_range(auxv["AT_BASE"])
+        except (gdb.error, gdb.MemoryError):
+            return None
+        if relro is None:
+            return None
+
+        def is_stack_address(addr):
+            return ProcessMap.lookup(addr).is_in_stack_segment()
+
+        start, end = relro
+        ptrsize = runtime.current_arch.ptrsize
+        # _dl_skip_args occupied one slot between _dl_argv and the guards until glibc 2.35.
+        guard_distance = 1 + int(libc_version < (2, 36)) + int(runtime.current_arch.get_canary_offset() is None)
+
+        """
+        x86_64 glibc 2.44
+        0x7ffff7ffcab0|+0x0000|+000: __pointer_chk_guard_local: 0xc1e710f8603f8d46
+        0x7ffff7ffcab8|+0x0008|+001: _dl_argv                 : 0x00007fffffffe538  ->  0x00007fffffffe769  ->  ...
+        0x7ffff7ffcac0|+0x0010|+002: _dl_argc                 : 0x0000000000000001
+
+        x86_64 glibc 2.35
+        0x7ffff7ffcab0|+0x0000|+000: __pointer_chk_guard_local: 0xf6bede021604f3c4
+        0x7ffff7ffcab8|+0x0008|+001: _dl_skip_args            : 0x0000000000000000
+        0x7ffff7ffcac0|+0x0010|+002: _dl_argv                 : 0x00007fffffffe738  ->  0x00007fffffffe93e  ->  ...
+        0x7ffff7ffcac8|+0x0018|+003: _dl_argc                 : 0x0000000000000001
+        """
+
+        for argv_slot in range(start, end, ptrsize):
+            try:
+                argv = read_int_from_memory(argv_slot)
+                if not is_stack_address(argv) or not is_stack_address(read_int_from_memory(argv)):
+                    continue
+            except (gdb.error, gdb.MemoryError, TypeError):
+                continue
+
+            for direction in (-1, 1):
+                argc_slot = argv_slot + direction * ptrsize
+                if argc_slot < start or argc_slot + 4 > end:
+                    continue
+                try:
+                    # _dl_argc check
+                    argc = u32(read_memory(argc_slot, 4))
+                    if not 1 <= argc <= 0x1000:
+                        continue
+                    # _dl_argv_check
+                    if any(not is_stack_address(read_int_from_memory(argv + i * ptrsize)) for i in range(min(argc, 4))):
+                        continue
+                    if read_int_from_memory(argv + argc * ptrsize) != 0:
+                        continue
+
+                    guard_slot = argv_slot - direction * ptrsize * guard_distance
+                    if not start <= guard_slot or guard_slot + ptrsize > end:
+                        continue
+                    cookie = read_int_from_memory(guard_slot)
+                    if cookie != 0:
+                        return cookie
+                except (gdb.error, gdb.MemoryError, TypeError):
+                    pass
+        return None
+
+    @staticmethod
+    def get_cookie_from_static_relro():
+        # In a stripped static binary, keep only RELRO slots that are zero in the file and randomized at runtime.
+        codebase = ProcessMap.get_codebase()
+        if codebase is None:
+            return None
+
+        elf = Elf.get_elf(codebase)
+        if elf is None or not elf.is_static():
+            return None
+
+        relro = PtrDemangleCommand.get_relro_range(codebase)
+        if relro is None:
+            return None
+
+        canary = None
+        try:
+            res = CanaryCommand.gef_read_canary()
+            if res is not None:
+                canary = res[0]
+        except Exception:
+            pass
+
+        start, end = relro
+        ptrsize = runtime.current_arch.ptrsize
+        unpack = GefUtil.get_unpack(ptrsize)
+        bits = ptrsize * 8
+        candidates = []
+        files = {}
+        for addr in range(start, end, ptrsize):
+            cookie = read_int_from_memory(addr, safe=True)
+            if cookie is None:
+                continue
+            if cookie == 0 or cookie == canary or is_valid_addr(cookie):
+                continue
+            ones = bin(cookie).count("1")
+            if not bits // 4 <= ones <= bits * 3 // 4:
+                continue
+
+            section = ProcessMap.process_lookup_address(addr)
+            if section is None or not section.path or section.path.startswith("["):
+                continue
+            if section.path not in files:
+                files[section.path], _ = GefUtil.read_mapped_file(section)
+            data = files[section.path]
+            if data is None:
+                continue
+            pos = section.offset + addr - section.page_start
+            original = data[pos:pos + ptrsize]
+            if len(original) == ptrsize and unpack(original) == 0:
+                candidates.append(cookie)
+
+        candidates = list(dict.fromkeys(candidates))
+        if len(candidates) == 1:
+            return candidates[0]
+        return None
+
+    @staticmethod
+    @Cache.cache_this_session(until_new_objfile=True)
+    def get_cookie_symbols():
+        """Return the pointer guard symbols that gdb is able to resolve.
+        gdb keeps no cache for a symbol it failed to find, so it rescans every symtab on
+        each attempt (2.5ms once the glibc debug symbols are loaded). get_cookie runs on
+        every stop, so the symbols that do not exist are dropped here once."""
+        symbols = []
+        for symbol in ("&__pointer_chk_guard", "&__pointer_chk_guard_local"):
+            try:
+                AddressUtil.parse_address(symbol)
+            except (gdb.error, OverflowError, ValueError):
+                continue
+            symbols.append(symbol)
+        return symbols
+
+    @staticmethod
     @Cache.cache_until_next
-    def get_cookie():
+    def get_cookie(force_heuristic=False):
         if is_in_kernel():
+            return None
+        if SignalHandlersCommand.get_libc() == "musl":
             return None
         if is_arm32_cortex_m():
             return None
         if is_qiling():
             return None
 
+        if not force_heuristic:
+            # glibc 2.44 stores the pointer guard in a RELRO variable on every architecture.
+            # rtld and several architectures used these variables before 2.44.
+            for symbol in PtrDemangleCommand.get_cookie_symbols():
+                try:
+                    cookie_ptr = AddressUtil.parse_address(symbol)
+                    return read_int_from_memory(cookie_ptr)
+                except (gdb.error, OverflowError):
+                    pass
+
+        libc_version = get_libc_version(silent=True)
+        if libc_version is None:
+            return None
+
+        # rtld keeps a RELRO copy of the pointer guard.
+        cookie = PtrDemangleCommand.get_cookie_from_rtld_relro(libc_version)
+        if cookie is not None:
+            return cookie
+
+        if libc_version >= (2, 44):
+            return PtrDemangleCommand.get_cookie_from_static_relro()
+
+        # fast path for x86/x64
         try:
+            # x86 stored the pointer guard in the TCB.
             if is_x86_64():
                 tls = runtime.current_arch.get_tls()
-                cookie = read_int_from_memory(tls + 0x30)
-                return cookie
-            elif is_x86_32():
+                if tls is not None:
+                    return read_int_from_memory(tls + 0x30)
+            if is_x86_32():
                 tls = runtime.current_arch.get_tls()
-                cookie = read_int_from_memory(tls + 0x18)
-                return cookie
-            elif is_arm32() or is_arm64():
-                cookie_ptr = AddressUtil.parse_address("&__pointer_chk_guard_local")
-                cookie = read_int_from_memory(cookie_ptr)
-                return cookie
+                if tls is not None:
+                    return read_int_from_memory(tls + 0x18)
         except (gdb.error, OverflowError):
             pass
 
-        # generic
+        # generic slow path
         try:
             auxv = Auxv.get_auxiliary_values()
             if auxv is None:
                 Cache.reset_gef_caches()
                 auxv = Auxv.get_auxiliary_values()
+            # The pointer guard is derived from the second uintptr_t at AT_RANDOM.
             if auxv and "AT_RANDOM" in auxv:
+                # Old s390x instead reused the stack guard with its least significant byte cleared.
                 if is_s390x():
                     cookie = read_int_from_memory(auxv["AT_RANDOM"]) & 0x00ff_ffff_ffff_ffff
                 else:
@@ -398,6 +722,10 @@ class PtrDemangleCommand(GenericCommand):
                     return cookie
         except gdb.error:
             pass
+
+        # Before glibc 2.44, try the static RELRO fallback on architectures where GEF does not have a TCB canary offset.
+        if runtime.current_arch.get_canary_offset() is None:
+            return PtrDemangleCommand.get_cookie_from_static_relro()
         return None
 
     @parse_args

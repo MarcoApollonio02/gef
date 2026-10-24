@@ -211,6 +211,9 @@ class X86(Architecture):
             return None
         return self.get_gs()
 
+    def get_canary_offset(self):
+        return 0x14
+
     def decode_cookie(self, value, cookie):
         return ror(value, 9, 32) ^ cookie
 
@@ -366,6 +369,9 @@ class X86_64(X86):
         if is_in_kernel():
             return None
         return self.get_fs()
+
+    def get_canary_offset(self):
+        return 0x28
 
     def decode_cookie(self, value, cookie):
         return ror(value, 17, 64) ^ cookie

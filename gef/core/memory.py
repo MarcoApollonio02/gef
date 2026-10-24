@@ -576,48 +576,55 @@ def read_int64_from_memory(addr, safe=False, signed=False):
         raise
 
 
-def read_cstring_from_memory(addr, max_length=None):
-    """Return a C-string read from memory."""
+def read_cstring_from_memory(addr, max_length=None, safe=False):
+    """Return a C-string read from memory, or None on error when safe is True."""
     from gef.core.process import get_pagesize, is_kgdb
     from gef.core.strings import String
 
-    if max_length is None:
-        max_length = Config.get_gef_setting("context.nb_max_string_length")
-
-    if is_kgdb():
-        # read_memory when kgdb is very slow, this is dirty hack
-        block_size = 64
-    else:
-        block_size = get_pagesize()
-
-    # first, read to page boundary
-    length = block_size - (addr % block_size)
     try:
-        res = read_memory(addr, length)
-    except gdb.MemoryError:
-        return None
+        if max_length is None:
+            max_length = Config.get_gef_setting("context.nb_max_string_length")
 
-    # if too short, more read
-    while len(res) < max_length:
-        if b"\x00" in res:
-            break
-        try:
-            read_length = min(max_length - len(res), block_size)
-            res += read_memory(addr + len(res), read_length)
-        except gdb.MemoryError:
-            break
+        if is_kgdb():
+            # read_memory when kgdb is very slow, this is dirty hack
+            block_size = 64
+        else:
+            block_size = get_pagesize()
 
-    # check if ascii
-    res = res.split(b"\x00")[0]
-    ustr = String.bytes2str(res)
+        # first, read to page boundary
+        length = block_size - (addr % block_size)
+        res = read_memory(addr, length, safe=True)
+        if res is None:
+            return None
 
-    if ustr and any(x not in String.STRING_PRINTABLE for x in ustr):
-        return None
+        # if too short, more read
+        while len(res) < max_length:
+            if b"\x00" in res:
+                break
+            try:
+                read_length = min(max_length - len(res), block_size)
+                res += read_memory(addr + len(res), read_length)
+            except gdb.MemoryError:
+                if safe:
+                    return None
+                break
 
-    if len(ustr) > max_length:
-        ustr = "{}[...]".format(ustr[:max_length])
+        # check if ascii
+        res = res.split(b"\x00")[0]
+        ustr = String.bytes2str(res)
 
-    return ustr
+        if ustr and any(x not in String.STRING_PRINTABLE for x in ustr):
+            return None
+
+        if len(ustr) > max_length:
+            ustr = "{}[...]".format(ustr[:max_length])
+
+        return ustr
+    except Exception:
+        if safe:
+            return None
+        raise
+
 
 @Cache.cache_until_next
 def is_valid_addr(addr):

@@ -208,6 +208,9 @@ class SPARC(Architecture):
     def get_tls(self):
         return get_register("$g7")
 
+    def get_canary_offset(self):
+        return 0x14
+
     def decode_cookie(self, value, cookie):
         return value ^ cookie
 
@@ -278,6 +281,9 @@ class SPARC64(SPARC):
     bit_length = 64
 
     syscall_insn = b"\x6d\x20\xd0\x91" # trap 0x6d
+
+    def get_canary_offset(self):
+        return 0x28
 
     def is_syscall(self, insn):
         try:

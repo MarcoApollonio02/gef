@@ -1,10 +1,13 @@
 """Command base infrastructure extracted from the monolithic gef.py.
 
 Contains GenericCommand, BufferingOutput, register_command /
-register_priority_command and the command-guard decorators.
+register_priority_command, the command-guard decorators, and the
+ContextManager collection of temporary-state context managers.
 """
 import abc
 import functools
+import contextlib
+import os
 
 import gdb
 
@@ -12,9 +15,11 @@ from gef.core import runtime
 from gef.core.cache import Cache
 from gef.core.color import Color, gef_print, ok, err, warn, info
 from gef.core.config import Config
-from gef.core.memory import is_valid_addr
+from gef.core.memory import is_valid_addr, read_memory, write_memory
 from gef.core.pagewalk import KernelAddressHeuristicFinder
 from gef.core.process import (
+    Path,
+    Pid,
     is_alive,
     is_remote_debug,
     is_in_kernel,
@@ -63,6 +68,8 @@ from gef.core.process import (
 )
 from gef.core.runtime import CommandRegistry
 from gef.core.utils import GefUtil
+from gef.core.events import EventHooking, EventHandler
+from gef.core.registers import get_register
 
 # Re-exports: these decorators were moved to gef.core by T5.7; keep them
 # importable from the command module namespace without duplicating the code.
@@ -699,4 +706,237 @@ class GefAlias(gdb.Command):
         if not self._repeat_:
             self.dont_repeat()
         gdb.execute("{} {}".format(self._command_, args), from_tty=from_tty)
+        return
+
+
+class ContextManager:
+    """A collection of context managers for temporary GEF state."""
+
+    stop_handler_suspended = False
+
+    @staticmethod
+    @contextlib.contextmanager
+    def config(name, value, enabled=True):
+        """Temporarily set a GEF setting and restore its original value on exit, unless disabled."""
+        if not enabled:
+            yield
+            return
+        original = Config.get_gef_setting(name)
+        Config.set_gef_setting(name, value)
+        try:
+            yield
+        finally:
+            Config.set_gef_setting(name, original)
+        return
+
+    @staticmethod
+    @contextlib.contextmanager
+    def hidden_context():
+        """Temporarily hide context output and restore its original visibility on exit."""
+        from gef.commands.debugging.context import ContextCommand
+        hidden = ContextCommand.context_hidden
+        ContextCommand.hide_context()
+        try:
+            yield
+        finally:
+            ContextCommand.context_hidden = hidden
+        return
+
+    @staticmethod
+    @contextlib.contextmanager
+    def suspend_stop_handler():
+        """Temporarily disconnect the GEF stop handler, restoring it when the outermost block exits."""
+        suspended = ContextManager.stop_handler_suspended
+        if not suspended:
+            EventHooking.gef_on_stop_unhook(EventHandler.hook_stop_handler)
+        ContextManager.stop_handler_suspended = True
+        try:
+            yield
+        finally:
+            ContextManager.stop_handler_suspended = suspended
+            if not suspended:
+                EventHooking.gef_on_stop_hook(EventHandler.hook_stop_handler)
+        return
+
+    @staticmethod
+    @contextlib.contextmanager
+    def selected_thread():
+        """Preserve the selected thread and frame, yielding the original thread.
+        Allow missing frames and ignore restoration errors if the saved context is no longer valid.
+        """
+        thread = gdb.selected_thread()
+        try:
+            frame = gdb.selected_frame()
+        except (gdb.error, RuntimeError):
+            frame = None
+        try:
+            yield thread
+        finally:
+            if thread is not None:
+                try:
+                    thread.switch()
+                    if frame is not None:
+                        frame.select()
+                except (gdb.error, RuntimeError):
+                    pass
+        return
+
+    @staticmethod
+    @contextlib.contextmanager
+    def threads(threads=None):
+        """Yield an iterator that selects each thread and restores the original selection on exit.
+        Use all threads of the selected inferior when omitted, skipping threads that cannot be selected.
+        Consume the iterator only inside the with block.
+        """
+
+        def switch_threads():
+            """Select and yield each available thread, skipping failed switches."""
+            for thread in threads:
+                try:
+                    thread.switch()
+                except (gdb.error, RuntimeError):
+                    continue
+                yield thread
+
+        with ContextManager.selected_thread():
+            if threads is None:
+                threads = gdb.selected_inferior().threads()
+            yield switch_threads()
+        return
+
+    @staticmethod
+    @contextlib.contextmanager
+    def gdb_parameter(name, value, ignore_error=False):
+        """Temporarily set a GDB parameter and restore the original value on exit.
+        With ignore_error, run the body unchanged if the parameter is missing or cannot be set,
+        and ignore a failed restoration. A scheduler-locking restoration may also fail after the inferior exits.
+        """
+        restore = None
+        try:
+            original = gdb.parameter(name)
+            if isinstance(original, bool):
+                if original:
+                    original = "on"
+                else:
+                    original = "off"
+            gdb.execute("set {:s} {:s}".format(name, value), to_string=True)
+            restore = "set {:s} {!s}".format(name, original)
+        except (gdb.error, RuntimeError):
+            if not ignore_error:
+                raise
+        try:
+            yield
+        finally:
+            if restore is not None:
+                try:
+                    gdb.execute(restore, to_string=True)
+                except (gdb.error, RuntimeError):
+                    if not ignore_error and (name != "scheduler-locking" or is_alive()):
+                        raise
+        return
+
+    @staticmethod
+    @contextlib.contextmanager
+    def temporary_memory(addr, data=None, length=None, safe=False):
+        """Preserve memory and optionally write data, yielding the original bytes.
+        With safe, yield None without writing if the original memory cannot be read.
+        """
+        if data is not None:
+            length = len(data)
+        original = read_memory(addr, length, safe=safe)
+        if original is None:
+            yield None
+            return
+        try:
+            if data is not None:
+                write_memory(addr, data)
+            yield original
+        finally:
+            write_memory(addr, original)
+        return
+
+    @staticmethod
+    @contextlib.contextmanager
+    def redirect_output(stderr=True):
+        """Temporarily silence stdout and optionally stderr, yielding a writer to the saved stdout."""
+        with contextlib.ExitStack() as restore:
+            saved = {}
+            for fd in (1, 2) if stderr else (1,):
+                saved[fd] = os.dup(fd)
+                restore.callback(os.close, saved[fd])
+                restore.callback(os.dup2, saved[fd], fd)
+            with open("/dev/null", "w") as null:
+                for fd in saved:
+                    os.dup2(null.fileno(), fd)
+
+            def write_stdout(msg):
+                with os.fdopen(os.dup(saved[1]), "wb") as fdw:
+                    fdw.write(msg)
+                return
+
+            yield write_stdout
+        return
+
+    @staticmethod
+    @contextlib.contextmanager
+    def temporary_file(data, prefix="", suffix=None):
+        """Yield a file containing data and remove it on exit."""
+        tmp_fd, tmp_path = GefUtil.mkstemp(prefix=prefix, suffix=suffix)
+        try:
+            with os.fdopen(tmp_fd, "wb") as fdw:
+                fdw.write(data)
+            del data
+            yield tmp_path
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+        return
+
+    @staticmethod
+    @contextlib.contextmanager
+    def local_elf(filepath=None, remote=False, prefix="", error=err):
+        """Yield local and remote ELF paths, removing any downloaded copy on exit."""
+        remote_filepath = None
+        local_filepath = filepath or None
+
+        if remote:
+            if not is_remote_debug():
+                error("-r option is allowed only remote debug")
+                yield None, None
+                return
+            if is_qemu_system():
+                error("-r option is unsupported under qemu-system")
+                yield None, None
+                return
+
+            remote_filepath = filepath or Path.get_remote_filepath()
+            if not remote_filepath:
+                pid = Pid.get_pid(remote=True)
+                if pid:
+                    remote_filepath = "/proc/{:d}/exe".format(pid)
+            if not remote_filepath:
+                error("File name could not be determined")
+                yield None, None
+                return
+
+            data = Path.read_remote_file(remote_filepath, as_byte=True)
+            if not data:
+                error("Failed to read remote filepath")
+                yield None, None
+                return
+        elif filepath is None:
+            if is_qemu_system():
+                error("Argument-less calls are unsupported under qemu-system")
+                yield None, None
+                return
+            local_filepath = Path.get_filepath()
+
+        if remote:
+            with ContextManager.temporary_file(data, prefix=prefix, suffix=".elf") as local_filepath:
+                del data
+                yield local_filepath, remote_filepath
+            return
+        if local_filepath is None:
+            error("File name could not be determined")
+        yield local_filepath, remote_filepath
         return

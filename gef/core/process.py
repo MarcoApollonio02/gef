@@ -787,6 +787,17 @@ class Path:
     """A collection of utility functions that obtains a path."""
 
     @staticmethod
+    def get_remote_filepath():
+        """Return the path on the remote target of the file currently debugged."""
+        filepath = gdb.current_progspace().filename
+        if filepath is None:
+            return None
+        for prefix in [".gnu_debugdata for target:", "target:"]:
+            if filepath.startswith(prefix):
+                return filepath[len(prefix):]
+        return filepath
+
+    @staticmethod
     def append_proc_root(filepath):
         if filepath is None:
             return None
@@ -1530,6 +1541,12 @@ class ProcessMap:
         return None
 
     @staticmethod
+    @Cache.cache_until_next(per_inferior=True)
+    def lookup(addr):
+        """Try to find the address in the process address space. Return an Address object with caching."""
+        return Address(addr)
+
+    @staticmethod
     @Cache.cache_until_next
     def lookup_address(addr):
         """Try to find the address in the process address space. Return an Address object with caching."""
@@ -1568,3 +1585,118 @@ class ProcessMap:
         filepath = Path.get_filepath_from_info_proc()
         code_base = ProcessMap.get_section_base_address(filepath)
         return code_base
+
+
+class LinuxSignal:
+    """Linux signal names and sigaction flags shared by userland and kernel commands."""
+
+    NAMES = {
+        1: "SIGHUP",
+        2: "SIGINT",
+        3: "SIGQUIT",
+        4: "SIGILL",
+        5: "SIGTRAP",
+        6: "SIGABRT",
+        7: "SIGBUS",
+        8: "SIGFPE",
+        9: "SIGKILL",
+        10: "SIGUSR1",
+        11: "SIGSEGV",
+        12: "SIGUSR2",
+        13: "SIGPIPE",
+        14: "SIGALRM",
+        15: "SIGTERM",
+        16: "SIGSTKFLT",
+        17: "SIGCHLD",
+        18: "SIGCONT",
+        19: "SIGSTOP",
+        20: "SIGTSTP",
+        21: "SIGTTIN",
+        22: "SIGTTOU",
+        23: "SIGURG",
+        24: "SIGXCPU",
+        25: "SIGXFSZ",
+        26: "SIGVTALRM",
+        27: "SIGPROF",
+        28: "SIGWINCH",
+        29: "SIGIO",
+        30: "SIGPWR",
+        31: "SIGSYS",
+        32: "SIGCANCEL",
+        33: "SIGSETXID",
+        34: "SIGRTMIN",
+        64: "SIGRTMAX",
+    }
+    for number in range(35, 50):
+        NAMES[number] = "SIGRTMIN+{:d}".format(number - 34)
+    for number in range(63, 49, -1):
+        NAMES[number] = "SIGRTMAX-{:d}".format(64 - number)
+
+    # the kernel UAPI numbers the RT signals from SIGRTMIN = 32
+    KERNEL_NAMES = {number: name for number, name in NAMES.items() if number < 32}
+    KERNEL_NAMES[32] = "SIGRTMIN"
+    for number in range(33, 49):
+        KERNEL_NAMES[number] = "SIGRTMIN+{:d}".format(number - 32)
+    for number in range(49, 65):
+        if number < 64:
+            KERNEL_NAMES[number] = "SIGRTMAX-{:d}".format(64 - number)
+        else:
+            KERNEL_NAMES[number] = "SIGRTMAX"
+
+    # the libc reserves the first RT signals for its internal use and moves its SIGRTMIN after them
+    LIBC_NAMES = {
+        "glibc": {32: "SIGCANCEL", 33: "SIGSETXID"},
+        "musl": {32: "SIGTIMER", 33: "SIGCANCEL", 34: "SIGSYNCCALL"},
+    }
+    for libc_names, rtmin in [(LIBC_NAMES["glibc"], 34), (LIBC_NAMES["musl"], 35)]:
+        libc_names[rtmin] = "SIGRTMIN"
+        for number in range(rtmin + 1, 50):
+            libc_names[number] = "SIGRTMIN+{:d}".format(number - rtmin)
+        for number in range(50, 65):
+            if number < 64:
+                libc_names[number] = "SIGRTMAX-{:d}".format(64 - number)
+            else:
+                libc_names[number] = "SIGRTMAX"
+
+    FLAGS = (
+        (0x0000_0001, "SA_NOCLDSTOP"),
+        (0x0000_0002, "SA_NOCLDWAIT"),
+        (0x0000_0004, "SA_SIGINFO"),
+        (0x0000_0400, "SA_UNSUPPORTED"),
+        (0x0000_0800, "SA_EXPOSE_TAGBITS"),
+        (0x0400_0000, "SA_RESTORER"),
+        (0x0800_0000, "SA_ONSTACK"),
+        (0x1000_0000, "SA_RESTART"),
+        (0x2000_0000, "SA_INTERRUPT"),
+        (0x4000_0000, "SA_NODEFER"),
+        (0x8000_0000, "SA_RESETHAND"),
+    )
+
+    # the flags that only the kernel sees
+    KERNEL_FLAGS = (
+        (0x0080_0000, "SA_IMMUTABLE"),
+    )
+
+    @classmethod
+    def format_flags(cls, flags, extra=()):
+        from gef.core.utils import GefUtil
+        names, unknown = GefUtil.flags_to_names(flags, cls.FLAGS + tuple(extra))
+        if unknown:
+            names.append("{:#x}".format(unknown))
+        if names:
+            return "|".join(names)
+        return "-"
+
+    @classmethod
+    def format_mask(cls, mask, names=None, compact=False):
+        if names is None:
+            names = cls.NAMES
+        if compact and bin(mask & 0xffff_ffff_ffff_ffff).count("1") > 32:
+            # a mask made by sigfillset() is shown by the signals it lacks
+            return "all except " + (cls.format_mask(~mask & 0xffff_ffff_ffff_ffff, names) if ~mask & 0xffff_ffff_ffff_ffff else "none")
+        names = [names.get(number, "SIG{:d}".format(number))
+                 for number in range(1, 65) if mask & (1 << (number - 1))]
+        if names:
+            return ",".join(names)
+        return "-"
+

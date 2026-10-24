@@ -399,6 +399,9 @@ class S390X(Architecture):
         lo = get_register("$acr1")
         return (hi << 32) | lo
 
+    def get_canary_offset(self):
+        return 0x28
+
     def decode_cookie(self, value, cookie):
         return value ^ cookie
 

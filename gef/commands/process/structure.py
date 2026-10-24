@@ -75,6 +75,262 @@ from gef.core.types import GlibcHeap
 from gef.core.utils import GefUtil, byteswap, get_libc_version
 
 @register_command
+class CppVtableCommand(GenericCommand, BufferingOutput):
+    """Dump C++ virtual tables and RTTI from an object or base subobject."""
+
+    _cmdline_ = "cpp-vtable"
+    _category_ = "02-e. Process Information - Complex Structure Information"
+
+    parser = argparse.ArgumentParser(prog=_cmdline_)
+    parser.add_argument("address", metavar="ADDRESS", type=AddressUtil.parse_address,
+                        help="the address of a C++ object or polymorphic base subobject.")
+    parser.add_argument("-c", "--count", type=int, default=64,
+                        help="maximum number of virtual function entries per table. (default: 64)")
+    parser.add_argument("-n", "--no-pager", action="store_true", help="do not use the pager.")
+    _syntax_ = parser.format_help()
+
+    _example_ = [
+        "{0:s} 0x55555556b2a0",
+        "{0:s} '&object'",
+        "{0:s} '(Base2 *)&object' -c 8",
+    ]
+    _example_ = "\n".join(_example_).format(_cmdline_)
+
+    _note_ = [
+        "Uses the Itanium C++ ABI with pointer-sized virtual function entries (Linux GCC/Clang).",
+        "No debug information is required; RTTI is decoded from target memory.",
+        "Stripped functions are shown by address; class names are recovered from RTTI.",
+        "Relative vtables and function descriptors are unsupported.",
+        "RTTI supplies inheritance and secondary tables, including virtual base offsets.",
+        "Without RTTI, only the specified subobject's table is displayed.",
+        "Function enumeration stops at non-code entries or --count; the ABI stores no table length.",
+    ]
+    _note_ = "\n".join(_note_)
+
+    def read_vtable(self, address):
+        vptr = read_int_from_memory(address)
+        if not vptr or vptr % self.ptrsize:
+            raise ValueError("Invalid vptr")
+        offset_to_top = read_int_from_memory(vptr - 2 * self.ptrsize, signed=True)
+        rtti = read_int_from_memory(vptr - self.ptrsize)
+        return {"vptr": vptr, "rtti": rtti, "offset_to_top": offset_to_top, "top": address + offset_to_top}
+
+    def read_typeinfo(self, address):
+        if address in self.typeinfos:
+            return self.typeinfos[address]
+        vptr = read_int_from_memory(address)
+        nameptr = read_int_from_memory(address + self.ptrsize)
+        if nameptr:
+            name = read_cstring_from_memory(nameptr, max_length=0x1000, safe=True)
+        else:
+            name = None
+        if not vptr or not name or name.endswith("[...]"):
+            raise ValueError("Invalid RTTI at {:#x}".format(address))
+
+        location = Symbol.lookup_gdb(vptr)
+        if location:
+            kind_name = location[0]
+        else:
+            kind_name = ""
+        kinds = ("__class_type_info", "__si_class_type_info", "__vmi_class_type_info")
+        if not any(kind in kind_name for kind in kinds):
+            meta = read_int_from_memory(vptr - self.ptrsize, safe=True)
+            if meta:
+                meta_nameptr = read_int_from_memory(meta + self.ptrsize, safe=True)
+            else:
+                meta_nameptr = None
+            if meta_nameptr:
+                kind_name = read_cstring_from_memory(meta_nameptr, max_length=0x100, safe=True)
+            else:
+                kind_name = ""
+        kind = next((kind for kind in kinds if kind in (kind_name or "")), None)
+        if kind is None:
+            raise ValueError("Unsupported RTTI at {:#x}".format(address))
+
+        if self.cppfilt:
+            try:
+                result = GefUtil.gef_execute_external([self.cppfilt, "_ZTS" + name.lstrip("*")]).strip()
+                if result.startswith("typeinfo name for "):
+                    name = result[len("typeinfo name for "):]
+            except (OSError, subprocess.CalledProcessError):
+                pass
+
+        bases = []
+        flags = 0
+        if kind == "__si_class_type_info":
+            bases.append((read_int_from_memory(address + 2 * self.ptrsize), 0, 2))
+        elif kind == "__vmi_class_type_info":
+            flags = read_int32_from_memory(address + 2 * self.ptrsize)
+            count = read_int32_from_memory(address + 2 * self.ptrsize + 4)
+            if count > 256:
+                raise ValueError("Too many RTTI bases at {:#x}".format(address))
+            for i in range(count):
+                entry = address + 2 * self.ptrsize + 8 + i * 2 * self.ptrsize
+                base = read_int_from_memory(entry)
+                offset_flags = read_int_from_memory(entry + self.ptrsize, signed=True)
+                bases.append((base, offset_flags >> 8, offset_flags & 0xff))
+
+        result = {"name": name, "kind": kind, "flags": flags, "bases": bases}
+        self.typeinfos[address] = result
+        return result
+
+    def dump_inheritance(self, rtti, address, root, tables, seen, depth=0, attributes="", prefix="", last=True):
+        if depth >= 32 or len(seen) >= 256:
+            self.warn_add_out("Inheritance traversal limit reached")
+            return
+        try:
+            record = self.read_typeinfo(rtti)
+        except (gdb.error, ValueError, OverflowError) as exception:
+            self.warn_add_out("Failed to read base RTTI: {!s}".format(exception))
+            return
+
+        flags = []
+        if record["flags"] & 1:
+            flags.append("repeated bases")
+        if record["flags"] & 2:
+            flags.append("diamond")
+        details = ", ".join(filter(None, (attributes, ", ".join(flags))))
+        if depth:
+            tree = prefix + ("\u2514\u2500\u2500 " if last else "\u251c\u2500\u2500 ")
+        else:
+            tree = ""
+        self.out.append("  {!s} {:s}{:s} (offset {:+d}){:s}".format(
+            ProcessMap.lookup(address), tree, record["name"], address - root["top"],
+            " [" + details + "]" if details else "",
+        ))
+        key = (rtti, address)
+        if key in seen:
+            return
+        seen.add(key)
+
+        try:
+            table = self.read_vtable(address)
+            if table["rtti"] == root["rtti"] and table["top"] == root["top"]:
+                tables[address] = table
+        except (gdb.error, ValueError, OverflowError):
+            pass
+
+        if depth:
+            if last:
+                prefix += "    "
+            else:
+                prefix += "\u2502   "
+        for i, (base, offset, flags) in enumerate(record["bases"]):
+            if flags & 2:
+                attributes = "public"
+            else:
+                attributes = "non-public"
+            if flags & 1:
+                attributes += ", virtual"
+                vptr = read_int_from_memory(address, safe=True)
+                if vptr:
+                    displacement = read_int_from_memory(vptr + offset, safe=True, signed=True)
+                else:
+                    displacement = None
+                if displacement is None:
+                    self.warn_add_out("Failed to read virtual base offset at {:#x}".format(address))
+                    continue
+                base_address = address + displacement
+            else:
+                base_address = address + offset
+            self.dump_inheritance(base, base_address, root, tables, seen, depth + 1, attributes,
+                                  prefix, i == len(record["bases"]) - 1)
+        return
+
+    def is_function(self, address):
+        if not address:
+            return False
+        if is_arm32():
+            address &= ~1
+        return ProcessMap.lookup(address).is_in_text_segment()
+
+    def dump_functions(self, table, count):
+        table_symbol = Symbol.lookup_gdb(table["vptr"])
+        for i in range(count):
+            slot = table["vptr"] + i * self.ptrsize
+            slot_symbol = Symbol.lookup_gdb(slot)
+            if table_symbol and slot_symbol and slot_symbol[0] != table_symbol[0]:
+                break
+            function = read_int_from_memory(slot, safe=True)
+            if function is None:
+                self.warn_add_out("Unreadable vtable entry at {:#x}".format(slot))
+                break
+            if function == 0:
+                next_entry = read_int_from_memory(slot + self.ptrsize, safe=True)
+                if next_entry and not self.is_function(next_entry):
+                    try:
+                        self.read_typeinfo(next_entry)
+                    except (gdb.error, ValueError, OverflowError):
+                        pass
+                    else:
+                        break
+            if function and not self.is_function(function):
+                break
+            symbol = Symbol.format(function, missing="NO_SYMBOL", show_address=True)
+            self.out.append("{:10s} {:s}".format("[{:d}]".format(i), symbol))
+        else:
+            self.warn_add_out("Function entry limit reached; use --count to adjust it")
+        return
+
+    @parse_args
+    @only_if_gdb_running
+    @exclude_specific_gdb_mode(mode=("qemu-system", "kgdb", "vmware", "wine"))
+    @require_arch_set
+    @only_if_specific_arch(arch=("x86_32", "x86_64", "ARM32", "ARM64", "MIPS32", "MIPS64", "MIPSN32", "RISCV32", "RISCV64"))
+    def do_invoke(self, args):
+        if args.count <= 0:
+            err("--count must be positive")
+            return
+
+        self.ptrsize = AddressUtil.get_memory_alignment()
+        self.typeinfos = {}
+        self.out = []
+        try:
+            self.cppfilt = GefUtil.which(Config.get_gef_setting("gef.cppfilt_command"))
+        except FileNotFoundError:
+            self.cppfilt = None
+
+        try:
+            table = self.read_vtable(args.address)
+            if table["rtti"]:
+                rtti = self.read_typeinfo(table["rtti"])
+            else:
+                rtti = None
+            if rtti is None:
+                symbol = Symbol.lookup_gdb(table["vptr"] - self.ptrsize)
+                if not (symbol and symbol[0].startswith(("vtable for ", "_ZTV"))) and not any(
+                    self.is_function(read_int_from_memory(table["vptr"] + i * self.ptrsize, safe=True))
+                    for i in range(3)
+                ):
+                    raise ValueError("No virtual function pointer found")
+        except (gdb.error, ValueError, OverflowError) as exception:
+            err("Failed to read C++ object at {:#x}: {!s}".format(args.address, exception))
+            return
+
+        self.out.append("{:10s} {!s}".format("Object:", ProcessMap.lookup(args.address)))
+        self.out.append("{:10s} {!s}".format("Top:", ProcessMap.lookup(table["top"])))
+        tables = {args.address: table}
+        if rtti:
+            self.out.append("{:10s} {:s}".format("Type:", rtti["name"]))
+            self.out.append("")
+            self.out.append("Inheritance:")
+            self.dump_inheritance(table["rtti"], table["top"], table, tables, set())
+        else:
+            self.warn_add_out("RTTI is unavailable; inheritance and secondary tables cannot be resolved")
+
+        for address, entry in tables.items():
+            self.out.append("")
+            self.out.append("{:10s} {!s} (offset {:+d})".format("Subobject:", ProcessMap.lookup(address), address - table["top"]))
+            self.out.append("{:10s} {:s}".format("vptr:", Symbol.format(entry["vptr"], show_address=True)))
+            self.out.append("{:10s} {:s}".format("RTTI:", Symbol.format(entry["rtti"], show_address=True)))
+            self.out.append("offset-to-top: {:d}".format(entry["offset_to_top"]))
+            self.dump_functions(entry, args.count)
+
+        self.print_output(check_terminal_size=True)
+        return
+
+
+@register_command
 class IouringDumpCommand(GenericCommand, BufferingOutput):
     """Dump the iouring area (x64 only)."""
 
@@ -2345,6 +2601,163 @@ class DwarfExceptionHandlerInfoCommand(GenericCommand, BufferingOutput):
         # print
         self.print_output()
         unlink_tmp_filepath(tmp_filepath)
+        return
+
+
+@register_command
+class UnwindInfoCommand(GenericCommand):
+    """Show the effective DWARF unwind rules at the current or specified PC."""
+
+    _cmdline_ = "unwind-info"
+    _category_ = "02-e. Process Information - Complex Structure Information"
+
+    parser = argparse.ArgumentParser(prog=_cmdline_)
+    parser.add_argument("location", metavar="PC", nargs="?", type=AddressUtil.parse_address,
+                        help="the program counter to inspect. (default: current_arch.pc)")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="decode the selected CIE and FDE.")
+    _syntax_ = parser.format_help()
+
+    _example_ = [
+        "{0:s}",
+        "{0:s} $pc",
+        "{0:s} -v $pc",
+        "{0:s} 0x55555555529a",
+    ]
+    _example_ = "\n".join(_example_).format(_cmdline_)
+
+    def find_handler(self, pc):
+        section = ProcessMap.process_lookup_address(pc)
+        if section is None:
+            return None, None
+
+        mapped_path = section.path.replace(" (deleted)", "")
+        if mapped_path.startswith("target:"):
+            mapped_path = mapped_path[len("target:"):]
+        candidates = []
+
+        try:
+            solib_path = gdb.solib_name(pc)
+        except (AttributeError, gdb.error):
+            solib_path = None
+        if solib_path:
+            candidates.append(solib_path)
+
+        mapped_name = os.path.basename(mapped_path)
+        for objfile in gdb.objfiles():
+            objfile_path = objfile.filename
+            if objfile_path and os.path.basename(objfile_path) == mapped_name:
+                candidates.append(objfile_path)
+
+        main_path = Path.get_filepath()
+        if main_path and os.path.basename(main_path) == mapped_name:
+            candidates.append(main_path)
+        remote = is_remote_debug()
+        if not remote and mapped_path.startswith("/"):
+            proc_path = Path.append_proc_root(mapped_path)
+            if proc_path:
+                candidates.append(proc_path)
+        candidates.append(mapped_path)
+        maps = [item for item in ProcessMap.get_process_maps() if item.path == section.path] or [section]
+        mapped_base = min(item.page_start - item.offset for item in maps)
+
+        elf = None
+        seen = set()
+        for filepath in candidates:
+            if not filepath or filepath in seen or not os.access(filepath, os.R_OK):
+                continue
+            seen.add(filepath)
+            candidate = Elf.get_elf(filepath)
+            if not candidate or not candidate.is_valid() or not candidate.get_shdr(".eh_frame"):
+                continue
+            if remote:
+                loads = [phdr for phdr in candidate.phdrs if phdr.p_type == Elf.Phdr.PT_LOAD]
+                if not loads:
+                    continue
+                linked_base = min(phdr.p_vaddr - phdr.p_offset for phdr in loads)
+                note = candidate.get_shdr(".note.gnu.build-id")
+                check_section = note or candidate.get_shdr(".eh_frame")
+                try:
+                    actual = read_memory(mapped_base + check_section.sh_addr - linked_base, check_section.sh_size)
+                except gdb.error:
+                    continue
+                if actual != candidate.read_shdr(".note.gnu.build-id" if note else ".eh_frame"):
+                    continue
+            elf = candidate
+            break
+
+        if elf is None:
+            candidate = Elf.get_elf(mapped_base)
+            if candidate and candidate.is_valid() and candidate.get_shdr(".eh_frame"):
+                elf = candidate
+        if elf is None:
+            return None, None
+
+        load_segments = [
+            phdr for phdr in elf.phdrs
+            if phdr.p_type == Elf.Phdr.PT_LOAD
+        ]
+        if not load_segments:
+            return None, None
+        linked_base = min(phdr.p_vaddr - phdr.p_offset for phdr in load_segments)
+        return DwarfExceptionHandler(elf), mapped_base - linked_base
+
+    @parse_args
+    @only_if_gdb_running
+    @exclude_specific_gdb_mode(mode=("qemu-system", "kgdb", "vmware"))
+    @require_arch_set
+    def do_invoke(self, args):
+        if args.location is None:
+            pc = runtime.current_arch.pc
+        else:
+            pc = args.location
+        handler, load_bias = self.find_handler(pc)
+        if handler is None:
+            err("Could not read .eh_frame for the mapping containing {:#x}".format(pc))
+            return
+
+        try:
+            unwind = handler.unwind_info(pc, load_bias)
+        except (IndexError, KeyError, ValueError) as exception:
+            err("Failed to evaluate unwind information: {!s}".format(exception))
+            return
+        if unwind is None:
+            err("No FDE covers {:#x}".format(pc))
+            return
+
+        cie = unwind["cie"]
+        fde = unwind["fde"]
+        state = unwind["state"]
+        registers = state["registers"]
+        return_register = cie["return_register"]
+        fde_start = fde["pc_begin"] + load_bias
+        fde_end = fde["pc_end"] + load_bias
+
+        lines = [
+            ("CIE", "{:#x}".format(cie["address"] + load_bias)),
+            ("FDE", "{:#x} [{:#x}-{:#x})".format(fde["address"] + load_bias, fde_start, fde_end)),
+            ("PC", Symbol.format(pc, show_address=True)),
+            ("CFA", handler.format_cfa_rule(state["cfa"])),
+            ("RA", handler.format_register_rule(registers.get(return_register, ("undefined",)))),
+        ]
+        for reg in sorted(registers):
+            if reg == return_register:
+                continue
+            regname = handler.get_register_name(reg)
+            if regname == "???":
+                regname = "r{:d}".format(reg)
+            lines.append((regname, handler.format_register_rule(registers[reg])))
+        if state["ra_state"]:
+            lines.append(("RA state", "negated/signed"))
+
+        width = max(len(label) for label, value in lines)
+        for label, value in lines:
+            gef_print("{0:<{1:d}s} : {2:s}".format(label, width, value))
+        if args.verbose:
+            details = handler.format_frame_records(cie["offset"], fde["offset"])
+            if details:
+                gef_print("")
+                gef_print("\n".join(details))
         return
 
 
