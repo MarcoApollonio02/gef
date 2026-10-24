@@ -775,6 +775,15 @@ class GefUtil:
         return
 
     @staticmethod
+    def matches_regex(text, filters=None, excludes=None):
+        """Match compiled inclusion and exclusion patterns, giving exclusions priority."""
+        if filters and not any(pattern.search(text) for pattern in filters):
+            return False
+        if excludes and any(pattern.search(text) for pattern in excludes):
+            return False
+        return True
+
+    @staticmethod
     def dict_to_namedtuple(name, dic):
         """Return the dict as a namedtuple, reusing the class made for the same name and keys."""
         key = (name, tuple(dic))
