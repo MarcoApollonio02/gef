@@ -28,8 +28,9 @@ from gef.core.address import AddressUtil, Endian, Permission, Section
 from gef.core.cache import Cache
 from gef.core.color import Color, err, gef_print, info, warn
 from gef.core.config import Config
+from gef.core.display import ProgressBar
 from gef.core.elf import Elf
-from gef.core.memory import (is_valid_addr, is_valid_addr_addr, p16, p32, p64,
+from gef.core.memory import (is_double_link_list, is_valid_addr, is_valid_addr_addr, p16, p32, p64,
                               read_cstring_from_memory, read_int8_from_memory, read_int16_from_memory,
                               read_int32_from_memory, read_int_from_memory, read_memory, read_physmem,
                               u32, u64)
@@ -8766,4 +8767,877 @@ class KernelLayout:
             if rw_base is not None:
                 klayout = klayout.replace(rw_base=rw_base)
         return klayout
+
+
+class KernelBuddy:
+    """Resolve buddy allocator layouts and read node, zone and per-CPU free lists."""
+
+    # the largest `offsetof(zone, name) + sizeof(zone)` seen in the corpus is 0xe78
+    ZONE_NAME_SCAN_SIZE = 0x1_0000
+
+    @classmethod
+    @Cache.cache_this_session(per_inferior=True, until_new_objfile=True)
+    def get_instance(cls, migrate_pcptypes=3):
+        return cls(migrate_pcptypes)
+
+    def __init__(self, migrate_pcptypes=3):
+        # Late import: command modules sit above core in the layering.
+
+        self.meta = []
+        self.MIGRATE_PCPTYPES = migrate_pcptypes
+        self.list_scan_incomplete = False
+        return
+
+    @Cache.cache_this_session(cache_None=False)
+    def initialize(self):
+        from gef.commands.kernel.page import PageInfoCommand
+
+        self.meta = []
+
+        # per_cpu_offset
+        self.percpu = Kernel.per_cpu()
+
+        # search for node_data
+        self.nodes = []
+        self.node_ids = []
+        node_data = KernelAddressHeuristicFinder.get_node_data()
+        if node_data:
+            # parse each node (*pglist_data)
+            nodes = []
+            node_ids = []
+            for index, node in GefUtil.iter_kernel_node_pointers(node_data, "node_data"):
+                node_ids.append(index)
+                nodes.append(node)
+            # a candidate without zone names is a false positive, fall back to CONFIG_NUMA=n layout
+            if nodes and self.resolve_zone_offset_name(nodes[0]):
+                self.meta.append(("info", "node_data: {:#x}".format(node_data)))
+                self.nodes = nodes
+                self.node_ids = node_ids
+
+        if not self.nodes:
+            first_node = KernelAddressHeuristicFinder.get_node_data0()
+            if first_node and self.resolve_zone_offset_name(first_node):
+                self.meta.append(("info", "first_node: {:#x}".format(first_node)))
+                self.nodes = [first_node]
+                self.node_ids = [0]
+
+        if not self.nodes:
+            self.meta.append(("err", "Failed to resolve node_data or first_node"))
+            return None
+
+        self.meta.append(("info", "num of nodes: {:d}".format(len(self.nodes))))
+        assert len(self.nodes) > 0
+
+        """
+        typedef struct pglist_data {
+            struct zone node_zones[MAX_NR_ZONES];
+            ...
+        };
+
+        struct zone { // v3.12, v3.14~
+            unsigned long _watermark[NR_WMARK]; // v5.0~
+            unsigned long watermark_boost; // v5.0~
+            unsigned long watermark[NR_WMARK]; // ~v4.20
+            unsigned long nr_reserved_highatomic; // v4.4~
+            unsigned long nr_free_highatomic; // v6.12~
+            long lowmem_reserve[MAX_NR_ZONES];
+        #ifdef CONFIG_NEED_MULTIPLE_NODES // v5.10
+        #ifdef CONFIG_NUMA // ~v5.9, v5.11~
+            int node;
+        #endif
+            unsigned int inactive_ratio; // ~v4.7
+            struct pglist_data *zone_pgdat;
+            struct per_cpu_pageset __percpu *pageset; // ~v5.13
+            struct per_cpu_pages __percpu *per_cpu_pageset; // v5.14~
+            struct per_cpu_zonestat __percpu *per_cpu_zonestats; // v5.14~
+            ...
+            const char *name;
+        #ifdef CONFIG_MEMORY_ISOLATION
+            unsigned long nr_isolate_pageblock;
+        #endif
+        #ifdef CONFIG_MEMORY_HOTPLUG
+            seqlock_t span_seqlock;
+        #endif
+            int initialized; // v4.9~
+            wait_queue_head_t *wait_table; // ~v4.8
+            unsigned long wait_table_hash_nr_entries; // ~v4.8
+            unsigned long wait_table_bits; // ~v4.8
+            ZONE_PADDING(_pad1_)
+            spinlock_t lock; // ~v3.19
+            struct free_area free_area[MAX_ORDER];
+            ...
+        };
+
+        struct zone { // ~v3.11, v3.13
+            unsigned long watermark[NR_WMARK];
+            unsigned long percpu_drift_mark;
+            unsigned long lowmem_reserve[MAX_NR_ZONES];
+            unsigned long dirty_balance_reserve; // v3.3~
+        #ifdef CONFIG_NUMA
+            int node;
+            unsigned long min_unmapped_pages;
+            unsigned long min_slab_pages;
+        #endif
+            struct per_cpu_pageset __percpu *pageset;
+            spinlock_t lock;
+            int all_unreclaimable;
+        #if defined CONFIG_COMPACTION || defined CONFIG_CMA
+            bool compact_blockskip_flush; // v3.7~
+            unsigned long compact_cached_free_pfn; // v3.6~
+            unsigned long compact_cached_migrate_pfn; // v3.7~
+        #endif
+        #ifdef CONFIG_MEMORY_HOTPLUG
+            seqlock_t span_seqlock;
+        #endif
+        #ifdef CONFIG_CMA
+            unsigned long min_cma_pages; // v3.4~v3.7
+        #endif
+            struct free_area free_area[MAX_ORDER];
+            ...
+            const char *name;
+        };
+
+        static char * const zone_names[MAX_NR_ZONES] = {
+        #ifdef CONFIG_ZONE_DMA
+             "DMA",
+        #endif
+        #ifdef CONFIG_ZONE_DMA32
+             "DMA32",
+        #endif
+             "Normal",
+        #ifdef CONFIG_HIGHMEM
+             "HighMem",
+        #endif
+             "Movable",
+        #ifdef CONFIG_ZONE_DEVICE
+             "Device", // v4.3~
+        #endif
+        };
+        """
+
+        # zone->name, sizeof(struct zone)
+        self.meta.append(("info", "offsetof(zone, name): {:#x}".format(self.offset_name)))
+        self.meta.append(("info", "sizeof(zone): {:#x}".format(self.sizeof_zone)))
+
+        # zone->per_cpu_pageset
+        self.resolve_zone_offset_per_cpu_pageset()
+        if self.offset_per_cpu_pageset is None:
+            self.meta.append(("err", "Failed to resolve per_cpu_pageset"))
+            return None
+        else:
+            self.meta.append(("info", "offsetof(zone, per_cpu_pageset): {:#x}".format(self.offset_per_cpu_pageset)))
+
+        # per_cpu_pageset->lists
+        per_cpu_pageset = read_int_from_memory(self.nodes[0] + self.offset_per_cpu_pageset)
+        per_cpu_pageset = self.percpu.addr_of(per_cpu_pageset, 0)
+        self.resolve_per_cpu_pages_offset_lists(per_cpu_pageset)
+        if self.offset_lists is None:
+            self.meta.append(("err", "Failed to resolve per_cpu_pages lists"))
+            return None
+        self.meta.append(("info", "offsetof(per_cpu_pages, lists): {:#x}".format(self.offset_lists)))
+
+        # NR_PCP_LISTS
+        self.resolve_NR_PCP_LISTS(per_cpu_pageset)
+        self.meta.append(("info", "NR_PCP_LISTS: {:d}".format(self.NR_PCP_LISTS)))
+
+        # MAX_NR_ZONES
+        self.resolve_MAX_NR_ZONES()
+        self.meta.append(("info", "MAX_NR_ZONES: {:d}".format(self.MAX_NR_ZONES)))
+
+        # zone->free_area
+        self.resolve_zone_offset_free_area()
+        if self.offset_free_area is None:
+            self.meta.append(("err", "Failed to resolve zone free_area"))
+            return None
+        self.meta.append(("info", "offsetof(zone, free_area): {:#x}".format(self.offset_free_area)))
+
+        # MIGRATE_TYPES
+        self.resolve_MIGRATE_TYPES()
+        self.meta.append(("info", "MIGRATE_TYPES: {:d}".format(self.MIGRATE_TYPES)))
+
+        # sizeof(free_area)
+        sizeof_list_head = runtime.current_arch.ptrsize * 2
+        self.sizeof_free_area = sizeof_list_head * self.MIGRATE_TYPES + runtime.current_arch.ptrsize
+        self.meta.append(("info", "sizeof(free_area): {:#x}".format(self.sizeof_free_area)))
+
+        # MAX_ORDER
+        self.resolve_MAX_ORDER()
+        self.meta.append(("info", "MAX_ORDER: {:d}".format(self.MAX_ORDER)))
+
+        """
+        struct page { // v5.18~
+            unsigned long flags;
+            union {
+                struct {
+                    union {
+                        struct list_head lru;
+                        ...
+        };
+
+        struct page { // v4.18~v5.17
+            unsigned long flags;
+            union {
+                struct {
+                    struct list_head lru;
+                    ...
+        };
+
+        struct page { // v3.1~v4.17
+            unsigned long flags;
+            union { }; // ptrsize
+            union { }; // ptrsize
+            union { }; // 8 bytes
+            union {
+                struct list_head lru;
+                ...
+        };
+        """
+        # page->lru
+        self.offset_lru = PageInfoCommand.get_page_layout()["lru"]
+
+        return True
+
+    def get_nodes(self, *, zone_filter=None, order_filter=None, mtype_filter=None, pcp_index_filter=None,
+                  cpus=None, count=0, only_pcp=False, skip_pcp=False, quiet=True):
+        """Return the nodes, zones and free lists, or None if initialization fails."""
+        if not self.initialize():
+            return None
+        self.resolve_migratetype_names()
+        self.list_scan_incomplete = False
+        options = {
+            "zone_filter": zone_filter, "order_filter": order_filter, "mtype_filter": mtype_filter,
+            "pcp_index_filter": pcp_index_filter, "cpus": cpus, "count": count,
+            "only_pcp": only_pcp, "skip_pcp": skip_pcp, "quiet": quiet,
+        }
+        nodes = []
+        for index, node in ProgressBar(enumerate(self.nodes), total=len(self.nodes), desc="node", disable=quiet):
+            nodes.append({"index": self.node_ids[index], "address": node, "zones": self.walk_node(node, options)})
+        return nodes
+
+    def get_entry_addresses(self, entry, *, skip_phys=False, for_sort=False, use_physmap=False, maps=None):
+        if for_sort:
+            virt = Kernel.page2virt(entry["page"])
+            phys = None
+            if virt is not None and not skip_phys:
+                if use_physmap:
+                    physmap = None
+                    if is_x86_64():
+                        physmap = KernelAddressHeuristicFinder.get_PAGE_OFFSET()
+                    elif is_arm64():
+                        physmap = KernelAddressHeuristicFinder.consts().physmap_base
+                    if physmap is not None:
+                        phys = virt - physmap
+                else:
+                    phys = AddrMap.v2p(virt, maps=maps)
+            return {"virt": virt, "phys": phys}
+
+        phys = Kernel.page2phys(entry["page"])
+        result = {"virt": None, "phys": None if skip_phys else phys}
+        if phys is None or entry["is_highmem"]:
+            return result
+
+        consts = KernelAddressHeuristicFinder.consts()
+        page_offset = KernelAddressHeuristicFinder.get_PAGE_OFFSET()
+        if is_arm64():
+            physmap = consts.physmap_base
+        elif is_arm32():
+            phys_offset = consts.PHYS_OFFSET
+            if page_offset is None or phys_offset is None:
+                physmap = None
+            else:
+                physmap = AddressUtil.normalize_address(page_offset - phys_offset)
+        else:
+            physmap = page_offset
+
+        if physmap is None:
+            virt = Kernel.page2virt(entry["page"])
+        else:
+            virt = AddressUtil.normalize_address(physmap + phys)
+            page_offset_end = KernelAddressHeuristicFinder.get_PAGE_OFFSET_END()
+            if page_offset is not None and page_offset_end is not None and not (
+                page_offset <= virt and virt + entry["size"] <= page_offset_end
+            ):
+                virt = Kernel.page2virt(entry["page"])
+        result["virt"] = virt
+        return result
+
+    @staticmethod
+    def find_block(nodes, page, sizeof_struct_page):
+
+        def contains(entry):
+            if entry is None:
+                return False
+            npages = entry["size"] // KernelAddressHeuristicFinder.consts().PAGE_SIZE
+            return entry["page"] <= page < entry["page"] + npages * sizeof_struct_page
+
+        for node in nodes:
+            for zone in node["zones"]:
+                for cpu_num, lists in zone.get("per_cpu_pageset", {}).items():
+                    for pcp_list in lists:
+                        for entry in pcp_list["entries"]:
+                            if contains(entry):
+                                return {
+                                    "kind": "pcp", "entry": entry, "node": node, "zone": zone,
+                                    "cpu_num": cpu_num, "list": pcp_list,
+                                }
+                for free_area in zone.get("free_area", []):
+                    for free_list in free_area["free_lists"]:
+                        for entry in free_list["entries"]:
+                            if contains(entry):
+                                return {
+                                    "kind": "free_area", "entry": entry, "node": node, "zone": zone,
+                                    "free_area": free_area, "list": free_list,
+                                }
+        return None
+
+    @Cache.cache_this_session
+    def get_pageblock_order(self): # for 5.14 ~ 6.10
+        kversion = Kernel.version()
+        if not ("5.14" <= kversion < "6.10"):
+            return None
+
+        PMD_SHIFT = KernelAddressHeuristicFinder.consts().PMD_SHIFT
+        PAGE_SHIFT = KernelAddressHeuristicFinder.consts().PAGE_SHIFT
+        HPAGE_SHIFT = PMD_SHIFT
+        HUGETLB_PAGE_ORDER = HPAGE_SHIFT - PAGE_SHIFT
+
+        CONFIG_HUGETLB_PAGE = bool(
+            Ksym.get_addr("hugetlb_fault") or Ksym.get_addr("hugetlbfs_read_iter")
+        )
+        # CONFIG_HUGETLB_PAGE_SIZE_VARIABLE is ia64 or ppc only, so ignored
+
+        if "5.14" <= kversion < "5.18":
+            if CONFIG_HUGETLB_PAGE:
+                return HUGETLB_PAGE_ORDER
+            else:
+                return self.MAX_ORDER - 1
+        elif "5.18" <= kversion < "6.8":
+            if CONFIG_HUGETLB_PAGE:
+                return min(HUGETLB_PAGE_ORDER, self.MAX_ORDER - 1)
+            else:
+                return self.MAX_ORDER - 1
+        else: # 6.8 <= kversion < "6.10"
+            MAX_PAGE_ORDER = self.MAX_ORDER - 1
+            if CONFIG_HUGETLB_PAGE:
+                return min(HUGETLB_PAGE_ORDER, MAX_PAGE_ORDER)
+            else:
+                return MAX_PAGE_ORDER
+
+    def get_buddy_order(self, page):
+        from gef.commands.kernel.page import PageInfoCommand
+
+        order = read_int_from_memory(page + PageInfoCommand.get_page_layout()["private"], safe=True)
+        if order is None:
+            return None
+        if order >= self.MAX_ORDER:
+            return None
+        return order
+
+    def is_page_buddy(self, page):
+        from gef.commands.kernel.page import PageInfoCommand
+
+        slot6_raw = read_int32_from_memory(page + PageInfoCommand.get_page_layout()["mapcount"], safe=True)
+        if slot6_raw is None:
+            return False
+        slot6_kind = PageInfoCommand.get_slot6_kind(slot6_raw)
+        return PageInfoCommand.is_buddy_free(slot6_raw, slot6_kind)
+
+    def find_head_page(self, page, pfn, sizeof_struct_page):
+        for order in range(self.MAX_ORDER):
+            # Go back order by order to find the head or not if the page is not in the buddy
+            head_pfn = pfn & ~((1 << order) - 1)
+            head_page = page - (pfn - head_pfn) * sizeof_struct_page
+
+            # Just for good measures
+            if not is_valid_addr(head_page):
+                continue
+            if not self.is_page_buddy(head_page):
+                continue
+            if self.get_buddy_order(head_page) != order:
+                continue
+            return head_page, head_pfn, order
+        return None, None, None
+
+    def walk_node(self, node, options):
+        zones = []
+        offset_spanned_pages = GefUtil.offsetof("struct zone", "spanned_pages")
+        for index in ProgressBar(range(self.MAX_NR_ZONES), desc="zone", disable=options["quiet"]):
+            zone = node + self.sizeof_zone * index
+            name = read_cstring_from_memory(read_int_from_memory(zone + self.offset_name))
+            if options["zone_filter"] and name not in options["zone_filter"]:
+                continue
+            record = {"index": index, "address": zone, "name": name}
+            zones.append(record)
+            if offset_spanned_pages is not None:
+                if read_int_from_memory(zone + offset_spanned_pages, safe=True) == 0:
+                    continue
+            else:
+                # the free lists of an empty zone are left zero-filled
+                free_list = zone + self.offset_free_area
+                next_ptr = read_int_from_memory(free_list, safe=True)
+                prev_ptr = read_int_from_memory(free_list + runtime.current_arch.ptrsize, safe=True)
+                if next_ptr == prev_ptr == 0:
+                    continue
+            if not options["skip_pcp"]:
+                record["per_cpu_pageset"] = self.walk_pcp(zone, name == "HighMem", options)
+            if not options["only_pcp"]:
+                record["free_area"] = []
+                for order in ProgressBar(range(self.MAX_ORDER), desc="order", disable=options["quiet"]):
+                    if options["order_filter"] and order not in options["order_filter"]:
+                        continue
+                    free_area = zone + self.offset_free_area + self.sizeof_free_area * order
+                    record["free_area"].append(self.walk_free_area(free_area, order, name == "HighMem", options))
+        return zones
+
+    def walk_pcp(self, zone, is_highmem, options):
+        per_cpu_pageset = read_int_from_memory(zone + self.offset_per_cpu_pageset)
+        per_cpu_pageset = self.percpu.addrs_of(per_cpu_pageset)
+        sizeof_list_head = runtime.current_arch.ptrsize * 2
+        result = {}
+        for cpu_num, pcp in ProgressBar(enumerate(per_cpu_pageset), desc="cpu", total=len(per_cpu_pageset),
+                                       disable=options["quiet"]):
+            if options["cpus"] and cpu_num not in options["cpus"]:
+                continue
+            lists = []
+            for index in ProgressBar(range(self.NR_PCP_LISTS), desc="pcplist", disable=options["quiet"]):
+                if options["pcp_index_filter"] and index not in options["pcp_index_filter"]:
+                    continue
+                head = pcp + self.offset_lists + sizeof_list_head * index
+                lists.append(self.walk_pcp_list(head, index, cpu_num, is_highmem, options))
+            result[cpu_num] = lists
+        return result
+
+    def walk_free_area(self, free_area, order, is_highmem, options):
+        size = KernelAddressHeuristicFinder.consts().PAGE_SIZE * (2 ** order)
+        sizeof_list_head = runtime.current_arch.ptrsize * 2
+        lists = []
+        for mtype in ProgressBar(range(self.MIGRATE_TYPES), desc="mtype", disable=options["quiet"]):
+            if options["mtype_filter"] and mtype not in options["mtype_filter"]:
+                continue
+            entries = self.walk_list(free_area + sizeof_list_head * mtype, size, is_highmem, options["count"])
+            lists.append({"mtype": mtype, "mtype_name": self.migrate_types[mtype], "entries": entries})
+        return {"order": order, "size": size, "free_lists": lists, "has_any": any(item["entries"] for item in lists)}
+
+    def walk_list(self, head, size, is_highmem, count, cpu_num=None):
+        entries = []
+        page_list = KernelListHead(head, self.offset_lru)
+        for page in page_list.iter_entries():
+            link = page + self.offset_lru
+            if link:
+                next_link = read_int_from_memory(link, safe=True)
+            else:
+                next_link = None
+            if next_link is None:
+                self.list_scan_incomplete = True
+                break
+            entries.append({"page": page, "size": size, "is_highmem": is_highmem, "cpu_num": cpu_num})
+            if count and len(entries) >= count:
+                if next_link != head:
+                    entries.append(None)
+                break
+        if page_list.broken:
+            self.list_scan_incomplete = True
+        return entries
+
+    def resolve_zone_offset_name(self, node):
+        # fast path
+        self.offset_name = GefUtil.offsetof("zone", "name")
+        self.sizeof_zone = GefUtil.sizeof("zone")
+        if None not in (self.offset_name, self.sizeof_zone):
+            return True
+
+        # slow path
+        current = node
+        name_offsets = []
+        while len(name_offsets) < 2:
+            if current - node >= self.ZONE_NAME_SCAN_SIZE:
+                return False
+            val = read_int_from_memory(current, safe=True)
+            if val is None:
+                return False
+            name = read_cstring_from_memory(val)
+            if name in ["DMA", "DMA32", "Normal", "HighMem", "Movable", "Device"]:
+                offset = current - node
+                name_offsets.append(offset)
+            current += runtime.current_arch.ptrsize
+        self.offset_name = name_offsets[0]
+        self.sizeof_zone = name_offsets[1] - name_offsets[0]
+        return True
+
+    def resolve_zone_offset_per_cpu_pageset(self):
+        # fast path
+        kversion = Kernel.version()
+        if kversion < "5.14":
+            self.offset_per_cpu_pageset = GefUtil.offsetof("zone", "pageset")
+        else:
+            self.offset_per_cpu_pageset = GefUtil.offsetof("zone", "per_cpu_pageset")
+        if self.offset_per_cpu_pageset is not None:
+            return
+
+        # slow path
+        if "3.12" <= kversion < "3.13" or "3.14" <= kversion:
+            current = self.nodes[0]
+            while current < self.nodes[0] + self.offset_name:
+                val = read_int_from_memory(current)
+                if is_valid_addr(val):
+                    offset_zone_pgdat = current - self.nodes[0]
+                    self.offset_per_cpu_pageset = offset_zone_pgdat + runtime.current_arch.ptrsize
+                    return
+                current += runtime.current_arch.ptrsize
+            self.offset_per_cpu_pageset = None
+            return
+
+        for i in range(1, 100):
+            candidate_offset = runtime.current_arch.ptrsize * i
+            val = read_int_from_memory(self.nodes[0] + candidate_offset)
+
+            if val == 0 or val < 0x100:
+                continue
+
+            if not self.percpu.is_smp:
+                if not is_valid_addr(val):
+                    continue
+                # found
+                self.offset_per_cpu_pageset = candidate_offset
+                return
+            else:
+                if not is_valid_addr(self.percpu.offsets[0] + val):
+                    continue
+                x = read_memory(self.percpu.offsets[0] + val, 0x40)
+                if set(x) == {0}:
+                    continue
+                # found
+                self.offset_per_cpu_pageset = candidate_offset
+                return
+
+        self.offset_per_cpu_pageset = None
+        return
+
+    def resolve_per_cpu_pages_offset_lists(self, per_cpu_pageset):
+        """
+        struct per_cpu_pageset { // ~v5.13
+            struct per_cpu_pages pcp;
+            ...
+        }
+
+        struct per_cpu_pages {
+            spinlock_t lock; // v5.14~
+            int count;
+            int high;
+            int batch;
+            short free_factor; // v5.14~
+        #ifdef CONFIG_NUMA
+            short expire; // v5.14~
+        #endif
+            struct list_head lists[NR_PCP_LISTS]; // v5.14~
+            struct list_head lists[MIGRATE_PCPTYPES]; // ~v5.13
+        } ____cacheline_aligned_in_smp;
+        """
+
+        # fast path
+        self.offset_lists = GefUtil.offsetof("per_cpu_pages", "lists")
+        if self.offset_lists is not None:
+            return
+
+        # slow path
+        self.offset_lists = None
+        if per_cpu_pageset is None or not is_valid_addr(per_cpu_pageset):
+            return
+        start = align_to_ptrsize(per_cpu_pageset + 4 * 3) # count, high, batch
+        for current in range(start, per_cpu_pageset + 0x100, runtime.current_arch.ptrsize):
+            if is_double_link_list(current):
+                self.offset_lists = current - per_cpu_pageset
+                break
+        return
+
+    def resolve_NR_PCP_LISTS(self, per_cpu_pageset):
+        # GEF detects MIGRATE_PCPTYPES and NR_PCP_LISTS using the same logic.
+        # It will retain them as NR_PCP_LISTS regardless of version.
+
+        # fast path
+        try:
+            self.NR_PCP_LISTS = to_unsigned_long(gdb.parse_and_eval(
+                "sizeof(((struct per_cpu_pages*)0).lists) / sizeof(((struct per_cpu_pages*)0).lists[0])",
+            ))
+            return
+        except gdb.error:
+            # In some environments, the size of list_head is not saved, resulting in division by 0.
+            try:
+                field = GefUtil.lookup_field("struct per_cpu_pages", "lists")
+                if field is not None:
+                    lo, hi = field.type.range()
+                    self.NR_PCP_LISTS = hi - lo + 1
+                    return
+            except gdb.error:
+                pass
+
+        # slow path
+        current = per_cpu_pageset + self.offset_lists
+        while current < per_cpu_pageset + self.offset_lists + 32 * runtime.current_arch.ptrsize * 2:
+            if not is_double_link_list(current):
+                break
+            current += runtime.current_arch.ptrsize * 2
+        self.NR_PCP_LISTS = ((current - per_cpu_pageset) - self.offset_lists) // (runtime.current_arch.ptrsize * 2)
+        return
+
+    def resolve_MAX_NR_ZONES(self):
+        # fast path
+        try:
+            self.MAX_NR_ZONES = to_unsigned_long(gdb.parse_and_eval(
+                "sizeof(((struct zone*)0).lowmem_reserve) / sizeof(((struct zone*)0).lowmem_reserve[0])",
+            ))
+            return
+        except gdb.error:
+            pass
+
+        # slow path
+        self.MAX_NR_ZONES = 0
+        for i in range(6):
+            zone = self.nodes[0] + self.sizeof_zone * i
+            name_ptr = read_int_from_memory(zone + self.offset_name)
+            name = read_cstring_from_memory(name_ptr)
+            if not name:
+                break
+            self.MAX_NR_ZONES += 1
+        return
+
+    def resolve_zone_offset_free_area(self):
+        """
+        struct free_area {
+            struct list_head free_list[MIGRATE_TYPES];
+            unsigned long nr_free;
+        };
+        """
+        # fast path
+        self.offset_free_area = GefUtil.offsetof("zone", "free_area")
+        if self.offset_free_area is not None:
+            return
+
+        # slow path
+        kversion = Kernel.version()
+        if "3.12" <= kversion < "3.13" or "3.14" <= kversion:
+            current = self.nodes[0] + self.offset_name + runtime.current_arch.ptrsize
+        else:
+            current = self.nodes[0]
+        self.offset_free_area = None
+        for address in range(current, self.nodes[0] + self.sizeof_zone, runtime.current_arch.ptrsize):
+            if is_double_link_list(address):
+                self.offset_free_area = address - self.nodes[0]
+                break
+        return
+
+    def resolve_MIGRATE_TYPES(self):
+        # fast path
+        try:
+            self.MIGRATE_TYPES = to_unsigned_long(gdb.parse_and_eval(
+                "sizeof(((struct free_area*)0).free_list) / sizeof(((struct free_area*)0).free_list[0])",
+            ))
+            return
+        except gdb.error:
+            pass
+
+        # slow path
+        current = free_area = self.nodes[0] + self.offset_free_area
+        while True:
+            val = read_int_from_memory(current)
+            if not is_valid_addr(val):
+                break
+            current += runtime.current_arch.ptrsize
+        offset_nr_free = current - free_area
+        sizeof_list_head = runtime.current_arch.ptrsize * 2
+        self.MIGRATE_TYPES = offset_nr_free // sizeof_list_head
+        return
+
+    def resolve_migratetype_names(self):
+        if self.MIGRATE_PCPTYPES == 3:
+            """
+            const char * const migratetype_names[MIGRATE_TYPES] = {
+                "Unmovable",
+                "Movable",
+                "Reclaimable",
+                "HighAtomic",
+            #ifdef CONFIG_CMA
+                "CMA",
+            #endif
+            #ifdef CONFIG_MEMORY_ISOLATION
+                "Isolate",
+            #endif
+            };
+            """
+            kversion = Kernel.version()
+            if self.MIGRATE_TYPES == 4:
+                if "4.4" <= kversion:
+                    self.migrate_types = [
+                        "Unmovable",
+                        "Movable",
+                        "Reclaimable",
+                        "HighAtomic",
+                    ]
+                else:
+                    self.migrate_types = [
+                        "Unmovable",
+                        "Reclaimable",
+                        "Movable",
+                        "Reserve",
+                    ]
+            elif self.MIGRATE_TYPES == 5:
+                if "4.4" <= kversion:
+                    self.migrate_types = [
+                        "Unmovable",
+                        "Movable",
+                        "Reclaimable",
+                        "HighAtomic",
+                        "Isolate",
+                    ]
+                else:
+                    self.migrate_types = [
+                        "Unmovable",
+                        "Reclaimable",
+                        "Movable",
+                        "Reserve",
+                        "Isolate",
+                    ]
+            elif self.MIGRATE_TYPES == 6:
+                if "4.4" <= kversion:
+                    self.migrate_types = [
+                        "Unmovable",
+                        "Movable",
+                        "Reclaimable",
+                        "HighAtomic",
+                        "Contiguous", # CONFIG_CMA needs CONFIG_MEMORY_ISOLATION, so there is only this pattern
+                        "Isolate",
+                    ]
+                else:
+                    self.migrate_types = [
+                        "Unmovable",
+                        "Reclaimable",
+                        "Movable",
+                        "Reserve",
+                        "Contiguous", # CONFIG_CMA needs CONFIG_MEMORY_ISOLATION, so there is only this pattern
+                        "Isolate",
+                    ]
+            else:
+                raise ValueError("Unsupported MIGRATE_TYPES: {:#x}".format(self.MIGRATE_TYPES))
+
+            self.MIGRATE_PCPTYPES = 3
+
+        elif self.MIGRATE_PCPTYPES == 4:
+            # https://android.googlesource.com/kernel/common/+/433445e9a160%5E%21/#F1
+            """
+            const char * const migratetype_names[MIGRATE_TYPES] = {
+                "Unmovable",
+                "Movable",
+                "Reclaimable",
+            #ifdef CONFIG_CMA
+                "CMA",
+            #endif
+                "HighAtomic",
+            #ifdef CONFIG_MEMORY_ISOLATION
+                "Isolate",
+            #endif
+            };
+            """
+
+            if self.MIGRATE_TYPES == 4:
+                self.migrate_types = [
+                    "Unmovable",
+                    "Movable",
+                    "Reclaimable",
+                    "HighAtomic",
+                ]
+            elif self.MIGRATE_TYPES == 5:
+                self.migrate_types = [
+                    "Unmovable",
+                    "Movable",
+                    "Reclaimable",
+                    "HighAtomic",
+                    "Isolate",
+                ]
+            elif self.MIGRATE_TYPES == 6:
+                self.migrate_types = [
+                    "Unmovable",
+                    "Movable",
+                    "Reclaimable",
+                    "Contiguous", # CONFIG_CMA needs CONFIG_MEMORY_ISOLATION, so there is only this pattern
+                    "HighAtomic",
+                    "Isolate",
+                ]
+            else:
+                raise ValueError("Unsupported MIGRATE_TYPES: {:#x}".format(self.MIGRATE_TYPES))
+            self.MIGRATE_PCPTYPES = 4
+        return
+
+    def resolve_MAX_ORDER(self):
+        # fast path
+        try:
+            self.MAX_ORDER = to_unsigned_long(gdb.parse_and_eval(
+                "sizeof(((struct zone*)0).free_area) / sizeof(((struct zone*)0).free_area[0])",
+            ))
+            return
+        except gdb.error:
+            pass
+
+        # slow path
+        current = free_area = self.nodes[0] + self.offset_free_area
+        while True:
+            ok = True
+            for i in range(self.MIGRATE_TYPES):
+                if not is_double_link_list(current + runtime.current_arch.ptrsize * (i * 2)):
+                    ok = False
+                    break
+            if not ok:
+                break
+            current += self.sizeof_free_area
+        self.MAX_ORDER = (current - free_area) // self.sizeof_free_area
+        return
+
+    def walk_pcp_list(self, list_i, i, cpu_num, is_highmem, options):
+        PAGE_ALLOC_COSTLY_ORDER = 3
+        NR_LOWORDER_PCP_LISTS = (self.MIGRATE_PCPTYPES * (PAGE_ALLOC_COSTLY_ORDER + 1))
+
+        if i < NR_LOWORDER_PCP_LISTS:
+            # for normal case
+            order = i // self.MIGRATE_PCPTYPES
+            mtype = i % self.MIGRATE_PCPTYPES
+            mtype_str = self.migrate_types[mtype]
+        else:
+            # for CONFIG_TRANSPARENT_HUGEPAGE
+            kversion = Kernel.version()
+
+            if kversion < "5.14":
+                raise ValueError("Unsupported kernel version for pcp lists: {!s}".format(kversion))
+
+            thp_i = i - NR_LOWORDER_PCP_LISTS
+            nr_thp_lists = self.NR_PCP_LISTS - NR_LOWORDER_PCP_LISTS
+            mtype = thp_i
+            if nr_thp_lists == self.MIGRATE_PCPTYPES:
+                # 1 slot per migratetype (5.14~5.19)
+                mtype_str = self.migrate_types[mtype]
+            elif nr_thp_lists == 1:
+                # 1 slot (6.0~6.9)
+                mtype_str = "THP"
+            elif nr_thp_lists == 2:
+                # 2 slots (6.10~, and backported to 6.1.97~, 6.6.37~, 6.9.8~)
+                if thp_i == 1:
+                    mtype_str = "THP_MOVABLE"
+                else:
+                    mtype_str = "THP_OTHER"
+            else:
+                mtype_str = "THP_UNKNOWN"
+
+            if kversion < "6.10":
+                order = self.get_pageblock_order()
+            else:
+                HPAGE_PMD_SHIFT = KernelAddressHeuristicFinder.consts().PMD_SHIFT
+                PAGE_SHIFT = KernelAddressHeuristicFinder.consts().PAGE_SHIFT
+                HPAGE_PMD_ORDER = HPAGE_PMD_SHIFT - PAGE_SHIFT
+                order = HPAGE_PMD_ORDER
+
+        size = KernelAddressHeuristicFinder.consts().PAGE_SIZE * (2 ** order)
+        entries = []
+        if not (options["mtype_filter"] and mtype not in options["mtype_filter"]) and not (
+            options["order_filter"] and order not in options["order_filter"]
+        ):
+            entries = self.walk_list(list_i, size, is_highmem, options["count"], cpu_num)
+        return {"index": i, "order": order, "size": size, "mtype": mtype, "mtype_name": mtype_str, "entries": entries}
 

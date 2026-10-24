@@ -459,6 +459,23 @@ class GefUtil:
         return read_memory(base, size)
 
     @staticmethod
+    def iter_kernel_node_pointers(addr, array=None, step=None, count=None):
+        if count is None:
+            count = GefUtil.get_kernel_node_count(array)
+        step = step or runtime.current_arch.ptrsize
+        for index in range(count if count is not None else 4096):
+            slot = addr + step * index
+            node = read_int_from_memory(slot, safe=True)
+            if node is None:
+                break
+            if node == slot or node & (runtime.current_arch.ptrsize - 1) or not is_valid_addr(node):
+                if count is None:
+                    break
+                continue
+            yield index, node
+
+
+    @staticmethod
     def get_unpack(size=None):
         """Return an integer unpacker for a byte size, defaulting to the current pointer size."""
         if size is None:
