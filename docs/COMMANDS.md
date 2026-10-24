@@ -8274,6 +8274,84 @@ options:
   -h, --help  show this help message and exit
 ```
 
+## kpercpu
+
+Resolve the per-cpu variables and the per-cpu areas.
+
+
+### Syntax
+
+```text
+usage: kpercpu [-h] [-c CPU] [--online] [-o OFFSET] [-l] [-x SIZE] [-n] [-q] [SYMBOL|ADDRESS]
+
+positional arguments:
+  SYMBOL|ADDRESS       a per-cpu symbol name to resolve, or an address to reverse-resolve.
+
+options:
+  -h, --help           show this help message and exit
+  -c, --cpu CPU        filter by specific cpu.
+  --online             filter by online cpus.
+  -o, --offset OFFSET  add this offset to the resolved symbol.
+  -l, --list           list all the static per-cpu symbols.
+  -x, --dump SIZE      hexdump SIZE bytes at each resolved address.
+  -n, --no-pager       do not use the pager.
+  -q, --quiet          show result only.
+```
+
+### Examples
+
+```gdb
+kpercpu                        # show the per-cpu area of each cpu
+kpercpu runqueues              # show per_cpu(runqueues, cpu) of each cpu
+kpercpu --online runqueues     # show per_cpu(runqueues, cpu) of each online cpu
+kpercpu -o 0x120 runqueues     # add an offset to the resolved symbol
+kpercpu 0xffff888100600120     # tell which cpu and which variable the address belongs to
+kpercpu -l                     # list all the static per-cpu symbols
+```
+
+### Notes
+
+```text
+per_cpu(var, cpu) is based on the static per-cpu symbol representation and the
+per-cpu offset selected for the detected kernel layout. Older x86-64 kernels use
+a zero-based representation; x86-64 v6.15 and later use relative offsets as well.
+
+`__per_cpu_start` and the per-cpu variables are data symbols, so a
+CONFIG_KALLSYMS_ALL=n kernel has none of them. `__per_cpu_start` is recovered from
+the code of `__is_kernel_percpu_address`, which keeps the areas and the reverse
+lookup working, but there the variables cannot be named nor looked up by name.
+CONFIG_SMP=n has no `__per_cpu_offset` at all, and `&var` is the address as is.
+Whether it is CONFIG_SMP=n or just unresolved is told by the "SMP" of the banner.
+
+The cpu-id upper bound comes from `nr_cpu_ids` or the possible cpu mask; it is
+estimated from `__per_cpu_offset[]` if both are unknown. Each cpu is tagged with the masks,
+which are recovered from `init_cpu_*()`/`set_cpu_online()` without the symbols.
+```
+
+## ks-selftest
+
+Compare kernel-address heuristic finders with kallsyms results.
+
+
+### Syntax
+
+```text
+usage: ks-selftest [-h] [-n] [-q] [--failures-only]
+
+options:
+  -h, --help       show this help message and exit
+  -n, --no-pager   do not use the pager.
+  -q, --quiet      enable quiet mode.
+  --failures-only  show only failed finders.
+```
+
+### Notes
+
+```text
+False means explicitly unsupported; None means not found; '-' means unavailable or not run.
+$ks_selftest_failures is nonzero if the test cannot run, otherwise it is the number of failed results.
+```
+
 ## kversion
 
 Display kernel version string.
@@ -8836,6 +8914,80 @@ options:
 ```
 
 # 06-f. Qemu-system/KGDB Cooperation - Linux Task
+## kcred
+
+Dump the credentials of each task.
+
+
+### Syntax
+
+```text
+usage: kcred [-h] [-hh] [-T TASK_FILTER] [-c CRED_FILTER] [-f FILTER] [-s] [-v] [-t] [-u] [--meta] [-n] [-q] [PID]
+
+positional arguments:
+  PID                   the pid of the task to display.
+
+options:
+  -h, --help            show this help message and exit
+  -hh, --help-simple    show help without ASCII diagram.
+  -T, --task-filter TASK_FILTER
+                        task address filter.
+  -c, --cred-filter CRED_FILTER
+                        cred address filter.
+  -f, --filter FILTER   comm string REGEXP filter.
+  -s, --shared          list the tasks that share the same cred, instead of dumping each cred.
+  -v, --verbose         dump each cred in detail even if no task is specified.
+  -t, --print-thread    display by thread (LWP), not by process.
+  -u, --user-process-only
+                        display user-land process (+ thread) only.
+  --meta                display offset information.
+  -n, --no-pager        do not use the pager.
+  -q, --quiet           enable quiet mode.
+```
+
+### Examples
+
+```gdb
+kcred -q
+kcred 1337
+kcred 1337 --shared
+kcred -f 'sh$' -v
+```
+
+### Notes
+
+```text
+This command requires CONFIG_RANDSTRUCT=n unless vmlinux with debug information is loaded.
+
+Simplified credential structure:
+
++-task_struct---+    +--->+-cred--------------------+
+| ...           |    |    | usage                   |
+| real_cred     |----+    | uid, gid                |
+| cred          |----+    | suid, sgid              |
+| comm[16]      |         | euid, egid              |
+| ...           |         | fsuid, fsgid            |
++---------------+         | securebits              |
+                          | cap_inheritable         |
+                          | cap_permitted           |
+                          | cap_effective           |
+                          | cap_bset                |
+                          | cap_ambient (v4.3~)     |
+                          | (keyrings; CONFIG_KEYS) |
+                          | security                |--->LSM blob
+                          | user                    |
+                          | user_ns                 |--->user_namespace
+                          | ucounts (branch/config) |
+                          | group_info              |--->+-group_info-+
+                          | ...                     |    | usage      |
+                          +-------------------------+    | ngroups    |
+                                                         | gid[]      |
+                                                         +------------+
+
+`real_cred` is the objective credential, `cred` is the subjective one. They differ only
+while the task acts on behalf of another (e.g., inside override_creds()).
+```
+
 ## kfiles
 
 Display open files for each process (shortcut for `ktask -quF`).
@@ -8849,6 +9001,110 @@ usage: kfiles [-h] [-n]
 options:
   -h, --help      show this help message and exit
   -n, --no-pager  do not use the pager.
+```
+
+## kkeyring
+
+Display the keyrings referenced by tasks, or inspect an arbitrary struct key.
+
+
+### Syntax
+
+```text
+usage: kkeyring [-h] [-hh] [-p PID] [-T TASK_FILTER] [-f FILTER] [-d MAX_DEPTH] [--max-keys MAX_KEYS] [--meta] [-n] [-v] [-q] [KEY_ADDR]
+
+positional arguments:
+  KEY_ADDR              inspect this `struct key` directly instead of walking task credentials.
+
+options:
+  -h, --help            show this help message and exit
+  -hh, --help-simple    show help without ASCII diagram.
+  -p, --pid PID         filter by task pid.
+  -T, --task-filter TASK_FILTER
+                        filter by specific task_struct address.
+  -f, --filter FILTER   comm string REGEXP filter.
+  -d, --max-depth MAX_DEPTH
+                        maximum nested keyring depth (default: 6).
+  --max-keys MAX_KEYS   maximum number of keys to walk (default: 0x1000).
+  --meta                display offset information.
+  -n, --no-pager        do not use the pager.
+  -v, --verbose         display ownership and internal key details.
+  -q, --quiet           show result only.
+```
+
+### Examples
+
+```gdb
+kkeyring -p 1337
+kkeyring -p 1337 -v
+kkeyring -f 'bash$'
+kkeyring 0xffff888012345000
+```
+
+### Notes
+
+```text
+Simplified keyring structures:
+
+[v3.8~]
++-task_struct-+    +-cred-------------+
+| cred        |--->| session_keyring  |----+
++-------------+    | process_keyring  |----+
+                   | thread_keyring   |----+--->struct key
+                   | request_key_auth |----+
+                   +------------------+
+[~v3.7]
++-task_struct-+    +-cred-------------+
+| cred        |--->| thread_keyring   |---------------------------->struct key
++-------------+    | request_key_auth |---------------------------->struct key
+                   | tgcred           |--->+-thread_group_cred-+
+                   +------------------+    | session_keyring   |--->struct key
+                                           | process_keyring   |--->struct key
+                                           +-------------------+
++-key----------------------------+
+| usage                          |
+| serial                         |
+| uid, gid, perm                 |
+| expiry                         |
+| flags                          |
+| state (v4.14~)                 |
+| type                           |
+| description                    |
+| payload.subscriptions (~v3.12) |---->struct keyring_list
+| payload.data[0] (auth key)     |---->struct request_key_auth
+| keys.root (v3.13~)             |---->assoc_array_ptr
++--------------------------------+
+
++-request_key_auth-+
+| rcu (v5.3~)      |
+| usage (v7.2~)    |
+| target_key       |---->struct key (being constructed)
+| dest_keyring     |---->struct key
+| cred             |---->struct cred (requester)
+| callout_info     |
+| callout_len      |
+| pid              |
+| op[8] (v5.0~)    |
++------------------+
+
+[~v3.12]
++-keyring_list-+
+| nkeys        |
+| keys[]       |---->struct key ...
++--------------+
+
+[v3.13~]
+keys.root ---> assoc_array_ptr (tagged)
+                +-- leaf -----> struct key (bit 1 is set if it is a keyring)
+                +-- node -----> +-assoc_array_node-----+
+                |               | slots[16]            |---> assoc_array_ptr ...
+                |               +----------------------+
+                +-- shortcut -> +-assoc_array_shortcut-+
+                                | next_node            |---> assoc_array_ptr
+                                +----------------------+
+
+A keyring leaf may itself be another keyring, so the command walks child keys recursively.
+The request-key authorisation key held by an upcall helper is shown as the `request` root.
 ```
 
 ## knamespaces
@@ -8879,6 +9135,51 @@ usage: kregs [-h] [-n]
 options:
   -h, --help      show this help message and exit
   -n, --no-pager  do not use the pager.
+```
+
+## ksched
+
+Dump the scheduler state of each task (cpu, state, class, priority, policy).
+
+
+### Syntax
+
+```text
+usage: ksched [-h] [-f FILTER] [-t] [-u] [--meta] [-n] [-q] [PID|TASK_ADDRESS]
+
+positional arguments:
+  PID|TASK_ADDRESS      dump a single task in detail, selected by its pid or task_struct address.
+
+options:
+  -h, --help            show this help message and exit
+  -f, --filter FILTER   comm string REGEXP filter.
+  -t, --print-thread    display by thread (LWP), not by process.
+  -u, --user-process-only
+                        display user-land process (+ thread) only.
+  --meta                display offset information.
+  -n, --no-pager        do not use the pager.
+  -q, --quiet           enable quiet mode.
+```
+
+### Examples
+
+```gdb
+ksched            # per-cpu current tasks and a table of every task
+ksched 1337       # dump the scheduler state of the task whose pid is 1337
+ksched -f bash    # filter the table by comm
+```
+
+### Notes
+
+```text
+This command requires CONFIG_RANDSTRUCT=n unless vmlinux with debug information is loaded.
+
+Without debug information, `state`, the prio cluster and the scheduler class are resolved on
+every supported version, `on_rq` up to v7.1, and `policy` on v5.3 or later. The scheduler class
+needs the `*_sched_class` symbols (CONFIG_KALLSYMS_ALL=y). The other fields (`on_cpu`, `cpu`)
+are shown only when debug information is loaded. The running cpu of each current task comes from
+`kcurrent`, which reads it from the cpu context rather than from `task_struct`.
+The exit state is included when its offset can be resolved; `--meta` reports a warning otherwise.
 ```
 
 ## ksighands

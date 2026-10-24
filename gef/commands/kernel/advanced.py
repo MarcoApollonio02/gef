@@ -8728,3 +8728,603 @@ class KernelNetDeviceCommand(GenericCommand, BufferingOutput):
         self.dump_net()
         self.print_output(check_terminal_size=True)
         return
+
+
+class KernelDmesgRing:
+    """Share layout lookup and resolved state across printk ring generations."""
+
+    def __init__(self, vmcoreinfo):
+        self.vmcoreinfo = vmcoreinfo
+        self.address = None
+        self.out = []
+        self.details = []
+        self.warnings = []
+
+    def get_type_layout(self, type_name, members):
+        """Get structure offsets and size from DWARF or live VMCOREINFO."""
+        if type_name.startswith("struct "):
+            name = type_name[7:]
+        else:
+            name = type_name
+        offsets = {}
+        sources = set()
+        for member in members:
+            offset = GefUtil.offsetof(type_name, member)
+            if offset is not None:
+                offsets[member] = offset
+                sources.add("DWARF")
+                continue
+            offset = self.vmcoreinfo.get(("OFFSET", "{:s}.{:s}".format(name, member)))
+            if offset is not None:
+                offsets[member] = offset
+                sources.add("VMCOREINFO")
+        size = GefUtil.sizeof(type_name)
+        if size:
+            sources.add("DWARF")
+        else:
+            size = self.vmcoreinfo.get(("SIZE", name))
+            if size:
+                sources.add("VMCOREINFO")
+        if sources:
+            source = "/".join(sorted(sources))
+        else:
+            source = "fallback"
+        return offsets, size, source
+
+
+
+class KernelDmesgOldestRing(KernelDmesgRing):
+    """Read the circular text printk ring used by Linux 3.0 through 3.4."""
+
+    partial_warning = "Partial dump: the legacy printk ring contains unreadable memory"
+
+    def resolve(self):
+        """Find and validate the active text ring."""
+        log_end_addr, log_buf_len_addr, buffer_pointer_addr, layout_source = (
+            KernelAddressHeuristicFinder.get_printk_text_ring_symbols()
+        )
+        if not log_end_addr or not log_buf_len_addr:
+            err("Could not resolve the pre-3.5 printk text ring metadata")
+            return False
+        log_buf_len = read_int32_from_memory(log_buf_len_addr, safe=True)
+        log_end = read_int32_from_memory(log_end_addr, safe=True)
+        if not log_buf_len or log_buf_len > 1 << 30 or log_end is None:
+            err("Invalid legacy printk ring metadata")
+            return False
+        log_buf_start = KernelAddressHeuristicFinder.get_log_buffer(log_buf_len, buffer_pointer_addr)
+        if not log_buf_start:
+            err("Could not find the active log_buf")
+            return False
+        self.address = log_buf_start
+        self.buf_len = log_buf_len
+        self.log_end = log_end
+        logged_chars_addr = Ksym.get_addr("logged_chars")
+        if logged_chars_addr:
+            logged_chars = read_int32_from_memory(logged_chars_addr, safe=True)
+        else:
+            logged_chars = None
+        if logged_chars is not None and logged_chars <= log_buf_len:
+            self.logged_chars = logged_chars
+        else:
+            self.logged_chars = None
+        if self.logged_chars is None:
+            log_start_addr = Ksym.get_addr("log_start")
+        else:
+            log_start_addr = None
+        if not log_start_addr and self.logged_chars is None:
+            if is_x86():
+                log_start_addr = log_end_addr + 8
+            elif is_arm32():
+                log_start_addr = log_end_addr + 4
+        if log_start_addr:
+            log_start = read_int32_from_memory(log_start_addr, safe=True)
+        else:
+            log_start = None
+        if log_start is not None and ((log_end - log_start) & 0xffff_ffff) <= log_buf_len:
+            self.log_start = log_start
+        else:
+            self.log_start = None
+        self.details = [
+            "active log_buf: {:#x}, size: {:#x}".format(log_buf_start, log_buf_len),
+            "legacy printk layout source: {:s}".format(layout_source),
+        ]
+        return True
+
+    def dump(self):
+        """Append retained text lines and report whether memory was unreadable."""
+        size = min(self.log_end, self.buf_len)
+        if self.log_start is not None:
+            size = max(size, min((self.log_end - self.log_start) & 0xffff_ffff, self.buf_len))
+        if self.logged_chars is not None:
+            size = self.logged_chars
+        start = self.log_end - size
+        index = start % self.buf_len
+        first_size = min(size, self.buf_len - index)
+        segments = [(self.address + index, first_size)]
+        if first_size < size:
+            segments.append((self.address, size - first_size))
+        text = b""
+        partial = False
+        for address, length in segments:
+            try:
+                text += read_memory(address, length)
+            except gdb.error:
+                partial = True
+        self.out.extend(String.bytes2str(text).splitlines())
+        return partial
+
+
+
+class KernelDmesgLegacyRing(KernelDmesgRing):
+    """Read the printk_log record ring used by Linux 3.5 through 5.9."""
+
+    partial_warning = "Partial dump: the printk log ring contains unreadable or corrupt records"
+
+    def get_legacy_layout(self, buf_start, buf_len, first_idx, next_idx):
+        """Resolve and validate the printk_log record header layout."""
+        offsets, size, source = self.get_type_layout(
+            "struct printk_log", ("ts_nsec", "len", "text_len", "dict_len", "caller_id"),
+        )
+        offsets.setdefault("dict_len", 12)
+        if all(name in offsets for name in ("ts_nsec", "len", "text_len")) and size:
+            return {"offsets": offsets, "size": size, "source": source}
+        offsets.setdefault("ts_nsec", 0)
+        offsets.setdefault("len", 8)
+        offsets.setdefault("text_len", 10)
+        caller_hint = offsets.get("caller_id") is not None or Ksym.get_addr("print_caller") is not None
+        if "caller_id" not in offsets:
+            offsets["caller_id"] = 16
+        candidates = ((16, 4), (16, 8), (20, 4), (24, 8))
+        scored = []
+        for header_size, alignment in candidates:
+            score = self.validate_legacy_header(buf_start, buf_len, first_idx, next_idx, offsets, header_size, alignment)
+            if score >= 0:
+                if caller_hint:
+                    preferred = header_size in (20, 24)
+                else:
+                    preferred = header_size == 16
+                scored.append((score, preferred, header_size))
+        if not scored:
+            return None
+        scored.sort(reverse=True)
+        return {"offsets": offsets, "size": scored[0][2], "source": "validated fallback"}
+
+    def validate_legacy_header(self, buf_start, buf_len, first_idx, next_idx, offsets, header_size, alignment):
+        """Score a header layout against records in the active log buffer."""
+        pos = first_idx
+        visited = set()
+        score = 0
+        for _ in range(4):
+            if pos == next_idx or pos in visited:
+                break
+            visited.add(pos)
+            try:
+                base = buf_start + pos
+                rec_len = read_int16_from_memory(base + offsets["len"])
+                if rec_len == 0:
+                    pos = 0
+                    continue
+                text_len = read_int16_from_memory(base + offsets["text_len"])
+                dict_len = read_int16_from_memory(base + offsets["dict_len"])
+                expected_len = (header_size + text_len + dict_len + alignment - 1) & -alignment
+                if rec_len != expected_len or rec_len > buf_len - pos:
+                    return -1
+                if text_len:
+                    text = read_memory(base + header_size, min(text_len, 8))
+                    if text[0] == 0 or any(byte not in (9, 10, 13) and not 0x20 <= byte <= 0x7e for byte in text[:1]):
+                        return -1
+                    score += 1
+                pos += rec_len
+                if pos >= buf_len:
+                    pos = 0
+            except gdb.error:
+                return -1
+        if score or first_idx == next_idx:
+            return score
+        return -1
+
+    def resolve(self):
+        """Find the active record ring and its header layout."""
+        log_first_idx_ptr = Ksym.get_addr("log_first_idx") or KernelAddressHeuristicFinder.get_log_first_idx()
+        log_next_idx_ptr = Ksym.get_addr("log_next_idx") or KernelAddressHeuristicFinder.get_log_next_idx()
+        log_buf_len_ptr = Ksym.get_addr("log_buf_len") or KernelAddressHeuristicFinder.get_log_buf_len()
+        if not log_first_idx_ptr or not log_next_idx_ptr or not log_buf_len_ptr:
+            err("Could not resolve printk log indexes and size")
+            return False
+        log_first_idx = read_int32_from_memory(log_first_idx_ptr, safe=True)
+        log_next_idx = read_int32_from_memory(log_next_idx_ptr, safe=True)
+        log_buf_len = read_int32_from_memory(log_buf_len_ptr, safe=True)
+        if log_first_idx is None or log_next_idx is None or not log_buf_len or log_buf_len > 1 << 30:
+            err("Invalid legacy printk ring metadata")
+            return False
+        if log_first_idx >= log_buf_len or log_next_idx >= log_buf_len:
+            err("Legacy printk ring indexes are outside log_buf_len")
+            return False
+        log_buf_start = KernelAddressHeuristicFinder.get_log_buffer(log_buf_len)
+        if not log_buf_start:
+            err("Could not find the active log_buf")
+            return False
+        layout = self.get_legacy_layout(log_buf_start, log_buf_len, log_first_idx, log_next_idx)
+        if layout is None:
+            err("Could not resolve a valid printk_log layout")
+            return False
+        self.address = log_buf_start
+        self.buf_len = log_buf_len
+        self.log_first_idx = log_first_idx
+        self.log_next_idx = log_next_idx
+        self.layout = layout
+        self.details = [
+            "active log_buf: {:#x}, size: {:#x}".format(log_buf_start, log_buf_len),
+            "printk_log layout source: {:s}".format(layout["source"]),
+        ]
+        if layout["source"] == "validated fallback":
+            self.warnings.append("Using validated printk_log header fallback ({:d} bytes)".format(layout["size"]))
+        return True
+
+    def dump(self):
+        """Read records from the pre-5.10 printk_log ring.
+
+        struct printk_log {
+            u64 ts_nsec;  /* timestamp in nanoseconds */
+            u16 len;      /* length of the entire record */
+            u16 text_len; /* length of the text */
+            u16 dict_len; /* length of the dictionary */
+            u8 facility;  /* syslog facility */
+            u8 flags:5;   /* internal record flags */
+            u8 level:3;   /* syslog level */
+        #ifdef CONFIG_PRINTK_CALLER
+            u32 caller_id; /* thread ID or processor ID */
+        #endif
+        };
+        """
+        log_first_idx = self.log_first_idx
+        log_end_idx = self.log_next_idx
+        buf_start = self.address
+        buf_end = self.address + self.buf_len
+        layout = self.layout
+        buf_len = buf_end - buf_start
+        pos = log_first_idx
+        visited = set()
+        partial = False
+        while pos != log_end_idx and pos not in visited and len(visited) <= buf_len // max(layout["size"], 1) + 1:
+            visited.add(pos)
+            try:
+                base = buf_start + pos
+                rec_len = read_int16_from_memory(base + layout["offsets"]["len"])
+                if rec_len == 0:
+                    pos = 0
+                    continue
+                text_len = read_int16_from_memory(base + layout["offsets"]["text_len"])
+                dict_len = read_int16_from_memory(base + layout["offsets"]["dict_len"])
+                if rec_len < layout["size"] or rec_len > buf_len - pos or text_len + dict_len > rec_len - layout["size"]:
+                    partial = True
+                    break
+                ts_nsec = read_int64_from_memory(base + layout["offsets"]["ts_nsec"])
+                if text_len:
+                    text = read_memory(base + layout["size"], text_len)
+                else:
+                    text = b""
+                sec = ts_nsec // 1_000_000_000
+                nsec = "{:09d}".format(ts_nsec % 1_000_000_000)[:6]
+                for line in String.bytes2str(text).splitlines():
+                    self.out.append("[{:5d}.{:s}] {:s}".format(sec, nsec, line))
+                pos += rec_len
+                if pos >= buf_len:
+                    pos = 0
+            except gdb.error:
+                partial = True
+                break
+        if pos != log_end_idx:
+            partial = True
+        return partial
+
+
+
+class KernelDmesgModernRing(KernelDmesgRing):
+    """Read the descriptor-based printk ring used by Linux 5.10 and later."""
+
+    partial_warning = "Partial dump: some printk records were unreadable, changing, or corrupt"
+
+    def get_atomic_long_offset(self):
+        """Find the counter field within atomic_long_t."""
+        offset = self.vmcoreinfo.get(("OFFSET", "atomic_long_t.counter"))
+        if offset is not None:
+            return offset, "VMCOREINFO"
+        offset = GefUtil.member_offset("atomic_long_t", "counter")
+        if offset is not None:
+            return offset, "DWARF"
+        return 0, "fallback"
+
+    def resolve_printk_ring(self, ring_address, source):
+        """Validate a ring candidate and return its resolved layout."""
+        ptrsize = runtime.current_arch.ptrsize
+        word_mask = (1 << (ptrsize * 8)) - 1
+        id_mask = (1 << (ptrsize * 8 - 2)) - 1
+        ring_offsets, _, ring_source = self.get_type_layout(
+            "struct printk_ringbuffer", ("desc_ring", "text_data_ring"),
+        )
+        desc_offsets, desc_size, desc_source = self.get_type_layout(
+            "struct prb_desc_ring",
+            ("count_bits", "descs", "infos", "head_id", "tail_id"),
+        )
+        data_offsets, _, data_source = self.get_type_layout(
+            "struct prb_data_ring", ("size_bits", "data"),
+        )
+        descriptor_offsets, descriptor_size, descriptor_source = self.get_type_layout(
+            "struct prb_desc", ("state_var", "text_blk_lpos"),
+        )
+        lpos_offsets, _, lpos_source = self.get_type_layout(
+            "struct prb_data_blk_lpos", ("begin", "next"),
+        )
+        info_offsets, info_size, info_source = self.get_type_layout(
+            "struct printk_info", ("seq", "ts_nsec", "text_len", "caller_id", "caller_id2"),
+        )
+        atomic_offset, atomic_source = self.get_atomic_long_offset()
+
+        defaults = {
+            "count_bits": 0,
+            "descs": ptrsize,
+            "infos": ptrsize * 2,
+            "head_id": ptrsize * 3,
+            "tail_id": ptrsize * 4,
+        }
+        for name, offset in defaults.items():
+            desc_offsets.setdefault(name, offset)
+        data_defaults = {"size_bits": 0, "data": ptrsize}
+        for name, offset in data_defaults.items():
+            data_offsets.setdefault(name, offset)
+        descriptor_offsets.setdefault("state_var", 0)
+        descriptor_offsets.setdefault("text_blk_lpos", ptrsize)
+        lpos_offsets.setdefault("begin", 0)
+        lpos_offsets.setdefault("next", ptrsize)
+        info_defaults = {"seq": 0, "ts_nsec": 8, "text_len": 16, "caller_id": 20}
+        for name, offset in info_defaults.items():
+            info_offsets.setdefault(name, offset)
+        descriptor_size = descriptor_size or ptrsize * 3
+        if not info_size:
+            info_sizes = [88]
+            if info_offsets.get("caller_id2") is not None or (Kernel.version() and Kernel.version() >= "7.0"):
+                if is_x86_32():
+                    info_sizes.insert(0, 108)
+                else:
+                    info_sizes.insert(0, 112)
+
+        desc_base = ring_offsets.get("desc_ring", 0)
+        text_base = ring_offsets.get("text_data_ring")
+        if text_base is not None:
+            text_bases = [text_base]
+        elif desc_size:
+            text_bases = [desc_base + desc_size]
+        else:
+            text_bases = [desc_base + ptrsize * count for count in (5, 6, 7)]
+
+        for data_base in text_bases:
+            try:
+                count_bits = read_int32_from_memory(ring_address + desc_base + desc_offsets["count_bits"])
+                descs = read_int_from_memory(ring_address + desc_base + desc_offsets["descs"])
+                infos = read_int_from_memory(ring_address + desc_base + desc_offsets["infos"])
+                head_id = read_int_from_memory(ring_address + desc_base + desc_offsets["head_id"] + atomic_offset) & id_mask
+                tail_id = read_int_from_memory(ring_address + desc_base + desc_offsets["tail_id"] + atomic_offset) & id_mask
+                size_bits = read_int32_from_memory(ring_address + data_base + data_offsets["size_bits"])
+                data = read_int_from_memory(ring_address + data_base + data_offsets["data"])
+                count = 0
+                if 0 < count_bits <= 24:
+                    count = 1 << count_bits
+                capacity = 0
+                if 1 <= size_bits <= 30:
+                    capacity = 1 << size_bits
+                distance = (head_id - tail_id) & id_mask
+                if (
+                    not count or not capacity or distance >= count or not descs or not infos or not data
+                    or any(address % ptrsize for address in (descs, infos, data))
+                    or not all(is_valid_addr(address) for address in (descs, infos, data))
+                ):
+                    continue
+                desc_addr = descs + (tail_id & (count - 1)) * descriptor_size
+                state = read_int_from_memory(desc_addr + descriptor_offsets["state_var"] + atomic_offset)
+                if (state & id_mask) != tail_id:
+                    continue
+                resolved_info_size = info_size
+                if not resolved_info_size:
+                    for size in info_sizes:
+                        valid = True
+                        for offset in range(min(distance + 1, 4)):
+                            identifier = (head_id - offset) & id_mask
+                            index = identifier & (count - 1)
+                            desc_addr = descs + index * descriptor_size
+                            state = read_int_from_memory(desc_addr + descriptor_offsets["state_var"] + atomic_offset)
+                            if (state & id_mask) != identifier or (state >> (ptrsize * 8 - 2)) not in (1, 2):
+                                continue
+                            seq = read_int64_from_memory(infos + index * size + info_offsets["seq"], safe=True)
+                            if seq is None or (seq & (count - 1)) != index:
+                                valid = False
+                                break
+                        if valid:
+                            resolved_info_size = size
+                            break
+                    if not resolved_info_size:
+                        continue
+                read_int64_from_memory(infos + (tail_id & (count - 1)) * resolved_info_size + info_offsets["seq"])
+            except gdb.error:
+                continue
+            return {
+                "address": ring_address,
+                "source": source,
+                "desc_base": desc_base,
+                "data_base": data_base,
+                "desc_offsets": desc_offsets,
+                "data_offsets": data_offsets,
+                "descriptor_offsets": descriptor_offsets,
+                "lpos_offsets": lpos_offsets,
+                "info_offsets": info_offsets,
+                "atomic_offset": atomic_offset,
+                "descriptor_size": descriptor_size,
+                "info_size": resolved_info_size,
+                "count_bits": count_bits,
+                "size_bits": size_bits,
+                "descs": descs,
+                "infos": infos,
+                "data": data,
+                "head_id": head_id,
+                "tail_id": tail_id,
+                "word_mask": word_mask,
+                "id_mask": id_mask,
+                "layout_source": "/".join(
+                    sorted({ring_source, desc_source, data_source, descriptor_source, lpos_source, info_source, atomic_source})
+                ),
+            }
+        return None
+
+    def resolve(self):
+        """Find and validate the active descriptor ring."""
+        ring = None
+        for address, source in KernelAddressHeuristicFinder.get_printk_ring_candidates():
+            ring = self.resolve_printk_ring(address, source)
+            if ring:
+                break
+        if ring is None:
+            err("Could not resolve a valid active printk ringbuffer")
+            return False
+        self.ring = ring
+        self.address = ring["address"]
+        self.details = [
+            "active printk ringbuffer: {:#x}".format(ring["address"]),
+            "layout source: {:s}".format(ring["layout_source"]),
+            "ring state: count={:d}, size={:#x}, tail_id={:#x}, head_id={:#x}".format(
+                1 << ring["count_bits"], 1 << ring["size_bits"], ring["tail_id"], ring["head_id"],
+            ),
+            "layout offsets: desc_ring={:#x}, text_data_ring={:#x}, descriptor_size={}, info_size={}".format(
+                ring["desc_base"], ring["data_base"], ring["descriptor_size"], ring["info_size"],
+            ),
+        ]
+        if ring["layout_source"] == "fallback":
+            self.warnings.append("Using validated printk ring layout fallback")
+        return True
+
+    def dump(self):
+        """Read the active printk ringbuffer.
+
+        struct printk_ringbuffer {
+            struct prb_desc_ring {
+                unsigned int count_bits;
+                struct prb_desc *descs;
+                struct printk_info *infos;
+                atomic_long_t head_id;
+                atomic_long_t tail_id;
+                atomic_long_t last_finalized_id;  /* present in later kernels */
+                atomic_long_t last_finalized_seq; /* present in later kernels */
+            } desc_ring;
+            struct prb_data_ring {
+                unsigned int size_bits;
+                char *data;
+                atomic_long_t head_lpos;
+                atomic_long_t tail_lpos;
+            } text_data_ring;
+            atomic_long_t fail;
+        };
+
+        struct prb_desc {
+            atomic_long_t state_var;
+            struct prb_data_blk_lpos {
+                unsigned long begin;
+                unsigned long next;
+            } text_blk_lpos;
+        };
+
+        struct printk_info {
+            u64 seq;
+            u64 ts_nsec;
+            u16 text_len;
+            u8 facility;
+            u8 flags:5;
+            u8 level:3;
+            u32 caller_id;
+        #ifdef CONFIG_PRINTK_EXECUTION_CTX
+            u32 caller_id2;
+            char comm[TASK_COMM_LEN];
+        #endif
+            struct dev_printk_info {
+                char subsystem[PRINTK_INFO_SUBSYSTEM_LEN];
+                char device[PRINTK_INFO_DEVICE_LEN];
+            } dev_info;
+        };
+        """
+        ring = self.ring
+        ptrsize = runtime.current_arch.ptrsize
+        desc_count = 1 << ring["count_bits"]
+        data_size = 1 << ring["size_bits"]
+        data_mask = data_size - 1
+        state_shift = ptrsize * 8 - 2
+        identifier = ring["tail_id"]
+        traversed = 0
+        partial = False
+        reached_head = False
+        while traversed < desc_count:
+            index = identifier & (desc_count - 1)
+            desc_addr = ring["descs"] + index * ring["descriptor_size"]
+            info_addr = ring["infos"] + index * ring["info_size"]
+            try:
+                state_var = read_int_from_memory(desc_addr + ring["descriptor_offsets"]["state_var"] + ring["atomic_offset"])
+                is_head = identifier == ring["head_id"]
+                if (state_var & ring["id_mask"]) != identifier:
+                    if not is_head:
+                        partial = True
+                else:
+                    state = (state_var >> state_shift) & 3
+                    if state in (1, 2):
+                        seq = read_int64_from_memory(info_addr + ring["info_offsets"]["seq"])
+                        ts_nsec = read_int64_from_memory(info_addr + ring["info_offsets"]["ts_nsec"])
+                        text_len = read_int16_from_memory(info_addr + ring["info_offsets"]["text_len"])
+                        caller_id = read_int32_from_memory(info_addr + ring["info_offsets"]["caller_id"])
+                        lpos = desc_addr + ring["descriptor_offsets"]["text_blk_lpos"]
+                        begin = read_int_from_memory(lpos + ring["lpos_offsets"]["begin"])
+                        next_pos = read_int_from_memory(lpos + ring["lpos_offsets"]["next"])
+                        if begin & 1:
+                            if begin == next_pos == 3 and text_len == 0:
+                                entry = ""
+                            else:
+                                entry = "<lost>"
+                                partial = True
+                        else:
+                            begin_index = begin & data_mask
+                            next_index = next_pos & data_mask
+                            if begin_index > next_index:
+                                data_offset = 0
+                            else:
+                                data_offset = begin_index
+                            text_offset = data_offset + ptrsize
+                            available = max(next_index - text_offset, 0)
+                            span = (next_pos - begin) & ring["word_mask"]
+                            if span > data_size or span < ptrsize + text_len or available < text_len:
+                                partial = True
+                                text_len = min(text_len, available, max(data_size - text_offset, 0))
+                            if text_len:
+                                entry = String.bytes2str(read_memory(ring["data"] + text_offset, text_len))
+                            else:
+                                entry = ""
+                        if caller_id & 0x80000000:
+                            caller = "C{:d}".format(caller_id & 0x7fffffff)
+                        else:
+                            caller = "T{:d}".format(caller_id)
+                        sec = ts_nsec // 1_000_000_000
+                        nsec = "{:09d}".format(ts_nsec % 1_000_000_000)[:6]
+                        output = "[{:5d}.{:s}] [{:>6s}] {:s}".format(sec, nsec, caller, entry)
+                        state_address = desc_addr + ring["descriptor_offsets"]["state_var"] + ring["atomic_offset"]
+                        state_after = read_int_from_memory(state_address)
+                        seq_after = read_int64_from_memory(info_addr + ring["info_offsets"]["seq"])
+                        if state_after != state_var or seq_after != seq:
+                            partial = True
+                        else:
+                            self.out.append(output)
+                    elif state == 0 and not is_head:
+                        partial = True
+            except gdb.error:
+                partial = True
+            traversed += 1
+            if identifier == ring["head_id"]:
+                reached_head = True
+                break
+            identifier = (identifier + 1) & ring["id_mask"]
+        if not reached_head:
+            partial = True
+        return partial

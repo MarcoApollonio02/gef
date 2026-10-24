@@ -5,11 +5,13 @@ version, cmdline and current-state commands. Auto-discovered by
 gef.bootstrap via pkgutil.walk_packages.
 """
 import argparse
+import collections
 import re
 
 import gdb
 
 from gef.commands.base import (
+    BufferingOutput,
     GenericCommand,
     only_if_gdb_running,
     only_if_in_kernel_or_kpti_disabled,
@@ -22,8 +24,9 @@ from gef.core import runtime
 from gef.core.address import AddressUtil
 from gef.core.cache import Cache
 from gef.core.color import Color, err, gef_print, info, titlify, warn
-from gef.core.kernel import Kernel
+from gef.core.kernel import Kernel, Ksym
 from gef.core.memory import (
+    hexdump,
     is_valid_addr,
     read_cstring_from_memory,
     read_int8_from_memory,
@@ -1839,3 +1842,473 @@ class KernelCurrentCommand(GenericCommand):
             self.dump_current_x86()
         return
 
+
+@register_command
+class KernelPerCpuCommand(GenericCommand, BufferingOutput):
+    """Resolve the per-cpu variables and the per-cpu areas."""
+
+    _cmdline_ = "kpercpu"
+    _category_ = "06-c. Qemu-system/KGDB Cooperation - Linux Basic"
+
+    parser = argparse.ArgumentParser(prog=_cmdline_)
+    parser.add_argument("target", metavar="SYMBOL|ADDRESS", nargs="?",
+                        help="a per-cpu symbol name to resolve, or an address to reverse-resolve.")
+    parser.add_argument("-c", "--cpu", action="append", type=lambda x: int(x, 0), default=[], help="filter by specific cpu.")
+    parser.add_argument("--online", action="store_true", help="filter by online cpus.")
+    parser.add_argument("-o", "--offset", type=AddressUtil.parse_address, default=0, help="add this offset to the resolved symbol.")
+    parser.add_argument("-l", "--list", action="store_true", help="list all the static per-cpu symbols.")
+    parser.add_argument("-x", "--dump", metavar="SIZE", type=AddressUtil.parse_address, default=0,
+                        help="hexdump SIZE bytes at each resolved address.")
+    parser.add_argument("-n", "--no-pager", action="store_true", help="do not use the pager.")
+    parser.add_argument("-q", "--quiet", action="store_true", help="show result only.")
+    _syntax_ = parser.format_help()
+
+    _example_ = [
+        "{0:s}                        # show the per-cpu area of each cpu",
+        "{0:s} runqueues              # show per_cpu(runqueues, cpu) of each cpu",
+        "{0:s} --online runqueues     # show per_cpu(runqueues, cpu) of each online cpu",
+        "{0:s} -o 0x120 runqueues     # add an offset to the resolved symbol",
+        "{0:s} 0xffff888100600120     # tell which cpu and which variable the address belongs to",
+        "{0:s} -l                     # list all the static per-cpu symbols",
+    ]
+    _example_ = "\n".join(_example_).format(_cmdline_)
+
+    _note_ = [
+        "per_cpu(var, cpu) is based on the static per-cpu symbol representation and the",
+        "per-cpu offset selected for the detected kernel layout. Older x86-64 kernels use",
+        "a zero-based representation; x86-64 v6.15 and later use relative offsets as well.",
+        "",
+        "`__per_cpu_start` and the per-cpu variables are data symbols, so a",
+        "CONFIG_KALLSYMS_ALL=n kernel has none of them. `__per_cpu_start` is recovered from",
+        "the code of `__is_kernel_percpu_address`, which keeps the areas and the reverse",
+        "lookup working, but there the variables cannot be named nor looked up by name.",
+        "CONFIG_SMP=n has no `__per_cpu_offset` at all, and `&var` is the address as is.",
+        "Whether it is CONFIG_SMP=n or just unresolved is told by the \"SMP\" of the banner.",
+        "",
+        "The cpu-id upper bound comes from `nr_cpu_ids` or the possible cpu mask; it is",
+        "estimated from `__per_cpu_offset[]` if both are unknown. Each cpu is tagged with the masks,",
+        "which are recovered from `init_cpu_*()`/`set_cpu_online()` without the symbols.",
+    ]
+    _note_ = "\n".join(_note_)
+
+    @staticmethod
+    def format_cpus(cpus):
+        """Return a cpu set as a cpulist string, e.g. {0, 1, 2, 5} -> "0-2,5"."""
+        if not cpus:
+            return "none"
+        ranges = []
+        for cpu in sorted(cpus):
+            if ranges and ranges[-1][1] == cpu - 1:
+                ranges[-1][1] = cpu
+            else:
+                ranges.append([cpu, cpu])
+        return ",".join(str(a) if a == b else "{:d}-{:d}".format(a, b) for a, b in ranges)
+
+    def cpu_state(self, cpu):
+        """Return the tag of `cpu` from the cpu masks, e.g. "[possible, present, online]", or ""."""
+        possible, present, online = (self.cpu_masks[x] for x in ("possible", "present", "online"))
+        tags = []
+        if possible is not None:
+            tags.append("possible" if cpu in possible else "not possible")
+        if present is not None and (possible is None or cpu in possible):
+            tags.append("present" if cpu in present else "not present")
+        if online is not None and (possible is None or cpu in possible):
+            tags.append("online" if cpu in online else "offline")
+        if not tags:
+            return ""
+        return "  [{:s}]".format(", ".join(tags))
+
+    def dump_meta(self, pc):
+        if pc.per_cpu_offset is not None:
+            self.quiet_info_add_out("__per_cpu_offset: {:#x}".format(pc.per_cpu_offset))
+        elif pc.is_up:
+            self.quiet_info_add_out("__per_cpu_offset: None (CONFIG_SMP=n, treated as one cpu at +0x0)")
+        else:
+            self.quiet_info_add_out("__per_cpu_offset: Not found")
+        if pc.state == "unknown":
+            self.err_add_out("This kernel is CONFIG_SMP=y, but `__per_cpu_offset[]` could not be resolved")
+        if pc.start is None:
+            self.quiet_info_add_out("static per-cpu section: {:s}".format("None" if pc.is_up else "Not found"))
+        elif pc.end is None:
+            self.quiet_info_add_out("static per-cpu section: {:#x}- (end unknown)".format(pc.start))
+        else:
+            self.quiet_info_add_out("static per-cpu section: {:#x}-{:#x}".format(pc.start, pc.end))
+        if pc.unit_size is not None:
+            self.quiet_info_add_out("per-cpu unit size: {:#x}".format(pc.unit_size))
+        if pc.state != "unknown":
+            if pc.is_up:
+                source = "CONFIG_SMP=n"
+            else:
+                source = pc.cpu_count_source
+            if pc.is_smp and pc.nr_cpu_ids is not None and pc.nr_cpus < pc.nr_cpu_ids:
+                source = "readable entries; {:d} cpu ids from {:s}".format(pc.nr_cpu_ids, source)
+            self.quiet_info_add_out("number of cpus: {:d} ({:s}, the upper bound of the cpu ids)".format(pc.nr_cpus, source))
+        for kind in ("possible", "present", "online"):
+            cpus = self.cpu_masks[kind]
+            self.quiet_info_add_out("{:s} cpus: {:s}".format(kind, "unknown" if cpus is None else self.format_cpus(cpus)))
+        return
+
+    def target_cpus(self, pc):
+        """Return the cpu numbers to display, honoring --cpu and --online."""
+        cpus = list(range(pc.nr_cpus))
+        if self.args.cpu:
+            cpus = [c for c in cpus if c in self.args.cpu]
+        if self.args.online:
+            online = self.cpu_masks["online"]
+            if online is None:
+                self.warn_add_out("The online cpu mask is unknown, so every cpu is shown")
+            else:
+                cpus = [c for c in cpus if c in online]
+        return cpus
+
+    def add_dump_out(self, addr):
+        if not self.args.dump:
+            return
+        data = read_memory(addr, self.args.dump, safe=True)
+        if data is None:
+            self.out.append("       (memory read error)")
+            return
+        for line in hexdump(data, base=addr, unit=runtime.current_arch.ptrsize).splitlines():
+            self.out.append("       " + line)
+        return
+
+    def dump_area(self, pc):
+        """Show the per-cpu area of each cpu."""
+        if pc.is_up:
+            self.info_add_out("This kernel is CONFIG_SMP=n, so cpu0 is at +0x0")
+        elif pc.state == "unknown":
+            return
+        elif pc.start is None:
+            self.warn_add_out("`__per_cpu_start` is unknown, so the base of each unit cannot be told")
+        for cpu in self.target_cpus(pc):
+            rng = pc.unit_range(cpu)
+            if rng is None:
+                self.out.append("CPU{:<4d} offset: {:s}{:s}".format(
+                    cpu, AddressUtil.format_address(pc.get_offset(cpu)), self.cpu_state(cpu),
+                ))
+                continue
+            self.out.append("CPU{:<4d} offset: {:s}  unit: {:#x}-{:#x}{:s}".format(
+                cpu, AddressUtil.format_address(pc.get_offset(cpu)), rng[0], rng[1], self.cpu_state(cpu),
+            ))
+            self.add_dump_out(rng[0])
+        return
+
+    def dump_symbol_list(self, pc):
+        """List the static per-cpu symbols."""
+        symbols = pc.get_symbols()
+        if not symbols:
+            self.err_add_out("No static per-cpu symbol was found; this kernel may be CONFIG_KALLSYMS_ALL=n")
+            return
+        self.quiet_info_add_out("Number of the static per-cpu symbols: {:d}".format(len(symbols)))
+        for addr, name in symbols:
+            self.out.append("{:s} {:s}".format(AddressUtil.format_address(addr), name))
+        return
+
+    def dump_symbol(self, pc, name):
+        """Show per_cpu(name, cpu) for each cpu."""
+        static_addr = Ksym.get_addr(name)
+        if static_addr is None:
+            self.err_add_out("Could not find the symbol `{:s}`".format(name))
+            return
+        if pc.get_symbols():
+            percpu_addr = pc.get_symbol_addr(name)
+            # an assembler constant of a vmlinux can fall into the section linked at 0
+            if percpu_addr is None and pc.is_static(static_addr):
+                self.err_add_out("`{:s}` ({:#x}) is an absolute symbol, not a per-cpu variable".format(name, static_addr))
+                return
+            if percpu_addr is not None:
+                static_addr = percpu_addr
+        if pc.start is not None and not pc.is_static(static_addr):
+            if pc.end is not None:
+                self.err_add_out("`{:s}` ({:#x}) is not in the static per-cpu section {:#x}-{:#x}".format(
+                    name, static_addr, pc.start, pc.end,
+                ))
+                return
+            self.warn_add_out("The end of the static per-cpu section is unknown; `{:s}` could not be verified".format(name))
+
+        static_addr += self.args.offset
+        if pc.start is not None and pc.end is not None and not pc.is_static(static_addr):
+            self.err_add_out("The requested offset leaves the static per-cpu section: {:#x}".format(static_addr))
+            return
+        if self.args.offset:
+            self.quiet_info_add_out("{:s}: {:#x} (+{:#x})".format(name, static_addr, self.args.offset))
+        else:
+            self.quiet_info_add_out("{:s}: {:#x}".format(name, static_addr))
+
+        for cpu in self.target_cpus(pc):
+            addr = pc.addr_of(static_addr, cpu)
+            self.out.append("CPU{:<4d} {:s}".format(cpu, AddressUtil.format_address(addr)))
+            self.add_dump_out(addr)
+        return
+
+    def dump_address(self, pc, addr):
+        """Reverse-resolve an address to the cpu and the per-cpu variable."""
+        if pc.state == "unknown":
+            self.err_add_out("The per-cpu areas are unknown, so {:#x} cannot be resolved".format(addr))
+            return
+        ret = pc.resolve(addr)
+        if ret is None:
+            self.err_add_out("{:#x} is not in any per-cpu area".format(addr))
+            if pc.start is None:
+                self.info_add_out("The static per-cpu section is unknown, so only the unit range was checked")
+            return
+        cpu, static_addr, sym = ret
+        self.out.append("{:<10s}{:s}".format("Address", AddressUtil.format_address(addr)))
+        self.out.append("{:<10s}{:d}".format("CPU", cpu))
+        if sym is None:
+            self.out.append("{:<10s}{:s}".format("Symbol", "Not found (dynamic per-cpu area?)"))
+        else:
+            name, offset = sym
+            self.out.append("{:<10s}{:s}".format("Symbol", name))
+            self.out.append("{:<10s}+{:#x}".format("Offset", offset))
+        self.out.append("{:<10s}{:#x}".format("Static", static_addr))
+        self.add_dump_out(addr)
+        return
+
+    @parse_args
+    @only_if_gdb_running
+    @only_if_specific_gdb_mode(mode=("qemu-system", "vmware", "kgdb"))
+    @only_if_in_kernel_or_kpti_disabled
+    def do_invoke(self, args):
+        if Kernel.version() is None:
+            err("Could not find Linux kernel")
+            return
+
+        pc = Kernel.per_cpu()
+        if any(cpu < 0 or cpu >= pc.nr_cpus for cpu in args.cpu):
+            err("CPU number is invalid")
+            return
+        self.cpu_masks = pc.get_cpu_masks()
+        self.out = []
+        self.dump_meta(pc)
+
+        if args.list:
+            self.dump_symbol_list(pc)
+        elif args.target is None:
+            self.dump_area(pc)
+        elif re.fullmatch(r"[A-Za-z_.][\w.$]*", args.target): # `$reg` is an address expression
+            self.dump_symbol(pc, args.target)
+        else:
+            try:
+                addr = AddressUtil.parse_address(args.target)
+            except Exception:
+                err("Could not parse `{:s}` as an address".format(args.target))
+                return
+            self.dump_address(pc, addr)
+
+        self.print_output(check_terminal_size=True)
+        return
+
+
+
+@register_command
+class KernelAddressHeuristicSelftestCommand(GenericCommand, BufferingOutput):
+    """Compare kernel-address heuristic finders with kallsyms results."""
+
+    _cmdline_ = "ks-selftest"
+    _category_ = "06-c. Qemu-system/KGDB Cooperation - Linux Basic"
+
+    parser = argparse.ArgumentParser(prog=_cmdline_)
+    parser.add_argument("-n", "--no-pager", action="store_true", help="do not use the pager.")
+    parser.add_argument("-q", "--quiet", action="store_true", help="enable quiet mode.")
+    parser.add_argument("--failures-only", action="store_true", help="show only failed finders.")
+    _syntax_ = parser.format_help()
+
+    _note_ = [
+        "False means explicitly unsupported; None means not found; '-' means unavailable or not run.",
+        "$ks_selftest_failures is nonzero if the test cannot run, otherwise it is the number of failed results.",
+    ]
+    _note_ = "\n".join(_note_)
+
+    def invoke(self, args, from_tty):
+        gdb.set_convenience_variable("ks_selftest_failures", -1)
+        return super().invoke(args, from_tty)
+
+    @staticmethod
+    def direct_symbol_name(finder_name):
+        if finder_name == "get_sys_call_table_x86":
+            if is_x86_64():
+                return "ia32_sys_call_table"
+            if is_x86_32():
+                return "sys_call_table"
+            return None
+
+        m = re.fullmatch(r"get_cpu_(possible|present|online)_mask", finder_name)
+        if m:
+            # the symbol changed in v4.5, and some old kernels keep only the pointer to the bitmap
+            names = [x.format(m.group(1)) for x in ("__cpu_{:s}_mask", "cpu_{:s}_bits", "cpu_{:s}_mask")]
+            return next((x for x in names if Ksym.get_addr(x) is not None), names[0])
+
+        exceptions = {
+            "get_sys_call_table_x64": "sys_call_table",
+            "get_sys_call_table_x32": "x32_sys_call_table",
+            "get_sys_call_table_arm32": "sys_call_table",
+            "get_sys_call_table_arm64": "sys_call_table",
+            "get_sys_call_table_arm64_compat": "compat_sys_call_table",
+            "get_per_cpu_offset": "__per_cpu_offset",
+            "get_PAGE_OFFSET_base": "page_offset_base",
+            "get_current_clocksource": "curr_clocksource",
+            "get_log_buffer": "log_buf",
+            "get_vmap_nodes_busy_head": "vmap_nodes",
+        }
+        return exceptions.get(finder_name, finder_name[len("get_"):])
+
+    @staticmethod
+    def finders():
+        finders = []
+        for name in dir(KernelAddressHeuristicFinder):
+            if not name.startswith("get_"):
+                continue
+            finder = getattr(KernelAddressHeuristicFinder, name)
+            implementation = finder
+            while hasattr(implementation, "__wrapped__"):
+                implementation = implementation.__wrapped__
+            if "USE_DIRECTLY" in implementation.__code__.co_names:
+                finders.append((name, finder))
+        return finders
+
+    @staticmethod
+    def invoke_finder(finder, args):
+        try:
+            return finder(*args), None
+        except Exception as exception:
+            return None, "{:s}: {:s}".format(type(exception).__name__, str(exception))
+
+    @staticmethod
+    def format_result(value, error, available=True):
+        if error is not None:
+            return "ERROR"
+        if not available:
+            return "-"
+        if value is None:
+            return "None"
+        if isinstance(value, bool):
+            return str(value)
+        if isinstance(value, int):
+            return "{:#x}".format(value)
+        return str(value)
+
+    @parse_args
+    @only_if_gdb_running
+    @only_if_specific_gdb_mode(mode=("qemu-system", "vmware", "kgdb"))
+    @only_if_specific_arch(arch=("x86_32", "x86_64", "ARM32", "ARM64"))
+    @only_if_in_kernel_or_kpti_disabled
+    def do_invoke(self, args):
+        self.quiet_info("Wait for kallsyms and heuristic scans")
+
+        direct_results = {}
+        heuristic_results = {}
+        errors = []
+        original_use_directly = KernelAddressHeuristicFinder.USE_DIRECTLY
+
+        try:
+            KernelAddressHeuristicFinder.USE_DIRECTLY = True
+            Cache.reset_gef_caches(all=True)
+            if Ksym.get_kallsyms() is None:
+                self.quiet_err("Could not read kallsyms")
+                return
+
+            for name, finder in self.finders():
+                symbol_name = self.direct_symbol_name(name)
+                if symbol_name is not None:
+                    symbol_address = Ksym.get_addr(symbol_name)
+                else:
+                    symbol_address = None
+                if symbol_address is None:
+                    direct_results[name] = (None, None, False, ())
+                    continue
+
+                finder_args = ()
+                if name in ("get_current_clocksource", "get_log_buffer"):
+                    try:
+                        if name == "get_current_clocksource":
+                            current_clocksource = read_int_from_memory(symbol_address)
+                            finder_args = ((current_clocksource,),)
+                        else:
+                            length_address = Ksym.get_addr("log_buf_len")
+                            if length_address is None:
+                                direct_results[name] = (None, None, False, ())
+                                continue
+                            finder_args = (read_int32_from_memory(length_address),)
+                    except (gdb.MemoryError, MemoryError) as exception:
+                        message = "{:s}: {:s}".format(type(exception).__name__, str(exception))
+                        direct_results[name] = (None, message, True, ())
+                        errors.append("{:s} direct: {:s}".format(name, message))
+                        continue
+
+                value, error = self.invoke_finder(finder, finder_args)
+                direct_results[name] = (value, error, True, finder_args)
+                if error is not None:
+                    errors.append("{:s} direct: {:s}".format(name, error))
+
+            KernelAddressHeuristicFinder.USE_DIRECTLY = False
+            Cache.reset_gef_caches(all=True)
+
+            for name, finder in self.finders():
+                direct, error, available, finder_args = direct_results[name]
+                if not available or error is not None or direct is None or direct is False:
+                    heuristic_results[name] = (None, None)
+                    continue
+                value, error = self.invoke_finder(finder, finder_args)
+                heuristic_results[name] = (value, error)
+                if error is not None:
+                    errors.append("{:s} heuristic: {:s}".format(name, error))
+        finally:
+            KernelAddressHeuristicFinder.USE_DIRECTLY = original_use_directly
+            Cache.reset_gef_caches(all=True)
+
+        rows = []
+        verdict_counts = collections.Counter()
+        for name, _ in self.finders():
+            direct, direct_error, available, _ = direct_results[name]
+            heuristic, heuristic_error = heuristic_results[name]
+            if (not available or direct is False or heuristic is False or
+                    (direct is None and direct_error is None)):
+                verdict = "n/a"
+            elif direct_error is not None or heuristic_error is not None:
+                verdict = "ERROR"
+            elif direct == heuristic:
+                verdict = "OK"
+            elif heuristic is None:
+                verdict = "MISS"
+            else:
+                verdict = "MISMATCH"
+            verdict_counts[verdict] += 1
+            rows.append((
+                name,
+                self.format_result(direct, direct_error, available),
+                self.format_result(
+                    heuristic, heuristic_error,
+                    available and direct is not None and direct is not False,
+                ),
+                verdict,
+            ))
+
+        failure_verdicts = ("MISS", "MISMATCH", "ERROR")
+        failure_count = sum(verdict_counts[verdict] for verdict in failure_verdicts)
+        gdb.set_convenience_variable("ks_selftest_failures", failure_count)
+        if args.failures_only:
+            visible_rows = [row for row in rows if row[-1] in failure_verdicts]
+        else:
+            visible_rows = rows
+
+        headers = ("finder", "direct", "heuristic", "verdict")
+        widths = [max(len(row[i]) for row in [headers] + visible_rows) for i in range(len(headers))]
+        row_format = "  ".join("{{:<{:d}s}}".format(width) for width in widths)
+        self.out = [GefUtil.make_legend(row_format.format(*headers))]
+        for row in visible_rows:
+            line = row_format.format(*row).rstrip()
+            if row[-1] in failure_verdicts:
+                line = Color.colorify(line, "yellow bold")
+            self.out.append(line)
+        self.out.append("")
+        self.out.append("  ".join(
+            "{:s}: {:d}".format(verdict, verdict_counts[verdict])
+            for verdict in ("OK", "MISS", "MISMATCH", "ERROR", "n/a")
+        ))
+        if errors:
+            self.out.append("")
+            self.out.append(GefUtil.make_legend("errors"))
+            self.out.extend(errors)
+        self.print_output(check_terminal_size=True)
+        return

@@ -19,6 +19,7 @@ import os
 import re
 import struct
 import subprocess
+import sys
 import tempfile
 
 import gdb
@@ -30,15 +31,17 @@ from gef.core.color import Color, err, gef_print, info, warn
 from gef.core.config import Config
 from gef.core.display import ProgressBar
 from gef.core.elf import Elf
-from gef.core.memory import (is_double_link_list, is_valid_addr, is_valid_addr_addr, p16, p32, p64,
-                              read_cstring_from_memory, read_int8_from_memory, read_int16_from_memory,
+from gef.core.memory import (is_ascii_string, is_double_link_list, is_valid_addr, is_valid_addr_addr, p16, p32,
+                              p64, read_cstring_from_memory, read_int8_from_memory, read_int16_from_memory,
                               read_int32_from_memory, read_int64_from_memory, read_int_from_memory, read_memory,
-                              read_physmem, u32, u64)
+                              read_physmem, u16, u32, u64)
 from gef.core.pagewalk import KernelAddressHeuristicFinder, KernelAddressHeuristicFinderUtil, PageMap
-from gef.core.process import (LinuxSignal, Pid, get_pagesize, get_pagesize_mask_high, get_pagesize_mask_low,
-                              is_32bit, is_64bit, is_arm32, is_arm64, is_in_kernel, is_in_secure, is_kdb,
-                              is_kgdb, is_qemu_system, is_riscv32, is_riscv64, is_vmware, is_x86, is_x86_32,
-                              is_x86_64)
+from gef.core.process import (LinuxSignal, Pid, ProcessMap, get_pagesize, get_pagesize_mask_high,
+                              get_pagesize_mask_low, is_32bit, is_64bit, is_alive, is_arm32, is_arm64,
+                              is_in_kernel, is_in_secure, is_kdb, is_kgdb, is_qemu_system, is_riscv32, is_riscv64,
+                              is_vmware, is_x86, is_x86_32, is_x86_64)
+from gef.core.qemu import QemuMonitor
+from gef.core.unicorn import UnicornEmulator
 from gef.core.registers import get_register, to_unsigned_long
 from gef.core.instruction import Disasm
 from gef.core.strings import String
@@ -3180,7 +3183,7 @@ class Kernel:
         """Return the dict of the slab object that contains `addr` resolved as `slab-contains`, or None."""
         if Kernel.get_slab_type() not in ["SLUB", "SLUB_TINY", "SLAB"] or not (is_x86() or is_arm32() or is_arm64()):
             return None
-        obj = __gef_command_instances__["slab-contains"].get_slab_object(addr)
+        obj = runtime.CommandRegistry.instances["slab-contains"].get_slab_object(addr)
         if obj["error"]:
             return None
         return obj

@@ -12,6 +12,7 @@ References to not-yet-extracted modules (gef.core.kernel `Kernel*` constants,
 gef.commands `TlsCommand` / `XSecureMemAddrCommand`) are late-imported inside
 the referencing method.
 """
+import collections
 import functools
 import gdb
 import itertools
@@ -22,12 +23,14 @@ from gef.core import runtime
 from gef.core.address import AddressUtil
 from gef.core.cache import Cache
 from gef.core.color import Color, err, gef_print, info, warn
-from gef.core.memory import (is_valid_addr, is_valid_addr_addr, p32, p64, read_cstring_from_memory,
-                             read_int32_from_memory, read_int_from_memory, read_memory, u32)
-from gef.core.process import (get_pagesize, is_32bit, is_64bit, is_arm32, is_arm64, is_kgdb, is_qemu_system,
-                              is_riscv32, is_riscv64, is_vmware, is_x86, is_x86_32, is_x86_64)
+from gef.core.memory import (is_ascii_string, is_valid_addr, is_valid_addr_addr, p32, p64,
+                             read_cstring_from_memory, read_int32_from_memory, read_int64_from_memory,
+                             read_int8_from_memory, read_int_from_memory, read_memory, u32)
+from gef.core.process import (get_pagesize, is_32bit, is_64bit, is_arm32, is_arm64, is_in_kernel, is_kgdb,
+                              is_qemu_system, is_riscv32, is_riscv64, is_vmware, is_x86, is_x86_32, is_x86_64)
 from gef.core.registers import get_register
 from gef.core.qemu import QemuMonitor
+from gef.core.registers import to_unsigned_long
 from gef.core.symbols import Symbol
 from gef.core.utils import (GefUtil, align, align_to_ptrsize, is_double_link_list, is_single_link_list,
                             slice_unpack, switch_to_intel_syntax, u2i)
@@ -57,6 +60,12 @@ KernelPerCpu = _LateKernelModule("KernelPerCpu")
 KernelTask = _LateKernelModule("KernelTask")
 KernelNamespace = _LateKernelModule("KernelNamespace")
 KernelXArray = _LateKernelModule("KernelXArray")
+KernelSysctl = _LateKernelModule("KernelSysctl")
+KernelResourceLayout = _LateKernelModule("KernelResourceLayout")
+KernelConstsX86 = _LateKernelModule("KernelConstsX86")
+KernelConstsX64 = _LateKernelModule("KernelConstsX64")
+KernelConstsArm32 = _LateKernelModule("KernelConstsArm32")
+KernelConstsArm64 = _LateKernelModule("KernelConstsArm64")
 
 
 class PageMap:
@@ -1717,6 +1726,8 @@ class KernelAddressHeuristicFinder:
     @cpu_context_dependent
     @switch_to_intel_syntax
     def get_init_task():
+        # runtime-only core -> commands dependency, allowed by layering rule 1
+        from gef.commands.base import ContextManager
         # plan 1 (directly)
         if KernelAddressHeuristicFinder.USE_DIRECTLY:
             x = Ksym.get_addr("init_task")
@@ -7481,6 +7492,8 @@ class KernelAddressHeuristicFinder:
     @staticmethod
     @switch_to_intel_syntax
     def get_debugfs_list():
+        # runtime-only core -> commands dependency, allowed by layering rule 1
+        from gef.commands.process.base_address import TlsCommand
         # need DMA_SHARED_BUFFER=y
 
         # plan 1 (directly)
@@ -7547,6 +7560,8 @@ class KernelAddressHeuristicFinder:
     @staticmethod
     @switch_to_intel_syntax
     def get_dmabuf_list():
+        # runtime-only core -> commands dependency, allowed by layering rule 1
+        from gef.commands.process.base_address import TlsCommand
         # need DMA_SHARED_BUFFER=y
 
         # plan 1 (directly)

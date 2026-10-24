@@ -144,6 +144,7 @@ class Symbol:
         """resolve_kdb_address("_stext") -> 0xffffffff81000000.
         resolve_kdb_address("missing") -> None.
         """
+        from gef.core.process import is_kdb
         if not is_kdb():
             return None
         text = gdb.execute("monitor {:s}".format(name), to_string=True)
@@ -187,6 +188,8 @@ class Symbol:
         lookup(0x1) -> None.
         """
         from gef.core.process import is_in_kernel
+        # runtime-only core dependency, allowed by layering rule 1
+        from gef.core.kernel import Ksym
         if ksym not in ("off", "cached", "prefer"):
             raise ValueError("Unknown kallsyms mode: {!r}".format(ksym))
         if address is None:

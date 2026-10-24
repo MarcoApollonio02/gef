@@ -33,15 +33,18 @@ import traceback
 import gdb
 
 from gef.core import runtime
-from gef.core.address import Endian
+from gef.core.address import AddressUtil, Endian
 from gef.core.cache import Cache
-from gef.core.color import Color, err, info
+from gef.core.color import Color, err, info, warn
 from gef.core.color import gef_print  # noqa: F401  (re-export for GefUtil.show_last_exception users)
 from gef.core.config import Config
 from gef.core.errors import show_last_exception  # noqa: F401  (re-export)
 from gef.core.memory import (is_double_link_list, is_single_link_list, is_valid_addr, p16, p32, p64, p8,
-                              read_int_from_memory, u128, u16, u32, u64, u8)
-from gef.core.registers import to_unsigned_long
+                              read_int32_from_memory, read_int_from_memory, read_memory, u128, u16, u32, u64,
+                              u8)
+from gef.core.process import is_emulated32, is_qemu_system, is_vmware, is_x86_64
+from gef.core.qemu import QemuMonitor
+from gef.core.registers import get_register, to_unsigned_long
 from gef.core.strings import String
 
 
@@ -457,6 +460,55 @@ class GefUtil:
         if GefUtil.get_x86_descriptor_mode() == "long" and base + size > AddressUtil.get_vmem_end():
             return gdb.selected_inferior().read_memory(base, size).tobytes()
         return read_memory(base, size)
+
+    @staticmethod
+    def read_memory_padded(addr, length, chunk_size=None):
+        """Read memory, retrying at chunk boundaries and zero-filling unreadable chunks.
+        Use the page size when chunk_size is omitted. Preserve offsets within the requested range.
+        """
+        if length < 0 or (chunk_size is not None and chunk_size <= 0):
+            raise ValueError("Invalid memory read size")
+        from gef.core.process import get_pagesize
+        data = read_memory(addr, length, safe=True)
+        if data is not None:
+            return data
+        if chunk_size is None:
+            chunk_size = get_pagesize()
+        data = bytearray()
+        while len(data) < length:
+            current = addr + len(data)
+            size = min(length - len(data), chunk_size - current % chunk_size)
+            chunk = read_memory(current, size, safe=True)
+            if chunk is not None:
+                data += chunk
+            else:
+                data += b"\0" * size
+        return bytes(data)
+
+    @staticmethod
+    def get_kernel_node_count(array=None):
+        # runtime-only core dependency, allowed by layering rule 1
+        from gef.core.kernel import Ksym
+        count = None
+        if array:
+            try:
+                count = to_unsigned_long(gdb.parse_and_eval("sizeof({:s}) / sizeof(({:s})[0])".format(array, array))) or None
+            except gdb.error:
+                pass
+        addr = Ksym.get_addr("nr_node_ids")
+        if addr:
+            runtime_count = read_int32_from_memory(addr, safe=True)
+            if runtime_count:
+                if count:
+                    return min(count, runtime_count)
+                return runtime_count
+        if count:
+            return count
+        configs = runtime.CommandRegistry.instances["kconfig"].get_configs()
+        if configs:
+            return 1 << int(configs.get("CONFIG_NODES_SHIFT", "0"))
+        warn("Node array length is unknown; scanning stops at the first invalid pointer")
+        return None
 
     @staticmethod
     def iter_kernel_node_pointers(addr, array=None, step=None, count=None):
