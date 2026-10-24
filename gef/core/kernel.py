@@ -40,6 +40,8 @@ from gef.core.process import (LinuxSignal, Pid, get_pagesize, get_pagesize_mask_
                               is_kgdb, is_qemu_system, is_riscv32, is_riscv64, is_vmware, is_x86, is_x86_32,
                               is_x86_64)
 from gef.core.registers import get_register, to_unsigned_long
+from gef.core.instruction import Disasm
+from gef.core.strings import String
 from gef.core.symbols import ModuleLoader, Symbol
 from gef.core.utils import (GEF_TEMP_DIR, GefUtil, align, align_to_pagesize, align_to_ptrsize, byteswap,
                             slice_unpack, switch_to_intel_syntax, u2i)
@@ -17738,3 +17740,8494 @@ class KernelSlob:
             parsed_freelist["small"] = self.walk_page_freelist(self.free_slob_small, simple=simple)
 
         return parsed_caches, parsed_freelist
+
+
+class KernelPipe:
+    """Resolve pipe layouts and read pipe buffers."""
+
+    # the resolved layout
+    LAYOUT_ATTRS = (
+        "ring_buffer", "offset_i_pipe", "offset_head", "offset_tail", "sizeof_pipe_index_t",
+        "offset_max_usage", "offset_ring_size", "offset_nrbufs", "offset_curbuf", "offset_buffers",
+        "offset_bufs", "offset_watch_queue", "offset_page", "offset_offset", "offset_len", "offset_ops",
+        "offset_flags", "sizeof_pipe_buffer",
+    )
+
+    @classmethod
+    @Cache.cache_this_session(per_inferior=True, until_new_objfile=True)
+    def get_instance(cls):
+        return cls()
+
+    def __init__(self):
+        self.meta = []
+        self.initialized = False
+        return
+
+    def initialize(self, pipe_files, force=False):
+        # the resolved offsets may be for the pipes of another kernel
+        if self.initialized and not force and self.is_consistent_layout(pipe_files):
+            return True
+
+        self.initialized = False
+        meta = []
+        for use_dwarf in [True, False]:
+            for name in self.LAYOUT_ATTRS:
+                setattr(self, name, None)
+            self.meta = meta
+            if use_dwarf and not self.resolve_by_dwarf():
+                continue
+            if self.resolve_by_heuristic(pipe_files):
+                if self.is_consistent_layout(pipe_files):
+                    self.initialized = True
+                    return True
+                self.meta.append(("err", "The resolved offsets do not match the pipes in memory"))
+            if use_dwarf:
+                # the debug info may be for another build
+                meta = [
+                    self.meta[0],
+                    ("warn", "The debug info does not match the pipes in memory; fall back to heuristic"),
+                ]
+        return None
+
+    def get_pipe_files(self):
+        """Parse `ktask --print-fd` and return ([(file, inode), ...], error)."""
+        ret = gdb.execute("ktask --no-pager --user-process-only --print-fd", to_string=True)
+        ret = Color.remove_color(ret)
+        if "Exception raised" in ret or "Disabled --print-fd" in ret:
+            return None, "Could not enumerate pipe files; see `ktask --print-fd`"
+        pipe_files = []
+        for line in ret.splitlines():
+            m = re.search(r"\d+\s+\S+\s+(0x\S+) 0x\S+ (0x\S+) pipe:\[\d+\]", line)
+            if not m:
+                continue
+            file = int(m.group(1), 16)
+            inode = int(m.group(2), 16)
+            pipe_files.append((file, inode))
+        if pipe_files:
+            return pipe_files, None
+
+        for line in ret.splitlines():
+            if line.startswith("[!]"):
+                return None, line[3:].lstrip()
+        return pipe_files, None
+
+    def get_pipe(self, inode):
+        """Return the pipe of `inode` as a dict. "buffers" is None if the ring state is unexpected."""
+        pipe_inode_info = read_int_from_memory(inode + self.offset_i_pipe)
+        bufs = read_int_from_memory(pipe_inode_info + self.offset_bufs)
+        state = self.read_ring_state(pipe_inode_info)
+        head, tail, used, max_usage, ring_size = state
+        pipe = {
+            "pipe_inode_info": pipe_inode_info, "bufs": bufs, "head": head, "tail": tail, "used": used,
+            "max_usage": max_usage, "ring_size": ring_size, "watch_queue": 0, "notification": False, "buffers": None,
+        }
+        if not self.is_valid_ring_state(state, self.has_watch_queue(pipe_inode_info)):
+            return pipe
+
+        # the kernel indexes the ring by `& (ring_size - 1)`, even if ring_size is not a power of 2
+        mask = ring_size - 1
+        used_range = {(tail + x) & mask for x in range(used)}
+
+        if self.offset_watch_queue is not None:
+            pipe["watch_queue"] = read_int_from_memory(pipe_inode_info + self.offset_watch_queue)
+        if pipe["watch_queue"]:
+            pipe["notification"] = True
+        else:
+            ops_set = set()
+            for idx in used_range:
+                ops_set.add(read_int_from_memory(bufs + self.sizeof_pipe_buffer * idx + self.offset_ops))
+            pipe["notification"] = any(Ksym.get_name(ops) == "watch_queue_pipe_buf_ops" for ops in ops_set if ops)
+
+        pipe["buffers"] = []
+        for idx in range(ring_size):
+            base = bufs + self.sizeof_pipe_buffer * idx
+            page = read_int_from_memory(base + self.offset_page)
+            pipe["buffers"].append({
+                "index": idx, "page": page, "virt": Kernel.page2virt(page),
+                "offset": read_int32_from_memory(base + self.offset_offset),
+                "len": read_int32_from_memory(base + self.offset_len),
+                "flags": read_int32_from_memory(base + self.offset_flags),
+                "is_used": idx in used_range, "is_head": head & mask == idx, "is_tail": tail & mask == idx,
+            })
+        return pipe
+
+    def resolve_by_dwarf(self):
+        offsetof = GefUtil.offsetof
+        sizeof = GefUtil.sizeof
+        found = []
+
+        # inode->i_pipe
+        self.offset_i_pipe = offsetof("inode", "i_pipe")
+        if self.offset_i_pipe is not None:
+            found.append("inode")
+
+        # pipe_inode_info->{head,tail,max_usage,ring_size} (v5.5~) or {nrbufs,curbuf,buffers} (~v5.4)
+        offsets = [offsetof("pipe_inode_info", x) for x in ["head", "tail", "max_usage", "ring_size"]]
+        sizeof_pipe_index_t = sizeof("((struct pipe_inode_info*)0)->head")
+        if None not in offsets and sizeof_pipe_index_t in [2, 4]:
+            self.ring_buffer = True
+            self.offset_head, self.offset_tail, self.offset_max_usage, self.offset_ring_size = offsets
+            self.sizeof_pipe_index_t = sizeof_pipe_index_t
+        else:
+            offsets = [offsetof("pipe_inode_info", x) for x in ["nrbufs", "curbuf", "buffers"]]
+            if None not in offsets:
+                self.ring_buffer = False
+                self.offset_nrbufs, self.offset_curbuf, self.offset_buffers = offsets
+        if self.ring_buffer is not None:
+            found.append("pipe_inode_info")
+            self.offset_bufs = offsetof("pipe_inode_info", "bufs")
+            # CONFIG_WATCH_QUEUE=y (v5.8~)
+            self.offset_watch_queue = offsetof("pipe_inode_info", "watch_queue")
+
+        # pipe_buffer->{page, offset, len, ops, flags}
+        offsets = [offsetof("pipe_buffer", x) for x in ["page", "offset", "len", "ops", "flags"]]
+        sizeof_pipe_buffer = sizeof("struct pipe_buffer")
+        if None not in offsets and sizeof_pipe_buffer:
+            self.offset_page, self.offset_offset, self.offset_len, self.offset_ops, self.offset_flags = offsets
+            self.sizeof_pipe_buffer = sizeof_pipe_buffer
+            found.append("pipe_buffer")
+
+        if found:
+            self.meta.append(("info", "Use the debug info of {:s}".format(", ".join(found))))
+        return bool(found)
+
+    def resolve_by_heuristic(self, pipe_files):
+        kversion = Kernel.version()
+        if self.ring_buffer is None:
+            self.ring_buffer = "5.5" <= kversion
+            if self.ring_buffer:
+                if kversion >= "6.14" and is_32bit():
+                    self.sizeof_pipe_index_t = 2
+                else:
+                    self.sizeof_pipe_index_t = 4
+
+        # pipe_buffer->{page, offset, len, ops, flags}
+        """
+        struct pipe_buffer {
+            struct page *page;
+            unsigned int offset, len;
+            const struct pipe_buf_operations *ops;
+            unsigned int flags;
+            unsigned long private;
+        };
+        """
+        if self.sizeof_pipe_buffer is None:
+            self.offset_page = 0
+            self.offset_offset = runtime.current_arch.ptrsize
+            self.offset_len = self.offset_offset + 4
+            self.offset_ops = self.offset_len + 4
+            self.offset_flags = self.offset_ops + runtime.current_arch.ptrsize
+            self.sizeof_pipe_buffer = align_to_ptrsize(self.offset_flags + 4) + runtime.current_arch.ptrsize
+
+        # inode->i_pipe
+        if self.offset_i_pipe is None:
+            offset_i_pipe = self.get_offset_i_pipe(pipe_files)
+            if not offset_i_pipe:
+                self.meta.append(("err", "Could not find inode->i_pipe"))
+                return None
+            self.offset_i_pipe = offset_i_pipe
+
+        if self.ring_buffer and self.offset_head is None:
+            # pipe_inode_info->{head,tail,max_usage,ring_size}
+            ret = self.get_offset_head_or_nrbuf(pipe_files)
+            if ret is None:
+                self.meta.append(("err", "Could not find pipe_inode_info->head"))
+                return None
+            self.offset_head, self.offset_tail, self.offset_max_usage, self.offset_ring_size = self.get_header_offsets(ret)
+        elif not self.ring_buffer and self.offset_nrbufs is None:
+            # pipe_inode_info->{nrbufs,curbuf,buffers}
+            ret = self.get_offset_head_or_nrbuf(pipe_files)
+            if ret is None:
+                self.meta.append(("err", "Could not find pipe_inode_info->nrbufs"))
+                return None
+            self.offset_nrbufs, self.offset_curbuf, self.offset_buffers = self.get_header_offsets(ret)
+
+        # pipe_inode_info->bufs
+        if self.offset_bufs is None:
+            offset_bufs = self.get_offset_bufs(pipe_files)
+            if not offset_bufs:
+                self.meta.append(("err", "Could not find pipe_inode_info->bufs"))
+                return None
+            self.offset_bufs = offset_bufs
+
+        if self.offset_watch_queue is None and Ksym.get_addr("watch_queue_set_size"):
+            self.offset_watch_queue = self.offset_bufs + runtime.current_arch.ptrsize * 2
+
+        self.meta.append(("info", "offsetof(inode, i_pipe): {:#x}".format(self.offset_i_pipe)))
+        if self.ring_buffer:
+            self.meta.append(("info", "offsetof(pipe_inode_info, head): {:#x}".format(self.offset_head)))
+            self.meta.append(("info", "offsetof(pipe_inode_info, tail): {:#x}".format(self.offset_tail)))
+            self.meta.append(("info", "sizeof(pipe_index_t): {:#x}".format(self.sizeof_pipe_index_t)))
+            self.meta.append(("info", "offsetof(pipe_inode_info, max_usage): {:#x}".format(self.offset_max_usage)))
+            self.meta.append(("info", "offsetof(pipe_inode_info, ring_size): {:#x}".format(self.offset_ring_size)))
+        else:
+            self.meta.append(("info", "offsetof(pipe_inode_info, nrbufs): {:#x}".format(self.offset_nrbufs)))
+            self.meta.append(("info", "offsetof(pipe_inode_info, curbuf): {:#x}".format(self.offset_curbuf)))
+            self.meta.append(("info", "offsetof(pipe_inode_info, buffers): {:#x}".format(self.offset_buffers)))
+        self.meta.append(("info", "offsetof(pipe_inode_info, bufs): {:#x}".format(self.offset_bufs)))
+        if self.offset_watch_queue is not None:
+            self.meta.append(("info", "offsetof(pipe_inode_info, watch_queue): {:#x}".format(self.offset_watch_queue)))
+        self.meta.append(("info", "offsetof(pipe_buffer, page): {:#x}".format(self.offset_page)))
+        self.meta.append(("info", "offsetof(pipe_buffer, offset): {:#x}".format(self.offset_offset)))
+        self.meta.append(("info", "offsetof(pipe_buffer, len): {:#x}".format(self.offset_len)))
+        self.meta.append(("info", "offsetof(pipe_buffer, ops): {:#x}".format(self.offset_ops)))
+        self.meta.append(("info", "offsetof(pipe_buffer, flags): {:#x}".format(self.offset_flags)))
+        self.meta.append(("info", "sizeof(pipe_buffer): {:#x}".format(self.sizeof_pipe_buffer)))
+        return True
+
+    def get_header_offsets(self, offset=None):
+        """Return the offsets of (head, tail, max_usage, ring_size) for v5.5~, or (nrbufs, curbuf, buffers) for ~v5.4.
+        They are the resolved ones, or derived from `offset` as a candidate of the first member."""
+        if offset is None:
+            if self.ring_buffer:
+                return self.offset_head, self.offset_tail, self.offset_max_usage, self.offset_ring_size
+            return self.offset_nrbufs, self.offset_curbuf, self.offset_buffers
+        if self.ring_buffer:
+            size = self.sizeof_pipe_index_t
+            return offset, offset + size, offset + size * 2, offset + size * 2 + 4
+        return offset, offset + 4, offset + 8
+
+    def read_ring_state(self, pipe_inode_info, offsets=None):
+        """Return (head, tail, used, max_usage, ring_size). ~v5.4 is converted to the same form."""
+        if offsets is None:
+            offsets = self.get_header_offsets()
+        if self.ring_buffer:
+            offset_head, offset_tail, offset_max_usage, offset_ring_size = offsets
+            # read each index, since the order of the 16-bit indices in a 32-bit word depends on the endianness
+            if self.sizeof_pipe_index_t == 2:
+                head = read_int16_from_memory(pipe_inode_info + offset_head)
+                tail = read_int16_from_memory(pipe_inode_info + offset_tail)
+            else:
+                head = read_int32_from_memory(pipe_inode_info + offset_head)
+                tail = read_int32_from_memory(pipe_inode_info + offset_tail)
+            max_usage = read_int32_from_memory(pipe_inode_info + offset_max_usage)
+            ring_size = read_int32_from_memory(pipe_inode_info + offset_ring_size)
+            used = (head - tail) & ((1 << (self.sizeof_pipe_index_t * 8)) - 1)
+            return head, tail, used, max_usage, ring_size
+
+        offset_nrbufs, offset_curbuf, offset_buffers = offsets
+        nrbufs = read_int32_from_memory(pipe_inode_info + offset_nrbufs)
+        curbuf = read_int32_from_memory(pipe_inode_info + offset_curbuf)
+        buffers = read_int32_from_memory(pipe_inode_info + offset_buffers)
+        return curbuf + nrbufs, curbuf, nrbufs, buffers, buffers
+
+    def is_valid_ring_state(self, state, notification=False):
+        tail, used, max_usage, ring_size = state[1:]
+        if ring_size == 0 or ring_size > 0x10000:
+            return False
+        # A notification pipe (v5.8~v5.16) has a ring of the requested number of notes (up to 512).
+        if ring_size & (ring_size - 1) and (
+            not notification or not self.ring_buffer or ring_size > 512 or Kernel.version() >= "5.17"
+        ):
+            return False
+        if not self.ring_buffer:
+            return used <= ring_size and tail < ring_size
+        # A notification pipe fills the ring regardless of max_usage.
+        return 0 < max_usage <= ring_size and used <= (ring_size if notification else max_usage)
+
+    def has_watch_queue(self, pipe_inode_info, offset_bufs=None):
+        offset = self.offset_watch_queue
+        if offset is None:
+            if offset_bufs is None or not Ksym.get_addr("watch_queue_set_size"):
+                return False
+            offset = offset_bufs + runtime.current_arch.ptrsize * 2
+        watch_queue = read_int_from_memory(pipe_inode_info + offset)
+        if not watch_queue or not is_valid_addr(watch_queue):
+            return False
+        offset_pipe = GefUtil.offsetof("watch_queue", "pipe")
+        if offset_pipe is None:
+            offset_pipe = runtime.current_arch.ptrsize * 3
+        if not is_valid_addr_addr(watch_queue + offset_pipe):
+            return False
+        return read_int_from_memory(watch_queue + offset_pipe) == pipe_inode_info
+
+    def is_consistent_layout(self, pipe_files):
+        seen = set()
+        for _file, inode in pipe_files:
+            if inode in seen:
+                continue
+            seen.add(inode)
+            try:
+                pipe_inode_info = read_int_from_memory(inode + self.offset_i_pipe)
+                if not is_valid_addr(pipe_inode_info):
+                    return False
+                state = self.read_ring_state(pipe_inode_info)
+                if not self.is_valid_ring_state(state, self.has_watch_queue(pipe_inode_info)):
+                    return False
+                bufs = read_int_from_memory(pipe_inode_info + self.offset_bufs)
+                if not is_valid_addr(bufs) or not is_valid_addr(bufs + state[4] * self.sizeof_pipe_buffer - 1):
+                    return False
+            except gdb.MemoryError:
+                return False
+        return True
+
+    def get_offset_i_pipe(self, pipe_files):
+        """
+        struct inode {
+            ...
+            struct list_head i_lru;
+            struct list_head i_sb_list;
+            struct list_head i_wb_list;
+            ...
+        #if defined(CONFIG_IMA) || defined(CONFIG_FILE_LOCKING)
+            atomic_t i_readcount;
+        #endif
+            const struct file_operations *i_fop;     // ~v5.1
+            union {                                  // v5.2~
+                const struct file_operations *i_fop; // v5.2~
+                void (*free_inode)(struct inode *);  // v5.2~
+            };                                       // v5.2~
+            struct file_lock_context *i_flctx;
+            struct address_space i_data;
+        #ifdef CONFIG_QUOTA                   // ~v3.18
+            struct dquot *i_dquot[MAXQUOTAS]; // ~v3.18 // MAXQUOTAS=2
+        #endif                                // ~v3.18
+            struct list_head i_devices;       // ~v6.13
+            union {                           // v6.14~
+                struct list_head i_devices;   // v6.14~
+                int i_linklen;                // v6.14~
+            };                                // v6.14~
+            union {
+                struct pipe_inode_info *i_pipe;  <-- here
+                struct block_device *i_bdev;
+                struct cdev *i_cdev;
+                char *i_link;
+                unsigned i_dir_seq;
+            };
+            ...
+        };
+        """
+
+        # plan 1
+        inode = pipe_files[0][1]
+        for i in range(0x100):
+            # search three list_head
+            if not is_double_link_list(inode + runtime.current_arch.ptrsize * (i + 0)):
+                continue
+            if not is_double_link_list(inode + runtime.current_arch.ptrsize * (i + 2)):
+                continue
+            if not is_double_link_list(inode + runtime.current_arch.ptrsize * (i + 4)):
+                continue
+            # search i_pipe
+            for j in range(i + 6, 0x100):
+                if not is_double_link_list(inode + runtime.current_arch.ptrsize * (j + 0)): # i_devices
+                    continue
+                if not is_valid_addr_addr(inode + runtime.current_arch.ptrsize * (j + 2)): # i_pipe
+                    continue
+                if is_double_link_list(inode + runtime.current_arch.ptrsize * (j + 2)): # i_pipe
+                    continue
+                i_pipe = read_int_from_memory(inode + runtime.current_arch.ptrsize * (j + 2))
+                # count 0x10 and 0x01 value
+                count_0x10 = 0
+                count_0x01 = 0
+                for k in range(0x20):
+                    v = read_int32_from_memory(i_pipe + 4 * k)
+                    if v == 0x01:
+                        count_0x01 += 1
+                    if v == 0x10:
+                        count_0x10 += 1
+                    if count_0x10 > 1 or count_0x01 > 3:
+                        offset_i_pipe = runtime.current_arch.ptrsize * (j + 2)
+                        if self.get_offset_head_or_nrbuf(pipe_files, offset_i_pipe) is not None:
+                            return offset_i_pipe
+                        break
+
+        # plan 2
+        for i in range(0x100):
+            v = read_int_from_memory(inode + runtime.current_arch.ptrsize * i)
+            # i_pipe is valid addr
+            if v < 0x10000 or not is_valid_addr(v):
+                continue
+            # skip invalid chunk
+            ret = Kernel.get_slab_contains(v)
+            if ret is None:
+                continue
+            # pipe_inode_info is allocated from kmalloc-192 (x64) or kmalloc-256 (arm64).
+            # sometimes it is allocated from kmalloc-512, kmalloc-128, kmalloc-96 and kmalloc-64.
+            # Other candidates found are kmalloc-2k, kmalloc-1024 and inode_cache (these are false positives),
+            # so these should be excluded.
+            if re.search(r"kmalloc(-cg)?-(64|96|128|192|256|512)", ret):
+                offset_i_pipe = runtime.current_arch.ptrsize * i
+                if self.get_offset_head_or_nrbuf(pipe_files, offset_i_pipe) is not None:
+                    return offset_i_pipe
+
+        return None
+
+    def get_offset_bufs(self, pipe_files):
+        """
+        [v6.7~]
+        struct pipe_inode_info {
+            struct mutex mutex;
+            wait_queue_head_t rd_wait, wr_wait;
+            unsigned int head; // ~v6.13
+            unsigned int tail; // ~v6.13
+            union {                      // v6.14~
+                unsigned long head_tail; // v6.14~
+                struct {                 // v6.14~
+                    pipe_index_t head;   // v6.14~ 32bit:ushort, 64bit:uint
+                    pipe_index_t tail;   // v6.14~ 32bit:ushort, 64bit:uint
+                };                       // v6.14~
+            };                           // v6.14~
+            unsigned int max_usage;
+            unsigned int ring_size;
+            unsigned int nr_accounted;
+            unsigned int readers;
+            unsigned int writers;
+            unsigned int files;
+            unsigned int r_counter;
+            unsigned int w_counter;
+            bool poll_usage;
+        #ifdef CONFIG_WATCH_QUEUE
+            bool note_loss;
+        #endif
+            struct page *tmp_page; // ~v6.14
+            struct page *tmp_page[2]; // v6.15~
+            struct fasync_struct *fasync_readers;
+            struct fasync_struct *fasync_writers;
+            struct pipe_buffer *bufs;
+            struct user_struct *user;
+        #ifdef CONFIG_WATCH_QUEUE
+            struct watch_queue *watch_queue;
+        #endif
+        };
+
+        [v5.5~v6.6]
+        struct pipe_inode_info {
+            struct mutex mutex;
+            wait_queue_head_t rd_wait, wr_wait; // v5.6~
+            wait_queue_head_t wait; // ~v5.5
+            unsigned int head;
+            unsigned int tail;
+            unsigned int max_usage;
+            unsigned int ring_size;
+        #ifdef CONFIG_WATCH_QUEUE // v5.8~
+            bool note_loss;       // v5.8~
+        #endif                    // v5.8~
+            unsigned int nr_accounted; // v5.8~
+            unsigned int readers;
+            unsigned int writers;
+            unsigned int files;
+            unsigned int r_counter;
+            unsigned int w_counter;
+            unsigned int poll_usage; // v5.10, v5.13~ (unsigned int or bool)
+            struct page *tmp_page;
+            struct fasync_struct *fasync_readers;
+            struct fasync_struct *fasync_writers;
+            struct pipe_buffer *bufs;  <-- here
+            struct user_struct *user;
+        #ifdef CONFIG_WATCH_QUEUE            // v5.8~
+            struct watch_queue *watch_queue; // v5.8~
+        #endif                               // v5.8~
+        };
+
+        [~v5.4]
+        struct pipe_inode_info {
+            struct mutex mutex; // v3.10~
+            wait_queue_head_t wait;
+            unsigned int nrbufs, curbuf, buffers;
+            unsigned int readers;
+            unsigned int writers;
+            unsigned int files; // v3.10~
+            unsigned int waiting_writers;
+            unsigned int r_counter;
+            unsigned int w_counter;
+            struct page *tmp_page;
+            struct fasync_struct *fasync_readers;
+            struct fasync_struct *fasync_writers;
+            struct inode *inode; // ~v3.9
+            struct pipe_buffer *bufs; <-- here
+            struct user_struct *user; // v3.10, v3.12, v3.14, v3.16, v3.18, v4.1, v4.4~
+        };
+
+        struct pipe_buffer {
+            struct page *page;
+            unsigned int offset, len;
+            const struct pipe_buf_operations *ops; // allow NULL
+            unsigned int flags;
+            unsigned long private;
+        };
+        """
+
+        # plan 1: validate the complete pipe buffer ring. This also works for
+        # empty pipes and does not depend on allocator metadata.
+        pipe_inode_infos = []
+        for _file, inode in pipe_files:
+            pipe_inode_info = read_int_from_memory(inode + self.offset_i_pipe)
+            if pipe_inode_info not in pipe_inode_infos:
+                pipe_inode_infos.append(pipe_inode_info)
+
+        PAGE_SIZE = KernelAddressHeuristicFinder.consts().PAGE_SIZE
+        fallback_offset = None
+        first_offset = align_to_ptrsize(self.get_header_offsets()[-1] + 4)
+        image_range = KernelAddressHeuristicFinderUtil.get_kernel_image_range()
+        for i in range(first_offset // runtime.current_arch.ptrsize, 0x80):
+            offset_bufs = runtime.current_arch.ptrsize * i
+            found = True
+            followed_by_user = True
+            for pipe_inode_info in pipe_inode_infos:
+                if not is_valid_addr_addr(pipe_inode_info + offset_bufs):
+                    found = False
+                    break
+                # Prefer the usual `bufs, user` pointer pair when `user` is present.
+                if not is_valid_addr_addr(pipe_inode_info + offset_bufs + runtime.current_arch.ptrsize):
+                    followed_by_user = False
+
+                bufs = read_int_from_memory(pipe_inode_info + offset_bufs)
+                if bufs == pipe_inode_info or is_double_link_list(pipe_inode_info + offset_bufs):
+                    found = False
+                    break
+                if image_range and image_range[0] <= bufs < image_range[1]:
+                    found = False
+                    break
+
+                state = self.read_ring_state(pipe_inode_info)
+                if not self.is_valid_ring_state(state, self.has_watch_queue(pipe_inode_info, offset_bufs)):
+                    found = False
+                    break
+                ring_size = state[4]
+                if not is_valid_addr(bufs + ring_size * self.sizeof_pipe_buffer - 1):
+                    found = False
+                    break
+
+                for idx in range(ring_size):
+                    base = bufs + idx * self.sizeof_pipe_buffer
+                    page = read_int_from_memory(base + self.offset_page)
+                    offset = read_int32_from_memory(base + self.offset_offset)
+                    len_ = read_int32_from_memory(base + self.offset_len)
+                    ops = read_int_from_memory(base + self.offset_ops)
+                    flags = read_int32_from_memory(base + self.offset_flags)
+                    if page and not is_valid_addr(page):
+                        found = False
+                        break
+                    if offset > PAGE_SIZE or len_ > PAGE_SIZE or offset + len_ > PAGE_SIZE:
+                        found = False
+                        break
+                    if ops and not is_valid_addr(ops):
+                        found = False
+                        break
+                    if flags & ~0x7f:
+                        found = False
+                        break
+                if not found:
+                    break
+            if found:
+                if followed_by_user:
+                    self.meta.append(("info", "offset of bufs is found by pipe buffer ring (way1-1)"))
+                    return offset_bufs
+                if fallback_offset is None:
+                    fallback_offset = offset_bufs
+
+        if fallback_offset is not None:
+            self.meta.append(("info", "offset of bufs is found by pipe buffer ring (way1-2)"))
+            return fallback_offset
+
+        # plan 2
+        seen = set()
+        for _file, inode in pipe_files:
+            if inode in seen:
+                continue
+            seen.add(inode)
+            pipe_inode_info = read_int_from_memory(inode + self.offset_i_pipe)
+            for i in range(first_offset // runtime.current_arch.ptrsize, 0x40):
+                offset_bufs = runtime.current_arch.ptrsize * i
+                if not is_valid_addr_addr(pipe_inode_info + offset_bufs):
+                    continue
+                if is_double_link_list(pipe_inode_info + offset_bufs):
+                    continue
+                if is_double_link_list(pipe_inode_info + offset_bufs - runtime.current_arch.ptrsize):
+                    continue
+                # bufs
+                bufs = read_int_from_memory(pipe_inode_info + offset_bufs)
+                if image_range and image_range[0] <= bufs < image_range[1]:
+                    continue
+                if is_64bit():
+                    if not is_valid_addr_addr(bufs + runtime.current_arch.ptrsize * 0): # page
+                        continue
+                    len_ = read_int32_from_memory(bufs + runtime.current_arch.ptrsize * 1 + 4) # len
+                    if len_ == 0 or is_valid_addr_addr(bufs + runtime.current_arch.ptrsize * 1): # offset||len
+                        continue
+                    ops = read_int_from_memory(bufs + runtime.current_arch.ptrsize * 2) # ops
+                    if ops != 0 and not is_valid_addr(ops):
+                        continue
+                    if is_valid_addr_addr(bufs + runtime.current_arch.ptrsize * 3): # flags
+                        continue
+                    if is_valid_addr_addr(bufs + runtime.current_arch.ptrsize * 4): # private
+                        continue
+                else:
+                    if not is_valid_addr_addr(bufs + runtime.current_arch.ptrsize * 0): # page
+                        continue
+                    if is_valid_addr_addr(bufs + runtime.current_arch.ptrsize * 1): # offset
+                        continue
+                    len_ = read_int_from_memory(bufs + runtime.current_arch.ptrsize * 2) # len
+                    if len_ == 0 or is_valid_addr_addr(len_):
+                        continue
+                    ops = read_int_from_memory(bufs + runtime.current_arch.ptrsize * 3) # ops
+                    if ops != 0 and not is_valid_addr(ops):
+                        continue
+                    if is_valid_addr_addr(bufs + runtime.current_arch.ptrsize * 4): # flags
+                        continue
+                    if is_valid_addr_addr(bufs + runtime.current_arch.ptrsize * 5): # private
+                        continue
+                # found
+                self.meta.append(("info", "offset of bufs is found by heuristic way2"))
+                return offset_bufs
+
+        # plan 3
+        inode = pipe_files[0][1]
+        pipe_inode_info = read_int_from_memory(inode + self.offset_i_pipe)
+        for i in range(first_offset // runtime.current_arch.ptrsize, 0x80):
+            if not is_valid_addr(pipe_inode_info + runtime.current_arch.ptrsize * i):
+                break
+            v = read_int_from_memory(pipe_inode_info + runtime.current_arch.ptrsize * i)
+            # bufs is valid addr
+            if v < 0x10000 or not is_valid_addr(v):
+                continue
+            # bufs is not self
+            if v == pipe_inode_info:
+                continue
+            if image_range and image_range[0] <= v < image_range[1]:
+                continue
+            # skip invalid chunk
+            ret = Kernel.get_slab_contains(v)
+            if ret is None:
+                continue
+            # pipe_inode_info is allocated from kmalloc-1k (x64) or kmalloc-512 (x86)
+            if re.search(r"kmalloc(-cg)?-(1k|1024|512)", ret):
+                self.meta.append(("info", "offset of bufs is found by heuristic way3-1"))
+                return runtime.current_arch.ptrsize * i
+            # before v5.5, pipe_buffer is allocated not from slub, but `user` is allocated from slub.
+            if not self.ring_buffer and "uid_cache" in ret:
+                self.meta.append(("info", "offset of bufs is found by heuristic way3-2"))
+                return runtime.current_arch.ptrsize * (i - 1)
+        return None
+
+    def get_offset_head_or_nrbuf(self, pipe_files, offset_i_pipe=None):
+        if offset_i_pipe is None:
+            offset_i_pipe = self.offset_i_pipe
+
+        pipe_inode_infos = []
+        seen_inodes = set()
+        for _file_addr, inode in pipe_files:
+            if inode in seen_inodes:
+                continue
+            seen_inodes.add(inode)
+            if not is_valid_addr_addr(inode + offset_i_pipe):
+                return None
+            pipe_inode_info = read_int_from_memory(inode + offset_i_pipe)
+            pipe_inode_infos.append(pipe_inode_info)
+
+        # the header resolved from the debug info only needs to be validated
+        if self.get_header_offsets()[0] is not None:
+            candidates = [self.get_header_offsets()[0]]
+        else:
+            candidates = [runtime.current_arch.ptrsize * i for i in range(3, 0x40)]
+
+        for offset in candidates:
+            offsets = self.get_header_offsets(offset)
+            found = True
+            for pipe_inode_info in pipe_inode_infos:
+                if self.get_header_offsets()[0] is None:
+                    if not is_double_link_list(pipe_inode_info + offset - runtime.current_arch.ptrsize * 2):
+                        found = False
+                        break
+                    if is_double_link_list(pipe_inode_info + offset):
+                        found = False
+                        break
+                state = self.read_ring_state(pipe_inode_info, offsets)
+                if not self.is_valid_ring_state(state, bool(Ksym.get_addr("watch_queue_set_size"))):
+                    found = False
+                    break
+            if found:
+                return offset
+        return None
+
+
+
+class KernelSocket:
+    """Resolve socket layouts and read socket fields and skb queues."""
+
+    # socket->state (socket_state)
+    SS_STATE = {0: "SS_FREE", 1: "SS_UNCONNECTED", 2: "SS_CONNECTING", 3: "SS_CONNECTED", 4: "SS_DISCONNECTING"}
+    # socket->type (SOCK_*)
+    SOCK_TYPE = {1: "SOCK_STREAM", 2: "SOCK_DGRAM", 3: "SOCK_RAW", 4: "SOCK_RDM",
+                 5: "SOCK_SEQPACKET", 6: "SOCK_DCCP", 10: "SOCK_PACKET"}
+    # TCP_* labels for sk->__sk_common.skc_state; other protocols use their own state values.
+    SK_STATE = {1: "TCP_ESTABLISHED", 2: "TCP_SYN_SENT", 3: "TCP_SYN_RECV", 4: "TCP_FIN_WAIT1",
+                5: "TCP_FIN_WAIT2", 6: "TCP_TIME_WAIT", 7: "TCP_CLOSE", 8: "TCP_CLOSE_WAIT",
+                9: "TCP_LAST_ACK", 10: "TCP_LISTEN", 11: "TCP_CLOSING", 12: "TCP_NEW_SYN_RECV"}
+    # address family (partial, only the common ones)
+    AF_FAMILY = {0: "AF_UNSPEC", 1: "AF_UNIX", 2: "AF_INET", 10: "AF_INET6", 16: "AF_NETLINK",
+                 17: "AF_PACKET", 4: "AF_IPX", 5: "AF_APPLETALK", 29: "AF_CAN", 30: "AF_TIPC", 31: "AF_BLUETOOTH",
+                 38: "AF_ALG", 39: "AF_NFC", 40: "AF_VSOCK", 41: "AF_KCM", 43: "AF_SMC",
+                 44: "AF_XDP", 45: "AF_MCTP"}
+
+    # (key, struct, member) resolved from the debug info
+    DWARF_MEMBERS = [
+        ("file.private_data", "file", "private_data"),
+        ("socket.state", "socket", "state"),
+        ("socket.type", "socket", "type"),
+        ("socket.file", "socket", "file"),
+        ("socket.sk", "socket", "sk"),
+        ("socket.ops", "socket", "ops"),
+        ("sock.skc_family", "sock", "__sk_common.skc_family"),
+        ("sock.skc_state", "sock", "__sk_common.skc_state"),
+        ("sock.skc_prot", "sock", "__sk_common.skc_prot"),
+        ("sock.sk_error_queue", "sock", "sk_error_queue"),
+        ("sock.sk_receive_queue", "sock", "sk_receive_queue"),
+        ("sock.sk_write_queue", "sock", "sk_write_queue"),
+        ("sock.sk_socket", "sock", "sk_socket"),
+        ("sock.sk_state_change", "sock", "sk_state_change"),
+        ("sock.sk_data_ready", "sock", "sk_data_ready"),
+        ("sock.sk_write_space", "sock", "sk_write_space"),
+        ("sock.sk_error_report", "sock", "sk_error_report"),
+        ("sock.sk_destruct", "sock", "sk_destruct"),
+        ("proto.name", "proto", "name"),
+    ]
+
+    PROTO_SYMBOL_RE = re.compile(r"(?:_prot|_proto|proto)$")
+
+    # sk callbacks, matched by resolved symbol name. Their relative order in struct sock is not
+    # stable (v6.10 pulled sk_data_ready out of the state_change/write_space/error_report run and
+    # moved it next to the RX path), so classify by name instead of by adjacency. Each role lists
+    # the default symbols, then keyword patterns that also catch protocol overrides.
+    CALLBACKS = [
+        ("sk_state_change", ("sock_def_wakeup",), (r"state_change",)),
+        ("sk_data_ready", ("sock_def_readable",), (r"data_ready",)),
+        ("sk_write_space", ("sock_def_write_space", "sk_stream_write_space"), (r"write_space$",)),
+        ("sk_error_report", ("sock_def_error_report",), (r"error_report",)),
+        ("sk_destruct", ("inet_sock_destruct", "unix_sock_destructor", "sock_def_destruct"),
+         (r"destruct",)),
+    ]
+
+    @classmethod
+    @Cache.cache_this_session(per_inferior=True, until_new_objfile=True)
+    def get_instance(cls):
+        return cls()
+
+    def __init__(self):
+        self.meta = []
+        return
+
+    def initialize(self):
+        self.meta = []
+        self.layout_meta = []
+        self.dwarf = self.resolve_by_dwarf()
+        self.dwarf_mismatch = set()
+        self.offset_proto_name = None
+        return True
+
+    def parse_sock(self, sk, socket, file, details):
+        # sk->sk_socket back pointer
+        offset_sk_socket = self.dwarf["sock.sk_socket"]
+        if socket and offset_sk_socket is not None:
+            if read_int_from_memory(sk + offset_sk_socket) == socket:
+                self.add_meta("offsetof(sock, sk_socket)", offset_sk_socket, "DWARF")
+            else:
+                self.warn_dwarf_mismatch("struct sock")
+
+        # protocol (resolve first, its family hint disambiguates skc_family)
+        prot, prot_sym, prot_name, offset_prot, source = self.find_skc_prot(sk)
+        prot_iname = None
+        if prot_name:
+            prot_iname, offset_name, source_name = prot_name
+        if prot is not None:
+            proto_hint = self.proto_hint_family(prot_iname or prot_sym)
+        else:
+            proto_hint = None
+        if prot is not None:
+            self.add_meta("offsetof(sock, __sk_common.skc_prot)", offset_prot, source)
+            if prot_name:
+                self.add_meta("offsetof(proto, name)", offset_name, source_name)
+
+        # family / state
+        fam, off_fam, off_state, source = self.find_skc_family(sk, proto_hint)
+        state = None
+        if fam is not None:
+            self.add_meta("offsetof(sock, __sk_common.skc_family)", off_fam, source)
+            self.add_meta("offsetof(sock, __sk_common.skc_state)", off_state, source)
+            if details:
+                state = read_int8_from_memory(sk + off_state)
+
+        # socket->{type,state}
+        stype = sstate = None
+        if socket and details:
+            offset_state = self.dwarf["socket.state"]
+            offset_type = self.dwarf["socket.type"]
+            if offset_state is None or offset_type is None:
+                offset_state, offset_type = 0, 4
+            stype = read_int16_from_memory(socket + offset_type)
+            sstate = read_int32_from_memory(socket + offset_state)
+
+        # callbacks follow all queues except sk_data_ready
+        callbacks = self.find_callbacks(sk)
+        limit = [off for label, _, _, off, _ in callbacks if label not in ["sk_data_ready", "sk_destruct"]]
+        if limit:
+            limit = min(limit)
+        else:
+            limit = None
+
+        # queues
+        queues, size, source = self.find_queues(sk, limit)
+        for name in ("receive_queue", "write_queue", "error_queue"):
+            if name in queues:
+                self.add_meta("offsetof(sock, sk_{:s})".format(name), queues[name], source)
+        if size is not None:
+            self.add_meta("sizeof(sk_buff_head)", size, source)
+
+        for label, _, _, off, source in callbacks:
+            self.add_meta("offsetof(sock, {:s})".format(label), off, source)
+        return {
+            "sock": sk, "socket": socket, "file": file, "family": fam, "state": state,
+            "type": stype, "socket_state": sstate, "protocol": prot,
+            "protocol_symbol": prot_sym, "protocol_name": prot_iname,
+            "queues": queues, "callbacks": callbacks, "meta": self.layout_meta,
+        }
+
+    def get_socket(self, sk=None, file=None, details=True):
+        self.layout_meta = []
+        if sk is None:
+            socket, ret = self.find_socket_from_file(file)
+            if ret is None:
+                return {"socket": None, "file": file, "meta": []}
+            file, sk, ops, offsets, source = ret
+            for name, offset in zip(["file", "sk", "ops"], offsets):
+                self.add_meta("offsetof(socket, {:s})".format(name), offset, source)
+        else:
+            socket, ret = self.find_socket_from_sock(sk)
+            if ret:
+                file = ret[0]
+            else:
+                file = None
+        return self.parse_sock(sk, socket, file, details)
+
+    def get_queue(self, sk, off):
+        head = sk + off
+        qlen = self.is_sk_buff_head(head)
+        skbs = []
+        truncated = False
+        if qlen:
+            for skb in KernelListHead(head, 0).iter_entries():
+                skbs.append(skb)
+                if len(skbs) >= 0x1000:
+                    truncated = read_int_from_memory(skb, safe=True) != head
+                    break
+        return {"address": head, "qlen": qlen if qlen else 0, "skbs": skbs, "truncated": truncated}
+
+    def collect_socket_files(self):
+        """Parse `ktask --print-fd` and return the socket file descriptors with their owning task."""
+        ret = gdb.execute("ktask --no-pager --user-process-only --print-fd --quiet", to_string=True)
+        ret = Color.remove_color(ret)
+        socks = []
+        pid, comm, task = None, None, None
+        task_re = re.compile(r"^(0x\w+)\s+\S+\s+[UK]T?\s+(\d+)\s+(.+?)\s+0x\w+ \[")
+        fd_re = re.compile(r"^(\d+)\s+\S+\s+(0x\w+)\s+(0x\w+)\s+(0x\w+)\s+socket:\[(\d+)\]")
+        title_re = re.compile(r"file descriptors of `(.+)`")
+        any_fd_re = re.compile(r"^\d+\s+(True|False)\s+0x")
+        any_task = any_fd = False
+        for line in ret.splitlines():
+            line = line.strip()
+            m = task_re.match(line)
+            if m:
+                task = int(m.group(1), 16)
+                pid = int(m.group(2))
+                comm = m.group(3).strip()
+                any_task = True
+                continue
+            if any_fd_re.match(line):
+                any_fd = True
+            m = title_re.search(line)
+            if m:
+                comm = m.group(1)
+                continue
+            m = fd_re.match(line)
+            if m:
+                socks.append({
+                    "pid": pid, "comm": comm, "task": task,
+                    "fd": int(m.group(1)), "file": int(m.group(2), 16),
+                    "dentry": int(m.group(3), 16), "inode": int(m.group(4), 16),
+                    "ino": int(m.group(5)),
+                })
+        for line in ret.splitlines():
+            if line.startswith("[!]"):
+                self.meta.append(("err", line[3:].lstrip()))
+                return None
+        # `ktask` disables --print-fd silently if the file layout is not resolved
+        if not socks and any_task and not any_fd:
+            self.meta.append(("err", "Could not list the file descriptors (see `ktask --print-fd --meta`)"))
+            return None
+        return socks
+
+    def add_meta(self, name, value, source):
+        self.layout_meta.append((name, value, source))
+        return
+
+    def warn_dwarf_mismatch(self, type_name):
+        if type_name in self.dwarf_mismatch:
+            return
+        self.dwarf_mismatch.add(type_name)
+        self.meta.append(("warn", "The debug info of {:s} does not match the memory; fall back to heuristic".format(type_name)))
+        return
+
+    @Cache.cache_this_session(per_inferior=True, until_new_objfile=True)
+    def resolve_by_dwarf(self):
+        layout = {}
+        for key, type_name, member in self.DWARF_MEMBERS:
+            layout[key] = GefUtil.offsetof(type_name, member)
+        return layout
+
+    def is_sk_buff_head(self, addr):
+        """Return the qlen if `addr` is an embedded `struct sk_buff_head`, or None."""
+        try:
+            nxt = read_int_from_memory(addr)
+            prv = read_int_from_memory(addr + runtime.current_arch.ptrsize)
+            qlen = read_int32_from_memory(addr + runtime.current_arch.ptrsize * 2)
+        except gdb.MemoryError:
+            return None
+        if qlen > 0x10000:
+            return None
+        # empty queue: head points to itself
+        if nxt == addr and prv == addr:
+            if qlen == 0:
+                return 0
+            return None
+        # non-empty queue: walk the circular list and confirm the count matches qlen
+        if not is_valid_addr(nxt) or not is_valid_addr(prv):
+            return None
+        count = 0
+        cur = nxt
+        seen = set()
+        while cur != addr:
+            if cur in seen or not is_valid_addr(cur) or count > 0x10000:
+                return None
+            seen.add(cur)
+            count += 1
+            cur = read_int_from_memory(cur, safe=True)
+            if cur is None:
+                return None
+        if count != qlen:
+            return None
+        return qlen
+
+    def find_socket_from_file(self, file):
+        """file->private_data points to `struct socket`. Confirm it with the socket->file back pointer."""
+        ptr = runtime.current_arch.ptrsize
+        offset = self.dwarf["file.private_data"]
+        if offset is not None:
+            socket = read_int_from_memory(file + offset)
+            ret = self.validate_socket(socket, file=file)
+            if ret:
+                self.add_meta("offsetof(file, private_data)", offset, "DWARF")
+                return socket, ret
+            self.warn_dwarf_mismatch("struct file")
+        for i in range(0x40):
+            socket = read_int_from_memory(file + ptr * i)
+            ret = self.validate_socket(socket, file=file)
+            if ret:
+                self.add_meta("offsetof(file, private_data)", ptr * i, "heuristic")
+                return socket, ret
+        return None, None
+
+    def find_socket_from_sock(self, sk):
+        """Direct mode: locate the `struct socket` that owns `sk` via the sk->sk_socket and socket->sk pointers."""
+        ptr = runtime.current_arch.ptrsize
+        offset = self.dwarf["sock.sk_socket"]
+        if offset is not None:
+            socket = read_int_from_memory(sk + offset)
+            ret = self.validate_socket(socket, sk=sk)
+            if ret:
+                self.add_meta("offsetof(sock, sk_socket)", offset, "DWARF")
+                return socket, ret
+            if socket == 0:
+                # not attached to a socket (e.g., orphaned)
+                return None, None
+            self.warn_dwarf_mismatch("struct sock")
+        # sk->sk_socket lives a few hundred bytes into struct sock.
+        for i in range(4, 0x80):
+            socket = read_int_from_memory(sk + ptr * i)
+            ret = self.validate_socket(socket, sk=sk)
+            if ret:
+                self.add_meta("offsetof(sock, sk_socket)", ptr * i, "heuristic")
+                return socket, ret
+        return None, None
+
+    def validate_socket(self, socket, file=None, sk=None):
+        """Return (file, sk, ops, (offset_file, offset_sk, offset_ops), source) if `socket` looks like a `struct socket`.
+        The socket->file back pointer must be `file`, or socket->sk must be `sk`."""
+        ptr = runtime.current_arch.ptrsize
+        if not is_valid_addr(socket) or (socket & (ptr - 1)):
+            return None
+        offset_state = self.dwarf["socket.state"]
+        offset_type = self.dwarf["socket.type"]
+        if offset_state is None or offset_type is None:
+            offset_state, offset_type = 0, 4
+        try:
+            state = read_int32_from_memory(socket + offset_state)
+            type_ = read_int16_from_memory(socket + offset_type)
+        except gdb.MemoryError:
+            return None
+        if state not in self.SS_STATE or type_ not in self.SOCK_TYPE:
+            return None
+
+        # socket->{file, sk, ops} are three consecutive pointers.
+        layouts = []
+        offsets = (self.dwarf["socket.file"], self.dwarf["socket.sk"], self.dwarf["socket.ops"])
+        if None not in offsets:
+            layouts.append((offsets, "DWARF"))
+        layouts += [((ptr * j, ptr * (j + 1), ptr * (j + 2)), "heuristic") for j in range(2, 8)]
+        for (offset_file, offset_sk, offset_ops), source in layouts:
+            try:
+                file_ = read_int_from_memory(socket + offset_file)
+                sk_ = read_int_from_memory(socket + offset_sk)
+                ops = read_int_from_memory(socket + offset_ops)
+            except gdb.MemoryError:
+                continue
+            if file is not None and file_ != file:
+                continue
+            if sk is not None and sk_ != sk:
+                continue
+            if not is_valid_addr(sk_) or (sk_ & (ptr - 1)):
+                continue
+            if not is_valid_addr(ops):
+                continue
+            if source != "DWARF" and None not in offsets:
+                self.warn_dwarf_mismatch("struct socket")
+            return file_, sk_, ops, (offset_file, offset_sk, offset_ops), source
+        return None
+
+    def is_proto_name(self, name):
+        return bool(name and 2 <= len(name) < 0x20 and re.fullmatch(r"[A-Za-z][A-Za-z0-9+/_.-]*", name))
+
+    def read_proto_name(self, prot):
+        """Return (name, offset, source) of the inline `char name[32]` of `struct proto`, or None if `prot` is not verified.
+        Without the debug info, it is verified by `struct list_head node` that follows the name
+        and links all registered protocols."""
+        ptr = runtime.current_arch.ptrsize
+        dwarf_offset = self.dwarf["proto.name"]
+        if dwarf_offset is not None:
+            name = read_cstring_from_memory(prot + dwarf_offset, 0x20, safe=True)
+            if self.is_proto_name(name):
+                return name, dwarf_offset, "DWARF"
+
+        if self.offset_proto_name is not None:
+            offsets = [self.offset_proto_name]
+        else:
+            offsets = range(0, ptr * 0x60, ptr)
+        for offset in offsets:
+            name = read_cstring_from_memory(prot + offset, 0x20, safe=True)
+            if not self.is_proto_name(name):
+                continue
+            node = prot + offset + 0x20
+            nxt = read_int_from_memory(node, safe=True)
+            prv = read_int_from_memory(node + ptr, safe=True)
+            if nxt is None or prv is None or nxt == node:
+                continue
+            if not is_valid_addr(nxt) or not is_valid_addr(prv):
+                continue
+            if read_int_from_memory(nxt + ptr, safe=True) != node or read_int_from_memory(prv, safe=True) != node:
+                continue
+            if dwarf_offset is not None:
+                self.warn_dwarf_mismatch("struct proto")
+            self.offset_proto_name = offset
+            return name, offset, "heuristic"
+        return None
+
+    def find_skc_prot(self, sk):
+        """skc_prot is a `struct proto*` in sock_common. Return (prot, symbol_name, name, offset, source),
+        where `name` is the return value of `read_proto_name()`.
+        It usually resolves to a static symbol (e.g. tcp_prot), but with CONFIG_KALLSYMS_ALL=n the
+        data symbol is missing, so fall back to the verified inline proto->name string."""
+        ptr = runtime.current_arch.ptrsize
+        offset = self.dwarf["sock.skc_prot"]
+        if offset is not None:
+            prot = read_int_from_memory(sk + offset)
+            if is_valid_addr(prot):
+                name = Symbol.format(prot, ksym="prefer", bracket="")
+                ret = self.read_proto_name(prot)
+                if ret or self.PROTO_SYMBOL_RE.search(name):
+                    return prot, name or None, ret, offset, "DWARF"
+            self.warn_dwarf_mismatch("struct sock_common")
+
+        # pass 1: a resolvable symbol whose name looks like a proto (fast, needs CONFIG_KALLSYMS_ALL=y).
+        for i in range(3, 0x12):
+            prot = read_int_from_memory(sk + ptr * i)
+            if not is_valid_addr(prot) or (prot & (ptr - 1)):
+                continue
+            name = Symbol.format(prot, ksym="prefer", bracket="")
+            if name and self.PROTO_SYMBOL_RE.search(name):
+                return prot, name, self.read_proto_name(prot), ptr * i, "heuristic"
+        # pass 2: a pointer to a verified `struct proto`.
+        for i in range(3, 0x12):
+            prot = read_int_from_memory(sk + ptr * i)
+            if not is_valid_addr(prot) or (prot & (ptr - 1)):
+                continue
+            if not KernelAddressHeuristicFinderUtil.is_kernel_space(prot):
+                continue
+            ret = self.read_proto_name(prot)
+            if ret:
+                name = Symbol.format(prot, ksym="prefer", bracket="")
+                return prot, name or None, ret, ptr * i, "heuristic"
+        return None, None, None, None, None
+
+    def proto_hint_family(self, proto_name):
+        """Guess the address family from the `struct proto` symbol name."""
+        if not proto_name:
+            return None
+        n = proto_name.lower()
+        if "v6" in n or n.endswith("6_prot") or n.endswith("6_proto"):
+            return 10  # AF_INET6
+        if "unix" in n:
+            return 1   # AF_UNIX
+        if "netlink" in n:
+            return 16  # AF_NETLINK
+        if "packet" in n:
+            return 17  # AF_PACKET
+        if re.match(r"(tcp|udp|raw|ping|dccp|udplite|sctp|mptcp|inet)", n):
+            return 2   # AF_INET
+        return None
+
+    def find_skc_family(self, sk, proto_hint=None):
+        """skc_family (unsigned short) is followed by skc_state (unsigned char).
+        Return (family, offset_family, offset_state, source).
+        skc_family lives at offset 0x10 of sock_common (after skc_addrpair/skc_hash/skc_portpair).
+        If it does not look valid, scan and prefer the value that agrees with the protocol family
+        implied by skc_prot."""
+        offset_family = self.dwarf["sock.skc_family"]
+        offset_state = self.dwarf["sock.skc_state"]
+        if offset_family is not None and offset_state is not None:
+            fam = read_int16_from_memory(sk + offset_family)
+            if 0 < fam < 0x40: # AF_MAX
+                return fam, offset_family, offset_state, "DWARF"
+            self.warn_dwarf_mismatch("struct sock_common")
+
+        matches = []
+        for off in range(4, 0x28, 2):
+            fam = read_int16_from_memory(sk + off)
+            if not fam or (fam not in self.AF_FAMILY and not (off == 0x10 and 0 < fam < 0x40)):
+                continue
+            st = read_int8_from_memory(sk + off + 2)
+            if st > 12:  # layout heuristic; protocol-specific state names are handled later
+                continue
+            matches.append((off, fam, st))
+        if not matches:
+            return None, None, None, None
+        # skc_family is at 0x10 on all supported kernels; the others are the last resort
+        matches.sort(key=lambda x: x[0] != 0x10)
+        if proto_hint is not None:
+            for off, fam, _st in matches:
+                if fam == proto_hint:
+                    return fam, off, off + 2, "heuristic"
+        off, fam, _st = matches[0]
+        return fam, off, off + 2, "heuristic"
+
+    def looks_like_backlog(self, addr):
+        """`struct { atomic_t rmem_alloc; int len; struct sk_buff *head, *tail; } sk_backlog`.
+        This struct always immediately follows sk_receive_queue, which is how we anchor it."""
+        try:
+            rmem = read_int32_from_memory(addr)
+            length = read_int32_from_memory(addr + 4)
+            head = read_int_from_memory(addr + 8)
+            tail = read_int_from_memory(addr + 8 + runtime.current_arch.ptrsize)
+        except gdb.MemoryError:
+            return False
+        if rmem > 0x1000_0000 or length > 0x100_0000:
+            return False
+        if head == 0 and tail == 0:
+            return True
+        if not is_valid_addr(head) or not is_valid_addr(tail):
+            return False
+        # A non-empty backlog always carries len > 0. When `addr` is really sk_error_queue, its
+        # +0x18 neighbour is sk_rx_skb_cache followed by sk_receive_queue whose next/prev point to
+        # real skbs (head != 0) while len stays 0 -- reject that.
+        if length == 0:
+            return False
+        # a queued backlog skb is a real skb, never a self-pointing list head.
+        next_head = read_int_from_memory(head, safe=True)
+        next_tail = read_int_from_memory(tail, safe=True)
+        if next_head is None or next_tail is None:
+            return False
+        if next_head == head or next_tail == tail:
+            return False
+        return True
+
+    def find_queues(self, sk, limit):
+        """Locate sk_error_queue / sk_receive_queue / sk_write_queue (the embedded sk_buff_heads).
+        Returns ({name: offset}, sizeof(struct sk_buff_head) or None, source).
+
+        [~v4.9]  sk_lock, sk_receive_queue, sk_backlog, ..., sk_write_queue, ..., sk_error_queue
+                 (sk_async_wait_queue sits before sk_write_queue on ~v3.18 with CONFIG_NET_DMA=y)
+        [v4.10~] sk_lock, sk_error_queue, [sk_rx_skb_cache,] sk_receive_queue, sk_backlog, ..., sk_write_queue
+        [v6.10~] sk_error_queue, sk_receive_queue, sk_backlog, ..., sk_lock, ..., sk_write_queue
+
+        Empty wait_queue_head list heads inside sk_lock masquerade as empty sk_buff_heads, so we
+        anchor on sk_backlog (which always immediately follows sk_receive_queue) instead of trusting
+        every self-pointing list head. `limit` is the offset of the callbacks that follow all queues, if known."""
+        names = ["error_queue", "receive_queue", "write_queue"]
+        offsets = [self.dwarf["sock.sk_" + name] for name in names]
+        if None not in offsets:
+            if all(self.is_sk_buff_head(sk + offset) is not None for offset in offsets):
+                return dict(zip(names, offsets)), None, "DWARF"
+            self.warn_dwarf_mismatch("struct sock")
+
+        ptr = runtime.current_arch.ptrsize
+        end = limit or ptr * 0x80
+        cands = [off for off in range(ptr * 8, end, ptr) if self.is_sk_buff_head(sk + off) is not None]
+        if not cands:
+            return {}, None, "heuristic"
+
+        # sizeof(struct sk_buff_head) = next + prev + qlen(4) + spinlock, which grows with the lock debugging.
+        min_size = align_to_ptrsize(ptr * 2 + 4)
+        kversion = Kernel.version()
+        max_size = 0x80
+
+        def is_followed_by_backlog(offset, size):
+            # the queue cannot contain another queue
+            if any(offset < x < offset + size for x in cands):
+                return False
+            return self.looks_like_backlog(sk + offset + size)
+
+        def find_old_layout():
+            # the lowest queue followed by sk_backlog is sk_receive_queue.
+            for receive in cands:
+                if not any(is_followed_by_backlog(receive, size) for size in range(min_size, max_size + 1, ptr)):
+                    continue
+                after = [x for x in cands if x > receive]
+                result = {"receive_queue": receive}
+                if len(after) >= 2:
+                    result["write_queue"], result["error_queue"] = after[-2:]
+                elif after:
+                    result["write_queue"] = after[0]
+                return result, None
+            return None
+
+        def find_new_layout():
+            # sk_error_queue and sk_receive_queue are adjacent and have the same size.
+            # sk_rx_skb_cache sits between them on v5.1~v5.15.
+            best = None
+            for error, receive in zip(cands, cands[1:]):
+                sizes = [receive - error, receive - error - ptr]
+                if kversion and "5.1" <= kversion < "5.16":
+                    sizes.reverse()
+                for size in sizes:
+                    if not min_size <= size <= max_size:
+                        continue
+                    if not is_followed_by_backlog(receive, size):
+                        continue
+                    # sk_error_queue itself is followed by sk_rx_skb_cache or sk_receive_queue
+                    if self.looks_like_backlog(sk + error + size):
+                        continue
+                    if best is None or size < best[2]:
+                        best = (error, receive, size)
+                    break
+            if best is None:
+                return None
+            error, receive, size = best
+            result = {"error_queue": error, "receive_queue": receive}
+            # sk_write_queue is the last queue; sk_lock sits between them on v6.10~.
+            after = [x for x in cands if x > receive]
+            if after:
+                if limit:
+                    result["write_queue"] = after[-1]
+                else:
+                    result["write_queue"] = after[0]
+            return result, size
+
+        if kversion and kversion < "4.10":
+            finders = [find_old_layout, find_new_layout]
+        else:
+            finders = [find_new_layout, find_old_layout]
+        for finder in finders:
+            ret = finder()
+            if ret:
+                return ret[0], ret[1], "heuristic"
+        return {}, None, "heuristic"
+
+    def find_callbacks(self, sk):
+        """Resolve the sk_* callbacks. Returns [(label, addr, name, offset, source), ...].
+        Without the debug info, scan struct sock for symbol-resolvable function pointers and classify each by name."""
+        offsets = [self.dwarf["sock." + label] for label, _, _ in self.CALLBACKS]
+        if None not in offsets:
+            found = []
+            for (label, _, _), offset in zip(self.CALLBACKS, offsets):
+                p = read_int_from_memory(sk + offset)
+                found.append((label, p, Symbol.format(p, ksym="prefer", bracket=""), offset, "DWARF"))
+            # sock_init_data() sets all of them, and only sk_destruct can be NULL.
+            if all(is_valid_addr(p) for label, p, _, _, _ in found if label != "sk_destruct"):
+                return found
+            self.warn_dwarf_mismatch("struct sock")
+
+        # struct sock is up to 0x230 bytes on 32-bit and 0x320 bytes on 64-bit, and grows with the lock debugging.
+        slots = []
+        for off in range(runtime.current_arch.ptrsize * 8, 0x800, runtime.current_arch.ptrsize):
+            p = read_int_from_memory(sk + off, safe=True)
+            if p is None:
+                break
+            if not is_valid_addr(p) or not KernelAddressHeuristicFinderUtil.is_kernel_space(p):
+                continue
+            nm = Symbol.format(p, ksym="prefer", bracket="")
+            if nm:
+                slots.append((off, p, nm))
+
+        # the lowest match wins, since the scan may run into the next object in the slab
+        found = []
+        used = set()
+        for label, exacts, patterns in self.CALLBACKS:
+            best = None
+            for off, p, nm in slots:
+                if off not in used and (nm in exacts or any(re.search(pat, nm) for pat in patterns)):
+                    best = (off, p, nm)
+                    break
+            if best is not None:
+                used.add(best[0])
+                found.append((label, best[1], best[2], best[0], "heuristic"))
+        return found
+
+
+
+class KernelSkbuff:
+    """Resolve sk_buff layouts and read packet fields, fragments and data."""
+
+    @classmethod
+    @Cache.cache_this_session(per_inferior=True, until_new_objfile=True)
+    def get_instance(cls):
+        return cls()
+
+    @staticmethod
+    def resolve_layout(skb, check_shinfo=True):
+        """Resolve the sk_buff layout at `skb`. Returns a dict, or None.
+        The debug info is used if it matches the memory, otherwise the live layout is probed."""
+        offsets = KernelSkbuff.get_dwarf_layout()
+        dwarf_mismatch = False
+        if offsets:
+            layout = KernelSkbuff.read_layout(skb, offsets)
+            if layout:
+                layout.update(source="DWARF", candidates=1, dwarf_mismatch=False)
+                return layout
+            dwarf_mismatch = True
+        ret = KernelSkbuff.probe_layout(skb, check_shinfo)
+        if ret is None:
+            return None
+        layout, candidates = ret
+        layout.update(source="heuristic", candidates=candidates, dwarf_mismatch=dwarf_mismatch)
+        return layout
+
+    @staticmethod
+    def resolve_shared_info_layout(shinfo):
+        dwarf = KernelSkbuff.get_shared_info_dwarf_layout()
+        if dwarf is not None:
+            nr_offset, nr_size, frag_list_offset, max_frags = dwarf
+            max_frags = max_frags or 0xff
+            try:
+                if nr_size == 2:
+                    nr_frags = read_int16_from_memory(shinfo + nr_offset)
+                else:
+                    nr_frags = read_int8_from_memory(shinfo + nr_offset)
+                frag_list = read_int_from_memory(shinfo + frag_list_offset)
+            except gdb.MemoryError:
+                return None
+            if nr_frags <= max_frags and (frag_list == 0 or is_valid_addr(frag_list)):
+                return nr_frags, frag_list, nr_offset, max_frags, "DWARF"
+
+        # nr_frags layouts used by supported kernels:
+        #   v3.0-v3.2: u16 at +0, frag_list at +0x10
+        #   v3.3-v4.11: u8 at +0, frag_list at +0x8
+        #   v4.12-:     u8 at +2, frag_list at +0x8
+        # CONFIG_MAX_SKB_FRAGS is configurable on newer kernels; 0xff is the
+        # storage-type limit and avoids baking the default value 17 into the probe.
+        layouts = [
+            (2, 1, 8, 4, 6),
+            (0, 1, 8, 2, 4),
+            (0, 2, 16, 2, 4),
+        ]
+        kversion = Kernel.version()
+        if kversion and "4.12" <= kversion:
+            preferred = 0
+        elif kversion and "3.3" <= kversion:
+            preferred = 1
+        else:
+            preferred = 2
+        candidates = []
+        for index, layout in enumerate(layouts):
+            result = KernelSkbuff.score_shared_info_layout(shinfo, layout, 0xff)
+            if result is None:
+                continue
+            score, nr_frags, frag_list = result
+            if index == preferred:
+                score += 1
+            candidates.append((score, -index, nr_frags, frag_list, layout[0]))
+        if not candidates:
+            return None
+        best = max(candidates)
+        return best[2], best[3], best[4], None, "live layout probe"
+
+    def get_skb(self, skb, layout=None):
+        if layout is None:
+            layout = self.resolve_layout(skb)
+        if layout is None:
+            return None
+        ptr = runtime.current_arch.ptrsize
+        # next / prev (list linkage at offset 0)
+        nxt = read_int_from_memory(skb)
+        prv = read_int_from_memory(skb + ptr)
+        len_v = data_len = None
+        if layout["len"] is not None and layout["data_len"] is not None:
+            len_v = read_int32_from_memory(skb + layout["len"])
+            data_len = read_int32_from_memory(skb + layout["data_len"])
+        if layout["truesize"] is not None:
+            truesize = read_int32_from_memory(skb + layout["truesize"])
+        else:
+            truesize = None
+        if layout["users"] is not None:
+            users = read_int32_from_memory(skb + layout["users"])
+        else:
+            users = None
+        return {
+            "address": skb, "layout": layout, "next": nxt, "prev": prv,
+            "len": len_v, "data_len": data_len, "truesize": truesize, "users": users,
+            "destructor": self.find_destructor(skb, layout),
+        }
+
+    def get_frags(self, shinfo, nr_frags):
+        frag_layout = self.get_frag_dwarf_layout()
+        if frag_layout is None:
+            return []
+        offset_frags, sizeof_frag, (page_offset, page_size), (offset_offset, offset_size), (size_offset, size_size) = frag_layout
+
+        def read_member(addr, size):
+            return {1: read_int8_from_memory, 2: read_int16_from_memory, 4: read_int32_from_memory,
+                    8: read_int64_from_memory}[size](addr)
+
+        fragments = []
+        for i in range(nr_frags):
+            frag = shinfo + offset_frags + sizeof_frag * i
+            try:
+                page = read_member(frag + page_offset, page_size)
+                offset = read_member(frag + offset_offset, offset_size)
+                size = read_member(frag + size_offset, size_size)
+            except gdb.MemoryError:
+                fragments.append({"index": i, "error": "unreadable"})
+                continue
+            # the lowest bit of netmem_ref marks a net_iov, which is not a struct page
+            if page and not page & 1:
+                virt = Kernel.page2virt(page)
+            else:
+                virt = None
+            fragments.append({"index": i, "page": page, "offset": offset, "size": size, "virt": virt})
+        return fragments
+
+    @staticmethod
+    def get_data(layout):
+        data = layout["data_value"]
+        headlen = layout["tail_value"] - (data - layout["head_value"])
+        size = min(0x40, headlen)
+        raw = b""
+        if size:
+            raw = read_memory(data, size, safe=True)
+        return {"address": data, "headlen": headlen, "size": size, "data": raw}
+
+    @staticmethod
+    @Cache.cache_this_session(per_inferior=True, until_new_objfile=True)
+    def get_dwarf_layout():
+        """Return the member offsets of struct sk_buff from DWARF, or None."""
+        layout = {}
+        for member in ["head", "data", "tail", "end", "len", "data_len", "truesize", "users", "destructor"]:
+            layout[member] = GefUtil.offsetof("sk_buff", member)
+        if None in [layout[x] for x in ["head", "data", "tail", "end"]]:
+            return None
+        # sk_buff_data_t is an offset from head if NET_SKBUFF_DATA_USES_OFFSET, otherwise a pointer.
+        try:
+            tail_type = gdb.parse_and_eval("((struct sk_buff*)0)->tail").type.strip_typedefs()
+        except gdb.error:
+            return None
+        layout["tail_is_offset"] = tail_type.code != gdb.TYPE_CODE_PTR
+        layout["sizeof_tail"] = tail_type.sizeof
+        return layout
+
+    @staticmethod
+    def is_valid_geometry(head, data, tail, end):
+        """head <= data <= head + tail <= head + end, and skb_shared_info at head + end is readable."""
+        if not is_valid_addr(head) or not is_valid_addr(data):
+            return False
+        if not (head <= data and data - head <= tail <= end):
+            return False
+        return is_valid_addr(head + end)
+
+    @staticmethod
+    def read_layout(skb, offsets):
+        """Read the geometry at the given offsets. Returns a dict, or None if it is not valid."""
+        try:
+            head = read_int_from_memory(skb + offsets["head"])
+            data = read_int_from_memory(skb + offsets["data"])
+            if offsets["tail_is_offset"]:
+                if offsets["sizeof_tail"] == 4:
+                    read_data_t = read_int32_from_memory
+                else:
+                    read_data_t = read_int_from_memory
+                tail = read_data_t(skb + offsets["tail"])
+                end = read_data_t(skb + offsets["end"])
+            else:
+                tail = read_int_from_memory(skb + offsets["tail"]) - head
+                end = read_int_from_memory(skb + offsets["end"]) - head
+        except gdb.MemoryError:
+            return None
+        if not KernelSkbuff.is_valid_geometry(head, data, tail, end):
+            return None
+        layout = dict(offsets)
+        layout.update(head_value=head, data_value=data, tail_value=tail, end_value=end)
+        return layout
+
+    @staticmethod
+    def find_len(skb, headlen):
+        """Locate the adjacent (len, data_len) u32 pair where skb->len - skb->data_len == headlen.
+        Returns the offset of len, or None.
+        len follows `char cb[48]`, _skb_refdst, destructor and a few config-dependent pointers.
+        The fields before cb (next, prev, dev/tstamp, sk) take ptrsize * 4 + 8 bytes."""
+        ptr = runtime.current_arch.ptrsize
+        start = ptr * 4 + 8 + 0x30 + ptr
+        for off in range(start, start + ptr * 5 + 4, 4):
+            len_v = read_int32_from_memory(skb + off)
+            data_len = read_int32_from_memory(skb + off + 4)
+            if 0 < len_v < 0x1000_0000 and data_len <= len_v and (len_v - data_len) == headlen:
+                return off
+        return None
+
+    @staticmethod
+    def probe_layout(skb, check_shinfo=True):
+        """Find the head/data/tail/end cluster without DWARF. Returns (layout, the number of the best candidates) or None.
+
+        struct sk_buff (tail):  ... tail; end; head; data; truesize; users; ...
+        - 64-bit: tail/end are u32 offsets from head. `head` is 8-aligned, so depending on the
+          preceding fields a 4-byte pad may sit between `end` and `head` (e.g. v6.1), which shifts
+          the (tail, end) pair from (head-8, head-4) to (head-0xc, head-8). Try both.
+        - 32-bit: tail/end are `unsigned char*` absolute pointers at (head-8, head-4).
+        The truesize is not used, since it is an accounting value (e.g., 2 for a TCP pure ACK on v4.15~).
+        """
+        ptr = runtime.current_arch.ptrsize
+        if is_64bit():
+            te_layouts = [(-8, -4), (-0xc, -8)]
+        else:
+            te_layouts = [(-ptr * 2, -ptr)]
+        candidates = []
+        for i in range(0xc, 0x40):
+            off_head = ptr * i
+            try:
+                head = read_int_from_memory(skb + off_head)
+                data = read_int_from_memory(skb + off_head + ptr)
+            except gdb.MemoryError:
+                return None
+            if not is_valid_addr(head) or not is_valid_addr(data) or head > data:
+                continue
+            for te_tail, te_end in te_layouts:
+                offsets = {
+                    "head": off_head, "data": off_head + ptr, "tail": off_head + te_tail, "end": off_head + te_end,
+                    "tail_is_offset": is_64bit(), "sizeof_tail": 4,
+                    "truesize": off_head + ptr * 2, "users": off_head + ptr * 2 + 4, "destructor": None,
+                }
+                layout = KernelSkbuff.read_layout(skb, offsets)
+                if layout is None:
+                    continue
+                if check_shinfo:
+                    shinfo = layout["head_value"] + layout["end_value"]
+                    if KernelSkbuff.resolve_shared_info_layout(shinfo) is None:
+                        continue
+                headlen = layout["tail_value"] - (layout["data_value"] - layout["head_value"])
+                layout["len"] = KernelSkbuff.find_len(skb, headlen)
+                if layout["len"] is None:
+                    layout["data_len"] = None
+                else:
+                    layout["data_len"] = layout["len"] + 4
+                score = 0
+                if layout["len"] is not None:
+                    score += 2
+                users = read_int32_from_memory(skb + layout["users"])
+                if 0 < users < 0x10000:
+                    score += 1
+                candidates.append((score, layout))
+        if not candidates:
+            return None
+        best_score = max(score for score, _ in candidates)
+        best = [layout for score, layout in candidates if score == best_score]
+        return best[0], len(best)
+
+    @staticmethod
+    @Cache.cache_this_session(per_inferior=True, until_new_objfile=True)
+    def get_shared_info_dwarf_layout():
+        """Return the nr_frags/frag_list layout and array bound from DWARF."""
+        try:
+            struct_type = GefUtil.cached_lookup_type("struct skb_shared_info")
+            if struct_type is None:
+                return None
+            nr_field = GefUtil.lookup_field(struct_type, "nr_frags")
+            frag_list_field = GefUtil.lookup_field(struct_type, "frag_list")
+            if nr_field is None or frag_list_field is None:
+                return None
+            frags_field = GefUtil.lookup_field(struct_type, "frags")
+            max_frags = None
+            if frags_field is not None:
+                frags_type = frags_field.type.strip_typedefs()
+                if frags_type.code == gdb.TYPE_CODE_ARRAY:
+                    low, high = frags_type.range()
+                    max_frags = int(high - low + 1)
+            return nr_field.bitpos // 8, int(nr_field.type.sizeof), frag_list_field.bitpos // 8, max_frags
+        except (gdb.error, KeyError, TypeError):
+            return None
+
+    @staticmethod
+    @Cache.cache_this_session(per_inferior=True, until_new_objfile=True)
+    def get_frag_dwarf_layout():
+        """Return (offsetof(skb_shared_info, frags), sizeof(skb_frag_t), page, offset, size) from DWARF, or None.
+        Each of page/offset/size is (member offset, member size)."""
+
+        def member(names):
+            for name in names:
+                offset = GefUtil.offsetof("skb_frag_t", name)
+                size = GefUtil.sizeof("((skb_frag_t *)0)->{:s}".format(name))
+                if None not in (offset, size):
+                    return offset, size
+            return None
+
+        offset_frags = GefUtil.offsetof("skb_shared_info", "frags")
+        sizeof_frag = GefUtil.type_size("skb_frag_t")
+        if offset_frags is None or not sizeof_frag:
+            return None
+        # skb_frag_struct (~v5.3), bio_vec (v5.4~v6.8) and skb_frag (v6.9~, netmem_ref since v6.10)
+        page = member(["netmem", "bv_page", "page.p", "page"])
+        offset = member(["offset", "bv_offset", "page_offset"])
+        size = member(["len", "bv_len", "size"])
+        if None in [page, offset, size]:
+            return None
+        return offset_frags, sizeof_frag, page, offset, size
+
+    @staticmethod
+    def score_shared_info_layout(shinfo, layout, max_frags):
+        """Score a no-DWARF skb_shared_info layout from related live fields."""
+        nr_offset, nr_size, frag_list_offset, gso_offset, gso_segs_offset = layout
+        try:
+            if nr_size == 2:
+                nr_frags = read_int16_from_memory(shinfo + nr_offset)
+            else:
+                nr_frags = read_int8_from_memory(shinfo + nr_offset)
+            if nr_frags > max_frags:
+                return None
+            gso_size = read_int16_from_memory(shinfo + gso_offset)
+            gso_segs = read_int16_from_memory(shinfo + gso_segs_offset)
+            frag_list = read_int_from_memory(shinfo + frag_list_offset)
+        except gdb.MemoryError:
+            return None
+
+        score = 2
+        if frag_list == 0:
+            score += 2
+        elif is_valid_addr(frag_list):
+            score += 2
+            if KernelSkbuff.resolve_layout(frag_list, check_shinfo=False) is not None:
+                score += 2
+        else:
+            return None
+        # A segmented skb has a segment size; random bytes often violate this.
+        if gso_segs > 1 and gso_size == 0:
+            score -= 2
+        else:
+            score += 1
+        return score, nr_frags, frag_list
+
+    def find_destructor(self, skb, layout):
+        """With DWARF, read skb->destructor. Otherwise a function pointer before head that resolves to a *free / *destruct symbol."""
+        if layout["destructor"] is not None:
+            p = read_int_from_memory(skb + layout["destructor"])
+            if p == 0:
+                return None
+            return p, Symbol.format(p, ksym="prefer", bracket=""), layout["destructor"]
+        for i in range(3, layout["head"] // runtime.current_arch.ptrsize):
+            p = read_int_from_memory(skb + runtime.current_arch.ptrsize * i)
+            if not is_valid_addr(p) or not KernelAddressHeuristicFinderUtil.is_kernel_space(p):
+                continue
+            nm = Symbol.format(p, ksym="prefer", bracket="")
+            if nm and re.search(r"free|destruct", nm):
+                return p, nm, runtime.current_arch.ptrsize * i
+        return None
+
+
+
+class KernelIpcs:
+    """Resolve System V IPC layouts and read their objects."""
+
+    @classmethod
+    @Cache.cache_this_session(per_inferior=True, until_new_objfile=True)
+    def get_instance(cls):
+        return cls()
+
+    def __init__(self):
+        self.meta = []
+        self.sysvipc_disabled = False
+        self.sysvipc_uninitialized = False
+        return
+
+    @Cache.cache_this_session(cache_None=False, per_inferior=True, until_new_objfile=True)
+    def initialize(self, init_ipc_ns):
+        self.meta = []
+
+        self.sysvipc_disabled = False
+        self.sysvipc_uninitialized = False
+        if not init_ipc_ns:
+            self.meta.append(("err", "Could not find valid ipc_ns (maybe CONFIG_SYSVIPC=n)"))
+            return None
+
+        # ipc_namespace
+        """
+        struct ipc_namespace {
+            refcount_t count; // ~5.10
+            struct ipc_ids {
+                int in_use;
+                unsigned short seq;
+                struct rw_semaphore {
+                    atomic_long_t count;
+                    atomic_long_t owner;
+                #ifdef CONFIG_RWSEM_SPIN_ON_OWNER
+                    struct optimistic_spin_queue osq;
+                #endif
+                    raw_spinlock_t wait_lock;
+                    struct list_head wait_list;
+                #ifdef CONFIG_DEBUG_RWSEMS
+                    void *magic;
+                #endif
+                #ifdef CONFIG_DEBUG_LOCK_ALLOC
+                    struct lockdep_map dep_map;
+                #endif
+                } rwsem;
+                struct idr {
+                    struct radix_tree_root { // =struct xarray
+                        spinlock_t xa_lock;
+                        gfp_t xa_flags;
+                        void __rcu *xa_head;
+                    } idr_rt;
+                    unsigned int idr_base;
+                    unsigned int idr_next;
+                } ipcs_idr;
+                int max_idx;
+                int last_idx;
+            #ifdef CONFIG_CHECKPOINT_RESTORE
+                int next_id;
+            #endif
+                struct rhashtable key_ht;
+            } ids[3];
+            ...
+        """
+        kversion = Kernel.version()
+        if "5.11" <= kversion:
+            self.offset_ids = 0
+        else:
+            self.offset_ids = runtime.current_arch.ptrsize
+        ptr = runtime.current_arch.ptrsize
+        if "4.20" <= kversion:
+            self.tree_kind = "xarray"
+        elif "4.11" <= kversion:
+            self.tree_kind = "radix"
+        else:
+            self.tree_kind = "idr"
+        self.offset_idr_layers = ptr * (1 if "3.16" <= kversion else 2)
+        if self.tree_kind == "idr":
+            top = GefUtil.offsetof("idr", "top")
+            layers = GefUtil.offsetof("idr", "layers")
+            if top is not None and layers is not None:
+                self.offset_idr_layers = layers - top
+        member = {"xarray": "ipcs_idr.idr_rt.xa_head", "radix": "ipcs_idr.idr_rt.rnode", "idr": "ipcs_idr.top"}[self.tree_kind]
+        offset_ids = GefUtil.offsetof("ipc_namespace", "ids")
+        if offset_ids is not None:
+            self.offset_ids = offset_ids
+        self.meta.append(("info", "offsetof(ipc_namespace, ids): {:#x}".format(self.offset_ids)))
+
+        # offsetof(ipc_ids, ipcs_idr.idr_rt.xa_head): tagged valid pointer is `xa_head`.
+        # sizeof(ids[0]): find three IDR heads and calculate the distance.
+        offset_xa_head = GefUtil.offsetof("ipc_ids", member)
+        sizeof_ipc_ids = GefUtil.sizeof("ipc_ids")
+        source = "DWARF"
+        if offset_xa_head is None or sizeof_ipc_ids is None:
+            source = "heuristic"
+            offset_xa_head = sizeof_ipc_ids = None
+        candidates = {True: {}, False: {}}
+        # DEBUG_LOCK_ALLOC makes struct ipc_ids large enough that ids[2]'s
+        # xa_head can be beyond the old 120-pointer scan window.
+        for offset in range(ptr * 3, ptr * 256, ptr):
+            if offset_xa_head is not None or self.tree_kind == "idr":
+                break
+            address = init_ipc_ns + self.offset_ids + offset
+            entry = read_int_from_memory(address, safe=True)
+            if entry is None:
+                break
+            """
+            [x64 before using IPC]
+            0xffffffff8b1841f8|+0x0038|+007: 0x0080000400000000 <- xa_lock, xa_flags
+            0xffffffff8b184200|+0x0040|+008: 0x0000000000000000 <- xa_head
+            0xffffffff8b184208|+0x0048|+009: 0x0000000000000000 <- idr_base, idr_next
+            [x64 after using IPC]
+            0xffffffff8b1841f8|+0x0038|+007: 0x0080000400000000
+            0xffffffff8b184200|+0x0040|+008: 0xffff9250c7dc2002 ->  0x0000000000000001
+            0xffffffff8b184208|+0x0048|+009: 0x0000000100000000
+            [x64 after deleting IPC]
+            0xffffffff8b1841f8|+0x0038|+007: 0x0080000400000000
+            0xffffffff8b184200|+0x0040|+008: 0x0000000000000000
+            0xffffffff8b184208|+0x0048|+009: 0x0000000100000000
+
+            [x86 before using IPC]
+            0xc1b4e104|+0x0024|+009: 0x00000000 <- xa_lock
+            0xc1b4e108|+0x0028|+010: 0x00800004 <- xa_flags
+            0xc1b4e10c|+0x002c|+011: 0x00000000 <- xa_head
+            0xc1b4e110|+0x0030|+012: 0x00000000 <- idr_base
+            0xc1b4e114|+0x0034|+013: 0x00000000 <- idr_next
+            [x86 after using IPC]
+            0xc1b4e104|+0x0024|+009: 0x00000000
+            0xc1b4e108|+0x0028|+010: 0x00800004
+            0xc1b4e10c|+0x002c|+011: 0xc2c67392  ->  0x00000001
+            0xc1b4e110|+0x0030|+012: 0x00000000
+            0xc1b4e114|+0x0034|+013: 0x00000001
+            [x86 after deleting IPC]
+            0xc1b4e104|+0x0024|+009: 0x00000000
+            0xc1b4e108|+0x0028|+010: 0x00800004
+            0xc1b4e10c|+0x002c|+011: 0x00000000
+            0xc1b4e110|+0x0030|+012: 0x00000000
+            0xc1b4e114|+0x0034|+013: 0x00000001
+            """
+
+            # Read xa_flags as u32, including the UP layout with padding before xa_head.
+            flags = [read_int32_from_memory(address - delta, safe=True) for delta in (4, ptr)]
+            xarray_markers = [
+                f for f in flags
+                if f is not None and (f == 4 or any(f == 4 | bits << shift for bits in (1, 3) for shift in range(23, 28)))
+            ]
+            if self.tree_kind == "xarray":
+                markers = xarray_markers
+                node = KernelXArray.is_node(entry)
+                if node:
+                    tag = 2
+                else:
+                    tag = 0
+            else:
+                # ROOT_IS_IDR is a high gfp bit until v4.16, then v4.17 moves it to the low bits as the xarray does
+                markers = [f for f in flags if f and f & 0xffff == 0] + xarray_markers
+                node = bool(entry & 1)
+                if node:
+                    tag = 1
+                else:
+                    tag = 0
+            if not markers and not (entry == 0 and 0 in flags):
+                continue
+            # xa_head
+            if entry and (entry & 3 != tag or not self.is_ipc_pointer(entry - tag)):
+                continue
+            # idr_base, idr_next
+            cursor = read_int32_from_memory(address + ptr + (4 if self.tree_kind == "xarray" else 0), safe=True)
+            if cursor is None or cursor > 1 << 24:
+                continue
+            if self.tree_kind == "xarray" and read_int32_from_memory(address + ptr, safe=True) != 0:
+                continue
+            if node and self.tree_kind == "xarray":
+                if not KernelXArray.cache_head_offset(address, entry):
+                    continue
+            candidates[bool(markers)][offset] = entry
+
+        # The rwsem wait lists locate the three ipc_ids even when every IDR is empty.
+        wait_lists = []
+        for offset in range(8, ptr * 256, ptr):
+            if offset_xa_head is not None:
+                break
+            address = init_ipc_ns + self.offset_ids + offset
+            if read_int_from_memory(address, safe=True) == address and read_int_from_memory(address + ptr, safe=True) == address:
+                wait_lists.append(offset)
+        if offset_xa_head is None and self.tree_kind == "idr":
+            for first in wait_lists:
+                for second in wait_lists:
+                    size = second - first
+                    if size < ptr * 8 or first >= size or first + size * 2 not in wait_lists:
+                        continue
+                    # idr follows rwsem; lockdep may extend rwsem after wait_list.
+                    if Ksym.get_addr("idr_find_slowpath"):
+                        hint = ptr
+                    else:
+                        hint = 0
+                    for offset in range(first + ptr * 2 + hint, size - ptr * 2, ptr):
+                        if self.validate_legacy_idr(init_ipc_ns, offset, size):
+                            offset_xa_head, sizeof_ipc_ids = offset, size
+                            break
+                    if offset_xa_head is not None:
+                        break
+                if offset_xa_head is not None:
+                    break
+
+        # ids[3] are contiguous. Requiring three equally spaced candidates avoids
+        # locking onto an unrelated zero-valued field before an empty xa_head.
+        # Prefer the IDR marker; zero flags additionally require the rwsem boundary.
+        for marked, heads in candidates.items():
+            offsets = sorted(heads)
+            offset_set = set(offsets)
+            for first_pos, first in enumerate(offsets):
+                for second in offsets[first_pos + 1:]:
+                    size = second - first
+                    if ptr * 8 <= size and first < size and first + size * 2 in offset_set:
+                        if not marked and not any(
+                            wait + ptr * 2 <= first and wait < size and
+                            wait + size in wait_lists and wait + size * 2 in wait_lists
+                            for wait in wait_lists
+                        ):
+                            continue
+                        valid = True
+                        for index in range(3):
+                            in_use = read_int32_from_memory(
+                                init_ipc_ns + self.offset_ids + size * index
+                            )
+                            if in_use > 1 << 24 or bool(in_use) != bool(heads[first + size * index]):
+                                valid = False
+                                break
+                        if not valid:
+                            continue
+                        offset_xa_head = first
+                        sizeof_ipc_ids = size
+                        break
+                if offset_xa_head is not None:
+                    break
+            if offset_xa_head is not None:
+                break
+
+        if offset_xa_head is None:
+            if all(
+                read_int_from_memory(init_ipc_ns + runtime.current_arch.ptrsize * i) == 0
+                for i in range(32)
+            ):
+                if Ksym.get_addr("sem_init"):
+                    self.sysvipc_uninitialized = True
+                    self.meta.append(("info", "SYSVIPC is enabled, but ipc_ids is not initialized"))
+                    return None
+                self.sysvipc_disabled = True
+                self.meta.append(("info", "SYSVIPC is disabled"))
+                return None
+            self.meta.append(("err", "Could not find ipc_namespace->ids[0].ipcs_idr.idr_rt.xa_head"))
+            self.meta.append(("err", "Not recognized sizeof(struct ipc_ids)"))
+            self.meta.append(("err", "SYSVIPC is enabled, but the ipc_ids layout could not be determined"))
+            return None
+        self.offset_xa_head = offset_xa_head
+        self.sizeof_ipc_ids = sizeof_ipc_ids
+        self.meta.append(("info", "offsetof(ipc_ids, {:s}): {:#x} ({:s})".format(member, self.offset_xa_head, source)))
+        self.meta.append(("info", "sizeof(struct ipc_ids): {:#x} ({:s})".format(self.sizeof_ipc_ids, source)))
+
+        # ipc_namespace->ns.ns_tree_node (v6.18~)
+        if Ksym.get_addr("__ns_tree_add_raw"):
+            offsets = KernelNamespace.get_offset_tree_list("ipc", init_ipc_ns)
+        else:
+            offsets = None
+        if offsets is not None and offsets[0] is not None:
+            self.meta.append(("info", "offsetof(ipc_namespace, list node of ipc_ns_tree): {:#x}".format(offsets[0])))
+        return True
+
+    def get_all_ipc_ns(self, task_addrs, offset_nsproxy):
+        """Return {"namespaces": [init_ipc_ns, ...], "incomplete": [reason, ...]}.
+        `task_addrs` must start with init_task, whose nsproxy is init_nsproxy. Until v6.17, the namespaces
+        not used by any task (e.g., held only by a file descriptor or a bind mount) are not found.
+        If `offset_nsproxy` is None, init_ipc_ns is searched instead of the namespaces of the tasks."""
+        offset_ipc_ns = dict(KernelTask.get_nsproxy_members())["ipc_ns"]
+        namespaces = []
+        incomplete = []
+        if offset_nsproxy is None:
+            init_ipc_ns = KernelAddressHeuristicFinder.get_init_ipc_ns()
+            if init_ipc_ns is None:
+                return {"namespaces": [], "incomplete": ["neither task_struct->nsproxy nor init_ipc_ns is found"]}
+            namespaces.append(init_ipc_ns)
+            incomplete.append("task_struct->nsproxy is not found, so the namespaces of the tasks are not shown")
+            task_addrs = []
+        # do not use `set()` because the order is important.
+        for task in task_addrs:
+            nsproxy = read_int_from_memory(task + offset_nsproxy, safe=True)
+            # the nsproxy of an exiting task is NULL
+            if nsproxy:
+                ipc_ns = read_int_from_memory(nsproxy + offset_ipc_ns, safe=True)
+                if ipc_ns is None:
+                    incomplete.append("task {:#x}->nsproxy->ipc_ns is unreadable".format(task))
+            else:
+                ipc_ns = None
+                if nsproxy is None:
+                    incomplete.append("task {:#x}->nsproxy is unreadable".format(task))
+            if ipc_ns is None and not namespaces:
+                return {"namespaces": [], "incomplete": ["init_task->nsproxy->ipc_ns is unreadable"]}
+            if ipc_ns is not None and ipc_ns not in namespaces:
+                namespaces.append(ipc_ns)
+
+        if namespaces and namespaces[0]:
+            ret = KernelNamespace.get_tree_namespaces("ipc", namespaces[0])
+            if ret is not None:
+                tree, reason = ret
+                namespaces += [x for x in tree if x not in namespaces]
+                if reason:
+                    incomplete.append("ipc_ns_tree {:s}, so some namespaces may be missing".format(reason))
+        return {"namespaces": namespaces, "incomplete": incomplete}
+
+    def has_objects(self, ipc_ns_list):
+        # the presence of IPC objects is live, so it must not be cached
+        return any(
+            read_int_from_memory(ipc_ns + self.offset_ids + self.sizeof_ipc_ids * i + self.offset_xa_head, safe=True) != 0
+            for ipc_ns in ipc_ns_list for i in range(3)
+        )
+
+    def get_semaphores(self, ipc_ids_ptr):
+        """Return {"objects": [...], "incomplete": [reason, ...]}. The values not found are None.
+
+        struct sem_array {
+            struct kern_ipc_perm sem_perm;
+            time64_t sem_ctime;
+            struct list_head pending_alter;
+            struct list_head pending_const;
+            struct list_head list_id;
+            int sem_nsems;
+            ...
+        } __randomize_layout;
+        """
+        elems, incomplete = self.get_entries(ipc_ids_ptr)
+        self.sem_elems_temp = elems
+        offset_sem_nsems = self.get_offset_sem_nsems()
+        del self.sem_elems_temp
+        objects = []
+        for e in elems:
+            item = self.get_permissions(e)
+            if item is None:
+                incomplete.append("sem_array {:#x} is unreadable".format(e))
+                continue
+            if offset_sem_nsems is not None:
+                item["nsems"] = read_int32_from_memory(e + offset_sem_nsems, safe=True)
+            else:
+                item["nsems"] = None
+            objects.append(item)
+        return {"objects": objects, "incomplete": incomplete}
+
+    def get_messages(self, ipc_ids_ptr):
+        """Return {"objects": [...], "incomplete": [reason, ...]}. The values not found are None.
+
+        struct msg_queue {
+            struct kern_ipc_perm q_perm;
+            time64_t q_stime;
+            time64_t q_rtime;
+            time64_t q_ctime;
+            unsigned long q_cbytes;
+            unsigned long q_qnum;
+            unsigned long q_qbytes;
+            struct pid *q_lspid;
+            struct pid *q_lrpid;
+            struct list_head q_messages; <--> msg_msg.m_list
+            struct list_head q_receivers;
+            struct list_head q_senders;
+        } __randomize_layout;
+
+        struct msg_msg {
+            struct list_head m_list;
+            long m_type;
+            size_t m_ts; /* message text size */
+            struct msg_msgseg *next;
+            void *security;
+        };
+        """
+        elems, incomplete = self.get_entries(ipc_ids_ptr)
+        self.msg_elems_temp = elems
+        offsets = self.get_offsets_msg()
+        del self.msg_elems_temp
+        objects = []
+        for e in elems:
+            item = self.get_permissions(e)
+            if item is None:
+                incomplete.append("msg_queue {:#x} is unreadable".format(e))
+                continue
+            item.update(q_cbytes=None, q_qnum=None, messages=None)
+            if offsets is not None:
+                offset_q_cbytes, offset_q_qnum, offset_q_messages = offsets
+                item.update(q_cbytes=read_int_from_memory(e + offset_q_cbytes, safe=True),
+                            q_qnum=read_int_from_memory(e + offset_q_qnum, safe=True), messages=e + offset_q_messages)
+            objects.append(item)
+        return {"objects": objects, "incomplete": incomplete}
+
+    def get_shared_memory(self, ipc_ids_ptr):
+        """Return {"objects": [...], "incomplete": [reason, ...]}. The values not found are None.
+
+        struct shmid_kernel {
+            struct kern_ipc_perm shm_perm;
+            struct file *shm_file;
+            unsigned long shm_nattch;
+            unsigned long shm_segsz;
+            ...
+        } __randomize_layout;
+        """
+        elems, incomplete = self.get_entries(ipc_ids_ptr)
+        self.shm_elems_temp = elems
+        offsets = self.get_offset_shm()
+        del self.shm_elems_temp
+        objects = []
+        for e in elems:
+            item = self.get_permissions(e)
+            if item is None:
+                incomplete.append("shmid_kernel {:#x} is unreadable".format(e))
+                continue
+            item.update(nattch=None, segsz=None)
+            if offsets is not None:
+                offset_shm_nattch, offset_shm_segsz = offsets
+                item.update(nattch=read_int_from_memory(e + offset_shm_nattch, safe=True),
+                            segsz=read_int_from_memory(e + offset_shm_segsz, safe=True))
+            objects.append(item)
+        return {"objects": objects, "incomplete": incomplete}
+
+    def get_message_entries(self, head, q_qnum=None):
+        """Return ([msg_msg, ...], [reason, ...]). The walk stops at an unreadable link or a cycle without `head`."""
+        lh = KernelListHead(head)
+        entries = list(lh.iter_entries())
+        incomplete = []
+        if lh.broken and lh.broken_reason == "unreadable" and entries and entries[-1] == lh.broken_at:
+            entries.pop() # it is not a message, but the invalid link
+            incomplete.append("the message list {:#x} has an invalid link to {:#x}".format(head, lh.broken_at))
+        elif lh.broken:
+            incomplete.append("the message list {:#x} is broken at {:#x} ({:s})".format(head, lh.broken_at, lh.broken_reason))
+        elif q_qnum is not None and len(entries) != q_qnum:
+            incomplete.append("the message list {:#x} has {:d} messages, but q_qnum is {:d}".format(head, len(entries), q_qnum))
+        return entries, incomplete
+
+    def get_entries(self, ipc_ids_ptr):
+        """Return ([entry, ...], [reason, ...]) of the IPC objects, and resolve the kern_ipc_perm layout with them."""
+        try:
+            entries = self.get_ipc_entries(ipc_ids_ptr)
+        except gdb.MemoryError:
+            return [], ["the IDR of ipc_ids {:#x} is unreadable".format(ipc_ids_ptr)]
+        self.perm_elems_temp = entries
+        offsets = self.get_offsets_perm()
+        del self.perm_elems_temp
+        self.offset_id, self.offset_key, self.offset_uid, self.offset_gid, self.offset_mode = offsets or (None,) * 5
+        incomplete = []
+        if entries and offsets is None:
+            incomplete.append("the layout of kern_ipc_perm is not determined, so id, key, uid, gid and perms are unknown")
+        return [entry for _index, entry in entries], incomplete
+
+    def get_permissions(self, address):
+        """Return the members of kern_ipc_perm, where the unknown ones are None, or None if `address` is unreadable."""
+
+        def read(offset, reader=read_int32_from_memory):
+            if offset is not None:
+                return reader(address + offset, safe=True)
+            return None
+
+        if read_int_from_memory(address, safe=True) is None:
+            return None
+        return {
+            "address": address,
+            "id": read(self.offset_id),
+            "key": read(self.offset_key),
+            "uid": read(self.offset_uid),
+            "gid": read(self.offset_gid),
+            "mode": read(self.offset_mode, read_int16_from_memory),
+        }
+
+    def get_ipc_entries(self, ipc_ids):
+        """Return [(index, entry), ...] of the IPC objects in the IDR of `ipc_ids`."""
+        head = read_int_from_memory(ipc_ids + self.offset_xa_head)
+        if head and not self.is_ipc_pointer(head & ~3):
+            self.meta.append(("err", "Invalid IPC IDR head: {:#x}".format(head)))
+            return []
+        if self.tree_kind == "idr":
+            entries = self.get_legacy_entries(head)
+        elif self.tree_kind == "radix":
+            entries = KernelRadixTree(ipc_ids, self.offset_xa_head).parse_indexed()
+        else:
+            entries = KernelXArray(ipc_ids, self.offset_xa_head).parse_indexed()
+        return [(index, entry) for index, entry in entries if self.is_ipc_pointer(entry)]
+
+    def is_ipc_pointer(self, address):
+        if not address or not is_valid_addr(address):
+            return False
+        layout = Kernel.layout()
+        return not (layout.text_base and layout.text_end and layout.text_base <= address < layout.text_end)
+
+    def validate_legacy_idr(self, ipc_ns, offset, size):
+        for i in range(3):
+            base = ipc_ns + self.offset_ids + size * i
+            head = read_int_from_memory(base + offset, safe=True)
+            if head is None or head and not self.is_ipc_pointer(head):
+                return False
+            layers = read_int32_from_memory(base + offset + self.offset_idr_layers, safe=True)
+            in_use = read_int32_from_memory(base)
+            if layers is None or layers > 7 or bool(layers) != bool(head) or bool(in_use) != bool(head):
+                return False
+            if head:
+                try:
+                    if len(self.get_legacy_entries(head)) != in_use:
+                        return False
+                except gdb.MemoryError:
+                    return False
+        return True
+
+    def get_legacy_entries(self, head):
+        """Return [(index, entry), ...] in the idr_layer tree of `head`."""
+        ptr = runtime.current_arch.ptrsize
+        old = not Ksym.get_addr("idr_find_slowpath") and Kernel.version() < "3.9"
+        slots = GefUtil.offsetof("idr_layer", "ary")
+        count_offset = GefUtil.offsetof("idr_layer", "count")
+        layer_offset = GefUtil.offsetof("idr_layer", "layer")
+        if old:
+            if ptr == 8:
+                count = 64
+            else:
+                count = 32
+        else:
+            count = 256
+        reordered = "3.16" <= Kernel.version()
+        if slots is None:
+            # v3.16 moved idr_layer.layer before ary and the bitmap after it.
+            if old:
+                slots = ptr
+            elif reordered:
+                slots = 8
+            else:
+                slots = align(4, ptr) + 32
+        if count_offset is None:
+            count_offset = slots + ptr * count
+        if layer_offset is None:
+            if reordered:
+                layer_offset = 4
+            else:
+                layer_offset = count_offset + 4
+        bits = count.bit_length() - 1
+        entries = []
+        if head:
+            pending = [(head, 0)]
+        else:
+            pending = []
+        seen = set()
+        while pending:
+            node, base = pending.pop()
+            if node in seen:
+                continue
+            seen.add(node)
+            layer = read_int32_from_memory(node + layer_offset)
+            used = read_int32_from_memory(node + count_offset)
+            if layer > 6 or used > count:
+                raise gdb.MemoryError("Invalid idr_layer")
+            for i in range(count):
+                entry = read_int_from_memory(node + slots + ptr * i)
+                if entry:
+                    if not self.is_ipc_pointer(entry):
+                        raise gdb.MemoryError("Invalid IDR entry")
+                    index = base | i << (bits * layer)
+                    if layer:
+                        pending.append((entry, index))
+                    else:
+                        entries.append((index, entry))
+        return entries
+
+    @Cache.cache_this_session(cache_None=False, per_inferior=True, until_new_objfile=True)
+    @switch_to_intel_syntax
+    def get_offsets_perm(self):
+        """Return offsetof(kern_ipc_perm, id/key/uid/gid/mode), or None if the samples do not tell it.
+
+        struct kern_ipc_perm {
+            spinlock_t lock;
+            bool deleted; // int (~v3.x)
+            int id;
+            key_t key;
+            kuid_t uid;
+            kgid_t gid;
+            kuid_t cuid;
+            kgid_t cgid;
+            umode_t mode;
+            unsigned long seq;
+            void *security;
+            struct rhash_head khtnode;
+            struct rcu_head rcu;
+            refcount_t refcount;
+        } ____cacheline_aligned_in_smp __randomize_layout;
+        """
+        # handed over from the caller; the samples are live, so they must not become a cache key.
+        # Keep trying until one of them matches, then reuse the layout for every IPC object.
+        offsets = tuple(GefUtil.offsetof("kern_ipc_perm", member) for member in ("id", "key", "uid", "gid", "mode"))
+        if None not in offsets:
+            return offsets
+
+        # spinlock_t grows with CONFIG_DEBUG_SPINLOCK, CONFIG_DEBUG_LOCK_ALLOC and CONFIG_PREEMPT_RT,
+        # so the guesses are verified with the samples, and the other offsets are searched.
+        hints = []
+        addr = Ksym.get_addr("kernel_to_ipc64_perm")
+        if addr:
+            # The key copied to ipc64_perm first identifies the lock layout too.
+            res = KernelAddressHeuristicFinderUtil.disassemble_until_next_symbol(addr, 60)
+            if is_x86_64() or is_x86_32():
+                pattern = r"mov\s+(\w+),DWORD PTR \[(?:rdi|eax)\+(0x[0-9a-f]+)\].*?mov\s+DWORD PTR \[(?:rsi|edx)\],\1\b"
+            elif is_arm64():
+                pattern = r"ldr\s+(w\d+), \[x0, #(\d+)\].*?str\s+\1, \[x1\]"
+            elif is_arm32():
+                pattern = r"ldr\s+(r\d+), \[r0, #(\d+)\].*?str\s+\1, \[r1\]"
+            else:
+                pattern = r"lw\s+(\w+),\s*(\d+)\(a0\).*?sw\s+\1,\s*0\(a1\)"
+            match = re.search(pattern, res, re.DOTALL)
+            if match:
+                hints.append(int(match.group(2), 0) - 4)
+        if not any(Ksym.get_addr(name) for name in ("do_raw_spin_lock", "lock_acquire", "rt_spin_lock")):
+            hints.append(4 if Kernel.per_cpu().is_up else 8)
+
+        # The id is (seq << 15 (or 24 with ipcmni_extend)) + the IDR index, and the seq follows the mode.
+        ptr = runtime.current_arch.ptrsize
+        samples = [(index, KernelNamespace.read_object(entry, ptr * 24 + 0x30)) for index, entry in self.perm_elems_temp[:0x10]]
+
+        def check(offset_id):
+            offset_seq = align(offset_id + 26, ptr)
+            mode_found = id_found = False
+            for index, data in samples:
+                if len(data) < offset_seq + ptr:
+                    return None
+                ipc_id = u32(data[offset_id:offset_id + 4])
+                mode = u16(data[offset_id + 24:offset_id + 26])
+                seq = slice_unpack(data[offset_seq:offset_seq + ptr], ptr)[0]
+                if mode & ~0o3777:
+                    return None
+                if not any(index < 1 << shift and ipc_id == (seq << shift) + index for shift in (15, 24)):
+                    return None
+                mode_found |= mode != 0
+                id_found |= ipc_id != 0
+            return mode_found, id_found
+
+        for offset_id in hints:
+            ret = check(offset_id)
+            if ret and ret[0]:
+                return offset_id, offset_id + 4, offset_id + 8, offset_id + 12, offset_id + 24
+        # Zeros in the lock look like the first object (id 0), so such a match must be unique.
+        weak = []
+        for offset_id in range(4, ptr * 24, 4):
+            ret = check(offset_id)
+            if ret and ret[0] and ret[1]:
+                return offset_id, offset_id + 4, offset_id + 8, offset_id + 12, offset_id + 24
+            if ret and ret[0]:
+                weak.append(offset_id)
+        if len(weak) == 1:
+            return weak[0], weak[0] + 4, weak[0] + 8, weak[0] + 12, weak[0] + 24
+        return None
+
+    @Cache.cache_this_session(cache_None=False, per_inferior=True, until_new_objfile=True)
+    def get_offset_sem_nsems(self):
+        # handed over from the caller; the samples are live, so they must not become a cache key.
+        # Keep trying until one of them matches, then reuse the layout for every semaphore array.
+        offset = GefUtil.offsetof("sem_array", "sem_nsems")
+        if offset is not None:
+            return offset
+        if self.offset_mode is None:
+            return None
+        ptr = runtime.current_arch.ptrsize
+        for sem_array in self.sem_elems_temp:
+            for base in range(align(self.offset_mode + 2, ptr), self.offset_mode + ptr * 64, ptr):
+                # search pending_alter, pending_const, list_id (two lists on older kernels)
+                for count in (3, 2):
+                    if all(is_double_link_list(sem_array + base + ptr * 2 * i) for i in range(count)):
+                        return base + ptr * 2 * count
+        return None
+
+    @Cache.cache_this_session(cache_None=False, per_inferior=True, until_new_objfile=True)
+    def get_offsets_msg(self):
+        # handed over from the caller; the samples are live, so they must not become a cache key.
+        # Keep trying until one of them matches, then reuse the layout for every message queue.
+        offsets = tuple(GefUtil.offsetof("msg_queue", member) for member in ("q_cbytes", "q_qnum", "q_messages"))
+        if None not in offsets:
+            return offsets
+        if self.offset_mode is None:
+            return None
+        ptr = runtime.current_arch.ptrsize
+        for msg_queue in self.msg_elems_temp:
+            for base in range(align(self.offset_mode + 2, ptr), self.offset_mode + ptr * 64, ptr):
+                # search q_messages, q_receivers, q_senders
+                if all(is_double_link_list(msg_queue + base + ptr * 2 * i) for i in range(3)):
+                    if "4.17" <= Kernel.version():
+                        pid_size = ptr * 2
+                    else:
+                        pid_size = 8
+                    return base - pid_size - ptr * 3, base - pid_size - ptr * 2, base
+        return None
+
+    @Cache.cache_this_session(cache_None=False, per_inferior=True, until_new_objfile=True)
+    def get_offset_shm(self):
+        # handed over from the caller; the samples are live, so they must not become a cache key.
+        # `shm_segsz` is the size requested by the user, so it is not always a multiple of the
+        # page size. Keep trying until one of them matches, then reuse it for every segment.
+        offsets = tuple(GefUtil.offsetof("shmid_kernel", member) for member in ("shm_nattch", "shm_segsz"))
+        if None not in offsets:
+            return offsets
+        if self.offset_mode is None:
+            return None
+        ptr = runtime.current_arch.ptrsize
+        kpath = Kernel.path()
+        for kern_ipc_perm in self.shm_elems_temp:
+            for base in range(align(self.offset_mode + 2, ptr), self.offset_mode + ptr * 64, ptr):
+                # search shm_file and shm_segsz
+                file = read_int_from_memory(kern_ipc_perm + base, safe=True)
+                size = read_int_from_memory(kern_ipc_perm + base + ptr * 2, safe=True)
+                if not file or not is_valid_addr(file) or not size or not 0 < size < 1 << (ptr * 8 - 1):
+                    continue
+                try:
+                    offset_mnt = kpath.get_offset_file_mnt(file)
+                except RuntimeError:
+                    continue
+                if offset_mnt is None:
+                    continue
+                dentry = read_int_from_memory(file + kpath.get_offset_file_dentry(offset_mnt), safe=True)
+                offset_iname = kpath.get_offset_d_iname(dentry)
+                if offset_iname is not None and re.fullmatch(r"SYSV[0-9a-fA-F]{8}", read_cstring_from_memory(dentry + offset_iname, safe=True) or ""):
+                    # found
+                    return base + ptr, base + ptr * 2
+        return None
+
+
+
+class KernelDmabuf:
+    """Resolve DMA-BUF layouts and read buffers and scatterlists."""
+
+    @classmethod
+    @Cache.cache_this_session(per_inferior=True, until_new_objfile=True)
+    def get_instance(cls):
+        return cls()
+
+    def __init__(self):
+        self.meta = []
+        return
+
+    @Cache.cache_this_session(cache_None=False, per_inferior=True, until_new_objfile=True)
+    def initialize(self):
+        self.meta = []
+
+        kversion = Kernel.version()
+        if kversion is None:
+            self.meta.append(("err", "Could not find kernel version"))
+            return None
+        # The list was `db_list` until v6.10 renamed it to `debugfs_list`, then renamed again to
+        # `dmabuf_list` when the iterator was exported. The latter rename is in v6.16 upstream but
+        # a tree based on v6.15 can carry it, so ask for the iterator instead of the version.
+        if Ksym.get_addr("dma_buf_iter_begin"):
+            name = "dmabuf_list"
+            self.db_list = KernelAddressHeuristicFinder.get_dmabuf_list()
+        elif "6.10" <= kversion:
+            name = "debugfs_list"
+            self.db_list = KernelAddressHeuristicFinder.get_debugfs_list()
+        else:
+            name = "db_list"
+            self.db_list = KernelAddressHeuristicFinder.get_db_list()
+        self.list_name = name
+        file_buffers = None
+        if self.db_list is None:
+            if not Ksym.get_addr("dma_buf_export"):
+                self.meta.append(("info", "DMA-BUF is unavailable (CONFIG_DMA_SHARED_BUFFER=n or module not loaded)"))
+                return None
+            self.meta.append(("info", "DMA-BUF global list is unavailable; showing buffers held by file descriptors"))
+            file_buffers = self.get_file_buffers()
+            if file_buffers is None:
+                return None
+            if not file_buffers:
+                self.meta.append(("info", "No DMA-BUF file descriptors are present"))
+                return None
+            first_dma_buf = file_buffers[0]
+        else:
+            self.meta.append(("info", "{:s}: {:#x}".format(name, self.db_list)))
+            first_dma_buf = read_int_from_memory(self.db_list)
+            if first_dma_buf == self.db_list:
+                self.meta.append(("info", "DMA-BUF is enabled, but no buffers are present"))
+                return None
+
+        """
+        struct dma_buf {
+            size_t size;
+            struct file *file;
+            struct list_head attachments;
+            const struct dma_buf_ops *ops;
+            struct mutex lock; // ~v6.2
+            unsigned vmapping_counter;
+            struct iosys_map {
+                union {
+                    void __iomem *vaddr_iomem;
+                    void *vaddr;
+                };
+                bool is_iomem;
+            } vmap_ptr;
+            const char *exp_name;
+            const char *name;
+            spinlock_t name_lock;
+            struct module *owner;
+            struct list_head list_node;
+            void *priv; <-- struct system_heap_buffer*
+            struct dma_resv *resv;
+            wait_queue_head_t poll;
+            ...
+        }
+
+        [v6.4 x64 example]
+        0xffff8880135f8a00|+0x0000|+000: 0x0000000000001000  // size
+        0xffff8880135f8a08|+0x0008|+001: 0xffff888000f85800  ->  0x0000000000000000 // file
+        0xffff8880135f8a10|+0x0010|+002: 0xffff8880135f8a10  ->  [loop detected] // attachments
+        0xffff8880135f8a18|+0x0018|+003: 0xffff8880135f8a10  ->  [loop detected]
+        0xffff8880135f8a20|+0x0020|+004: 0xffffffff83e79d00 <system_heap_buf_ops>  ->  0x0000000000000000 // ops
+        0xffff8880135f8a28|+0x0028|+005: 0x0000000000000000  // vmapping_counter
+        0xffff8880135f8a30|+0x0030|+006: 0x0000000000000000  // vmap_ptr.vaddr_iomem
+        0xffff8880135f8a38|+0x0038|+007: 0x0000000000000000  // vmap_ptr.is_iomem
+        0xffff8880135f8a40|+0x0040|+008: 0xffffffff8482754e <linux_banner+0x6d70ae>  ->  0x6e006d6574737973 ('system'?) // exp_name
+        0xffff8880135f8a48|+0x0048|+009: 0x0000000000000000  // name
+        0xffff8880135f8a50|+0x0050|+010: 0xdead4ead00000000  // name_lock
+        0xffff8880135f8a58|+0x0058|+011: 0x00000000ffffffff
+        0xffff8880135f8a60|+0x0060|+012: 0xffffffffffffffff
+        0xffff8880135f8a68|+0x0068|+013: 0xffffffff883cc330 <__key.7>  ->  0x0000000000000000
+        0xffff8880135f8a70|+0x0070|+014: 0x0000000000000000
+        0xffff8880135f8a78|+0x0078|+015: 0x0000000000000000
+        0xffff8880135f8a80|+0x0080|+016: 0xffffffff847790c3 <linux_banner+0x628c23>  ->  '&dmabuf->name_lock'
+        0xffff8880135f8a88|+0x0088|+017: 0x0000000000000200
+        0xffff8880135f8a90|+0x0090|+018: 0x0000000000000000  // owner
+        0xffff8880135f8a98|+0x0098|+019: 0xffff8880135f8c98  ->  0xffffffff883cc360 <db_list>  ->  [loop detected] // list_node
+        0xffff8880135f8aa0|+0x00a0|+020: 0xffffffff883cc360 <db_list>  ->  0xffff8880135f8a98  ->  0xffff8880135f8c98  ->  ...
+        0xffff8880135f8aa8|+0x00a8|+021: 0xffff88800f978600  ->  ... // priv
+        0xffff8880135f8ab0|+0x00b0|+022: 0xffff8880135f8b58  ->  0x0000000000000000
+        0xffff8880135f8ab8|+0x00b8|+023: 0xdead4ead00000000
+        0xffff8880135f8ac0|+0x00c0|+024: 0x00000000ffffffff
+        0xffff8880135f8ac8|+0x00c8|+025: 0xffffffffffffffff
+        """
+        self.offset_list_node = GefUtil.offsetof("dma_buf", "list_node")
+        if self.offset_list_node is None and file_buffers is None:
+            self.offset_list_node = self.find_list_node(first_dma_buf)
+        if self.offset_list_node is None and file_buffers is None:
+            self.meta.append(("err", "Could not find dma_buf->list_node"))
+            return None
+        if self.offset_list_node is not None:
+            self.meta.append(("info", "offsetof(dma_buf, list_node): {:#x}".format(self.offset_list_node)))
+
+        # dma_buf->{size,file,priv}
+        for name, default in (("size", 0), ("file", runtime.current_arch.ptrsize),
+                              ("priv", self.offset_list_node + runtime.current_arch.ptrsize * 2 if file_buffers is None else None), ("ops", runtime.current_arch.ptrsize * 4)):
+            offset = GefUtil.offsetof("dma_buf", name)
+            if offset is None:
+                offset = default
+            setattr(self, "offset_" + name, offset)
+            if offset is not None:
+                self.meta.append(("info", "offsetof(dma_buf, {:s}): {:#x}".format(name, offset)))
+
+        # dma_buf->{exp_name,name}
+        self.offset_exp_name = GefUtil.offsetof("dma_buf", "exp_name")
+        self.offset_name = GefUtil.offsetof("dma_buf", "name")
+        if self.offset_exp_name is None and file_buffers is None:
+            top = first_dma_buf - self.offset_list_node
+            for i in range(5, self.offset_list_node // runtime.current_arch.ptrsize):
+                x = read_int_from_memory(top + runtime.current_arch.ptrsize * i)
+                if not x or not is_valid_addr(x):
+                    continue
+                name = read_cstring_from_memory(x, 128, safe=True)
+                if name and re.fullmatch(r"[A-Za-z0-9_.+/-]{1,127}", name):
+                    self.offset_exp_name = runtime.current_arch.ptrsize * i
+                    break
+        if self.offset_name is None and self.offset_exp_name is not None and "5.3" <= kversion:
+            self.offset_name = self.offset_exp_name + runtime.current_arch.ptrsize
+        for name in ("exp_name", "name"):
+            offset = getattr(self, "offset_" + name)
+            if offset is not None:
+                self.meta.append(("info", "offsetof(dma_buf, {:s}): {:#x}".format(name, offset)))
+
+        self.sizeof_scatterlist = GefUtil.sizeof("scatterlist")
+        if self.offset_priv is not None:
+            if file_buffers is None:
+                dma_buf = first_dma_buf - self.offset_list_node
+            else:
+                dma_buf = first_dma_buf
+            size = read_int_from_memory(dma_buf + self.offset_size, safe=True)
+            priv = read_int_from_memory(dma_buf + self.offset_priv, safe=True)
+            if size is not None and priv is not None:
+                system_heap = self.get_system_heap_sgl(dma_buf, size, priv)
+            else:
+                system_heap = None
+            if system_heap is not None:
+                self.meta.append(("info", "offsetof(system_heap_buffer, sg_table): {:#x}".format(system_heap[2])))
+                if self.get_sizeof_scatterlist(system_heap[0], system_heap[1]) is not None:
+                    self.meta.append(("info", "sizeof(scatterlist): {:#x}".format(self.sizeof_scatterlist)))
+        return True
+
+    def get_buffers(self):
+        """Return {"buffers": [...], "incomplete": [reason, ...]}. The list is live, so it is walked on each call."""
+        objects = []
+        incomplete = []
+        if self.db_list is None:
+            incomplete.append("{:s} is unavailable, so only the buffers held by file descriptors are shown".format(self.list_name))
+            buffers = self.get_file_buffers()
+        else:
+            lh = KernelListHead(self.db_list)
+            buffers = lh.iter_entries()
+        for current in buffers:
+            # calc top
+            if self.db_list is not None:
+                dma_buf = current - self.offset_list_node
+            else:
+                dma_buf = current
+
+            # size, file, priv
+            size = read_int_from_memory(dma_buf + self.offset_size, safe=True)
+            file = read_int_from_memory(dma_buf + self.offset_file, safe=True)
+            if self.offset_priv is not None:
+                priv = read_int_from_memory(dma_buf + self.offset_priv, safe=True)
+            else:
+                priv = None
+            if size is None or file is None:
+                if is_valid_addr(current): # otherwise the walk stops there and tells it
+                    incomplete.append("dma_buf {:#x} is unreadable".format(dma_buf))
+                continue
+
+            # exp_name
+            exp_name = "<unknown>"
+            if self.offset_exp_name is not None:
+                exp_name_p = read_int_from_memory(dma_buf + self.offset_exp_name, safe=True)
+                if exp_name_p:
+                    exp_name = read_cstring_from_memory(exp_name_p, safe=True) or exp_name
+            # name
+            name = "<none>"
+            if self.offset_name is not None:
+                name_p = read_int_from_memory(dma_buf + self.offset_name, safe=True)
+                if name_p:
+                    name = read_cstring_from_memory(name_p, safe=True) or "<unreadable>"
+
+            # dump sgl
+            if priv is not None:
+                system_heap = self.get_system_heap_sgl(dma_buf, size, priv)
+            else:
+                system_heap = None
+            objects.append({
+                "address": dma_buf, "size": size, "exp_name": exp_name, "name": name,
+                "file": file, "priv": priv, "system_heap": system_heap,
+            })
+        if self.db_list is not None and lh.broken:
+            incomplete.append("{:s} is broken at {:#x} ({:s})".format(self.list_name, lh.broken_at, lh.broken_reason))
+        return {"buffers": objects, "incomplete": incomplete}
+
+    def get_sgl(self, sg, nents):
+        stride = self.get_sizeof_scatterlist(sg, nents)
+        for address, page_link, error in self.walk_sgl(sg, nents, stride):
+            if error:
+                yield {"error": error}
+                break
+            offset = read_int32_from_memory(address + runtime.current_arch.ptrsize, safe=True)
+            length = read_int32_from_memory(address + runtime.current_arch.ptrsize + 4, safe=True)
+            if offset is None or length is None:
+                yield {"error": "unreadable entry {:#x}".format(address)}
+                break
+
+            # output page, phys, virt
+            page = page_link & ~3
+            phys = Kernel.page2phys(page)
+            # check the mapping instead of the MSB, since PAGE_OFFSET is 0x40000000 with VMSPLIT_1G
+            if phys is not None:
+                virt = [v for v, entry in AddrMap.p2v_mappings(phys) if entry.is_kernel()]
+            else:
+                virt = None
+            yield {"page": page, "offset": offset, "length": length, "phys": phys, "virt": virt}
+        return
+
+    def walk_sgl(self, sg, nents, stride):
+        """Yield (address, page_link, None) of each entry, or (address, None, error) and stop."""
+        seen = set()
+        while nents:
+            if sg not in seen and is_valid_addr(sg):
+                page_link = read_int_from_memory(sg, safe=True)
+            else:
+                page_link = None
+            if page_link is None:
+                yield sg, None, "invalid link {:#x}".format(sg)
+                return
+            seen.add(sg)
+
+            # check if chain
+            if page_link & 1: # SG_CHAIN
+                sg = page_link & ~3
+                continue
+
+            nents -= 1
+            yield sg, page_link, None
+
+            # check if end
+            if page_link & 2: # SG_END
+                return
+            if stride is None:
+                yield sg, None, "sizeof(scatterlist) is unknown"
+                return
+            sg += stride
+        return
+
+    def get_sizeof_scatterlist(self, sg, nents):
+        """
+        struct scatterlist {
+            unsigned long page_link;
+            unsigned int offset;
+            unsigned int length;
+            dma_addr_t dma_address;
+        #ifdef CONFIG_NEED_SG_DMA_LENGTH
+            unsigned int dma_length;
+        #endif
+        #ifdef CONFIG_NEED_SG_DMA_FLAGS // v6.0~v6.4: CONFIG_PCI_P2PDMA
+            unsigned int dma_flags;
+        #endif
+        };
+        """
+        if self.sizeof_scatterlist is not None or nents < 2:
+            return self.sizeof_scatterlist
+
+        # dma_addr_t is 64-bit even on 32-bit arch if ARM_LPAE, X86_PAE, etc.,
+        # and only x86_32 aligns 64-bit integers to 4 bytes.
+        ptrsize = runtime.current_arch.ptrsize
+        candidates = set()
+        for dma_size in {ptrsize, 8}:
+            if is_x86_32():
+                dma_align = 4
+            else:
+                dma_align = dma_size
+            for extra in (0, 4, 8):
+                candidates.add(align(align(ptrsize + 8, dma_align) + dma_size + extra, max(ptrsize, dma_align)))
+
+        # the right size reaches SG_END exactly at the last entry, through valid entries
+        for size in sorted(candidates):
+            entries = list(self.walk_sgl(sg, nents, size))
+            if len(entries) != nents or entries[-1][2] is not None or not entries[-1][1] & 2:
+                continue
+            if not all(is_valid_addr(page_link & ~3) for _, page_link, _ in entries):
+                continue
+            if not all(read_int32_from_memory(x + ptrsize + 4, safe=True) for x, _, _ in entries):
+                continue
+            self.sizeof_scatterlist = size
+            break
+        return self.sizeof_scatterlist
+
+    def get_file_buffers(self):
+        output = Color.remove_color(gdb.execute("ktask --print-fd --user-process-only --no-pager --quiet", to_string=True))
+        for line in output.splitlines():
+            if "Disabled --print-fd" in line:
+                self.meta.append(("err", line.strip()))
+                return None
+        buffers = []
+        ptr = runtime.current_arch.ptrsize
+        offset = GefUtil.offsetof("file", "private_data")
+        for line in output.splitlines():
+            match = re.match(r"^\s*\d+\s+(?:True|False)\s+(0x[0-9a-f]+)\s+.*(?:dmabuf|dma_buf)", line)
+            if not match:
+                continue
+            file = int(match.group(1), 16)
+            if offset is not None:
+                offsets = [offset]
+            else:
+                offsets = range(0, ptr * 0x40, ptr)
+            for candidate in offsets:
+                buffer = read_int_from_memory(file + candidate, safe=True)
+                if not buffer or not is_valid_addr(buffer):
+                    continue
+                if read_int_from_memory(buffer + ptr, safe=True) != file:
+                    continue
+                if not is_double_link_list(buffer + ptr * 2):
+                    continue
+                if buffer not in buffers:
+                    buffers.append(buffer)
+                break
+        return buffers
+
+    def find_list_node(self, first_dma_buf):
+        for i in range(1, 50):
+            a = read_int_from_memory(first_dma_buf - runtime.current_arch.ptrsize * (i + 4)) # size
+            b = read_int_from_memory(first_dma_buf - runtime.current_arch.ptrsize * (i + 3)) # file
+            c = read_int_from_memory(first_dma_buf - runtime.current_arch.ptrsize * (i + 2)) # attachments
+            e = read_int_from_memory(first_dma_buf - runtime.current_arch.ptrsize * (i + 0)) # ops
+
+            # size check
+            if a == 0 or (is_valid_addr(a) and KernelAddressHeuristicFinderUtil.is_kernel_space(a)):
+                continue
+            # file check
+            if not is_valid_addr(b):
+                continue
+            # attachments check
+            if not is_double_link_list(c):
+                continue
+            # ops check
+            if not is_valid_addr(e):
+                continue
+
+            return runtime.current_arch.ptrsize * (i + 4)
+        return None
+
+    def get_system_heap_sgl(self, dma_buf, size, priv):
+        """
+        struct system_heap_buffer {
+            struct dma_heap *heap;
+            struct list_head attachments;
+            struct mutex lock;
+            unsigned long len;
+            struct sg_table {
+                struct scatterlist *sgl;
+                unsigned int nents;
+                unsigned int orig_nents;
+            } sg_table;
+            int vmap_cnt;
+            void *vaddr;
+        };
+        """
+        ops = read_int_from_memory(dma_buf + self.offset_ops, safe=True)
+        system_ops = Ksym.get_addr("system_heap_buf_ops")
+        if not system_ops or ops != system_ops:
+            release = Ksym.get_addr("system_heap_dma_buf_release")
+            if not release or not ops or not is_valid_addr(ops):
+                return None
+            if not any(read_int_from_memory(ops + runtime.current_arch.ptrsize * i, safe=True) == release for i in range(20)):
+                return None
+        if not is_valid_addr(priv):
+            return None
+        # system_heap_buffer->sg_table
+        offset = GefUtil.offsetof("system_heap_buffer", "sg_table")
+        if offset is None:
+            for i in range(50):
+                if read_int_from_memory(priv + runtime.current_arch.ptrsize * i, safe=True) == size:
+                    offset = runtime.current_arch.ptrsize * (i + 1)
+                    break
+        if offset is None:
+            return None
+        table = priv + offset
+        sgl = read_int_from_memory(table, safe=True)
+        nents = read_int32_from_memory(table + runtime.current_arch.ptrsize, safe=True)
+        if not sgl or not is_valid_addr(sgl) or not nents or nents > 1 << 20:
+            return None
+        return sgl, nents, offset
+
+
+
+class KernelBpf:
+    """Resolve BPF layouts and read the registered programs and maps."""
+
+    # include/uapi/linux/bpf.h
+    defined_prog_types = [
+        "UNSPEC",
+        "SOCKET_FILTER",
+        "KPROBE",
+        "SCHED_CLS",
+        "SCHED_ACT",
+        "TRACEPOINT",
+        "XDP",
+        "PERF_EVENT",
+        "CGROUP_SKB",
+        "CGROUP_SOCK",
+        "LWT_IN",
+        "LWT_OUT",
+        "LWT_XMIT",
+        "SOCK_OPS",
+        "SK_SKB",
+        "CGROUP_DEVICE",
+        "SK_MSG",
+        "RAW_TRACEPOINT",
+        "CGROUP_SOCK_ADDR",
+        "LWT_SEG6LOCAL",
+        "LIRC_MODE2",
+        "SK_REUSEPORT",
+        "FLOW_DISSECTOR",
+        "CGROUP_SYSCTL",
+        "RAW_TRACEPOINT_WRITABLE",
+        "CGROUP_SOCKOPT",
+        "TRACING",
+        "STRUCT_OPS",
+        "EXT",
+        "LSM",
+        "SK_LOOKUP",
+        "SYSCALL",
+        "NETFILTER",
+    ]
+
+    defined_attach_types = [
+        "CGROUP_INET_INGRESS",
+        "CGROUP_INET_EGRESS",
+        "CGROUP_INET_SOCK_CREATE",
+        "CGROUP_SOCK_OPS",
+        "SK_SKB_STREAM_PARSER",
+        "SK_SKB_STREAM_VERDICT",
+        "CGROUP_DEVICE",
+        "SK_MSG_VERDICT",
+        "CGROUP_INET4_BIND",
+        "CGROUP_INET6_BIND",
+        "CGROUP_INET4_CONNECT",
+        "CGROUP_INET6_CONNECT",
+        "CGROUP_INET4_POST_BIND",
+        "CGROUP_INET6_POST_BIND",
+        "CGROUP_UDP4_SENDMSG",
+        "CGROUP_UDP6_SENDMSG",
+        "LIRC_MODE2",
+        "FLOW_DISSECTOR",
+        "CGROUP_SYSCTL",
+        "CGROUP_UDP4_RECVMSG",
+        "CGROUP_UDP6_RECVMSG",
+        "CGROUP_GETSOCKOPT",
+        "CGROUP_SETSOCKOPT",
+        "TRACE_RAW_TP",
+        "TRACE_FENTRY",
+        "TRACE_FEXIT",
+        "MODIFY_RETURN",
+        "LSM_MAC",
+        "TRACE_ITER",
+        "CGROUP_INET4_GETPEERNAME",
+        "CGROUP_INET6_GETPEERNAME",
+        "CGROUP_INET4_GETSOCKNAME",
+        "CGROUP_INET6_GETSOCKNAME",
+        "XDP_DEVMAP",
+        "CGROUP_INET_SOCK_RELEASE",
+        "XDP_CPUMAP",
+        "SK_LOOKUP",
+        "XDP",
+        "SK_SKB_VERDICT",
+        "SK_REUSEPORT_SELECT",
+        "SK_REUSEPORT_SELECT_OR_MIGRATE",
+        "PERF_EVENT",
+        "TRACE_KPROBE_MULTI",
+        "LSM_CGROUP",
+        "STRUCT_OPS",
+        "NETFILTER",
+        "TCX_INGRESS",
+        "TCX_EGRESS",
+        "TRACE_UPROBE_MULTI",
+        "CGROUP_UNIX_CONNECT",
+        "CGROUP_UNIX_SENDMSG",
+        "CGROUP_UNIX_RECVMSG",
+        "CGROUP_UNIX_GETPEERNAME",
+        "CGROUP_UNIX_GETSOCKNAME",
+        "NETKIT_PRIMARY",
+        "NETKIT_PEER",
+        "TRACE_KPROBE_SESSION",
+        "TRACE_UPROBE_SESSION",
+        "TRACE_FSESSION",
+        "TRACE_FENTRY_MULTI",
+        "TRACE_FEXIT_MULTI",
+        "TRACE_FSESSION_MULTI",
+    ]
+
+    defined_map_types = [
+        "UNSPEC",
+        "HASH",
+        "ARRAY",
+        "PROG_ARRAY",
+        "PERF_EVENT_ARRAY",
+        "PERCPU_HASH",
+        "PERCPU_ARRAY",
+        "STACK_TRACE",
+        "CGROUP_ARRAY",
+        "LRU_HASH",
+        "LRU_PERCPU_HASH",
+        "LPM_TRIE",
+        "ARRAY_OF_MAPS",
+        "HASH_OF_MAPS",
+        "DEVMAP",
+        "SOCKMAP",
+        "CPUMAP",
+        "XSKMAP",
+        "SOCKHASH",
+        "CGROUP_STORAGE",
+        "REUSEPORT_SOCKARRAY",
+        "PERCPU_CGROUP_STORAGE",
+        "QUEUE",
+        "STACK",
+        "SK_STORAGE",
+        "DEVMAP_HASH",
+        "STRUCT_OPS",
+        "RINGBUF",
+        "INODE_STORAGE",
+        "TASK_STORAGE",
+        "BLOOM_FILTER",
+        "USER_RINGBUF",
+        "CGRP_STORAGE",
+        "ARENA",
+        "INSN_ARRAY",
+        "RHASH",
+    ]
+
+    # ARRAY, PROG_ARRAY, PERF_EVENT_ARRAY, PERCPU_ARRAY, CGROUP_ARRAY, ARRAY_OF_MAPS (allocated by array_map_alloc)
+    array_map_types = (2, 3, 4, 6, 8, 12)
+
+    @classmethod
+    @Cache.cache_this_session(per_inferior=True, until_new_objfile=True)
+    def get_instance(cls):
+        return cls()
+
+    def __init__(self):
+        self.meta = []
+        self.prog_idr = None
+        self.map_idr = None
+        self.offset_head = None
+        self.offset_map_type = None
+        self.offset_union_array = None
+        self.offset_prog_name = None
+        self.offset_map_name = None
+        self.seccomp_tools_command = None
+        return
+
+    @Cache.cache_this_session(cache_None=False)
+    def initialize(self):
+        self.meta = []
+
+        # get global address
+        prog_idr = KernelAddressHeuristicFinder.get_prog_idr()
+        if not prog_idr:
+            return None
+        self.meta.append(("info", "prog_idr: {:#x}".format(prog_idr)))
+
+        map_idr = KernelAddressHeuristicFinder.get_map_idr()
+        if not map_idr:
+            return None
+        self.meta.append(("info", "map_idr: {:#x}".format(map_idr)))
+        self.prog_idr = prog_idr
+        self.map_idr = map_idr
+
+        # idr->idr_rt->xa_head; see KernelXArray for struct xarray and struct xa_node
+        # ~v4.19: idr->idr_rt->rnode; see KernelRadixTree for struct radix_tree_root and struct radix_tree_node
+        if "4.20" <= Kernel.version():
+            self.tree_kind = "xarray"
+        else:
+            self.tree_kind = "radix"
+        if self.tree_kind == "xarray":
+            self.head_member = "idr_rt.xa_head"
+        else:
+            self.head_member = "idr_rt.rnode"
+        self.max_sizeof_idr = min(abs(prog_idr - map_idr), runtime.current_arch.ptrsize * 20)
+        self.offset_map_type = self.offset_union_array = self.offset_prog_name = self.offset_map_name = None
+        self.offset_head = GefUtil.offsetof("idr", self.head_member)
+        if self.offset_head is not None:
+            self.meta.append(("info", "offsetof(idr, {:s}): {:#x}".format(self.head_member, self.offset_head)))
+        elif not self.resolve_head_offset():
+            # Both IDRs are empty unless a tagged pointer to a node is left unverified.
+            if self.tree_kind == "xarray":
+                tag = 2
+            else:
+                tag = 1
+            for idr in (prog_idr, map_idr):
+                for offset in range(0, self.max_sizeof_idr, runtime.current_arch.ptrsize):
+                    entry = read_int_from_memory(idr + offset, safe=True)
+                    if entry and entry & 3 == tag and is_valid_addr(entry - tag):
+                        self.meta.append(("err", "Could not find xa_head. (maybe uninitialized?)"))
+                        return None
+
+        if self.tree_kind == "xarray":
+            # xa_node->{shift,count,slots}
+            KernelXArray.initialize_layout()
+            self.meta.append(("info", "offsetof(xa_node, shift): {:#x}".format(KernelXArray.offset_shift)))
+            self.meta.append(("info", "offsetof(xa_node, count): {:#x}".format(KernelXArray.offset_count)))
+            self.meta.append(("info", "offsetof(xa_node, slots): {:#x}".format(KernelXArray.offset_slots)))
+
+        """
+        struct bpf_prog {
+            u16 pages;
+            u16 jited:1,
+                jit_requested:1,
+                gpl_compatible:1,
+                cb_access:1,
+                dst_needed:1,
+                blinded:1,
+                is_func:1,
+                kprobe_override:1,
+                has_callchain_buf:1,
+                enforce_expected_attach_type:1,
+                call_get_stack:1;
+            enum bpf_prog_type type;
+            enum bpf_attach_type expected_attach_type;
+            u32 len;
+            u32 jited_len;
+            union {
+                u8 digest[SHA256_DIGEST_SIZE]; // v6.18~
+                u8 tag[BPF_TAG_SIZE];
+            };
+            struct bpf_prog_stats __percpu *stats; // v5.12~
+            int __percpu *active;                  // v5.12~
+            unsigned int (*bpf_func)(const void *ctx, const struct bpf_insn *insn); // v5.12~
+            struct bpf_prog_aux *aux;
+            struct sock_fprog_kern *orig_prog;
+            unsigned int (*bpf_func)(const void *ctx, const struct bpf_insn *insn); // ~v5.11
+            struct sock_filter insns[0];
+            struct bpf_insn insnsi[];
+        };
+        """
+        offsets = self.get_prog_offsets()
+        self.offset_prog_type = offsets["type"]
+        self.offset_expected_attach_type = offsets["expected_attach_type"]
+        self.offset_len = offsets["len"]
+        self.offset_jited_len = offsets["jited_len"]
+        self.offset_tag = offsets["tag"]
+        self.offset_aux = offsets["aux"]
+        self.offset_bpf_func = offsets["bpf_func"]
+        self.offset_orig_prog = offsets["orig_prog"]
+        for member, offset in offsets.items():
+            if offset is not None:
+                self.meta.append(("info", "offsetof(bpf_prog, {:s}): {:#x}".format(member, offset)))
+
+        try:
+            self.seccomp_tools_command = [GefUtil.which("ceccomp"), "disasm", "-c", "always"]
+            self.meta.append(("info", "ceccomp is found"))
+        except FileNotFoundError:
+            try:
+                self.seccomp_tools_command = [GefUtil.which("seccomp-tools"), "disasm"]
+                self.meta.append(("info", "seccomp-tools is found"))
+                if is_arm32():
+                    self.meta.append(("warn", "`seccomp-tools` is not supported on ARM32. "
+                                                      "Consider using `ceccomp` instead, as it supports ARM32."))
+                    self.meta.append(("info", "GEF uses `capstone-disassemble bpf_func`"))
+                    self.seccomp_tools_command = None
+            except FileNotFoundError:
+                self.meta.append(("info", "Could not find ceccomp or seccomp-tools, GEF uses `capstone-disassemble bpf_func`"))
+                self.seccomp_tools_command = None
+
+        return True
+
+    @staticmethod
+    @Cache.cache_this_session(per_inferior=True, until_new_objfile=True)
+    def get_prog_offsets():
+        """Return bpf_prog member offsets, preferring the target's debug information."""
+        kversion = Kernel.version()
+        if kversion is None or kversion < "3.16":
+            return {}
+
+        ptrsize = runtime.current_arch.ptrsize
+        offsets = dict.fromkeys(["type", "expected_attach_type", "len", "jited_len", "tag", "aux", "orig_prog", "bpf_func"])
+        if kversion < "3.17":
+            offsets.update(len=4, orig_prog=8, bpf_func=8 + ptrsize * 3)
+        elif kversion < "3.18":
+            offsets.update(len=0, orig_prog=ptrsize, bpf_func=ptrsize * 2)
+        elif kversion < "4.1":
+            offsets.update(len=4, orig_prog=8, aux=8 + ptrsize, bpf_func=8 + ptrsize * 2)
+        else:
+            if kversion < "4.10":
+                offsets.update(len=4, type=8)
+                end = 12
+            else:
+                offsets.update(type=4, len=8)
+                end = 12
+                if "4.13" <= kversion:
+                    offsets["jited_len"] = end
+                    end += 4
+                if "4.17" <= kversion:
+                    offsets.update(expected_attach_type=8, len=12, jited_len=16)
+                    end = 20
+                if "7.2.6" <= kversion:
+                    offsets.update(type=8, expected_attach_type=12, len=16, jited_len=20)
+                    end = 24
+                offsets["tag"] = end
+                if "6.18" <= kversion:
+                    end += 32
+                else:
+                    end += 8
+            offsets["aux"] = align_to_ptrsize(end)
+            offsets["bpf_func"] = offsets["aux"] + ptrsize * 2
+            if "5.12" <= kversion:
+                offsets["aux"] += ptrsize * 3
+            offsets["orig_prog"] = offsets["aux"] + ptrsize
+
+        if kversion < "3.17":
+            type_name = "struct sk_filter"
+        else:
+            type_name = "struct bpf_prog"
+        for member in offsets:
+            offset = GefUtil.offsetof(type_name, member)
+            if offset is not None:
+                offsets[member] = offset
+        return offsets
+
+    def get_progs(self):
+        progs = []
+        for prog_id, prog in self.parse_idr(self.prog_idr):
+            expected_attach_type = None # v4.17~
+            if self.offset_expected_attach_type is not None:
+                expected_attach_type = read_int32_from_memory(prog + self.offset_expected_attach_type)
+            progs.append({
+                "address": prog,
+                "id": prog_id,
+                "type": read_int32_from_memory(prog + self.offset_prog_type),
+                "expected_attach_type": expected_attach_type,
+                "jited_len": read_int32_from_memory(prog + self.offset_jited_len),
+                "orig_prog": read_int_from_memory(prog + self.offset_orig_prog),
+                "tag": read_memory(prog + self.offset_tag, 8).hex(), # the byte order is kept, as /proc/PID/fdinfo shows
+                "aux": read_int_from_memory(prog + self.offset_aux),
+                "bpf_func": read_int_from_memory(prog + self.offset_bpf_func),
+            })
+        self.resolve_prog_name_offset(progs)
+        for prog in progs:
+            prog["name"] = self.read_name(prog["aux"], self.offset_prog_name)
+        return progs
+
+    def get_maps(self):
+        entries = self.parse_idr(self.map_idr)
+        self.resolve_map_layout([m for _, m in entries])
+        self.resolve_map_name_offset([m for _, m in entries])
+        self.resolve_union_array_offset([m for _, m in entries])
+        maps = []
+        for map_id, m in entries:
+            map_type = read_int32_from_memory(m + self.offset_map_type)
+            union_array = None
+            if map_type in self.array_map_types and self.offset_union_array is not None:
+                union_array = m + self.offset_union_array
+            maps.append({
+                "address": m,
+                "id": map_id,
+                "name": self.read_name(m, self.offset_map_name),
+                "type": map_type,
+                "key_size": read_int32_from_memory(m + self.offset_key_size),
+                "value_size": read_int32_from_memory(m + self.offset_value_size),
+                "max_entries": read_int32_from_memory(m + self.offset_max_entries),
+                "union_array": union_array,
+            })
+        return maps
+
+    @staticmethod
+    def disassemble_prog(orig_prog, bpf_func, jited_len, tools_command=None):
+        """Return disassembly lines for a BPF program, or None on an invalid target."""
+        # runtime-only core -> commands dependency, allowed by layering rule 1
+        from gef.commands.base import ContextManager
+        try:
+            if tools_command and is_valid_addr(orig_prog):
+                count = read_int16_from_memory(orig_prog)
+                prog = read_int_from_memory(orig_prog + runtime.current_arch.ptrsize)
+                data = read_memory(prog, count * 8)
+                with ContextManager.temporary_file(data, prefix="kbpf") as tmp_path:
+                    return GefUtil.gef_execute_external(tools_command + [tmp_path], as_list=True)
+            if not is_valid_addr(bpf_func):
+                return None
+            if not jited_len:
+                return [gdb.execute("x/40i {:#x}".format(bpf_func), to_string=True).rstrip(), "..."]
+            __import__("capstone")
+            data = read_memory(bpf_func, jited_len)
+            lines = []
+            dump_count = 0
+            for insn in Disasm.capstone_disassemble(
+                bpf_func, jited_len, code=data.hex(),
+            ):
+                lines.append(insn.colored_text(10))
+                dump_count += insn.size
+                if dump_count >= jited_len:
+                    break
+            return lines
+        except ImportError:
+            ret = gdb.execute("x/40i {:#x}".format(bpf_func), to_string=True).rstrip()
+            return [ret, "..."]
+        except gdb.MemoryError:
+            return None
+
+    def resolve_head_offset(self):
+        """Resolve offsetof(idr, idr_rt.xa_head) from either IDR. Return False if neither has a node to verify it."""
+        if self.offset_head is not None:
+            return True
+        for idr in (self.prog_idr, self.map_idr):
+            if self.tree_kind == "xarray":
+                offset = KernelXArray(idr).find_head_offset(self.max_sizeof_idr)
+                if offset is not None and not KernelXArray.is_node(read_int_from_memory(idr + offset)):
+                    offset = None
+            else:
+                offset = KernelRadixTree(idr).find_rnode_offset(self.max_sizeof_idr)
+            if offset is not None:
+                self.offset_head = offset
+                self.meta.append(("info", "offsetof(idr, {:s}): {:#x}".format(self.head_member, offset)))
+                return True
+        return False
+
+    def parse_idr(self, idr):
+        """Return [(id, entry), ...] of prog_idr or map_idr. The index in the IDR is the ID."""
+        if not self.resolve_head_offset(): # both IDRs have been empty so far
+            return []
+        if self.tree_kind == "xarray":
+            return KernelXArray(idr, self.offset_head).parse_indexed()
+        return KernelRadixTree(idr, self.offset_head).parse_indexed()
+
+    def resolve_prog_name_offset(self, progs):
+        if self.offset_prog_name is not None or not progs or Kernel.version() < "4.15":
+            return
+
+        """
+        struct bpf_prog_aux {
+            ...
+            struct bpf_prog *prog;
+            struct user_struct *user;
+            u64 load_time;
+            u32 verified_insns;                                          // v5.16~
+            int cgroup_atype;                                            // v6.0~
+            struct bpf_map *cgroup_storage[MAX_BPF_CGROUP_STORAGE_TYPE]; // v4.19~
+            char name[BPF_OBJ_NAME_LEN];
+            ...
+        };
+        """
+        offset = GefUtil.offsetof("struct bpf_prog_aux", "name")
+        if offset is None:
+            # The position of aux->prog varies widely, but it points back to bpf_prog and is followed by name soon.
+            ptrsize = runtime.current_arch.ptrsize
+            chunks = []
+            backlinks = set()
+            for prog in progs:
+                data = read_memory(prog["aux"], 0x800, safe=True)
+                if data is None:
+                    continue
+                words = slice_unpack(data, ptrsize)
+                if prog["address"] in words:
+                    backlinks.add(words.index(prog["address"]) * ptrsize)
+                    chunks.append(data)
+            if len(backlinks) != 1:
+                return
+            base = backlinks.pop() + ptrsize
+            offset = self.find_name_offset(chunks, range(base, base + 0x40, 4))
+            if offset is None:
+                return
+        self.offset_prog_name = offset
+        self.meta.append(("info", "offsetof(bpf_prog_aux, name): {:#x}".format(offset)))
+        return
+
+    def resolve_map_layout(self, maps):
+        if self.offset_map_type is not None or not maps:
+            return
+
+        """
+        struct bpf_map {
+            u8 sha[SHA256_DIGEST_SIZE]; // v6.18~
+            u32 excl;                 // v7.2~
+            atomic_t refcnt;          // ~v4.14
+            const struct bpf_map_ops *ops; // v4.15~
+            struct bpf_map *inner_map_meta;
+        #ifdef CONFIG_SECURITY
+            void *security;
+        #endif
+            enum bpf_map_type map_type;
+            u32 key_size;
+            u32 value_size;
+            u32 max_entries;
+            ...
+            char name[BPF_OBJ_NAME_LEN]; // v4.15~
+            ...
+        };
+        """
+        # bpf_map->{map_type,key_size,value_size,max_entries}
+        self.offset_map_type = GefUtil.offsetof("struct bpf_map", "map_type")
+        if self.offset_map_type is None:
+            kversion = Kernel.version()
+            if kversion < "4.15" and not is_valid_addr(read_int_from_memory(maps[0])):
+                # ~v4.14 starts with refcnt and map_type (some v4.14.y backport the ops-first layout)
+                self.offset_map_type = 4
+            else:
+                # sha (v6.18~) and excl (v7.2~) are backported to some stable trees, so find ops itself
+                candidates = [0, 32, align_to_ptrsize(32 + 4)]
+                if "7.2" <= kversion:
+                    candidates = candidates[::-1]
+                elif "6.18" <= kversion:
+                    candidates = candidates[1:] + candidates[:1]
+                offset_ops = next((x for x in candidates if is_valid_addr(read_int_from_memory(maps[0] + x))), candidates[0])
+                self.offset_map_type = offset_ops + runtime.current_arch.ptrsize * 2
+                cand = read_int_from_memory(maps[0] + self.offset_map_type)
+                if cand == 0 or is_valid_addr(cand):
+                    self.offset_map_type += runtime.current_arch.ptrsize
+        self.offset_key_size = self.offset_map_type + 4
+        self.offset_value_size = self.offset_key_size + 4
+        self.offset_max_entries = self.offset_value_size + 4
+        self.meta.append(("info", "offsetof(bpf_map, map_type): {:#x}".format(self.offset_map_type)))
+        self.meta.append(("info", "offsetof(bpf_map, key_size): {:#x}".format(self.offset_key_size)))
+        self.meta.append(("info", "offsetof(bpf_map, value_size): {:#x}".format(self.offset_value_size)))
+        self.meta.append(("info", "offsetof(bpf_map, max_entries): {:#x}".format(self.offset_max_entries)))
+        return
+
+    def resolve_map_name_offset(self, maps):
+        if self.offset_map_name is not None or not maps or Kernel.version() < "4.15":
+            return
+
+        offset = GefUtil.offsetof("struct bpf_map", "name")
+        if offset is None:
+            # map->name is in the second cache line before v5.10, so search a wide area after max_entries.
+            base = self.offset_max_entries + 4
+            chunks = []
+            for m in maps:
+                data = read_memory(m, base + 0x180, safe=True)
+                if data is None:
+                    continue
+                chunks.append(data)
+            offset = self.find_name_offset(chunks, range(base, base + 0x170, 4))
+            if offset is None:
+                return
+        self.offset_map_name = offset
+        self.meta.append(("info", "offsetof(bpf_map, name): {:#x}".format(offset)))
+        return
+
+    def resolve_union_array_offset(self, maps):
+        if self.offset_union_array is not None or not maps:
+            return
+
+        """
+        struct bpf_array {
+            struct bpf_map map;
+            u32 elem_size;
+            u32 index_mask;
+            struct bpf_array_aux *aux;
+            union {
+                char value[0] __aligned(8);
+                void *ptrs[0] __aligned(8);
+                void __percpu *pptrs[0] __aligned(8);
+            };
+        };
+        """
+        # bpf_array->union_array
+        # Only an array map has the elem_size/index_mask pair, so scan every array map instead of assuming maps[0] is one.
+        # Every map type allocated by array_map_alloc() is a bpf_array, not only BPF_MAP_TYPE_ARRAY.
+        # The offset is a layout constant, so the first map that resolves it is enough.
+        self.offset_union_array = GefUtil.offsetof("struct bpf_array", "value")
+        arrays = [m for m in maps if read_int32_from_memory(m + self.offset_map_type) in self.array_map_types]
+        if self.offset_union_array is None and arrays:
+            self.offset_union_array = self.get_legacy_array_offset(arrays)
+        for m in arrays:
+            if self.offset_union_array is not None:
+                break
+            value_size = read_int32_from_memory(m + self.offset_value_size)
+            value_size_aligned_8 = align(value_size, 8)
+            max_entries = read_int32_from_memory(m + self.offset_max_entries)
+            k = 1
+            while k < max_entries:
+                k <<= 1
+            index_mask = k - 1
+
+            # bpf_array->elem_size follows bpf_map, which ends after map->name since v4.15.
+            # The size of bpf_map depends on the cache line size and the configs, so search from there.
+            if self.offset_map_name is not None:
+                base = m + align_to_ptrsize(self.offset_map_name + 16)
+            else:
+                base = m + align_to_ptrsize(self.offset_max_entries + 4)
+            data = read_memory(base, 0x400 + 4)
+            for i in range(0, 0x400, runtime.current_arch.ptrsize):
+                x, y = struct.unpack_from(Endian.endian_str() + "II", data, i)
+                if x == value_size_aligned_8 and y == index_mask:
+                    self.offset_union_array = align((base + i - m) + 4 * 2 + runtime.current_arch.ptrsize, 8)
+                    break
+        if self.offset_union_array is not None:
+            self.meta.append(("info", "offsetof(bpf_array, union_array): {:#x}".format(self.offset_union_array)))
+        elif arrays and ("warn", "Could not find offsetof(bpf_array, union_array)") not in self.meta:
+            # Keep going; the array column is the only thing that cannot be shown.
+            self.meta.append(("warn", "Could not find offsetof(bpf_array, union_array)"))
+        return
+
+    @switch_to_intel_syntax
+    def get_legacy_array_offset(self, arrays):
+        if self.offset_map_type != 4 or not "4.13" <= Kernel.version() < "4.14.14":
+            return None
+        address = Ksym.get_addr("array_map_lookup_elem")
+        if address is None:
+            return None
+        try:
+            res = KernelAddressHeuristicFinderUtil.disassemble_until_next_symbol(address, 40)
+        except gdb.error:
+            return None
+        if is_x86():
+            candidates = itertools.chain(
+                KernelAddressHeuristicFinderUtil.x64_lea_reg_const(res, skip_msb_check=True),
+                KernelAddressHeuristicFinderUtil.x64_x86_add_reg_const(res, skip_msb_check=True),
+            )
+        elif is_arm32() or is_arm64():
+            candidates = (int(x, 0) for x in re.findall(
+                r"\badds?(?:eq|ne|cs|hs|cc|lo|mi|pl|vs|vc|hi|ls|ge|lt|gt|le|al)?(?:\.w)?"
+                r"\s+\w+,\s*(?:\w+,\s*)?#(0x[\da-f]+|\d+)", res,
+            ))
+        else:
+            return None
+
+        # array_map_lookup_elem() adds offsetof(bpf_array, value), independent of work_struct's size.
+        for offset in candidates:
+            if offset <= self.offset_max_entries or offset > 0x400 or offset % 8:
+                continue
+            for elem_offset in (offset - 12, offset - 16):
+                if elem_offset % runtime.current_arch.ptrsize or align(elem_offset + 9, 8) != offset:
+                    continue
+                if all(read_int32_from_memory(m + elem_offset) ==
+                       align(read_int32_from_memory(m + self.offset_value_size), 8) for m in arrays):
+                    return offset
+        return None
+
+    @staticmethod
+    def find_name_offset(chunks, offsets):
+        """Return the offset where every chunk holds a valid name and the names are the longest in total, or None."""
+        best = None
+        best_score = 0
+        for offset in offsets:
+            score = 0
+            for data in chunks:
+                name = data[offset:offset + 16]
+                text = name.split(b"\0")[0]
+                # bpf_obj_name_cpy() accepts only [0-9A-Za-z_.] and zero-fills the rest of BPF_OBJ_NAME_LEN.
+                if len(text) == 16 or name != text.ljust(16, b"\0") or not re.fullmatch(rb"[\w.]*", text):
+                    break
+                score += len(text)
+            else:
+                if score > best_score:
+                    best = offset
+                    best_score = score
+        return best
+
+    @staticmethod
+    def read_name(address, offset):
+        if offset is None:
+            return None
+        return String.bytes2str(read_memory(address + offset, 16).split(b"\0")[0])
+
+
+
+class KernelSeccomp:
+    """Resolve seccomp layouts and parse filters attached to tasks."""
+
+    TaskInfo = collections.namedtuple("SeccompTaskInfo", "address mode mode_name filter_count first_filter")
+    FilterInfo = collections.namedtuple("SeccompFilterInfo", "address previous prog bpf_func jited_len orig_prog")
+
+    MODE_NAMES = {
+        0: "SECCOMP_MODE_DISABLED",
+        1: "SECCOMP_MODE_STRICT",
+        2: "SECCOMP_MODE_FILTER",
+    }
+
+    @classmethod
+    @Cache.cache_this_session(per_inferior=True, until_new_objfile=True)
+    def get_instance(cls):
+        return cls()
+
+    def __init__(self):
+        self.meta = []
+        self.initialized = False
+        self.task_addrs = ()
+        self.offset_stack = None
+        self.offset_seccomp = None
+        self.offset_filter = None
+        self.has_filter_count = None
+        self.offset_prev = None
+        self.offset_prog = None
+        self.offset_bpf_func = None
+        self.offset_orig_prog = None
+        self.offset_jited_len = None
+        self.tools_command = None
+        return
+
+    def initialize(self, task_addrs, offset_stack, offset_signal):
+        """Resolve all layouts required to dump a seccomp filter chain."""
+        if self.initialized:
+            return True
+
+        self.meta = []
+        self.task_addrs = tuple(task_addrs)
+        self.offset_stack = offset_stack
+
+        ret = self.get_offset_seccomp(offset_signal)
+        if ret is None:
+            self.meta.append(("err", "Could not find task_struct->seccomp"))
+            return None
+        self.offset_seccomp, self.offset_filter, self.has_filter_count = ret
+        self.meta.append(("info", "offsetof(task_struct, seccomp): {:#x}".format(self.offset_seccomp)))
+        self.meta.append(("info", "offsetof(seccomp, filter): {:#x}".format(self.offset_filter)))
+
+        self.offset_prev = self.get_offset_prev()
+        if self.offset_prev is None:
+            self.meta.append(("err", "Could not find seccomp_filter->prev"))
+            return None
+        self.meta.append(("info", "offsetof(seccomp_filter, prev): {:#x}".format(self.offset_prev)))
+
+        self.offset_prog = self.get_offset_prog(self.offset_prev)
+        if self.offset_prog is None:
+            self.meta.append(("err", "Could not find seccomp_filter->prog"))
+            return None
+        self.meta.append(("info", "offsetof(seccomp_filter, prog): {:#x}".format(self.offset_prog)))
+
+        offsets = KernelBpf.get_prog_offsets()
+        self.offset_jited_len = offsets.get("jited_len")
+        self.offset_bpf_func = self.get_offset_bpf_func()
+        if self.offset_bpf_func is None:
+            self.meta.append(("err", "Could not find bpf_prog->bpf_func"))
+            return None
+        self.meta.append(("info", "offsetof(bpf_prog, bpf_func): {:#x}".format(self.offset_bpf_func)))
+
+        self.offset_orig_prog = self.get_offset_orig_prog(self.offset_bpf_func)
+        if self.offset_orig_prog is None:
+            self.meta.append(("err", "Could not find bpf_prog->orig_prog"))
+            return None
+        self.meta.append(("info", "offsetof(bpf_prog, orig_prog): {:#x}".format(self.offset_orig_prog)))
+
+        try:
+            self.tools_command = [GefUtil.which("ceccomp"), "disasm", "-c", "always"]
+            self.meta.append(("info", "ceccomp is found"))
+        except FileNotFoundError:
+            try:
+                self.tools_command = [GefUtil.which("seccomp-tools"), "disasm"]
+                self.meta.append(("info", "seccomp-tools is found"))
+                if is_arm32():
+                    self.meta.append((
+                        "warn",
+                        "`seccomp-tools` is not supported on ARM32. "
+                        "Consider using `ceccomp` instead, as it supports ARM32.",
+                    ))
+                    self.meta.append(("info", "GEF uses `capstone-disassemble bpf_func`"))
+                    self.tools_command = None
+            except FileNotFoundError:
+                self.meta.append((
+                    "info",
+                    "Could not find ceccomp or seccomp-tools, GEF uses `capstone-disassemble bpf_func`",
+                ))
+                self.tools_command = None
+
+        self.initialized = True
+        return True
+
+    def parse_task(self, task):
+        """Read the task's top-level ``struct seccomp`` fields."""
+        address = task + self.offset_seccomp
+        mode = read_int32_from_memory(address)
+        first_filter = read_int_from_memory(address + self.offset_filter)
+        if self.has_filter_count:
+            filter_count = read_int32_from_memory(address + 4)
+        else:
+            # ~v5.8 has no filter_count, so count the chain
+            filter_count = 0
+            seen = set()
+            current = first_filter
+            while is_valid_addr(current) and current not in seen and filter_count < 0x1000:
+                seen.add(current)
+                filter_count += 1
+                current = read_int_from_memory(current + self.offset_prev)
+        return self.TaskInfo(address, mode, self.MODE_NAMES.get(mode, "UNKNOWN"), filter_count, first_filter)
+
+    def iter_filters(self, task_info):
+        """Yield the filter chain, bounded by seccomp.filter_count."""
+        filter_current = task_info.first_filter
+        remaining = task_info.filter_count
+        while remaining:
+            if not filter_current:
+                break
+            prog = read_int_from_memory(filter_current + self.offset_prog)
+            previous = read_int_from_memory(filter_current + self.offset_prev)
+            bpf_func = read_int_from_memory(prog + self.offset_bpf_func)
+            orig_prog = read_int_from_memory(prog + self.offset_orig_prog)
+            if self.offset_jited_len is not None:
+                jited_len = read_int32_from_memory(prog + self.offset_jited_len)
+            else:
+                jited_len = 0
+            yield self.FilterInfo(filter_current, previous, prog, bpf_func, jited_len, orig_prog)
+            filter_current = previous
+            remaining -= 1
+
+    def disassemble(self, filter_info):
+        """Return disassembly lines for one seccomp filter, or None on an invalid target."""
+        return KernelBpf.disassemble_prog(
+            filter_info.orig_prog, filter_info.bpf_func, filter_info.jited_len, self.tools_command,
+        )
+
+    @staticmethod
+    def is_enabled(task_addr, offset_stack):
+        """Return whether the task's architecture-specific seccomp thread flag is set."""
+        if offset_stack is None:
+            return None
+
+        thread_info = KernelSeccomp.get_thread_info(task_addr, offset_stack)
+        if thread_info is None:
+            return None
+
+        kversion = Kernel.version()
+        if kversion is None:
+            return None
+
+        if is_x86():
+            if "5.11" <= kversion:
+                flags = read_int_from_memory(thread_info + runtime.current_arch.ptrsize)
+                bit = 0 # SYSCALL_WORK_SECCOMP
+            elif "4.9" <= kversion:
+                flags = read_int_from_memory(thread_info)
+                bit = 8 # TIF_SECCOMP
+            elif "4.1" <= kversion:
+                flags = read_int32_from_memory(thread_info + runtime.current_arch.ptrsize)
+                bit = 8
+            else:
+                flags = read_int32_from_memory(thread_info + runtime.current_arch.ptrsize * 2)
+                bit = 8
+            return bool(flags & (1 << bit))
+
+        if is_arm32():
+            flags = read_int_from_memory(thread_info)
+            if "6.0" <= kversion:
+                bit = 23
+            elif "5.16" <= kversion:
+                bit = 7
+            elif "5.15" <= kversion:
+                bit = 23
+            elif "5.11" <= kversion:
+                bit = 7
+            elif "5.10" <= kversion:
+                bit = 23
+            elif "4.3" <= kversion:
+                bit = 7
+            elif "3.8" <= kversion:
+                bit = 11
+            else:
+                bit = 21
+            return bool(flags & (1 << bit))
+
+        if is_arm64() and "3.16" <= kversion:
+            flags = read_int_from_memory(thread_info)
+            return bool(flags & (1 << 11))
+
+        if (is_riscv32() or is_riscv64()) and "5.5" <= kversion:
+            if "6.3" <= kversion: # generic entry
+                offset = GefUtil.offsetof("thread_info", "syscall_work")
+                if offset is None:
+                    offset = runtime.current_arch.ptrsize * 5
+                flags = read_int_from_memory(thread_info + offset)
+                bit = 0 # SYSCALL_WORK_SECCOMP
+            else:
+                flags = read_int_from_memory(thread_info)
+                bit = 8 # TIF_SECCOMP
+            return bool(flags & (1 << bit))
+
+        return None
+
+    @staticmethod
+    def get_thread_info(task_addr, offset_stack):
+        """Return ``thread_info`` for both in-task and stack-based layouts."""
+        # fast path
+        offset = GefUtil.offsetof("task_struct", "thread_info")
+        if offset is not None:
+            return task_addr + offset
+        try:
+            gdb.parse_and_eval("(struct task_struct*)0")
+            return read_int_from_memory(task_addr + offset_stack)
+        except gdb.error:
+            pass
+
+        # slow path
+        kstack = read_int_from_memory(task_addr + offset_stack)
+        if not is_valid_addr(kstack):
+            return None
+        if read_int32_from_memory(kstack) == 0x57ac6e9d: # STACK_END_MAGIC
+            return task_addr # CONFIG_THREAD_INFO_IN_TASK=y
+        return kstack # CONFIG_THREAD_INFO_IN_TASK=n
+
+    @Cache.cache_this_session(cache_None=False)
+    def get_offset_seccomp(self, offset_signal):
+        """Return (offsetof(task_struct, seccomp), offsetof(seccomp, filter), has seccomp.filter_count).
+
+        struct seccomp {
+            int mode;
+            atomic_t filter_count; // v5.9~
+            struct seccomp_filter *filter;
+        };
+        """
+        # fast path
+        offset_seccomp = GefUtil.offsetof("task_struct", "seccomp")
+        offset_filter = GefUtil.offsetof("seccomp", "filter")
+        if None not in (offset_seccomp, offset_filter):
+            has_filter_count = GefUtil.offsetof("seccomp", "filter_count") is not None
+            return offset_seccomp, offset_filter, has_filter_count
+
+        # slow path
+        kversion = Kernel.version()
+        # A task in strict mode has no filter, so try every seccomped task.
+        for task in self.task_addrs:
+            if not self.is_enabled(task, self.offset_stack):
+                continue
+
+            # Find task_struct.pending, then search the following words for seccomp.filter.
+            base = offset_signal + runtime.current_arch.ptrsize
+            for i in range(0x100):
+                if is_double_link_list(task + base + runtime.current_arch.ptrsize * i):
+                    base += runtime.current_arch.ptrsize * i * 2
+                    break
+            else:
+                continue
+
+            for i in range(0x100):
+                offset_filter = base + runtime.current_arch.ptrsize * i
+                filt = read_int_from_memory(task + offset_filter)
+                if not is_valid_addr(filt):
+                    continue
+                before8 = read_int32_from_memory(task + offset_filter - 8)
+                before4 = read_int32_from_memory(task + offset_filter - 4)
+                # a task that has a filter is always in SECCOMP_MODE_FILTER (2)
+                new_layout = before8 == 2 and before4 != 0
+                if is_64bit():
+                    old_layout = before8 == 2 and before4 == 0 # padding
+                    old_offset_filter = 8
+                else:
+                    old_layout = before4 == 2
+                    old_offset_filter = 4
+                # the word before `mode` may happen to be 2, so the filter chain itself must look like one
+                if not (new_layout or old_layout):
+                    continue
+                if not self.is_filter_chain(filt, before4 if new_layout else None):
+                    continue
+                # both are possible on 32-bit, when the word before `mode` happens to be 2
+                if new_layout and (not old_layout or "5.9" <= kversion):
+                    return offset_filter - 8, 8, True
+                if old_layout:
+                    return offset_filter - old_offset_filter, old_offset_filter, False
+        return None
+
+    @staticmethod
+    def is_filter_chain(filter_addr, filter_count):
+        """Return whether `filter_addr` heads a chain of `seccomp_filter`s, as long as `filter_count` if it is given.
+        Each filter begins with `refcount_t refs`."""
+        offset_prev = KernelSeccomp.find_offset_prev(filter_addr)
+        if offset_prev is None:
+            return False
+        if filter_count is not None and not 0 < filter_count <= 0x100:
+            return False
+        length = 0
+        while filter_addr:
+            refs = read_int32_from_memory(filter_addr, safe=True)
+            if refs is None or not 0 < refs < 0x10000 or length > 0x100:
+                return False
+            length += 1
+            filter_addr = read_int_from_memory(filter_addr + offset_prev, safe=True)
+            if filter_addr is None or (filter_addr and not is_valid_addr(filter_addr)):
+                return False
+        return filter_count is None or length == filter_count
+
+    @staticmethod
+    def find_offset_prev(filter_addr):
+        """Return the offset of `prev` in the `seccomp_filter` at `filter_addr`, which is followed by `prog`, or None."""
+        for i in range(0x100):
+            # a wrong candidate of `filter` may be at the end of a mapping
+            previous = read_int_from_memory(filter_addr + runtime.current_arch.ptrsize * i, safe=True)
+            prog = read_int_from_memory(filter_addr + runtime.current_arch.ptrsize * (i + 1), safe=True)
+            if previous is None or prog is None:
+                break
+            if (previous & 0x7) or (previous != 0 and not is_valid_addr(previous)):
+                continue
+            if (prog & 0xfff) or not is_valid_addr(prog):
+                continue
+            if is_valid_addr(read_int_from_memory(prog)):
+                continue
+            return runtime.current_arch.ptrsize * i
+        return None
+
+    @Cache.cache_this_session(cache_None=False)
+    def get_offset_prev(self):
+        # fast path
+        offset = GefUtil.offsetof("seccomp_filter", "prev")
+        if offset is not None:
+            return offset
+
+        # slow path
+        for task in self.task_addrs:
+            if not self.is_enabled(task, self.offset_stack):
+                continue
+            mode = read_int32_from_memory(task + self.offset_seccomp)
+            if mode != 2:
+                continue
+            if self.has_filter_count and read_int32_from_memory(task + self.offset_seccomp + 4) == 0:
+                continue
+            filter_addr = read_int_from_memory(task + self.offset_seccomp + self.offset_filter)
+            if not is_valid_addr(filter_addr):
+                continue
+            offset_prev = self.find_offset_prev(filter_addr)
+            if offset_prev is not None:
+                return offset_prev
+        return None
+
+    @staticmethod
+    @Cache.cache_this_session(cache_None=False, per_inferior=True, until_new_objfile=True)
+    def get_offset_prog(offset_prev):
+        # fast path
+        offset = GefUtil.offsetof("seccomp_filter", "prog")
+        if offset is not None:
+            return offset
+
+        # slow path
+        kversion = Kernel.version()
+        if offset_prev is None or kversion is None or kversion < "3.16":
+            return None
+        return offset_prev + runtime.current_arch.ptrsize
+
+    def get_offset_bpf_func(self):
+        return KernelBpf.get_prog_offsets().get("bpf_func")
+
+    @staticmethod
+    def get_offset_orig_prog(offset_bpf_func):
+        if offset_bpf_func is None:
+            return None
+        return KernelBpf.get_prog_offsets().get("orig_prog")
+
+
+
+class KernelModule:
+    """Resolve the layout of `struct module` and parse it.
+    It is shared by `kmod`, `kmod-load` and the commands that look up the loaded modules.
+
+    struct module {
+        enum module_state state;
+        struct list_head list;
+        char name[MODULE_NAME_LEN];
+        ...
+        struct module_memory mem[MOD_MEM_NUM_TYPES]; // v6.4~
+        struct module_layout core_layout;            // v4.5~v6.3
+        void *module_core;                           // ~v4.4
+        ...
+        struct mod_kallsyms __rcu *kallsyms;         // v4.5~
+        Elf_Sym *symtab, *core_symtab;               // ~v4.4
+        ...
+        struct module_sect_attrs *sect_attrs;
+        ...
+    };
+    """
+
+    # enum mod_mem_type (v6.4~)
+    MOD_MEM_TYPES = ["text", "data", "rodata", "ro_after_init", "init_text", "init_data", "init_rodata"]
+    # not a limit of the kernel, only to reject garbage
+    MAX_MODULE_SIZE = 0x4000_0000
+
+    @classmethod
+    @Cache.cache_this_session(per_inferior=True, until_new_objfile=True)
+    def get_instance(cls):
+        return cls()
+
+    def __init__(self):
+        self.meta = []
+        self.initialized = False
+        self.modules = None
+        self.offset_name = None
+        self.memory_meta = []
+        self.memory_initialized = False
+        self.memory_kind = None
+        self.offset_base = None
+        self.offset_size = None
+        self.sizeof_module_memory = None
+        self.kallsyms_meta = []
+        self.kallsyms_initialized = False
+        self.offset_kallsyms = None
+        self.offset_symtab = None
+        self.sect_attrs_meta = []
+        self.sect_attrs_initialized = False
+        self.offset_sect_attrs = None
+        self.offset_attrs = None
+        self.offset_address = None
+        return
+
+    def initialize(self):
+        if self.initialized:
+            return True
+
+        self.meta = []
+        kversion = Kernel.version()
+        if kversion is None:
+            self.meta.append(("err", "Failed to resolve kernel version"))
+            return None
+
+        # modules
+        self.modules = KernelAddressHeuristicFinder.get_modules()
+        if self.modules is None:
+            self.meta.append(("err", "Could not find modules (CONFIG_MODULES may not be set)"))
+            return None
+        self.meta.append(("info", "modules: {:#x}".format(self.modules)))
+
+        # module->name
+        self.offset_name = runtime.current_arch.ptrsize * 3 # state + list_head
+        self.meta.append(("info", "offsetof(module, name): {:#x}".format(self.offset_name)))
+        self.initialized = True
+        return True
+
+    def initialize_memory(self, module_addrs):
+        if self.memory_initialized:
+            return True
+
+        self.memory_meta = []
+        kversion = Kernel.version()
+
+        # module->{mem,core_layout,module_core}
+        # (member name, size member name, getter)
+        mem = ("mem", "mem.size", self.get_offset_mem) # v6.4~
+        core_layout = ("core_layout", "core_layout.size", self.get_offset_core_layout) # v4.5~v6.4
+        module_core = ("module_core", "core_size", self.get_offset_module_core) # ~v4.4
+        # the kernel version only decides which layout is tried first, because distributions
+        # backport the layout change (e.g. Ubuntu 4.4 already has core_layout)
+        if "6.4" <= kversion:
+            plans = [mem, core_layout, module_core]
+        elif "4.5" <= kversion:
+            plans = [core_layout, mem, module_core]
+        else:
+            plans = [module_core, core_layout, mem]
+        for base_name, size_name, getter in plans:
+            ret = getter(module_addrs)
+            if ret is None:
+                continue
+            self.offset_base, self.offset_size = ret[:2]
+            self.memory_meta.append(("info", "offsetof(module, {:s}): {:#x}".format(base_name, self.offset_base)))
+            self.memory_meta.append(("info", "offsetof(module, {:s}): {:#x}".format(size_name, self.offset_size)))
+            if base_name == "mem":
+                self.sizeof_module_memory = ret[2]
+                self.memory_meta.append(("info", "sizeof(module_memory): {:#x}".format(self.sizeof_module_memory)))
+            self.memory_kind = base_name
+            break
+        else:
+            self.memory_meta.append(("err", "Could not find module->{:s}".format(plans[0][0])))
+            return None
+        self.memory_initialized = True
+        return True
+
+    def initialize_kallsyms(self, module_addrs):
+        if self.kallsyms_initialized:
+            return True
+
+        self.kallsyms_meta = []
+        # the kernel version only decides which layout is tried first, because distributions
+        # backport the change of v4.5 (struct mod_kallsyms)
+        if Kernel.version() < "4.5":
+            self.offset_symtab = self.get_offset_symtab(module_addrs)
+            if self.offset_symtab is None:
+                self.offset_kallsyms = self.get_offset_kallsyms(module_addrs)
+        else:
+            self.offset_kallsyms = self.get_offset_kallsyms(module_addrs)
+            if self.offset_kallsyms is None:
+                self.offset_symtab = self.get_offset_symtab(module_addrs)
+
+        if self.offset_kallsyms is not None:
+            self.kallsyms_meta.append(("info", "offsetof(module, kallsyms): {:#x}".format(self.offset_kallsyms)))
+        elif self.offset_symtab is not None:
+            self.kallsyms_meta.append(("info", "offsetof(module, symtab): {:#x}".format(self.offset_symtab)))
+        else:
+            self.kallsyms_meta.append(("err", "Could not find module->kallsyms"))
+            return None
+        self.kallsyms_initialized = True
+        return True
+
+    def initialize_sect_attrs(self, module_addrs, preferred=None):
+        if self.sect_attrs_initialized:
+            return True
+
+        self.sect_attrs_meta = []
+        kversion = Kernel.version()
+
+        # the preferred module is tried first, but the layout is common to all modules
+        samples = [x for x in module_addrs if x != preferred][:8]
+        if preferred is not None:
+            samples = [preferred] + samples
+
+        errors = []
+        for module in samples:
+            # module->sect_attrs
+            offset_sect_attrs, sect_attrs = self.get_offset_sect_attrs(module)
+            if offset_sect_attrs is None:
+                errors.append("Could not find module->sect_attrs (CONFIG_KALLSYMS or CONFIG_SYSFS may not be set)")
+                continue
+            if sect_attrs is None:
+                errors.append("module->sect_attrs is NULL or invalid (CONFIG_SYSFS may not be set, or its creation failed)")
+                continue
+
+            # sect_attrs.grp.{attrs,bin_attrs}
+            offset_attrs, attribute_arr_ptr = self.get_offset_bin_attrs(sect_attrs)
+            if offset_attrs is None:
+                errors.append("Could not find module->sect_attrs.grp.{attrs,bin_attrs}")
+                continue
+
+            # ~6.13: module_sect_attr.address
+            # 6.14~: bin_attribute.private
+            offset_address = self.get_offset_address(module, attribute_arr_ptr)
+            if offset_address is None:
+                if kversion < "6.14":
+                    errors.append("Could not find offset of module_sect_attr.address (section address)")
+                else:
+                    errors.append("Could not find offset of bin_attribute.private (section address)")
+                continue
+            break
+        else:
+            # the error of the preferred module is the most relevant
+            self.sect_attrs_meta.append(("err", errors[0] if errors else "Could not find any modules"))
+            return None
+
+        self.offset_sect_attrs, self.offset_attrs, self.offset_address = offset_sect_attrs, offset_attrs, offset_address
+        self.sect_attrs_meta.append(("info", "sample module: {:#x}".format(module)))
+        self.sect_attrs_meta.append(("info", "offsetof(module, sect_attrs): {:#x}".format(offset_sect_attrs)))
+        self.sect_attrs_meta.append(("info", "offsetof(module_sect_attrs, grp.{{attrs,bin_attrs}}): {:#x}".format(offset_attrs)))
+        if kversion < "6.14":
+            self.sect_attrs_meta.append(("info", "offsetof(module_sect_attr, address): {:#x}".format(offset_address)))
+        else:
+            self.sect_attrs_meta.append(("info", "offsetof(bin_attribute, private): {:#x}".format(offset_address)))
+        self.sect_attrs_initialized = True
+        return True
+
+    def get_addrs(self):
+        """Return the addresses of the loaded modules and the warnings (level, line) of the list walk.
+        The list is live, so it is walked on each call."""
+        if self.modules is None:
+            return None, []
+
+        meta = []
+        # struct module { enum module_state state; struct list_head list; ... };
+        lh = KernelListHead(self.modules, runtime.current_arch.ptrsize)
+        entries = list(lh.iter_entries())
+        if lh.broken:
+            meta.append(("warn", "Stopped at {:s} module: {:#x}".format(lh.broken_reason, lh.broken_at)))
+            # the list is circular and doubly-linked, so the entries located behind the broken
+            # one are still reachable by following `prev` from the list head
+            seen = set(entries)
+            backward = list(lh.iter_entries(backward=True))
+            if lh.broken:
+                meta.append(("warn", "Stopped at {:s} module: {:#x} (backward)".format(lh.broken_reason, lh.broken_at)))
+            entries += [x for x in reversed(backward) if x not in seen]
+            # the entries the walks stopped at are unreadable, they must not be passed to the
+            # `struct module` layout heuristics
+            entries = [x for x in entries if is_valid_addr(x)]
+        return entries, meta
+
+    def get_name(self, module):
+        return read_cstring_from_memory(module + self.offset_name)
+
+    def find(self, module_addrs, name):
+        for module in module_addrs:
+            if self.get_name(module) == name:
+                return module
+        return None
+
+    def get_loaded(self):
+        """Return [(module, name, regions), ...] for the commands that look up the loaded modules,
+        or None if the modules or their memory layout are unresolvable."""
+        try:
+            if not self.initialize():
+                return None
+            module_addrs = self.get_addrs()[0]
+            if not module_addrs:
+                return []
+            if not self.initialize_memory(module_addrs):
+                return None
+            return [(module, self.get_name(module), self.get_regions(module)) for module in module_addrs]
+        except gdb.error:
+            return None
+
+    def get_text_ranges(self):
+        """Return [(start, end, module, name), ...] of the text of the loaded modules, or [] if unresolvable."""
+        ranges = []
+        for module, name, regions in self.get_loaded() or []:
+            if self.memory_kind in ("module_core", "core_layout"):
+                base = read_int_from_memory(module + self.offset_base, safe=True)
+                size = read_int32_from_memory(module + self.offset_size + 4, safe=True)
+                core_size = read_int32_from_memory(module + self.offset_size, safe=True)
+                if base and size and core_size is not None and size <= core_size:
+                    ranges.append((base, base + size, module, name))
+                continue
+            for region_name, base, size in regions:
+                if region_name in ("core", "text", "init_text"):
+                    ranges.append((base, base + size, module, name))
+        return ranges
+
+    def get_regions(self, module):
+        if self.memory_kind != "mem":
+            base = read_int_from_memory(module + self.offset_base)
+            size = read_int32_from_memory(module + self.offset_size)
+            return [("core", base, size)]
+
+        # v6.4~: each type is allocated separately; an empty type (and init ones after the initialization) is NULL
+        regions = []
+        for i, region_name in enumerate(self.MOD_MEM_TYPES):
+            base = read_int_from_memory(module + self.offset_base + self.sizeof_module_memory * i)
+            size = read_int32_from_memory(module + self.offset_size + self.sizeof_module_memory * i)
+            if base and size:
+                regions.append((region_name, base, size))
+        return regions
+
+    def parse_kallsyms(self, module, progress=False):
+        kversion = Kernel.version()
+
+        if is_64bit():
+            sizeof_symtab_entry = 24
+        else:
+            sizeof_symtab_entry = 16
+        typetab = None
+        if self.offset_symtab is not None: # ~v4.4
+            symtab = read_int_from_memory(module + self.offset_symtab)
+            num_symtab = read_int32_from_memory(module + self.offset_symtab + runtime.current_arch.ptrsize * 2)
+            strtab = read_int_from_memory(module + self.offset_symtab + runtime.current_arch.ptrsize * 2 + 4 * 2)
+        else:
+            kallsyms = read_int_from_memory(module + self.offset_kallsyms)
+            symtab = read_int_from_memory(kallsyms + runtime.current_arch.ptrsize * 0)
+            num_symtab = read_int32_from_memory(kallsyms + runtime.current_arch.ptrsize * 1)
+            strtab = read_int_from_memory(kallsyms + runtime.current_arch.ptrsize * 2)
+            if "5.2" <= kversion:
+                typetab = read_int_from_memory(kallsyms + runtime.current_arch.ptrsize * 3)
+
+        #gef_print("symtab: {:#x}".format(symtab))
+        #gef_print("sizeof_symtab_entry: {:#x}".format(sizeof_symtab_entry))
+        #gef_print("num_symab: {:#x}".format(num_symtab))
+        #gef_print("strtab: {:#x}".format(strtab))
+        #if "5.2" <= kversion:
+        #    gef_print("typetab: {:#x}".format(typetab))
+
+        entries = []
+        for i in ProgressBar(range(num_symtab), disable=not progress):
+            sym_addr = read_int_from_memory(symtab + sizeof_symtab_entry * i + runtime.current_arch.ptrsize)
+            strtab_pos = read_int32_from_memory(symtab + sizeof_symtab_entry * i)
+            sym_name = read_cstring_from_memory(strtab + strtab_pos)
+
+            if typetab is not None:
+                sym_type = chr(read_int8_from_memory(typetab + i))
+            elif "5.0" <= kversion:
+                # st_size
+                if is_64bit():
+                    sym_type = chr(read_int8_from_memory(symtab + sizeof_symtab_entry * i + 16))
+                else:
+                    sym_type = chr(read_int8_from_memory(symtab + sizeof_symtab_entry * i + 8))
+            else:
+                # st_info
+                if is_64bit():
+                    sym_type = chr(read_int8_from_memory(symtab + sizeof_symtab_entry * i + 4))
+                else:
+                    sym_type = chr(read_int8_from_memory(symtab + sizeof_symtab_entry * i + 12))
+            entries.append([sym_addr, sym_type, sym_name])
+        return entries
+
+    def get_sections(self, module):
+        """Return [(section name, address), ...] from `module->sect_attrs`, or None if it is unavailable."""
+        sect_attrs = read_int_from_memory(module + self.offset_sect_attrs)
+        if not self.is_valid_sect_attrs(sect_attrs):
+            return None
+        attribute_list = read_int_from_memory(sect_attrs + self.offset_attrs)
+        if not self.is_valid_attribute_arr(attribute_list):
+            return None
+
+        # get each section name and address
+        sections = []
+        while True:
+            attribute = read_int_from_memory(attribute_list)
+            if attribute == 0:
+                break
+            nameptr = read_int_from_memory(attribute)
+            name = read_cstring_from_memory(nameptr)
+            addr = read_int_from_memory(attribute + self.offset_address)
+            sections.append((name, addr))
+            attribute_list += runtime.current_arch.ptrsize
+        return sections
+
+    def is_valid_region(self, base, size):
+        if base == 0 or base & 0xfff:
+            return False
+        if size == 0 or size > self.MAX_MODULE_SIZE:
+            return False
+        return base + size <= (1 << (runtime.current_arch.ptrsize * 8))
+
+    def get_offset_mem(self, module_addrs): # v6.4~
+        """
+        ac3b43283923440900b4f36ca5f9f0b1ca43b70e changed the module layout information structure
+        MOD_TEXT = 0,
+        MOD_DATA,
+        MOD_RODATA,
+        MOD_RO_AFTER_INIT,
+        MOD_INIT_TEXT,
+        MOD_INIT_DATA,
+        MOD_INIT_RODATA,
+
+        struct module {
+            enum module_state state;
+            struct list_head list;
+            char name[MODULE_NAME_LEN]; // 64 - sizeof(unsigned long) bytes
+        #ifdef CONFIG_STACKTRACE_BUILD_ID
+            unsigned char build_id[BUILD_ID_SIZE_MAX]; // 20 bytes
+        #endif
+            struct module_kobject mkobj;
+            struct module_attribute *modinfo_attrs;
+            const char *version;
+            const char *srcversion;
+            struct kobject *holders_dir;
+            const struct kernel_symbol *syms;
+            const s32 *crcs;
+            unsigned int num_syms;
+        #ifdef CONFIG_ARCH_USES_CFI_TRAPS
+            s32 *kcfi_traps;
+            s32 *kcfi_traps_end;
+        #endif
+        #ifdef CONFIG_SYSFS
+            struct mutex param_lock;
+        #endif
+            struct kernel_param *kp;
+            unsigned int num_kp;
+            unsigned int num_gpl_syms;
+            const struct kernel_symbol *gpl_syms;
+            const s32 *gpl_crcs;
+            bool using_gplonly_symbols;
+        #ifdef CONFIG_MODULE_SIG
+            bool sig_ok;
+        #endif
+            bool async_probe_requested;
+            unsigned int num_exentries;
+            struct exception_table_entry *extable;
+            int (*init)(void);
+            struct module_memory mem[MOD_MEM_NUM_TYPES] __module_memory_align;    <-- here
+            struct mod_arch_specific arch;
+            unsigned long taints;
+        #ifdef CONFIG_GENERIC_BUG
+            unsigned num_bugs;
+            struct list_head bug_list;
+            struct bug_entry *bug_table;
+        #endif
+        #ifdef CONFIG_KALLSYMS
+            struct mod_kallsyms __rcu *kallsyms;
+            struct mod_kallsyms core_kallsyms;
+            struct module_sect_attrs *sect_attrs;
+            struct module_notes_attrs *notes_attrs;
+        #endif
+        };
+
+        struct module_memory {
+            void *base;
+            void *rw_copy; // v6.13~6.14
+            bool is_rox;   // v6.13~
+            unsigned int size;
+        #ifdef CONFIG_MODULES_TREE_LOOKUP
+            struct mod_tree_node mtn; (0x38)
+        #endif
+        };
+        """
+        # fast path
+        offset_mem = GefUtil.offsetof("module", "mem")
+        offset_size = GefUtil.offsetof("module_memory", "size")
+        sizeof_module_memory = GefUtil.sizeof("module_memory")
+        if None not in (offset_mem, offset_size, sizeof_module_memory):
+            return offset_mem, offset_mem + offset_size, sizeof_module_memory
+
+        # slow_path
+        MOD_TEXT = 0
+        MOD_DATA = 1
+        MOD_RODATA = 2
+
+        kversion = Kernel.version()
+        if kversion < "6.13":
+            offset_size = runtime.current_arch.ptrsize # void*
+        elif "6.13" <= kversion < "6.15":
+            offset_size = runtime.current_arch.ptrsize * 2 + 4 # void*, void*, bool
+        else:
+            offset_size = runtime.current_arch.ptrsize + 4 # void*, bool
+        sizeof_module_memory_min = align_to_ptrsize(offset_size + 4)
+        sizeof_mod_tree_node = runtime.current_arch.ptrsize * 7
+        sizeof_module_memory_max = sizeof_module_memory_min + sizeof_mod_tree_node
+
+        # the struct module itself is in .gnu.linkonce.this_module, which is placed in mem[MOD_DATA]
+        for i in range(300):
+            offset_mem = i * runtime.current_arch.ptrsize
+            for sizeof_module_memory in (sizeof_module_memory_min, sizeof_module_memory_max):
+                valid = True
+                text_found = False
+                for module in module_addrs:
+                    for mem_type in (MOD_TEXT, MOD_DATA, MOD_RODATA):
+                        mem_ptr = module + offset_mem + mem_type * sizeof_module_memory
+                        # memory access check
+                        if not is_valid_addr(mem_ptr + offset_size + 3):
+                            valid = False
+                            break
+                        cand_base = read_int_from_memory(mem_ptr)
+                        cand_size = read_int32_from_memory(mem_ptr + offset_size)
+                        # an empty type is not allocated
+                        if mem_type != MOD_DATA and cand_base == 0 and cand_size == 0:
+                            continue
+                        if not self.is_valid_region(cand_base, cand_size):
+                            valid = False
+                            break
+                        if mem_type == MOD_DATA and not cand_base <= module < cand_base + cand_size:
+                            valid = False
+                            break
+                        if mem_type == MOD_TEXT:
+                            text_found = True
+                    if not valid:
+                        break
+                if valid and text_found:
+                    return offset_mem, offset_mem + offset_size, sizeof_module_memory
+        return None
+
+    def get_offset_core_layout(self, module_addrs): # v4.5 ~ v6.4
+        """
+        struct module { // kernel v4.5~
+            enum module_state state;
+            struct list_head list;
+            char name[MODULE_NAME_LEN]; // 64 - sizeof(unsigned long) bytes
+        #ifdef CONFIG_STACKTRACE_BUILD_ID
+            unsigned char build_id[BUILD_ID_SIZE_MAX]; // 20 bytes
+        #endif
+            struct module_kobject mkobj;
+            struct module_attribute *modinfo_attrs;
+            const char *version;
+            const char *srcversion;
+            struct kobject *holders_dir;
+            const struct kernel_symbol *syms;
+            const s32 *crcs;
+            unsigned int num_syms;
+        #ifdef CONFIG_CFI_CLANG
+            cfi_check_fn cfi_check;
+        #endif
+        #ifdef CONFIG_SYSFS
+            struct mutex param_lock;
+        #endif
+            struct kernel_param *kp;
+            unsigned int num_kp;
+            unsigned int num_gpl_syms;
+            const struct kernel_symbol *gpl_syms;
+            const s32 *gpl_crcs;
+            bool using_gplonly_symbols;
+        #ifdef CONFIG_MODULE_SIG
+            bool sig_ok;
+        #endif
+            bool async_probe_requested;
+            unsigned int num_exentries;
+            struct exception_table_entry *extable;
+            int (*init)(void);
+            struct module_layout core_layout __module_layout_align; <-- here
+            struct module_layout init_layout;
+        #ifdef CONFIG_ARCH_WANTS_MODULES_DATA_IN_VMALLOC
+            struct module_layout data_layout;
+        #endif
+            struct mod_arch_specific arch;
+            unsigned long taints;
+        #ifdef CONFIG_GENERIC_BUG
+            unsigned num_bugs;
+            struct list_head bug_list;
+            struct bug_entry *bug_table;
+        #endif
+        #ifdef CONFIG_KALLSYMS
+            struct mod_kallsyms __rcu *kallsyms;
+            struct mod_kallsyms core_kallsyms;
+            struct module_sect_attrs *sect_attrs;
+            struct module_notes_attrs *notes_attrs;
+        #endif
+            ...
+        };
+
+        struct module_layout {
+            /* The actual code + data. */
+            void *base;
+            /* Total size. */
+            unsigned int size;
+            /* The size of the executable code.  */
+            unsigned int text_size;
+            /* Size of RO section of the module (text+rodata) */
+            unsigned int ro_size;
+            /* Size of RO after init section */
+            unsigned int ro_after_init_size; // v4.8~
+        #ifdef CONFIG_MODULES_TREE_LOOKUP
+            struct mod_tree_node mtn;
+        #endif
+        };
+
+        [Example arm32]
+            gef> x/128xw 0x00000000bf22b084
+            0xbf22b084:     0xbf1bb044      0xc1696530      0x00006773      0x00000000
+            0xbf22b094:     0x00000000      0x00000000      0x00000000      0x00000000
+            0xbf22b0a4:     0x00000000      0x00000000      0x00000000      0x00000000
+            0xbf22b0b4:     0x00000000      0x00000000      0x00000000      0x00000000
+            0xbf22b0c4:     0x00000000      0xc1ec2d00      0xc1a11d80      0xbf1bb08c
+            0xbf22b0d4:     0xc1a11d8c      0xc1a11d80      0xc1628e38      0xc8e0b2c0
+            0xbf22b0e4:     0x00000003      0x00000007      0xbf22b080      0x00000000
+            0xbf22b0f4:     0xc8d4f380      0x00000000      0xc1e47400      0xc8f6d900
+            0xbf22b104:     0xc8f6d080      0xc8004300      0x00000000      0x00000000
+            0xbf22b114:     0x00000000      0x00000000      0x00000000      0x00000000
+            0xbf22b124:     0xbf22b124      0xbf22b124      0xbf22a990      0x00000003
+            0xbf22b134:     0x00000000      0x00000000      0x00000000      0x00000001
+            0xbf22b144:     0x00000000      0x00000000      0x00000000      0x00000000
+            0xbf22b154:     0x00000000      0xbf17e000      0x00000000      0x00000000
+            0xbf22b164:     0x00000000      0x00000000      0x00000000      0x00000000
+            0xbf22b174:     0x00000000      0x00000000      0x00000000      0xbf225000 <- core_layout.base
+            0xbf22b184:     0x00008000      0x00005000      0x00006000      0x00006000
+        """
+        # fast path
+        offset_core_layout = GefUtil.offsetof("module", "core_layout")
+        offset_size = GefUtil.offsetof("module_layout", "size")
+        if None not in (offset_core_layout, offset_size):
+            return offset_core_layout, offset_core_layout + offset_size
+
+        # slow_path
+        for i in range(300):
+            offset_core_layout = i * runtime.current_arch.ptrsize
+            valid = True
+            for module in module_addrs:
+                # memory access check
+                core_layout_ptr = module + offset_core_layout
+                if not is_valid_addr(core_layout_ptr + runtime.current_arch.ptrsize + 4 * 4 - 1):
+                    valid = False
+                    break
+                # base and size check; the struct module itself is in the core layout
+                cand_base = read_int_from_memory(core_layout_ptr)
+                cand_size = read_int32_from_memory(core_layout_ptr + runtime.current_arch.ptrsize)
+                if not self.is_valid_region(cand_base, cand_size) or not cand_base <= module < cand_base + cand_size:
+                    valid = False
+                    break
+                # text_size check
+                cand_text_size = read_int32_from_memory(core_layout_ptr + runtime.current_arch.ptrsize + 4 * 1)
+                if cand_text_size > cand_size:
+                    valid = False
+                    break
+                # ro_size check (text+rodata)
+                cand_ro_size = read_int32_from_memory(core_layout_ptr + runtime.current_arch.ptrsize + 4 * 2)
+                if cand_ro_size < cand_text_size or cand_ro_size > cand_size:
+                    valid = False
+                    break
+                # ro_after_init_size check; it does not exist under v4.8, then the read hits
+                # the tail padding (or init_layout.base of an already initialized module)
+                cand_ro_after_init_size = read_int32_from_memory(core_layout_ptr + runtime.current_arch.ptrsize + 4 * 3)
+                if cand_ro_after_init_size != 0:
+                    if cand_ro_after_init_size < cand_ro_size or cand_ro_after_init_size > cand_size:
+                        valid = False
+                        break
+            if valid:
+                return offset_core_layout, offset_core_layout + runtime.current_arch.ptrsize
+        return None
+
+    def get_offset_module_core(self, module_addrs): # ~v4.4
+        """
+        struct module { // ~v4.4
+            enum module_state state;
+            struct list_head list;
+            char name[MODULE_NAME_LEN];
+            struct module_kobject mkobj;
+            struct module_attribute *modinfo_attrs;
+            const char *version;
+            const char *srcversion;
+            struct kobject *holders_dir;
+            const struct kernel_symbol *syms;
+            const unsigned long *crcs;
+            unsigned int num_syms;
+        #ifdef CONFIG_SYSFS
+            struct mutex param_lock;
+        #endif
+            struct kernel_param *kp;
+            unsigned int num_kp;
+            unsigned int num_gpl_syms;
+            const struct kernel_symbol *gpl_syms;
+            const unsigned long *gpl_crcs;
+        #ifdef CONFIG_UNUSED_SYMBOLS
+            const struct kernel_symbol *unused_syms;
+            const unsigned long *unused_crcs;
+            unsigned int num_unused_syms;
+            unsigned int num_unused_gpl_syms;
+            const struct kernel_symbol *unused_gpl_syms;
+            const unsigned long *unused_gpl_crcs;
+        #endif
+        #ifdef CONFIG_MODULE_SIG
+            bool sig_ok;
+        #endif
+            bool async_probe_requested;
+            const struct kernel_symbol *gpl_future_syms;
+            const unsigned long *gpl_future_crcs;
+            unsigned int num_gpl_future_syms;
+            unsigned int num_exentries;
+            struct exception_table_entry *extable;
+            int (*init)(void);
+            void *module_init ____cacheline_aligned;
+            /* Here is the actual code + data, vfree'd on unload. */
+            void *module_core;                                          <-- here
+            /* Here are the sizes of the init and core sections */
+            unsigned int init_size, core_size;
+            /* The size of the executable code in each section. */
+            unsigned int init_text_size, core_text_size;
+        #ifdef CONFIG_MODULES_TREE_LOOKUP
+            struct mod_tree_node mtn_core;
+            struct mod_tree_node mtn_init;
+        #endif
+            unsigned int init_ro_size, core_ro_size;
+            struct mod_arch_specific arch;
+            unsigned int taints;
+        #ifdef CONFIG_GENERIC_BUG
+            unsigned num_bugs;
+            struct list_head bug_list;
+            struct bug_entry *bug_table;
+        #endif
+        #ifdef CONFIG_KALLSYMS
+            struct mod_kallsyms *kallsyms;                              <-- here
+            struct mod_kallsyms core_kallsyms;
+            struct module_sect_attrs *sect_attrs;
+            struct module_notes_attrs *notes_attrs;
+        #endif
+            ...
+        };
+        """
+        # fast path
+        offset_module_core = GefUtil.offsetof("module", "module_core")
+        offset_core_size = GefUtil.offsetof("module", "core_size")
+        if None not in (offset_module_core, offset_core_size):
+            return offset_module_core, offset_core_size
+
+        # slow_path
+        for i in range(300):
+            offset_module_core = i * runtime.current_arch.ptrsize
+            valid = True
+            for module in module_addrs:
+                module_core_ptr = module + offset_module_core
+                # memory access check
+                if not is_valid_addr(module_core_ptr + runtime.current_arch.ptrsize + 4 * 4 - 1):
+                    valid = False
+                    break
+                # module_core and core_size check; the struct module itself is in the core
+                cand_module_core = read_int_from_memory(module_core_ptr)
+                cand_core_size = read_int32_from_memory(module_core_ptr + runtime.current_arch.ptrsize + 4 * 1)
+                if not self.is_valid_region(cand_module_core, cand_core_size):
+                    valid = False
+                    break
+                if not cand_module_core <= module < cand_module_core + cand_core_size:
+                    valid = False
+                    break
+                # init_size check
+                cand_init_size = read_int32_from_memory(module_core_ptr + runtime.current_arch.ptrsize)
+                if cand_init_size > self.MAX_MODULE_SIZE:
+                    valid = False
+                    break
+                # init_text_size check
+                cand_init_text_size = read_int32_from_memory(module_core_ptr + runtime.current_arch.ptrsize + 4 * 2)
+                if cand_init_text_size > cand_init_size:
+                    valid = False
+                    break
+                # core_text_size check
+                cand_core_text_size = read_int32_from_memory(module_core_ptr + runtime.current_arch.ptrsize + 4 * 3)
+                if cand_core_text_size > cand_core_size:
+                    valid = False
+                    break
+            if valid:
+                return offset_module_core, offset_module_core + runtime.current_arch.ptrsize + 4
+        return None
+
+    def get_offset_kallsyms(self, module_addrs):
+        """
+        struct mod_kallsyms {
+            Elf_Sym *symtab;
+            unsigned int num_symtab;
+            char *strtab;
+            char *typetab; // v5.2~
+        };
+        """
+        # fast path
+        offset = GefUtil.offsetof("module", "kallsyms")
+        if offset is not None:
+            return offset
+
+        # slow_path
+        kversion = Kernel.version()
+        if is_64bit():
+            sizeof_symtab_entry = 24
+        else:
+            sizeof_symtab_entry = 16
+        for i in range(300):
+            offset_kallsyms = i * runtime.current_arch.ptrsize
+            valid = True
+            for module in module_addrs:
+                kallsyms_ptr = module + offset_kallsyms
+                # access check
+                if not is_valid_addr(kallsyms_ptr):
+                    valid = False
+                    break
+                # kallsyms access check
+                cand_kallsyms = read_int_from_memory(kallsyms_ptr)
+                if not is_valid_addr(cand_kallsyms):
+                    valid = False
+                    break
+                # struct mod_kallsyms member access check
+                cand_symtab = read_int_from_memory(cand_kallsyms)
+                if not is_valid_addr(cand_symtab):
+                    valid = False
+                    break
+                cand_num_symtab = read_int32_from_memory(cand_kallsyms + runtime.current_arch.ptrsize * 1)
+                if cand_num_symtab == 0 or cand_num_symtab > 0x10_0000:
+                    valid = False
+                    break
+                cand_strtab = read_int_from_memory(cand_kallsyms + runtime.current_arch.ptrsize * 2)
+                if not is_valid_addr(cand_strtab):
+                    valid = False
+                    break
+                # strtab is placed just after symtab
+                if cand_strtab != cand_symtab + cand_num_symtab * sizeof_symtab_entry:
+                    valid = False
+                    break
+                if "5.2" <= kversion:
+                    cand_typetab = read_int_from_memory(cand_kallsyms + runtime.current_arch.ptrsize * 3)
+                    if not is_valid_addr(cand_typetab):
+                        valid = False
+                        break
+            if valid:
+                return offset_kallsyms
+        return None
+
+    def get_offset_symtab(self, module_addrs): # ~v4.4
+        """
+        struct module { // ~v4.4
+            ...
+        #ifdef CONFIG_KALLSYMS
+            Elf_Sym *symtab, *core_symtab;
+            unsigned int num_symtab, core_num_syms;
+            char *strtab, *core_strtab;
+            ...
+        #endif
+            ...
+        };
+        Once the module is initialized, symtab, num_symtab and strtab are replaced by the core_* ones.
+        """
+        # fast path
+        offset = GefUtil.offsetof("module", "symtab")
+        if offset is not None:
+            return offset
+
+        # slow path
+        if is_64bit():
+            sizeof_symtab_entry = 24
+        else:
+            sizeof_symtab_entry = 16
+        for i in range(300):
+            offset_symtab = i * runtime.current_arch.ptrsize
+            valid = True
+            for module in module_addrs:
+                symtab_ptr = module + offset_symtab
+                num_symtab_ptr = symtab_ptr + runtime.current_arch.ptrsize * 2
+                strtab_ptr = num_symtab_ptr + 4 * 2
+                # access check
+                if not is_valid_addr(symtab_ptr) or not is_valid_addr(strtab_ptr + runtime.current_arch.ptrsize * 2 - 1):
+                    valid = False
+                    break
+                # symtab == core_symtab
+                cand_symtab = read_int_from_memory(symtab_ptr)
+                if cand_symtab != read_int_from_memory(symtab_ptr + runtime.current_arch.ptrsize) or not is_valid_addr(cand_symtab):
+                    valid = False
+                    break
+                # num_symtab == core_num_syms
+                cand_num_symtab = read_int32_from_memory(num_symtab_ptr)
+                if cand_num_symtab != read_int32_from_memory(num_symtab_ptr + 4) or cand_num_symtab == 0 or cand_num_symtab > 0x10_0000:
+                    valid = False
+                    break
+                # strtab == core_strtab
+                cand_strtab = read_int_from_memory(strtab_ptr)
+                if cand_strtab != read_int_from_memory(strtab_ptr + runtime.current_arch.ptrsize) or not is_valid_addr(cand_strtab):
+                    valid = False
+                    break
+                # strtab is placed just after symtab
+                if cand_strtab != cand_symtab + cand_num_symtab * sizeof_symtab_entry:
+                    valid = False
+                    break
+            if valid:
+                return offset_symtab
+        return None
+
+    def get_offset_sect_attrs(self, module_addr):
+        """
+        struct module {
+            ...
+        #ifdef CONFIG_KALLSYMS
+            struct mod_kallsyms __rcu *kallsyms;
+            struct mod_kallsyms core_kallsyms;
+            struct module_sect_attrs *sect_attrs;
+            struct module_notes_attrs *notes_attrs;
+        #endif
+            ...
+        };
+        """
+        # fast path
+        offset_sect_attrs = GefUtil.offsetof("module", "sect_attrs")
+        try:
+            # it is created only if CONFIG_SYSFS=y, and it is NULL if the creation failed
+            if offset_sect_attrs is not None:
+                sect_attrs = read_int_from_memory(module_addr + offset_sect_attrs)
+                if not self.is_valid_sect_attrs(sect_attrs):
+                    return offset_sect_attrs, None
+                return offset_sect_attrs, sect_attrs
+        except gdb.error:
+            pass
+
+        # slow_path
+        for i in range(0x100):
+            offset_sect_attrs = runtime.current_arch.ptrsize * i
+            # access check
+            if not is_valid_addr(module_addr + offset_sect_attrs):
+                continue
+            sect_attrs = read_int_from_memory(module_addr + offset_sect_attrs)
+            if not self.is_valid_sect_attrs(sect_attrs):
+                continue
+            return offset_sect_attrs, sect_attrs
+
+        return None, None
+
+    """
+    This function looks for the module->sect_attrs.grp.{attrs,bin_attrs} field,
+    which is an array of pointers to the various structures `bin_attribute`
+    that represent a the various sections. The array is guaranteed to terminate
+    with a NULL pointer therefore we can safely use a while True to iterate the
+    array in `is_valid_attribute_arr`.
+    On recent systems module->sect_attrs.grp.attrs is 0 and the array of
+    pointers is found in module->sect_attrs.grp.bin_attrs instead, but the
+    logic is the same.
+    """
+    def is_valid_sect_attrs(self, sect_attrs):
+        if not is_valid_addr(sect_attrs):
+            return False
+        # Check that the pointer is properly aligned
+        if sect_attrs & (runtime.current_arch.ptrsize - 1):
+            return False
+        for offset in range(40):
+            attribute_arr_ptr = read_int_from_memory(sect_attrs + offset * runtime.current_arch.ptrsize, safe=True)
+            if attribute_arr_ptr is None:
+                return False
+            if self.is_valid_attribute_arr(attribute_arr_ptr):
+                return True
+        return False
+
+    @Cache.cache_until_next
+    def is_valid_attribute_arr(self, attribute_arr_ptr):
+        """
+        struct module_sect_attrs {
+            struct attribute_group {
+                const char *name;
+                umode_t (*is_visible)(struct kobject *, struct attribute *, int);
+                umode_t (*is_bin_visible)(struct kobject *, struct bin_attribute *, int); // v4.4~
+                size_t (*bin_size)(struct kobject *, const struct bin_attribute *, int); // v6.13~
+                struct attribute **attrs;                          <--- here
+                struct bin_attribute **bin_attrs; // v3.11~v6.12   <--- here
+                union {
+                    struct bin_attribute **bin_attrs;              <--- here
+                    const struct bin_attribute *const *bin_attrs_new;
+                }; // v6.13~
+            } grp;
+            unsigned int nsections; // ~v6.13
+            struct module_sect_attr {
+                struct bin_attribute battr; // v5.7~
+                struct module_attribute mattr; // ~v5.6
+                char *name; // ~v5.6
+                unsigned long address;
+            } attrs[]; // ~v6.13
+            struct bin_attribute attrs[]; // v6.14~
+        };
+
+        struct attribute {
+            const char *name;
+            umode_t mode;
+        #ifdef CONFIG_DEBUG_LOCK_ALLOC
+            bool ignore_lockdep:1;
+            struct lock_class_key *key;
+            struct lock_class_key skey;
+        #endif
+        };
+
+        struct bin_attribute { // v5.7~
+            struct attribute attr;
+            size_t size;
+            void *private;
+            struct address_space *(*f_mapping)(void); // v5.15~
+            struct address_space *mapping; // v5.12~5.14
+            ssize_t (*read)(struct file *, struct kobject *, struct bin_attribute *, char *, loff_t, size_t);
+            ssize_t (*read_new)(struct file *, struct kobject *, const struct bin_attribute *, char *, loff_t, size_t); // v6.13~6.17
+            ssize_t (*write)(struct file *, struct kobject *, struct bin_attribute *, char *, loff_t, size_t);
+            ssize_t (*write_new)(struct file *, struct kobject *, const struct bin_attribute *, char *, loff_t, size_t); // v6.13~6.17
+            loff_t (*llseek)(struct file *, struct kobject *, struct bin_attribute *, loff_t, int); // v6.7~
+            int (*mmap)(struct file *, struct kobject *, struct bin_attribute *attr, struct vm_area_struct *vma);
+        };
+
+        struct module_attribute { // ~v5.6
+            struct attribute attr;
+            ssize_t (*show)(struct module_attribute *, struct module_kobject *, char *);
+            ssize_t (*store)(struct module_attribute *, struct module_kobject *, const char *, size_t count);
+            void (*setup)(struct module *, const char *);
+            int (*test)(struct module *);
+            void (*free)(struct module *);
+        };
+        """
+        found = 0
+        while True:
+            if found > 0x200:
+                # If we got to this point we can definitely return
+                break
+            if not is_valid_addr(attribute_arr_ptr):
+                return False
+            attribute = read_int_from_memory(attribute_arr_ptr)
+            if attribute == 0:
+                break
+            if not is_valid_addr(attribute):
+                return False
+            nameptr = read_int_from_memory(attribute)
+            if not self.is_valid_sectname(nameptr):
+                return False
+            found += 1
+            attribute_arr_ptr += runtime.current_arch.ptrsize
+        return found > 0
+
+    def is_valid_sectname(self, nameptr):
+        if not is_valid_addr(nameptr):
+            return False
+        sectname = read_cstring_from_memory(nameptr)
+        if sectname is None or not sectname.startswith((".", "__", "_")):
+            if sectname and len(sectname) >= 4:
+                self.sect_attrs_meta.append((
+                    "info",
+                    'possible section name (rejected for not starting with ".", "__" or "_"): {:s}'.format(sectname),
+                ))
+            return False
+        return True
+
+    def get_offset_bin_attrs(self, sect_attrs):
+        kversion = Kernel.version()
+
+        # fast path
+        offset_attrs = GefUtil.offsetof("attribute_group", "attrs")
+        try:
+            if offset_attrs is not None:
+                attrs_arr_ptr = read_int_from_memory(sect_attrs + offset_attrs)
+                # It is possible to use attrs or bin_attrs, so check both.
+                if kversion < "3.11" or is_valid_addr(attrs_arr_ptr):
+                    return offset_attrs, attrs_arr_ptr
+
+                # Avoid relying on GDB's handling of anonymous union members in 6.14+.
+                # bin_attrs/bin_attrs_new is immediately after attrs.
+                offset_bin_attrs = offset_attrs + runtime.current_arch.ptrsize
+                attrs_arr_ptr = read_int_from_memory(sect_attrs + offset_bin_attrs)
+                return offset_bin_attrs, attrs_arr_ptr
+        except gdb.error:
+            pass
+
+        # slow path
+        for i in range(0x10):
+            offset_bin_attrs = runtime.current_arch.ptrsize * i
+            attrs_arr_ptr = read_int_from_memory(sect_attrs + offset_bin_attrs)
+            if not self.is_valid_attribute_arr(attrs_arr_ptr):
+                continue
+            return offset_bin_attrs, attrs_arr_ptr
+
+        return None, None
+
+    """
+    This function aims at locating module_sect_attr->address or bin_attribute->private,
+    which stores the address of where the section resides in memory. To do so, it
+    performs a statistical analysis on the various section attribute structures to
+    identify pointer-sized values that are different for each one. If there is a
+    specific offset where a pointer is present and different for every structure,
+    it is very probable that the offset is that of the section address field.
+    """
+    def get_offset_address(self, module, attribute_arr_ptr):
+        kversion = Kernel.version()
+
+        # fast path
+        if kversion < "6.14":
+            offset = GefUtil.offsetof("module_sect_attr", "address")
+        else:
+            offset = GefUtil.offsetof("bin_attribute", "private")
+        if offset is not None:
+            return offset
+
+        # slow path
+        attrs_arr = []
+        curr_attr = attribute_arr_ptr
+        while True:
+            attribute = read_int_from_memory(curr_attr)
+            if attribute == 0:
+                break
+            attrs_arr.append(attribute)
+            curr_attr += runtime.current_arch.ptrsize
+
+        if len(attrs_arr) < 2:
+            self.sect_attrs_meta.append(("warn", "module->sect_attrs.grp.bin_attrs has too few elements"))
+            return None
+
+        # Find size of struct bin_attribute by pointer arithmetic from list (assuming they are contiguous and in order)
+        attrs_arr.sort()
+        bin_attr_size_map = {}
+        for i in range(len(attrs_arr) - 1):
+            tmp_size = attrs_arr[i + 1] - attrs_arr[i]
+            if tmp_size not in bin_attr_size_map:
+                bin_attr_size_map[tmp_size] = 1
+            else:
+                bin_attr_size_map[tmp_size] += 1
+
+        # in fact:
+        # ~6.13: sizeof(module_sect_attr)
+        # 6.14~: sizeof(bin_attribute)
+        bin_attr_size = max(bin_attr_size_map, key=bin_attr_size_map.get)
+        bin_attr_size = min(bin_attr_size - bin_attr_size % runtime.current_arch.ptrsize, runtime.current_arch.ptrsize * 0x40)
+
+        # The struct module itself is the only content of .gnu.linkonce.this_module
+        for attr in attrs_arr:
+            nameptr = read_int_from_memory(attr)
+            if read_cstring_from_memory(nameptr, safe=True) != ".gnu.linkonce.this_module":
+                continue
+            words = slice_unpack(read_memory(attr, bin_attr_size), runtime.current_arch.ptrsize)
+            if module in words:
+                return words.index(module) * runtime.current_arch.ptrsize
+
+        # Statistical analysis to find pointers that differ across every structure
+        # First we find potential pointers and save their count and offset
+        offset_map = {}
+        for attr in attrs_arr:
+            data = read_memory(attr, bin_attr_size)
+            for i, word in enumerate(slice_unpack(data, runtime.current_arch.ptrsize)):
+                offset = i * runtime.current_arch.ptrsize
+                # TODO: Find a way to distinguish attrs.attr.{key,skey} from pointers
+                #   Maybe we could skip the initial fields by using bin_attribute.size?
+                if not KernelAddressHeuristicFinderUtil.is_kernel_space(word):
+                    continue
+                if offset not in offset_map:
+                    offset_map[offset] = {}
+                if word not in offset_map[offset]:
+                    offset_map[offset][word] = 1
+                else:
+                    offset_map[offset][word] += 1
+                # Remove pointers to strings if possible
+                maybe_string = read_cstring_from_memory(word, safe=True)
+                if maybe_string is None:
+                    continue
+                if len(maybe_string) > 4:
+                    del offset_map[offset][word]
+
+        # Find the best candidate to avoid name pointers that are not deleted (don't know why that happens)
+        max_len = 0
+        offset_address = None
+        for offset, words in offset_map.items():
+            for _val, count in words.items():
+                # If multiple identical pointers are found, they are not `address` and `private`.
+                if count > 1:
+                    break
+            else:
+                if len(words) > max_len:
+                    max_len = len(words)
+                    offset_address = offset
+        if max_len != 0:
+            return offset_address
+
+        return None
+
+
+
+class KernelSysctl:
+    """Resolve the sysctl layout and walk its directory and table trees.
+
+    struct ctl_table_root {
+        struct ctl_table_set {
+            int (*is_seen)(struct ctl_table_set *);
+            struct ctl_dir dir;
+        } default_set;
+        ...
+    };
+
+    struct ctl_dir {
+        struct ctl_table_header {
+            struct ctl_table *ctl_table;
+            int ctl_table_size;               // v6.6~
+            ...
+            struct ctl_table_root *root;
+            struct ctl_table_set *set;
+            struct ctl_dir *parent;
+            ...
+        } header;
+        struct rb_root root;
+    };
+
+    struct ctl_node {
+        struct rb_node node;
+        struct ctl_table_header *header;
+    };
+
+    struct ctl_table {
+        const char *procname;
+        void *data;
+        int maxlen;
+        umode_t mode;                         // mode_t (~v3.2)
+        struct ctl_table *child;              // ~v6.4
+        struct ctl_table *parent;             // ~v3.3
+        enum sysctl_table_type type;          // v6.5~v6.10
+        proc_handler *proc_handler;
+        ...
+    };
+
+    Until v3.3, each root has a list of headers, and each header has a ctl_table tree linked by `child`.
+
+    struct ctl_table_root {
+        struct list_head root_list;
+        struct ctl_table_set {
+            struct list_head list;
+            struct ctl_table_set *parent;
+            int (*is_seen)(struct ctl_table_set *);
+        } default_set;
+        struct ctl_table_set *(*lookup)(struct ctl_table_root *root, struct nsproxy *namespaces);
+        ...
+    };
+
+    struct ctl_table_header {
+        struct ctl_table *ctl_table;
+        struct list_head ctl_entry;
+        int used;
+        int count;
+        struct completion *unregistering;
+        struct ctl_table *ctl_table_arg;
+        struct ctl_table_root *root;
+        struct ctl_table_set *set;
+        ...
+    };
+    """
+
+    Entry = collections.namedtuple("SysctlEntry", "header table path mode")
+    Data = collections.namedtuple("SysctlData", "maxlen address handler ctset namespace")
+
+    # The representation of ctl_table.data is decided by proc_handler, not by maxlen.
+    # A string, or (element size (0: pointer size, None: maxlen), signed, unit).
+    HANDLER_TYPES = {
+        "cdrom_sysctl_info": "string",
+        "devkmsg_sysctl_set_loglvl": "string",
+        "numa_zonelist_order_handler": "string",
+        "proc_allowed_congestion_control": "string",
+        "proc_do_uts_string": "string",
+        "proc_dostring": "string",
+        "proc_dostring_coredump": "string",
+        "proc_tcp_available_congestion_control": "string",
+        "proc_tcp_available_ulp": "string",
+        "seccomp_actions_logged_handler": "string",
+        "set_default_qdisc": "string",
+        "proc_dointvec": (4, True, ""),
+        "proc_dointvec_conv": (4, True, ""),
+        "proc_dointvec_minmax": (4, True, ""),
+        "proc_dointvec_minmax_coredump": (4, True, ""),
+        "proc_dointvec_minmax_sysadmin": (4, True, ""),
+        "proc_dointvec_minmax_warn_RT_change": (4, True, ""),
+        "proc_douintvec": (4, False, ""),
+        "proc_douintvec_conv": (4, False, ""),
+        "proc_douintvec_minmax": (4, False, ""),
+        "proc_dopipe_max_size": (4, False, ""),
+        "proc_dou8vec_minmax": (1, False, ""),
+        "proc_dobool": (None, False, ""),
+        "proc_doulongvec_minmax": (0, False, ""),
+        "proc_doulongvec_minmax_conv": (0, False, ""),
+        "proc_dointvec_jiffies": (4, True, "jiffies"),
+        "proc_dointvec_userhz_jiffies": (4, True, "jiffies"),
+        "proc_dointvec_ms_jiffies": (4, True, "jiffies"),
+        "proc_dointvec_ms_jiffies_minmax": (4, True, "jiffies"),
+        "proc_doulongvec_ms_jiffies_minmax": (0, False, "jiffies"),
+        "proc_do_large_bitmap": "bitmap",
+        "proc_do_static_key": "static_key",
+        # custom handlers passing a temporary table of another type, or wrapping a custom handler
+        "addrconf_sysctl_stable_secret": None,
+        "bpf_stats_handler": "static_key",
+        "ipv4_ping_group_range": (4, False, ""),
+        "neigh_proc_dointvec_unres_qlen": (4, True, "bytes"),
+        "proc_cap_handler": None,
+        "proc_unres_qlen": (4, True, "bytes"),
+        "proc_watchdog_common": (4, True, ""),
+    }
+
+    @classmethod
+    @Cache.cache_this_session(per_inferior=True, until_new_objfile=True)
+    def get_instance(cls):
+        return cls()
+
+    def __init__(self):
+        self.meta = []
+        self.initialized = False
+        self.sysctl_table_root = None
+        self.root_ctl_dir = None
+        self.root_rb_node = None
+        self.offset_default_set = None
+        self.offset_set_dir = None
+        self.offset_ctl_table = None
+        self.offset_rb_node = None
+        self.offset_parent = None
+        self.offset_node_header = None
+        self.offset_procname = None
+        self.offset_data = None
+        self.offset_maxlen = None
+        self.offset_mode = None
+        self.offset_handler = None
+        self.offset_ctl_table_size = None
+        self.offset_root = None
+        self.offset_set = None
+        self.sizeof_ctl_table = None
+        # ~v3.3
+        self.is_legacy = False
+        self.offset_lookup = None
+        self.offset_is_seen = 0
+        self.offset_ctl_entry = None
+        self.offset_child = None
+        self.init_net = None
+        self.ctsets = {}
+        self.ctset_namespaces = {}
+        self.handler_types = {}
+        self.known_handlers = {}
+        return
+
+    def initialize(self, force=False):
+        """Resolve all layouts and roots required for a sysctl tree walk."""
+        if self.initialized and not force:
+            return True
+
+        self.meta = []
+        self.initialized = False
+        self.sysctl_table_root = KernelAddressHeuristicFinder.get_sysctl_table_root()
+        if self.sysctl_table_root is None:
+            self.meta.append(("err", "Could not find sysctl_table_root"))
+            return None
+        self.meta.append(("info", "sysctl_table_root: {:#x}".format(self.sysctl_table_root)))
+
+        kversion = Kernel.version()
+        self.is_legacy = kversion is not None and kversion < "3.4"
+        by_debug_info = self.resolve_layout_by_debug_info()
+        if by_debug_info and self.is_valid_layout():
+            self.meta.append(("info", "layout: debug info"))
+        else:
+            if by_debug_info:
+                # e.g., the debug information of another build
+                self.meta.append(("warn", "The debug information does not match the sysctl tree"))
+            self.resolve_layout(kversion)
+            if not self.is_valid_layout():
+                self.meta.append(("err", "Could not resolve the layout (CONFIG_RANDSTRUCT=y needs the debug information)"))
+                return None
+            self.meta.append(("info", "layout: kernel version"))
+        self.meta.append(("info", "offsetof(ctl_table, procname): {:#x}".format(self.offset_procname)))
+        self.meta.append(("info", "offsetof(ctl_table, data): {:#x}".format(self.offset_data)))
+        self.meta.append(("info", "offsetof(ctl_table, maxlen): {:#x}".format(self.offset_maxlen)))
+        self.meta.append(("info", "offsetof(ctl_table, mode): {:#x}".format(self.offset_mode)))
+        self.meta.append(("info", "offsetof(ctl_table, proc_handler): {:#x}".format(self.offset_handler)))
+        self.meta.append(("info", "sizeof(ctl_table): {:#x}".format(self.sizeof_ctl_table)))
+
+        self.resolve_namespace_sets()
+        self.resolve_handler_types()
+
+        if not self.is_legacy:
+            self.root_rb_node = read_int_from_memory(self.root_ctl_dir + self.offset_rb_node)
+            self.meta.append(("info", "root_ctl_dir: {:#x}".format(self.root_ctl_dir)))
+            self.meta.append(("info", "root_rb_node: {:#x}".format(self.root_rb_node)))
+        self.initialized = True
+        return True
+
+    @staticmethod
+    @Cache.cache_this_session(per_inferior=True, until_new_objfile=True)
+    def get(sym):
+        try:
+            res = gdb.execute("ksysctl --quiet --no-pager --exact --filter {:s}".format(sym), to_string=True)
+            return int(res.split()[1], 16)
+        except (gdb.error, IndexError, ValueError):
+            return None
+
+    def walk(self, skip_symlink=False, progress=None):
+        """Yield every data-bearing sysctl entry from all selected roots."""
+        self.seen_ctl_dir = set()
+        self.seen_ctl_table = set()
+        self.seen_ctset = set()
+        if self.is_legacy:
+            yield from self.walk_legacy_roots(skip_symlink, progress)
+            return
+        self.parent_paths = {self.root_ctl_dir: ""}
+        yield from self.walk_node(self.root_rb_node, skip_symlink, progress)
+        return
+
+    def parse_entry(self, entry, include_namespace=False):
+        """Read the value-related fields of one ctl_table entry."""
+        maxlen = read_int32_from_memory(entry.table + self.offset_maxlen)
+        address = read_int_from_memory(entry.table + self.offset_data)
+        handler = read_int_from_memory(entry.table + self.offset_handler)
+        ctset = None
+        namespace = "-"
+        if include_namespace:
+            ctset = read_int_from_memory(entry.header + self.offset_set)
+            namespace = self.ctset_namespaces.get(ctset, "-")
+        return self.Data(maxlen, address, handler, ctset, namespace)
+
+    def resolve_layout_by_debug_info(self):
+        """Resolve the structure offsets from the loaded debug information. Return False if any is missing."""
+        if self.is_legacy:
+            return self.resolve_legacy_layout_by_debug_info()
+        offsetof = GefUtil.offsetof
+        self.offset_default_set = offsetof("ctl_table_root", "default_set")
+        self.offset_set_dir = offsetof("ctl_table_set", "dir")
+        self.offset_ctl_table = offsetof("ctl_dir", "header.ctl_table")
+        self.offset_root = offsetof("ctl_dir", "header.root")
+        self.offset_set = offsetof("ctl_dir", "header.set")
+        self.offset_parent = offsetof("ctl_dir", "header.parent")
+        self.offset_rb_node = offsetof("ctl_dir", "root.rb_node")
+        self.offset_node_header = offsetof("ctl_node", "header")
+        self.offset_procname = offsetof("ctl_table", "procname")
+        self.offset_data = offsetof("ctl_table", "data")
+        self.offset_maxlen = offsetof("ctl_table", "maxlen")
+        self.offset_mode = offsetof("ctl_table", "mode")
+        self.offset_handler = offsetof("ctl_table", "proc_handler")
+        self.sizeof_ctl_table = GefUtil.sizeof("ctl_table")
+        if None in [
+            self.offset_default_set, self.offset_set_dir, self.offset_root, self.offset_ctl_table,
+            self.offset_set, self.offset_parent, self.offset_rb_node, self.offset_node_header,
+            self.offset_procname, self.offset_data, self.offset_maxlen, self.offset_mode,
+            self.offset_handler, self.sizeof_ctl_table,
+        ]:
+            return False
+        # v6.6~
+        self.offset_ctl_table_size = offsetof("ctl_dir", "header.ctl_table_size")
+        return True
+
+    def resolve_legacy_layout_by_debug_info(self):
+        """Resolve the structure offsets of v3.0~v3.3 from the loaded debug information. Return False if any is missing."""
+        offsetof = GefUtil.offsetof
+        self.offset_default_set = offsetof("ctl_table_root", "default_set")
+        self.offset_lookup = offsetof("ctl_table_root", "lookup")
+        self.offset_is_seen = offsetof("ctl_table_set", "is_seen")
+        self.offset_ctl_table = offsetof("ctl_table_header", "ctl_table")
+        self.offset_ctl_entry = offsetof("ctl_table_header", "ctl_entry")
+        self.offset_root = offsetof("ctl_table_header", "root")
+        self.offset_set = offsetof("ctl_table_header", "set")
+        self.offset_procname = offsetof("ctl_table", "procname")
+        self.offset_data = offsetof("ctl_table", "data")
+        self.offset_maxlen = offsetof("ctl_table", "maxlen")
+        self.offset_mode = offsetof("ctl_table", "mode")
+        self.offset_child = offsetof("ctl_table", "child")
+        self.offset_handler = offsetof("ctl_table", "proc_handler")
+        self.sizeof_ctl_table = GefUtil.sizeof("ctl_table")
+        return None not in [
+            self.offset_default_set, self.offset_lookup, self.offset_is_seen, self.offset_ctl_table,
+            self.offset_ctl_entry, self.offset_root, self.offset_set, self.offset_procname,
+            self.offset_data, self.offset_maxlen, self.offset_mode, self.offset_child,
+            self.offset_handler, self.sizeof_ctl_table,
+        ]
+
+    def resolve_layout(self, kversion):
+        """Resolve version- and architecture-dependent structure offsets."""
+        if self.is_legacy:
+            self.resolve_legacy_layout(kversion)
+            return
+        self.offset_default_set = 0
+        self.offset_set_dir = runtime.current_arch.ptrsize
+        self.offset_ctl_table = 0
+        self.offset_node_header = runtime.current_arch.ptrsize * 3
+        self.offset_procname = 0
+        self.offset_data = runtime.current_arch.ptrsize
+        if is_64bit():
+            if kversion < "4.9.120":
+                self.offset_rb_node = 0x48
+            elif kversion < "4.10":
+                self.offset_rb_node = 0x50
+            elif kversion < "4.11":
+                self.offset_rb_node = 0x48
+            elif kversion < "4.12.2":
+                self.offset_rb_node = 0x58
+            elif kversion < "6.10":
+                self.offset_rb_node = 0x50
+            else:
+                self.offset_rb_node = 0x58
+            self.offset_parent = 0x38
+            self.offset_maxlen = 0x10
+            self.offset_mode = 0x14
+            if kversion < "6.10":
+                self.offset_handler = 0x20
+                self.sizeof_ctl_table = 0x40
+            else:
+                self.offset_handler = 0x18
+                self.sizeof_ctl_table = 0x38
+        else:
+            if kversion < "4.9.120":
+                self.offset_rb_node = 0x28
+                self.offset_parent = 0x20
+            elif kversion < "4.10":
+                self.offset_rb_node = 0x2c
+                self.offset_parent = 0x20
+            elif kversion < "4.11":
+                self.offset_rb_node = 0x28
+                self.offset_parent = 0x20
+            elif kversion < "4.12.2":
+                self.offset_rb_node = 0x30
+                self.offset_parent = 0x20
+            elif kversion < "6.6":
+                self.offset_rb_node = 0x2c
+                self.offset_parent = 0x20
+            elif kversion < "6.10":
+                self.offset_rb_node = 0x30
+                self.offset_parent = 0x24
+            else:
+                self.offset_rb_node = 0x34
+                self.offset_parent = 0x24
+            self.offset_maxlen = 0x8
+            self.offset_mode = 0xc
+            if kversion < "6.10":
+                self.offset_handler = 0x14
+                self.sizeof_ctl_table = 0x24
+            else:
+                self.offset_handler = 0x10
+                self.sizeof_ctl_table = 0x20
+
+        # Since v6.10 ctl_table has no sentinel, so ctl_table_size (added in
+        # v6.6) is needed to bound the array.
+        if kversion < "6.6":
+            self.offset_ctl_table_size = None
+        else:
+            self.offset_ctl_table_size = runtime.current_arch.ptrsize
+        self.offset_set = self.offset_parent - runtime.current_arch.ptrsize
+        self.offset_root = self.offset_set - runtime.current_arch.ptrsize
+        return
+
+    def resolve_legacy_layout(self, kversion):
+        """Resolve version- and architecture-dependent structure offsets of v3.0~v3.3."""
+        ptrsize = runtime.current_arch.ptrsize
+        self.offset_default_set = ptrsize * 2
+        self.offset_lookup = ptrsize * 6
+        self.offset_is_seen = ptrsize * 3
+        self.offset_ctl_table = 0
+        self.offset_ctl_entry = ptrsize
+        # after `int used` and `int count`, unregistering and ctl_table_arg precede root
+        self.offset_root = align_to_ptrsize(ptrsize * 3 + 8) + ptrsize * 2
+        self.offset_set = self.offset_root + ptrsize
+        self.offset_procname = 0
+        self.offset_data = ptrsize
+        self.offset_maxlen = ptrsize * 2
+        self.offset_mode = ptrsize * 2 + 4
+        self.offset_child = ptrsize * 2 + 8
+        self.offset_handler = self.offset_child + ptrsize * 2
+        # poll (v3.2~), extra1 and extra2 follow proc_handler
+        if kversion < "3.2":
+            self.sizeof_ctl_table = self.offset_handler + ptrsize * 3
+        else:
+            self.sizeof_ctl_table = self.offset_handler + ptrsize * 4
+        return
+
+    def is_valid_layout(self):
+        """Check the layout with the root directory and its first child, which is always a directory.
+        sysctl_table_root.default_set.dir.header.set points to sysctl_table_root.default_set,
+        and a top-level directory has the root directory as its parent and a ctl_table entry of S_IFDIR."""
+        if self.is_legacy:
+            return self.is_valid_legacy_layout()
+        self.root_ctl_dir = self.sysctl_table_root + self.offset_default_set + self.offset_set_dir
+        default_set = self.sysctl_table_root + self.offset_default_set
+        if read_int_from_memory(self.root_ctl_dir + self.offset_set, safe=True) != default_set:
+            return False
+        if read_int_from_memory(self.root_ctl_dir + self.offset_root, safe=True) != self.sysctl_table_root:
+            return False
+        rb_node = read_int_from_memory(self.root_ctl_dir + self.offset_rb_node, safe=True)
+        if not rb_node or not is_valid_addr(rb_node):
+            return False
+        ctl_dir = read_int_from_memory(rb_node + self.offset_node_header, safe=True)
+        if not ctl_dir or not is_valid_addr(ctl_dir):
+            return False
+        if read_int_from_memory(ctl_dir + self.offset_parent, safe=True) != self.root_ctl_dir:
+            return False
+        ctl_table = read_int_from_memory(ctl_dir + self.offset_ctl_table, safe=True)
+        if not ctl_table or not is_valid_addr(ctl_table):
+            return False
+        mode = read_int16_from_memory(ctl_table + self.offset_mode, safe=True)
+        if mode is None or (mode & 0o170000) != 0o040000:
+            return False
+        procname = read_int_from_memory(ctl_table + self.offset_procname, safe=True)
+        return bool(procname and read_cstring_from_memory(procname, max_length=0x40, safe=True))
+
+    def is_valid_legacy_layout(self):
+        """Check the layout of v3.0~v3.3 with the first header and its first two entries.
+        sysctl_table_root.default_set.list starts with root_table_header, which points back to the root and the set,
+        and its ctl_table is root_table, whose entries ("kernel", "vm", ...) are directories having `child`."""
+        default_set = self.sysctl_table_root + self.offset_default_set
+        ctl_entry = read_int_from_memory(default_set, safe=True)
+        if not ctl_entry or not is_valid_addr(ctl_entry):
+            return False
+        header = ctl_entry - self.offset_ctl_entry
+        if read_int_from_memory(header + self.offset_root, safe=True) != self.sysctl_table_root:
+            return False
+        if read_int_from_memory(header + self.offset_set, safe=True) != default_set:
+            return False
+        ctl_table = read_int_from_memory(header + self.offset_ctl_table, safe=True)
+        if not ctl_table or not is_valid_addr(ctl_table):
+            return False
+        for entry in [ctl_table, ctl_table + self.sizeof_ctl_table]:
+            child = read_int_from_memory(entry + self.offset_child, safe=True)
+            if not child or not is_valid_addr(child):
+                return False
+            procname = read_int_from_memory(entry + self.offset_procname, safe=True)
+            if not procname or not read_cstring_from_memory(procname, max_length=0x40, safe=True):
+                return False
+        return True
+
+    @staticmethod
+    def find_set(start, handlers, offset_is_seen=0):
+        """Find a ctl_table_set by its is_seen callback."""
+        current = start
+        remaining = 0x1000
+        while remaining: # avoid unbounded scan
+            if read_int_from_memory(current) in handlers:
+                return current - offset_is_seen
+            current += runtime.current_arch.ptrsize
+            remaining -= 1
+        return None
+
+    def resolve_namespace_sets(self):
+        """Resolve the sets of the initial namespaces that the symlinks (net.*, user.*, and ipc since v5.19) lead to."""
+        self.ctset_namespaces = {self.sysctl_table_root + self.offset_default_set: "global"}
+        self.ctsets = {}
+        if self.is_legacy:
+            # a root without `lookup` (e.g., net_sysctl_ro_root) shares its default set among the namespaces
+            for root in KernelListHead(self.sysctl_table_root).iter_entries():
+                if read_int_from_memory(root + self.offset_lookup, safe=True) == 0:
+                    self.ctset_namespaces[root + self.offset_default_set] = "global"
+
+        self.init_net = init_net = KernelAddressHeuristicFinder.get_init_net()
+        is_seen = Ksym.get_addr("is_seen")
+        if init_net and is_seen:
+            ctset = self.find_set(init_net, {is_seen}, self.offset_is_seen)
+            self.add_set(ctset, "net:{:#018x}".format(init_net))
+
+        # the user, ipc and mqueue namespaces have their own `set_is_seen` and `set_lookup`
+        set_is_seen = Ksym.get_addrs("set_is_seen")
+        if not set_is_seen:
+            return
+        init_user_ns = KernelAddressHeuristicFinder.get_init_user_ns()
+        if init_user_ns:
+            self.add_set(self.find_set(init_user_ns, set_is_seen), "user:{:#018x}".format(init_user_ns))
+
+        init_ipc_ns = KernelAddressHeuristicFinder.get_init_ipc_ns()
+        if init_ipc_ns:
+            # mq_set and ipc_set
+            ctset = self.find_set(init_ipc_ns, set_is_seen)
+            if self.add_set(ctset, "ipc:{:#018x}".format(init_ipc_ns)):
+                ctset = self.find_set(ctset + runtime.current_arch.ptrsize, set_is_seen)
+                self.add_set(ctset, "ipc:{:#018x}".format(init_ipc_ns))
+        return
+
+    def add_set(self, ctset, namespace):
+        """Register a ctl_table_set by the ctl_table_root that the symlinks to it have as data.
+        Until v3.3, the set has no directory, and the root is taken from the first header in its list."""
+        if ctset is None or ctset in self.ctset_namespaces:
+            return False
+        if self.is_legacy:
+            ctl_entry = read_int_from_memory(ctset, safe=True)
+            if not ctl_entry or ctl_entry == ctset:
+                return False
+            ctl_dir = ctl_entry - self.offset_ctl_entry
+        else:
+            ctl_dir = ctset + self.offset_set_dir
+        if read_int_from_memory(ctl_dir + self.offset_set, safe=True) != ctset:
+            return False
+        root = read_int_from_memory(ctl_dir + self.offset_root, safe=True)
+        self.ctsets[root] = ctset
+        self.ctset_namespaces[ctset] = namespace
+        return True
+
+    def resolve_handler_types(self):
+        """Resolve the addresses of the proc handlers whose data representation is known."""
+        self.handler_types = {}
+        self.known_handlers = {}
+        for name, handler_type in self.HANDLER_TYPES.items():
+            addr = Ksym.get_addr(name)
+            if addr:
+                self.handler_types[addr] = handler_type
+                if handler_type is not None:
+                    self.known_handlers[addr] = handler_type
+        return
+
+    def get_handler_type(self, handler):
+        """Return the data representation of `handler`, or None if unknown.
+        A custom handler is classified by the known handlers it calls, if they agree."""
+        if handler in self.handler_types:
+            return self.handler_types[handler]
+        self.handler_types[handler] = None
+        if not is_valid_addr(handler):
+            return None
+        try:
+            res = KernelAddressHeuristicFinderUtil.disassemble_until_next_symbol(handler, 128)
+        except gdb.error:
+            return None
+        targets = set()
+        for line in res.splitlines():
+            targets.update(int(x, 16) for x in re.findall(r"0x[0-9a-f]+", line.partition(":")[2]))
+        if is_riscv64() or is_riscv32():
+            # a far call is `auipc ra, hi20` and `jalr ra, lo12(ra)`
+            targets.update(KernelAddressHeuristicFinderUtil.riscv_auipc_gen(
+                res, use_addi=False, use_mem=True, skip=0, skip_msb_check=False, read_valid=False,
+            ))
+        found = {self.known_handlers[x] for x in targets if x in self.known_handlers}
+        if found == {"string"}:
+            # a wrapper of a string handler may format binary data (e.g., proc_do_uuid)
+            self.handler_types[handler] = "wrapped-string"
+        found.discard("string")
+        if len(found) == 1:
+            self.handler_types[handler] = found.pop()
+        elif len({x[:2] for x in found}) == 1:
+            # e.g., a handler calling both proc_dointvec and proc_dointvec_jiffies
+            self.handler_types[handler] = found.pop()[:2] + ("",)
+        return self.handler_types[handler]
+
+    def get_param_path(self, ctl_dir, ctl_table):
+        """Build and remember the dotted path for a ctl_table entry."""
+        procname = read_int_from_memory(ctl_table + self.offset_procname)
+        if procname == 0:
+            return None
+        procname_str = read_cstring_from_memory(procname)
+        if not procname_str:
+            return None
+        parent = read_int_from_memory(ctl_dir + self.offset_parent)
+        parent_path = self.parent_paths.get(parent, "")
+        param_path = (parent_path + "." + procname_str).lstrip(".")
+        self.parent_paths[ctl_dir] = param_path
+        return param_path
+
+    def get_table_end(self, ctl_dir, ctl_table):
+        """Return the array boundary for kernels that store ctl_table_size."""
+        if self.offset_ctl_table_size is None:
+            return None
+        num_entries = read_int32_from_memory(ctl_dir + self.offset_ctl_table_size)
+        if num_entries > 0x1000:
+            return None
+        return ctl_table + self.sizeof_ctl_table * num_entries
+
+    def get_symlink_root(self, ctl_table, skip_symlink):
+        """Return the RB root of the set that a symlink leads to."""
+        if skip_symlink:
+            return None
+        root = read_int_from_memory(ctl_table + self.offset_data)
+        ctset = self.ctsets.get(root)
+        if ctset is None or ctset in self.seen_ctset:
+            return None
+        self.seen_ctset.add(ctset)
+        return read_int_from_memory(ctset + self.offset_set_dir + self.offset_rb_node)
+
+    def walk_table(self, ctl_dir, skip_symlink, progress):
+        """Yield data entries in one ctl_table array and follow its symlinks."""
+        ctl_table = read_int_from_memory(ctl_dir + self.offset_ctl_table)
+        ctl_table_end = self.get_table_end(ctl_dir, ctl_table)
+        while ctl_table not in self.seen_ctl_table:
+            if ctl_table_end is not None and ctl_table >= ctl_table_end:
+                break
+            self.seen_ctl_table.add(ctl_table)
+            param_path = self.get_param_path(ctl_dir, ctl_table)
+            if param_path is None:
+                break
+
+            mode = read_int32_from_memory(ctl_table + self.offset_mode)
+            if (mode & 0o0120000) == 0o0120000:
+                symlink_root = self.get_symlink_root(ctl_table, skip_symlink)
+                if symlink_root is not None:
+                    yield from self.walk_node(symlink_root, skip_symlink, progress)
+            elif (mode & 0o0040000) == 0o0040000:
+                pass
+            elif mode > 0o777:
+                break
+            else:
+                yield self.Entry(ctl_dir, ctl_table, param_path, mode)
+            ctl_table += self.sizeof_ctl_table
+        return
+
+    def walk_node(self, rb_node, skip_symlink, progress):
+        """Walk one ctl_node, its child directory, then its right and left nodes."""
+        if not rb_node:
+            return
+        if progress is not None:
+            progress.update(1)
+
+        ctl_dir = read_int_from_memory(rb_node + self.offset_node_header)
+        if ctl_dir not in self.seen_ctl_dir:
+            self.seen_ctl_dir.add(ctl_dir)
+            yield from self.walk_table(ctl_dir, skip_symlink, progress)
+            child = read_int_from_memory(ctl_dir + self.offset_rb_node) & ~1
+            yield from self.walk_node(child, skip_symlink, progress)
+
+        right = read_int_from_memory(rb_node + runtime.current_arch.ptrsize) & ~1
+        yield from self.walk_node(right, skip_symlink, progress)
+        left = read_int_from_memory(rb_node + runtime.current_arch.ptrsize * 2) & ~1
+        yield from self.walk_node(left, skip_symlink, progress)
+        return
+
+    def walk_legacy_roots(self, skip_symlink, progress):
+        """Walk the headers of each root (v3.0~v3.3).
+        A root with `lookup` has a set for each namespace (net.*), and the set of the initial one is walked."""
+        for root in KernelListHead(self.sysctl_table_root).iter_entries(include_head=True):
+            if read_int_from_memory(root + self.offset_lookup) == 0:
+                ctset = root + self.offset_default_set
+            elif skip_symlink:
+                continue
+            else:
+                ctset = self.ctsets.get(root)
+            if ctset is None or ctset in self.seen_ctset:
+                continue
+            self.seen_ctset.add(ctset)
+            for header in KernelListHead(ctset, self.offset_ctl_entry).iter_entries():
+                if progress is not None:
+                    progress.update(1)
+                ctl_table = read_int_from_memory(header + self.offset_ctl_table)
+                yield from self.walk_legacy_table(header, ctl_table, "")
+        return
+
+    def walk_legacy_table(self, header, ctl_table, parent_path):
+        """Yield data entries in one ctl_table array and its child arrays (v3.0~v3.3)."""
+        while ctl_table not in self.seen_ctl_table:
+            self.seen_ctl_table.add(ctl_table)
+            procname = read_int_from_memory(ctl_table + self.offset_procname)
+            if procname:
+                procname_str = read_cstring_from_memory(procname)
+            else:
+                procname_str = None
+            if not procname_str:
+                break
+            param_path = (parent_path + "." + procname_str).lstrip(".")
+
+            mode = read_int32_from_memory(ctl_table + self.offset_mode)
+            child = read_int_from_memory(ctl_table + self.offset_child)
+            if child:
+                yield from self.walk_legacy_table(header, child, param_path)
+            elif mode > 0o777:
+                break
+            else:
+                yield self.Entry(header, ctl_table, param_path, mode)
+            ctl_table += self.sizeof_ctl_table
+        return
+
+
+
+class KernelNftables:
+    """Resolve the nftables layouts and walk the object graph of each network namespace.
+
+    The table list of a network namespace:
+      v3.13~v4.15: net->nft.af_info -> nft_af_info.tables (one list per family)
+      v4.16~v5.12: net->nft.tables
+      v5.13~:      net_generic(net, nf_tables_net_id) -> nftables_pernet.tables
+
+    struct nft_table {
+        struct list_head list;
+        struct rhltable chains_ht;            // v4.17~
+        struct list_head chains;
+        struct list_head sets;
+        struct list_head objects;             // v4.10~
+        struct list_head flowtables;          // v4.16~
+        struct rhltable objname_ht;           // v7.2~ (7.1.8~)
+        u64 hgenerator;
+        u64 handle;                           // v4.16~
+        u32 use;
+        u16 family:6, flags:8, genmask:2;     // u16 flags (~v4.15)
+        u32 nlpid;                            // v5.12~
+        char *name;                           // char name[NFT_TABLE_MAXNAMELEN] (~v4.13)
+        ...
+    };
+
+    The chains, rules and expressions are decoded by KernelNftablesRule, and the sets by KernelNftablesSet.
+    """
+
+    # NFPROTO_* families
+    FAMILIES = {0: "unspec", 1: "inet", 2: "ipv4", 3: "arp", 5: "netdev", 7: "bridge", 10: "ipv6", 12: "decnet"}
+    TABLE_FAMILIES = frozenset((1, 2, 3, 5, 7, 10))
+    NFT_TABLE_F_OWNER = 0x2
+    TYPE_NAMES = {
+        "chains": "struct nft_chain",
+        "sets": "struct nft_set",
+        "objects": "struct nft_object",
+        "flowtables": "struct nft_flowtable",
+    }
+
+    NET_SCAN = 0x3000  # fallback window when sizeof(struct net) is unavailable
+    MEMBER_SCAN = 0x200  # window used to locate a member inside an object
+    BACKREF_SCAN = 0x60  # the table back-pointer sits near the start of a chain/set/object
+    MAX_LIST_SCAN = 0x1_0000  # scan safety limit, not a kernel nftables limit
+
+    @classmethod
+    @Cache.cache_this_session(per_inferior=True, until_new_objfile=True)
+    def get_instance(cls):
+        return cls()
+
+    def __init__(self):
+        self.meta = []
+        self.kversion = None
+        self.nets = []
+        self.initialize_scan()
+        return
+
+    def initialize(self):
+        self.meta = []
+        self.initialize_scan()
+        self.kversion = Kernel.version()
+        if self.kversion is None:
+            self.meta.append(("err", "Could not find Linux kernel"))
+            return None
+
+        self.nets = self.get_networks()
+        if not self.nets:
+            if KernelAddressHeuristicFinderUtil.has_networking_symbols() is False:
+                self.meta.append(("warn", "No core networking symbols found; this kernel may be built with CONFIG_NET=n"))
+            else:
+                self.meta.append(("err", "Could not find init_net"))
+            return None
+        self.meta.append(("info", "kernel version: {!s}".format(self.kversion)))
+
+        if self.has_nf_tables() is False:
+            self.meta.append(("warn", "nf_tables is neither built in nor loaded as a module"))
+            return None
+        return True
+
+    def initialize_scan(self):
+        self.parsed_lists = {}
+        self.backref_cache = {}
+        self.name_cache = {}
+        self.rules = KernelNftablesRule(self)
+        self.sets = KernelNftablesSet(self)
+        self.table_layout_cache = {}
+        self.table_child_count_cache = {}
+        self.candidate_head_sources = {}
+        self.resolved_tables = {}
+        self.legacy_af_layout = None
+        self.net_offset_gen = None
+        self.nf_tables_net_id = None
+        self.nf_tables_net_id_resolved = False
+        self.net_offset_ns_ops = None
+        self.partial_reasons = set()
+        return
+
+    @staticmethod
+    def has_nf_tables():
+        ret = Ksym.get_kallsyms()
+        if ret is None or not ret[0]:
+            return None
+        if Ksym.get_addrs("nf_tables_newtable", match="split"):
+            return True
+        kmod = Kernel.modules()
+        if not kmod.initialize():
+            return None
+        module_addrs = kmod.get_addrs()[0]
+        return kmod.find(module_addrs, "nf_tables") is not None
+
+    def net_inum(self, net):
+        value = GefUtil.typed_struct(net, "struct net")
+        if value is not None:
+            inum = GefUtil.field_int(value, "ns", "inum")
+            if inum is None:
+                inum = GefUtil.field_int(value, "proc_inum")
+            return inum
+
+        offset = self.resolve_net_ns_ops_offset(net)
+        if offset is not None:
+            offset += runtime.current_arch.ptrsize
+        else:
+            # proc_inum (v3.8~v3.18)
+            offset = KernelNamespace.get_offset_inum("net", self.nets[0][0], KernelAddressHeuristicFinder.get_init_user_ns())
+        if offset is None:
+            return None
+        return read_int32_from_memory(net + offset, safe=True)
+
+    def parse_tables(self, net):
+        if self.kversion < "4.16":
+            return self.parse_legacy_tables(net)
+
+        found = self.resolve_tables(net)
+        if found is None:
+            return None
+        entries, offset_name, table_head, tail_layout = found
+        tables = []
+        stride = runtime.current_arch.ptrsize * 2
+        if GefUtil.offsetof("struct nft_table", "name") == offset_name:
+            name_source = "type"
+        else:
+            name_source = "heuristic"
+        for table in entries:
+            name = self.name_at(table, offset_name) or "?"
+            offset_chain = self.resolve_table_list_offset(table, offset_name=offset_name)
+            kinds = self.parse_table_sublists(table, offset_chain)
+            family_info = self.get_table_family_info(table, offset_name, tail_layout=tail_layout)
+            layout = None
+            if offset_chain is not None:
+                layout = {
+                    "chains": offset_chain,
+                    "sets": offset_chain + stride,
+                    "objects": offset_chain + stride * 2,
+                    "flowtables": offset_chain + stride * 3,
+                }
+            tables.append({
+                "address": table,
+                "name": name,
+                "family": family_info["family"],
+                "use": family_info["use"],
+                "family_info": family_info,
+                "layout": layout,
+                "kinds": kinds,
+            })
+        return {
+            "offset_name": offset_name,
+            "name_source": name_source,
+            "table_head": table_head,
+            "table_source": self.candidate_head_sources.get(table_head, "heuristic"),
+            "tail_layout": tail_layout,
+            "tables": tables,
+        }
+
+    def entry_name(self, entry, kind=None, table=None):
+        if kind is not None:
+            type_name = self.TYPE_NAMES.get(kind)
+            if type_name is not None:
+                offset_list = GefUtil.offsetof(type_name, "list")
+                if offset_list is not None:
+                    base = entry - offset_list
+                    name = self.field_string(GefUtil.typed_struct(base, type_name), "name")
+                    if self.looks_name(name):
+                        return name
+                    # Newer nft_object stores its name in the nested hash key rather than in a
+                    # direct member.  get_name_offset() accounts for both layouts.
+                    if kind == "objects":
+                        offset_name = self.get_name_offset(kind)
+                        if offset_name is not None:
+                            name = self.name_at(base, offset_name)
+                            if self.looks_name(name):
+                                return name
+
+        if kind is not None and self.kversion < "4.16":
+            name = self.legacy_entry_name(entry, kind)
+            if self.looks_name(name):
+                return name
+
+        # Stripped-kernel fallback: the list_head occupies the first two pointer-sized words at the
+        # entry address in the layouts handled here, so do not rescan those pointers as names.
+        # The table back-reference is not a name either, although its first bytes may be printable.
+        info = self.resolve_name(entry, min_offset=runtime.current_arch.ptrsize * 2,
+                                 max_offset=min(self.MEMBER_SCAN, 0x100), exclude=table)
+        if info:
+            return info[1]
+        return "?"
+
+    @staticmethod
+    def table_range(table):
+        start = table["address"]
+        offset_list = GefUtil.offsetof("struct nft_table", "list")
+        if offset_list is not None:
+            start -= offset_list
+        size = GefUtil.sizeof("struct nft_table")
+        if size is None or size <= 0:
+            return start, None
+        return start, start + size
+
+    def entry_object_range(self, entry, kind):
+        type_name = self.TYPE_NAMES.get(kind)
+        if type_name is None:
+            return entry, None
+        offset_list = GefUtil.offsetof(type_name, "list")
+        size = GefUtil.sizeof(type_name)
+        if offset_list is None or size is None or size <= 0:
+            return entry, None
+        base = entry - offset_list
+        return base, base + size
+
+    def get_table_attrs(self, table, nftables):
+        value = GefUtil.typed_struct(table["address"], "struct nft_table")
+        if GefUtil.field(value, "handle") is not None:
+            return {
+                "handle": GefUtil.field_int(value, "handle"),
+                "flags": GefUtil.field_int(value, "flags"),
+                "genmask": GefUtil.field_int(value, "genmask"),
+                "nlpid": GefUtil.field_int(value, "nlpid"),
+                "udata": self.typed_udata(value),
+            }
+
+        if nftables.get("tail_layout") is None or nftables.get("offset_name") is None:
+            return None
+        values = self.table_tail_candidate_values(table["address"], nftables["offset_name"], nftables["tail_layout"])
+        if values is None:
+            return None
+        return {
+            "handle": values["handle"],
+            "flags": values["flags"],
+            "genmask": values["genmask"],
+            "nlpid": values["nlpid"],
+            "udata": None,
+        }
+
+    def get_object_attrs(self, entry):
+        offset_list = GefUtil.offsetof("struct nft_object", "list")
+        if offset_list is None:
+            return None
+        value = GefUtil.typed_struct(entry - offset_list, "struct nft_object")
+        if GefUtil.field(value, "handle") is None and GefUtil.field(value, "use") is None:
+            return None
+        return {
+            "handle": GefUtil.field_int(value, "handle"),
+            "type": GefUtil.field_int(value, "ops", "type", "type"),
+            "use": GefUtil.field_int(value, "use"),
+            "genmask": GefUtil.field_int(value, "genmask"),
+            "udata": self.typed_udata(value),
+        }
+
+    def get_flowtable_attrs(self, entry):
+        offset_list = GefUtil.offsetof("struct nft_flowtable", "list")
+        if offset_list is None:
+            return None
+        value = GefUtil.typed_struct(entry - offset_list, "struct nft_flowtable")
+        if GefUtil.field(value, "hooknum") is None:
+            return None
+        flags = GefUtil.field_int(value, "data", "flags")
+        if flags is None:
+            flags = GefUtil.field_int(value, "flags")
+        priority = GefUtil.field_int(value, "data", "priority")
+        if priority is None:
+            priority = GefUtil.field_int(value, "priority")
+        return {
+            "handle": GefUtil.field_int(value, "handle"),
+            "use": GefUtil.field_int(value, "use"),
+            "flags": flags,
+            "genmask": GefUtil.field_int(value, "genmask"),
+            "hooknum": GefUtil.field_int(value, "hooknum"),
+            "priority": priority,
+            "devices": self.hook_devices(value),
+        }
+
+    def get_net_meta(self, net, label, nftables, elements=True):
+        lines = ["{:s}: {:#x}".format(label or "net", net)] + self.rule_layout_meta()
+        if nftables is None or not nftables["tables"]:
+            lines.append("  table list: not found")
+            return [("info", line) for line in lines]
+
+        lines.append("  table list: {:#x} [{}]".format(nftables["table_head"], nftables["table_source"]))
+        lines.append(self.offset_meta("nft_table.name", nftables["offset_name"], nftables["name_source"]))
+
+        table = nftables["tables"][0]
+        if table["layout"] is not None:
+            if self.typed_table_list_layout() is not None:
+                source = "type"
+            elif nftables.get("legacy_af") and GefUtil.offsetof("struct nft_table", "chains") is not None:
+                source = "type"
+            else:
+                source = "heuristic"
+            for kind in ("chains", "sets", "objects", "flowtables"):
+                if kind in table["layout"]:
+                    lines.append(self.offset_meta("nft_table." + kind, table["layout"][kind], source))
+
+        family_info = table["family_info"]
+        if nftables.get("legacy_af"):
+            family_owner = "nft_af_info.family"
+        else:
+            family_owner = "nft_table.family"
+        lines.append(self.offset_meta(family_owner, family_info["offset_family"], family_info["source"]))
+        lines.append(self.offset_meta("nft_table.use", family_info["offset_use"], family_info["source"]))
+        tail_meta = self.table_tail_layout_meta(nftables["tail_layout"])
+        if tail_meta is not None:
+            lines.append(tail_meta)
+
+        lines += [self.member_meta("struct nft_chain", member) for member in ("list", "name", "blob_gen_0", "blob_gen_1")]
+
+        chains = table["kinds"].get("chains", {}).get("entries", [])
+        if chains:
+            chain = chains[0]
+            backref = self.resolve_table_offset(chain, table["address"])
+            lines.append(self.offset_meta("chain table backref", backref, "heuristic"))
+            offset_rules = self.rules.resolve_chain_rules_offset(chain)
+            lines.append(self.offset_meta("chain rules list", offset_rules, "heuristic"))
+
+        lines += [self.member_meta("struct nft_expr_ops", member) for member in ("type", "size")]
+
+        sets = table["kinds"].get("sets", {}).get("entries", [])
+        if sets:
+            nft_set = self.sets.parse_set(sets[0], elements)
+            lines.append(self.offset_meta("nft_set.ops", nft_set["offset_ops"],
+                                          "type" if GefUtil.offsetof("struct nft_set", "ops") is not None else "heuristic"))
+            lines.append(self.offset_meta("nft_set.data", nft_set["offset_data"],
+                                          "type" if nft_set["offset_data"] is not None else "heuristic"))
+            lines.append("  {:<28s} {:s}".format("set backend", nft_set["backend"] or "not found"))
+            for type_name, members in self.sets.SET_BACKEND_TYPES.get(nft_set["backend"], ()):
+                type_size = GefUtil.sizeof(type_name)
+                type_label = type_name.split(" ")[-1]
+                if type_size is not None:
+                    lines.append("  {:<28s} {:<12s} [type]".format(type_label + ".size", "{:#x}".format(type_size)))
+                for member in members:
+                    offset = GefUtil.offsetof(type_name, member)
+                    if offset is not None:
+                        lines.append(self.offset_meta(type_label + "." + member, offset, "type"))
+        return [("info", line) for line in lines]
+
+    def get_networks(self):
+        init_net = KernelAddressHeuristicFinder.get_init_net()
+        if init_net is None:
+            return []
+        nets = [(init_net, "init_net")]
+        net_namespace_list = Ksym.get_addr("net_namespace_list")
+        if net_namespace_list:
+            first = read_int_from_memory(net_namespace_list, safe=True)
+            if first and read_int_from_memory(first, safe=True) is not None and 0 <= first - init_net < self.MEMBER_SCAN:
+                offset_list = first - init_net
+                entries, status = self.walk_list(net_namespace_list)
+                if status in ("broken", "limit"):
+                    self.partial_reasons.add("network namespace list")
+                for entry in entries:
+                    net = entry - offset_list
+                    if net != init_net:
+                        nets.append((net, None))
+        else:
+            nets += [(net, None) for net in self.nets_from_ring(init_net) if net != init_net]
+        return nets
+
+    def nets_from_ring(self, init_net):
+        # Without net_namespace_list (CONFIG_KALLSYMS_ALL=n), walk the ring through init_net.list.
+        # Every node but the static list head must be a struct net with the same ns_common.ops,
+        # or before v3.19, a dynamically numbered proc_inum outside the kernel image.
+        offset_ns = self.resolve_net_ns_ops_offset(init_net)
+        if offset_ns is not None:
+            ops = read_int_from_memory(init_net + offset_ns, safe=True)
+
+            def is_net(net):
+                return read_int_from_memory(net + offset_ns, safe=True) == ops
+        else:
+            offset_ns = KernelNamespace.get_offset_inum("net", init_net, KernelAddressHeuristicFinder.get_init_user_ns())
+            if offset_ns is None:
+                return []
+
+            def is_net(net):
+                inum = read_int32_from_memory(net + offset_ns, safe=True)
+                return inum is not None and inum >= 0xF000_0000 and not KernelAddressHeuristicFinderUtil.is_in_kernel_image(net)
+
+        offset_list = GefUtil.offsetof("struct net", "list")
+        if offset_list is not None:
+            offsets = [offset_list]
+        else:
+            offsets = range(0, self.MEMBER_SCAN, runtime.current_arch.ptrsize)
+        for offset in offsets:
+            if offset == offset_ns:
+                continue
+            entries, status = self.walk_list(init_net + offset, maxent=0x1000)
+            nets = [entry - offset for entry in entries if is_net(entry - offset)]
+            if status in ("broken", "limit") and offset_list is not None and nets:
+                self.partial_reasons.add("network namespace list")
+                return nets
+            if status == "ok" and nets and len(nets) == len(entries) - 1:
+                return nets
+        return []
+
+    def resolve_net_ns_ops_offset(self, net):
+        # struct ns_common (v3.19~): ..., const struct proc_ns_operations *ops; unsigned int inum;
+        # ops points to netns_operations, whose name is "net" and type is CLONE_NEWNET.
+        ptrsize = runtime.current_arch.ptrsize
+        if self.net_offset_ns_ops is not None:
+            offsets = [self.net_offset_ns_ops]
+        else:
+            offsets = range(0, self.MEMBER_SCAN * 2, ptrsize)
+        for offset in offsets:
+            ops = read_int_from_memory(net + offset, safe=True)
+            if not ops or not KernelAddressHeuristicFinderUtil.is_kernel_space(ops) or ops % ptrsize:
+                continue
+            if self.name_at(ops, 0, 8) != "net":
+                continue
+            if 0x4000_0000 not in (read_int32_from_memory(ops + ptrsize, safe=True),
+                                   read_int32_from_memory(ops + ptrsize * 2, safe=True)):
+                continue
+            inum = read_int32_from_memory(net + offset + ptrsize, safe=True)
+            if inum is None or inum < 0xf000_0000:
+                continue
+            self.net_offset_ns_ops = offset
+            return offset
+        return None
+
+    def parse_legacy_tables(self, net):
+        discovery = self.legacy_af_groups(net)
+        if discovery is None:
+            return None
+
+        child_kinds = self.legacy_child_kinds()
+        tables = []
+        name_offsets = set()
+        name_sources = set()
+        for group in discovery["groups"]:
+            for entry in group["entries"]:
+                name_info = self.legacy_table_name_info(entry)
+                if name_info is None:
+                    continue
+                table, offset_name, name, name_source = name_info
+                layout = self.legacy_table_layout(table)
+                if layout is None:
+                    continue
+
+                kinds = {}
+                for kind in child_kinds:
+                    offset = layout[kind]
+                    head = table + offset
+                    entries, status = self.walk_list(head, maxent=self.MAX_LIST_SCAN)
+                    if status in ("broken", "limit"):
+                        self.partial_reasons.add("table child list")
+                    if entries:
+                        backref = self.resolve_table_offset(entries[0], table)
+                    else:
+                        backref = None
+                    kinds[kind] = {"offset": offset, "entries": entries, "offset_table": backref}
+
+                offset_use = GefUtil.offsetof("struct nft_table", "use")
+                if offset_use is None:
+                    offset_use = runtime.current_arch.ptrsize * 2 * (1 + len(child_kinds)) + 8
+                use = read_int32_from_memory(table + offset_use, safe=True)
+                tables.append({
+                    "address": table,
+                    "name": name,
+                    "family": group["family"],
+                    "use": use,
+                    "family_info": {
+                        "family": group["family"],
+                        "use": use,
+                        "offset_family": self.legacy_af_layout["family"],
+                        "offset_use": offset_use,
+                        "source": self.legacy_af_layout["source"],
+                    },
+                    "layout": layout,
+                    "kinds": kinds,
+                })
+                name_offsets.add(offset_name)
+                name_sources.add(name_source)
+
+        if not tables:
+            return None
+        return {
+            "offset_name": next(iter(name_offsets)) if len(name_offsets) == 1 else None,
+            "name_source": next(iter(name_sources)) if len(name_sources) == 1 else "mixed",
+            "table_head": discovery["head"],
+            "table_source": discovery["source"],
+            "tail_layout": None,
+            "legacy_af": True,
+            "tables": tables,
+        }
+
+    def legacy_af_groups(self, net):
+        offsets = self.legacy_af_offsets()
+        heads = []
+        offset_nft = GefUtil.offsetof("struct net", "nft")
+        offset_af_info = GefUtil.offsetof("struct netns_nftables", "af_info")
+        if offset_nft is not None and offset_af_info is not None:
+            heads.append((net + offset_nft + offset_af_info, "type:net.nft.af_info"))
+        else:
+            heads.extend((net + offset, "heuristic:struct net af_info scan")
+                         for offset in range(0, GefUtil.sizeof("struct net") or self.NET_SCAN, runtime.current_arch.ptrsize))
+
+        best = None
+        for head, source in heads:
+            typed = source.startswith("type:")
+            list_status = self.walk_list(head, maxent=64)[1]
+            groups = self.legacy_af_groups_from_head(head, offsets, allow_partial=typed)
+            if groups is None:
+                continue
+            partial = list_status in ("broken", "limit") or any(group["partial"] for group in groups)
+            table_count = sum(len(group["entries"]) for group in groups)
+            score = (table_count > 0, len(groups), table_count)
+            if best is None or score > best[0]:
+                best = (score, head, source, groups, partial)
+        if best is None:
+            if heads and heads[0][1].startswith("type:") \
+                    and self.walk_list(heads[0][0], maxent=64)[1] in ("broken", "limit"):
+                self.partial_reasons.add("family list")
+            return None
+        if best[4]:
+            self.partial_reasons.add("family or table list")
+        self.legacy_af_layout = offsets
+        return {
+            "head": best[1],
+            "source": best[2],
+            "groups": best[3],
+        }
+
+    @staticmethod
+    def legacy_af_offsets():
+        offset_list = GefUtil.offsetof("struct nft_af_info", "list")
+        offset_family = GefUtil.offsetof("struct nft_af_info", "family")
+        offset_nhooks = GefUtil.offsetof("struct nft_af_info", "nhooks")
+        offset_owner = GefUtil.offsetof("struct nft_af_info", "owner")
+        offset_tables = GefUtil.offsetof("struct nft_af_info", "tables")
+        if None not in (offset_list, offset_family, offset_nhooks, offset_owner, offset_tables):
+            return {
+                "list": offset_list,
+                "family": offset_family,
+                "nhooks": offset_nhooks,
+                "owner": offset_owner,
+                "tables": offset_tables,
+                "source": "type",
+            }
+
+        ptrsize = runtime.current_arch.ptrsize
+        stride = ptrsize * 2
+        return {
+            "list": 0,
+            "family": stride,
+            "nhooks": stride + 4,
+            "owner": stride + 8,
+            "tables": stride + 8 + ptrsize,
+            "source": "heuristic",
+        }
+
+    def legacy_af_groups_from_head(self, head, offsets, allow_partial=False):
+        af_entries, list_status = self.walk_list(head, maxent=64)
+        if list_status in ("broken", "limit") and not allow_partial:
+            return None
+        if not af_entries and list_status != "broken":
+            return None
+
+        groups = []
+        families = set()
+        for entry in af_entries:
+            base = entry - offsets["list"]
+            family = read_int32_from_memory(base + offsets["family"], safe=True)
+            nhooks = read_int32_from_memory(base + offsets["nhooks"], safe=True)
+            owner = read_int_from_memory(base + offsets["owner"], safe=True)
+            tables_head = base + offsets["tables"]
+            if family not in self.TABLE_FAMILIES or family in families:
+                return None
+            if nhooks is None or not (1 <= nhooks <= 16):
+                return None
+            if owner and (not KernelAddressHeuristicFinderUtil.is_kernel_space(owner) or owner % runtime.current_arch.ptrsize):
+                return None
+            if not self.list_head_plausible(tables_head):
+                return None
+            entries, status = self.walk_list(tables_head, maxent=self.MAX_LIST_SCAN)
+            if status in ("broken", "limit") and not allow_partial:
+                return None
+            families.add(family)
+            groups.append({
+                "family": family,
+                "af": base,
+                "tables_head": tables_head,
+                "entries": entries,
+                "partial": list_status in ("broken", "limit") or status in ("broken", "limit"),
+            })
+        return groups
+
+    def legacy_child_kinds(self):
+        # Objects were added in v4.10. Flowtables appeared together with the unified table list
+        # in v4.16 and are handled by the modern layout path.
+        kinds = ["chains", "sets"]
+        if self.kversion >= "4.10":
+            kinds.append("objects")
+        return kinds
+
+    def legacy_table_name_info(self, table):
+        offset_list = GefUtil.offsetof("struct nft_table", "list")
+        offset_name = GefUtil.offsetof("struct nft_table", "name")
+        if offset_list is not None and offset_name is not None:
+            base = table - offset_list
+            name = self.field_string(GefUtil.typed_struct(base, "struct nft_table"), "name")
+            if self.looks_name(name):
+                return base, offset_name, name, "type"
+            return None
+
+        stride = runtime.current_arch.ptrsize * 2
+        base = table
+        tail = stride * (1 + len(self.legacy_child_kinds())) + 8 + 4 + 2
+        if self.kversion < "4.14":
+            offset_name = tail
+            name = read_cstring_from_memory(base + offset_name, 0x100, safe=True)
+        else:
+            offset_name = align_to_ptrsize(tail)
+            name = self.name_at(base, offset_name)
+        if not self.looks_name(name):
+            return None
+        return base, offset_name, name, "heuristic"
+
+    def legacy_table_layout(self, table):
+        kinds = self.legacy_child_kinds()
+        offsets = [GefUtil.offsetof("struct nft_table", kind) for kind in kinds]
+        if None in offsets:
+            offsets = [runtime.current_arch.ptrsize * 2 * (index + 1) for index in range(len(kinds))]
+        if not all(self.list_head_plausible(table + offset) for offset in offsets):
+            return None
+        return dict(zip(kinds, offsets))
+
+    def resolve_tables(self, net):
+        # The four consecutive nft_table child lists are a cheaper discriminator than decoding
+        # rules for every candidate. Name/tail evidence is required when child back-references are
+        # unavailable, including a completely empty table.
+        if net in self.resolved_tables:
+            return self.resolved_tables[net]
+        # the candidates may reach the table list of another namespace, so the namespaces are resolved
+        # in order and a head taken by an earlier one is skipped
+        taken = set()
+        for other, _ in self.nets:
+            if other == net:
+                break
+            found = self.resolve_tables(other)
+            if found is not None:
+                taken.add(found[2])
+
+        best = None
+        for head in self.candidate_heads(net):
+            if head in taken:
+                continue
+            entries, list_status = self.walk_list(head)
+            if not entries:
+                if list_status in ("broken", "limit") \
+                        and self.candidate_head_sources.get(head, "").startswith("type:"):
+                    self.partial_reasons.add("table list")
+                continue
+
+            probe = entries[:16]
+            provisional = [self.resolve_table_list_offset(table) for table in probe]
+            if any(layout is None for layout in provisional) or len(set(provisional)) != 1:
+                continue
+            offset_chain = provisional[0]
+
+            # A short name candidate in the first window may be a hashtable field (e.g., "@" is size 0x40),
+            # and a longer one may belong to the next object, so a candidate is taken only if the whole
+            # table layout is validated with it.
+            offsets = (offset for start, stop in self.table_name_windows(offset_chain)
+                       for offset in self.table_name_offsets(entries, min_offset=start, max_offset=stop))
+            for offset_name in offsets:
+                found = self.table_list_score(entries, offset_name)
+                if found is None:
+                    continue
+                score, tail_layout = found
+                if best is None or score > best[0]:
+                    best = (score, entries, offset_name, head, tail_layout, list_status)
+                break
+
+        if best is None:
+            self.resolved_tables[net] = None
+            return None
+        if best[5] in ("broken", "limit"):
+            self.partial_reasons.add("table list")
+        self.resolved_tables[net] = best[1], best[2], best[3], best[4]
+        return self.resolved_tables[net]
+
+    def candidate_heads(self, net):
+        heads = []
+        seen = set()
+
+        # another namespace may have gathered the same address, so deduplicate per namespace only
+        def add_head(head, source):
+            if head not in seen:
+                seen.add(head)
+                heads.append(head)
+                self.candidate_head_sources[head] = source
+
+        offset_nft = GefUtil.offsetof("struct net", "nft")
+        offset_tables = GefUtil.offsetof("struct netns_nftables", "tables")
+        if offset_nft is not None and offset_tables is not None:
+            add_head(net + offset_nft + offset_tables, "type:net.nft.tables")
+        elif GefUtil.sizeof("struct net") is None:
+            for offset in range(0, self.NET_SCAN, runtime.current_arch.ptrsize):
+                add_head(net + offset, "heuristic:struct net scan")
+
+        offset_pernet_tables = GefUtil.offsetof("struct nftables_pernet", "tables")
+        structs = self.gather_structs(net)
+        for struct_addr in structs:
+            if offset_pernet_tables is not None:
+                # the member offset is exact, but the slot is certain only if one candidate remains
+                if len(structs) == 1:
+                    source = "type:nftables_pernet.tables"
+                else:
+                    source = "heuristic:nftables_pernet.tables"
+                add_head(struct_addr + offset_pernet_tables, source)
+            else:
+                for offset_sub in range(0, 0x48, runtime.current_arch.ptrsize):
+                    add_head(struct_addr + offset_sub, "heuristic:net_generic subscan")
+
+        return heads
+
+    def gather_structs(self, net):
+        # v5.13~ keeps the table list in net_generic(net, nf_tables_net_id). If the id symbol is
+        # visible, inspect only that slot (plus the older id-1 convention); otherwise fall back to
+        # probing the pointer array.
+        structs = set()
+        for gen, (length, base) in self.net_generic_candidates(net).items():
+            slots = self.net_id_slots(length)
+            for index in range(length) if slots is None else slots:
+                pointer = read_int_from_memory(gen + base + runtime.current_arch.ptrsize * index, safe=True)
+                if self.is_heap_ptr(pointer):
+                    structs.add(pointer)
+        return structs
+
+    def net_generic_candidates(self, net):
+        # Return {gen: (length, base)} of the plausible net->gen.
+        # Prefer the real struct net.gen offset when debug type information is available.
+        offset_gen = GefUtil.offsetof("struct net", "gen")
+        if offset_gen is not None:
+            offsets = [offset_gen]
+        elif self.net_offset_gen is not None:
+            # Once a stripped-kernel fallback offset has been identified, every network namespace uses
+            # the same struct net layout. Reuse it instead of rescanning the whole object.
+            offsets = [self.net_offset_gen]
+        else:
+            offsets = range(0, GefUtil.sizeof("struct net") or self.NET_SCAN, runtime.current_arch.ptrsize)
+
+        candidates = {}
+        candidate_offsets = []
+        for offset in offsets:
+            gen = read_int_from_memory(net + offset, safe=True)
+            info = self.net_generic_candidate_info(gen)
+            if info is None:
+                continue
+            candidates[gen] = info
+            candidate_offsets.append(offset)
+
+        if offset_gen is None and self.net_offset_gen is not None and not candidates:
+            self.net_offset_gen = None
+            return self.net_generic_candidates(net)
+        # A unique structurally valid candidate is strong enough to reuse on later namespaces.
+        if offset_gen is None and len(candidate_offsets) == 1:
+            self.net_offset_gen = candidate_offsets[0]
+        return candidates
+
+    def net_generic_candidate_info(self, gen):
+        if not gen or not KernelAddressHeuristicFinderUtil.is_kernel_space(gen) or read_int_from_memory(gen, safe=True) is None:
+            return None
+        length = read_int32_from_memory(gen, safe=True)
+        if not length or not (4 <= length <= 256):
+            return None
+        base = self.resolve_net_generic_ptr_offset(gen, length)
+        if base is None:
+            return None
+
+        # When nf_tables_net_id is visible, require at least one of the historical/current index
+        # conventions to contain a plausible pernet pointer. This makes stripped-kernel net->gen
+        # discovery much less permissive than checking only the len field.
+        slots = self.net_id_slots(length)
+        if slots is not None:
+            pointers = [read_int_from_memory(gen + base + runtime.current_arch.ptrsize * index, safe=True) for index in slots]
+            if not any(self.is_heap_ptr(pointer) for pointer in pointers):
+                return None
+        return length, base
+
+    def resolve_net_generic_ptr_offset(self, gen, length):
+        offset_ptr = GefUtil.offsetof("struct net_generic", "ptr")
+        # Current kernels place the flexible ptr[] member at offset zero in an anonymous union.
+        # GDB exposes only that unnamed union in some DWARF versions, so the direct field lookup
+        # above cannot see ptr even though the struct type itself is available.
+        if offset_ptr is None and GefUtil.sizeof("struct net_generic") is not None:
+            offset_ptr = 0
+        if offset_ptr is not None:
+            # Most pernet slots are allowed to be NULL.  With debug type information the member
+            # offset is exact, so requiring a dense pointer array would reject valid kernels.
+            if read_int_from_memory(gen + offset_ptr + runtime.current_arch.ptrsize * (length - 1), safe=True) is not None:
+                return offset_ptr
+
+        # A stripped kernel usually still exposes nf_tables_net_id through kallsyms.  Use that
+        # slot as the anchor: the nftables pernet object starts with one of several list heads.
+        # Testing the small pernet prefix keeps arbitrary {len, pointer} pairs out of this path.
+        slots = self.net_id_slots(length)
+        if slots is not None:
+            for base in range(0, 0x30, runtime.current_arch.ptrsize):
+                for index in slots:
+                    pointer = read_int_from_memory(gen + base + runtime.current_arch.ptrsize * index, safe=True)
+                    if not self.is_heap_ptr(pointer):
+                        continue
+                    if any(self.list_head_plausible(pointer + offset_sub)
+                           for offset_sub in range(0, 0x48, runtime.current_arch.ptrsize * 2)):
+                        return base
+
+        # Fallback for stripped kernels: locate the densest pointer array near the header.
+        best_base, best_valid = None, 0
+        for base in range(0, 0x30, runtime.current_arch.ptrsize):
+            sample = [read_int_from_memory(gen + base + runtime.current_arch.ptrsize * i, safe=True) for i in range(min(length, 12))]
+            # pernet objects are distinct, unlike a value repeated in the memory after the array
+            valid = len({pointer for pointer in sample if self.is_heap_ptr(pointer)})
+            if valid > best_valid:
+                best_valid, best_base = valid, base
+        # A loadable pernet subsystem may leave most slots NULL. Requiring half of the first
+        # twelve slots rejected valid modular nf_tables layouts (notably Debian v5.10 i386).
+        # Three readable aligned objects still distinguishes net_generic from ordinary data;
+        # candidate_heads() subsequently requires the full nft_table/list topology.
+        if best_base is None or best_valid < 3:
+            return None
+        return best_base
+
+    def net_id_slots(self, length):
+        # net_generic(net, id) is ptr[id], or ptr[id - 1] by the older convention
+        net_id = self.get_nf_tables_net_id()
+        if net_id is None:
+            return None
+        return [index for index in dict.fromkeys((net_id, net_id - 1)) if 0 <= index < length]
+
+    def get_nf_tables_net_id(self):
+        if self.nf_tables_net_id_resolved:
+            return self.nf_tables_net_id
+        self.nf_tables_net_id_resolved = True
+
+        address = Ksym.get_addr("nf_tables_net_id")
+        if address is None:
+            return None
+        value = read_int32_from_memory(address, safe=True)
+        if value is None or not (0 < value < 0x1_0000):
+            return None
+        self.nf_tables_net_id = value
+        return value
+
+    def resolve_table_list_offset(self, table, offset_name=None):
+        # v4.16+ nft_table has four consecutive list_head fields: chains/sets/objects/flowtables.
+        key = (table, offset_name)
+        if key in self.table_layout_cache:
+            return self.table_layout_cache[key]
+
+        offset_typed = self.typed_table_list_layout()
+        if offset_typed is not None:
+            heads = [table + offset_typed + runtime.current_arch.ptrsize * 2 * i for i in range(4)]
+            if all(self.list_head_plausible(head) for head in heads):
+                result = offset_typed
+            else:
+                result = None
+            self.table_layout_cache[key] = result
+            return result
+
+        ptrsize = runtime.current_arch.ptrsize
+        stride = ptrsize * 2
+        limit = self.MEMBER_SCAN - stride * 3
+        best = None
+        for offset in range(stride, limit, ptrsize):
+            heads = [table + offset + stride * i for i in range(4)]
+            if not all(self.list_head_plausible(head) for head in heads):
+                continue
+
+            nonempty = 0
+            backrefs = 0
+            named_children = 0
+            for head in heads:
+                first = read_int_from_memory(head, safe=True)
+                if first == head:
+                    continue
+                nonempty += 1
+                if self.resolve_table_offset(first, table) is not None:
+                    backrefs += 1
+                if self.resolve_name(first) is not None:
+                    named_children += 1
+
+            if offset_name is not None:
+                tail_score = self.table_tail_evidence(table, offset, offset_name)
+            else:
+                tail_score = 0
+
+            # A non-empty chain/object/flowtable normally gives a table back-reference. Keep a
+            # no-backref path for old set-only tables, but require strong independent tail/name
+            # evidence. Fully empty tables also need this tail evidence to avoid matching an
+            # unrelated structure that merely contains four initialized empty list_head fields.
+            if backrefs == 0 and offset_name is not None and (tail_score < 4 or (nonempty and named_children == 0)):
+                continue
+
+            # Without a back-reference, the non-empty lists of the neighboring table object would outscore
+            # the empty lists of this table, so the children are not counted and the nearest offset wins.
+            if backrefs:
+                score = (backrefs, tail_score, named_children, nonempty, -offset)
+            else:
+                score = (0, tail_score, 0, 0, -offset)
+            if best is None or score > best[0]:
+                best = (score, offset)
+
+        if best is not None:
+            result = best[1]
+        else:
+            result = None
+        self.table_layout_cache[key] = result
+        return result
+
+    @staticmethod
+    def typed_table_list_layout():
+        ptrsize = runtime.current_arch.ptrsize
+        stride = ptrsize * 2
+        offsets = [GefUtil.offsetof("struct nft_table", member)
+                   for member in ("chains", "sets", "objects", "flowtables")]
+        if any(offset is None for offset in offsets):
+            return None
+        if offsets != [offsets[0] + stride * i for i in range(4)]:
+            return None
+        return offsets[0]
+
+    def table_tail_evidence(self, table, offset_chain, offset_name, tail_layout=None):
+        if not any(start <= offset_name < stop for start, stop in self.table_name_windows(offset_chain)):
+            return 0
+
+        score = 1
+        name = self.name_at(table, offset_name)
+        if self.looks_identifier_name(name):
+            score += 1
+        if tail_layout is None and GefUtil.offsetof("struct nft_table", "use") is None \
+                and GefUtil.offsetof("struct nft_table", "family") is None:
+            tail_layout = self.resolve_table_tail_layout([table], offset_name, offset_chain)
+        family_info = self.get_table_family_info(table, offset_name, tail_layout=tail_layout)
+        if family_info["family"] is not None:
+            score += 2
+        if family_info["use"] is not None:
+            score += 1
+        return score
+
+    @staticmethod
+    def table_name_windows(offset_chain):
+        # The tail follows the four lists. v7.2 (and 7.1.8~) inserts objname_ht, an rhltable like chains_ht, between them.
+        stride = runtime.current_arch.ptrsize * 2
+        lists_end = offset_chain + stride * 4
+        windows = [(lists_end, lists_end + 0x68)]
+        if offset_chain > stride:
+            windows.append((lists_end + offset_chain - stride, lists_end + offset_chain - stride + 0x68))
+        return windows
+
+    def resolve_table_tail_layout(self, entries, offset_name, offset_chain=None):
+        if not entries:
+            return None
+
+        child_counts = {}
+        if offset_chain is not None:
+            child_counts = {table: self.table_child_count(table, offset_chain) for table in entries}
+
+        valid = []
+        for layout in self.table_tail_layout_candidates(offset_name):
+            values = []
+            for table in entries:
+                info = self.table_tail_candidate_values(
+                    table, offset_name, layout, child_count=child_counts.get(table))
+                if info is None:
+                    break
+                values.append(info)
+            if len(values) != len(entries):
+                continue
+
+            handles = [info["handle"] for info in values]
+            if len(set(handles)) != len(handles):
+                continue
+            if any(left >= right for left, right in zip(handles, handles[1:])):
+                continue
+
+            use_matches = sum(info["use_matches_children"] for info in values)
+            valid.append((use_matches, layout))
+
+        if not valid:
+            return None
+        best_score = max(score for score, layout in valid)
+        best = [layout for score, layout in valid if score == best_score]
+        if len(best) == 1:
+            return best[0]
+        return None
+
+    def table_child_count(self, table, offset_chain):
+        key = (table, offset_chain)
+        if key in self.table_child_count_cache:
+            return self.table_child_count_cache[key]
+
+        total = 0
+        stride = runtime.current_arch.ptrsize * 2
+        for index in range(4):
+            head = table + offset_chain + stride * index
+            entries, status = self.walk_list(head, maxent=self.MAX_LIST_SCAN)
+            if status == "empty":
+                continue
+            if status != "ok":
+                self.table_child_count_cache[key] = None
+                return None
+            total += len(entries)
+
+        self.table_child_count_cache[key] = total
+        return total
+
+    @staticmethod
+    def table_tail_layout_candidates(offset_name):
+        ptrsize = runtime.current_arch.ptrsize
+        state_end = 0x16
+        layouts = []
+        for kind, nlpid_rel, name_rel in (
+                ("without-nlpid", None, align(state_end, ptrsize)),
+                ("with-nlpid", align(state_end, 4), align(align(state_end, 4) + 4, ptrsize))):
+            base = offset_name - name_rel
+            if base < 0:
+                continue
+            offset_state = base + 0x14
+            layout = {
+                "kind": kind,
+                "hgenerator": base,
+                "handle": base + 0x8,
+                "use": base + 0x10,
+                "state": offset_state,
+                "family": offset_state,
+                "flags": offset_state,
+                "genmask": offset_state,
+                "nlpid": None if nlpid_rel is None else base + nlpid_rel,
+                "name": offset_name,
+                "padding": [],
+            }
+            if nlpid_rel is None:
+                state_padding_end = name_rel
+            else:
+                state_padding_end = nlpid_rel
+            if state_end < state_padding_end:
+                layout["padding"].append((base + state_end, base + state_padding_end))
+            if nlpid_rel is not None and nlpid_rel + 4 < name_rel:
+                layout["padding"].append((base + nlpid_rel + 4, base + name_rel))
+            layouts.append(layout)
+        return layouts
+
+    def table_tail_candidate_values(self, table, offset_name, layout, child_count=None):
+        if layout["name"] != offset_name or not self.looks_name(self.name_at(table, offset_name)):
+            return None
+
+        hgenerator = read_int64_from_memory(table + layout["hgenerator"], safe=True)
+        handle = read_int64_from_memory(table + layout["handle"], safe=True)
+        use = read_int32_from_memory(table + layout["use"], safe=True)
+        state = read_int16_from_memory(table + layout["state"], safe=True)
+        if None in (hgenerator, handle, use, state):
+            return None
+
+        family = state & 0x3f
+        flags = (state >> 6) & 0xff
+        genmask = (state >> 14) & 0x3
+        if family not in self.TABLE_FAMILIES or handle == 0:
+            return None
+        if not (0 <= use < 0x1_0000) or hgenerator < use:
+            return None
+
+        for start, stop in layout["padding"]:
+            for offset in range(start, stop):
+                if read_int8_from_memory(table + offset, safe=True) != 0:
+                    return None
+
+        nlpid = None
+        if layout["nlpid"] is not None:
+            nlpid = read_int32_from_memory(table + layout["nlpid"], safe=True)
+            if nlpid is None:
+                return None
+            if bool(flags & self.NFT_TABLE_F_OWNER) != bool(nlpid):
+                return None
+
+        return {
+            "family": family,
+            "flags": flags,
+            "genmask": genmask,
+            "hgenerator": hgenerator,
+            "handle": handle,
+            "use": use,
+            "nlpid": nlpid,
+            "use_matches_children": child_count is not None and use == child_count,
+        }
+
+    def table_name_offsets(self, entries, min_offset=0, max_offset=None):
+        # Return the name offset candidates, best first.
+        # Prefer the real member offset when type information is present.
+        offset_typed = GefUtil.offsetof("struct nft_table", "name")
+        if offset_typed is not None:
+            names = [self.name_at(entry, offset_typed) for entry in entries[:8]]
+            if all(self.looks_name(name) for name in names):
+                return [offset_typed]
+            return []
+
+        # Otherwise score printable char* candidates in the expected tail region.
+        probe = entries[:8]
+        if max_offset is None:
+            stop = self.MEMBER_SCAN
+        else:
+            stop = min(self.MEMBER_SCAN, max_offset)
+        candidates = []
+        for offset in range(min_offset, stop, runtime.current_arch.ptrsize):
+            names = [self.name_at(entry, offset) for entry in probe]
+            if all(self.looks_name(name) for name in names):
+                candidates.append((offset, names))
+
+        def score(cand):
+            offset, names = cand
+            distinct = len(set(names))
+            avglen = sum(len(name) for name in names) / len(names)
+            idents = sum(1 for name in names if self.looks_identifier_name(name))
+            return (distinct, idents, avglen)
+        return [offset for offset, _ in sorted(candidates, key=score, reverse=True)]
+
+    def table_list_score(self, entries, offset_name):
+        probe = entries[:16]
+        layouts = [self.resolve_table_list_offset(table, offset_name=offset_name) for table in probe]
+        if any(layout is None for layout in layouts) or len(set(layouts)) != 1:
+            return None
+
+        names = [self.name_at(table, offset_name) for table in probe]
+        if not all(self.looks_name(name) for name in names):
+            return None
+
+        tail_layout = None
+        offset_use = GefUtil.offsetof("struct nft_table", "use")
+        offset_family = GefUtil.offsetof("struct nft_table", "family")
+        if offset_use is None and offset_family is None:
+            tail_layout = self.resolve_table_tail_layout(entries, offset_name, layouts[0])
+            if tail_layout is None:
+                return None
+
+        idents = sum(1 for name in names if self.looks_identifier_name(name))
+        distinct = len(set(names))
+        tail_scores = [self.table_tail_evidence(
+            table, layouts[0], offset_name, tail_layout=tail_layout) for table in probe]
+        return (min(tail_scores), len(probe), idents, distinct), tail_layout
+
+    def parse_table_sublists(self, table_base, offset_chain):
+        # Keep all four child lists in the graph, including empty lists, so layout metadata is not
+        # lost merely because a table currently has no entries of that kind.
+        if offset_chain is None:
+            return {}
+
+        lists = {}
+        stride = runtime.current_arch.ptrsize * 2
+        for index, kind in enumerate(("chains", "sets", "objects", "flowtables")):
+            offset = offset_chain + stride * index
+            head = table_base + offset
+            entries, status = self.walk_list(head, maxent=self.MAX_LIST_SCAN)
+            if status in ("broken", "limit"):
+                self.partial_reasons.add("table child list")
+            if entries:
+                backref = self.resolve_table_offset(entries[0], table_base)
+            else:
+                backref = None
+            lists[kind] = {"offset": offset, "entries": entries, "offset_table": backref}
+        return lists
+
+    def get_table_family_info(self, table, offset_name, tail_layout=None):
+        family = None
+        use = None
+        offset_use = GefUtil.offsetof("struct nft_table", "use")
+        offset_family = GefUtil.offsetof("struct nft_table", "family")
+        if offset_use is not None or offset_family is not None:
+            if offset_use is not None:
+                value = read_int32_from_memory(table + offset_use, safe=True)
+                if value is not None and 0 <= value < 0x1_0000:
+                    use = value
+            if offset_family is not None:
+                # family is a bitfield sharing its byte with flags on v4.16 and later
+                value = GefUtil.field_int(GefUtil.typed_struct(table, "struct nft_table"), "family")
+                if value in self.FAMILIES:
+                    family = value
+            return {
+                "family": family,
+                "use": use,
+                "offset_family": offset_family,
+                "offset_use": offset_use,
+                "source": "type",
+            }
+
+        if tail_layout is None:
+            tail_layout = self.resolve_table_tail_layout([table], offset_name)
+        if tail_layout is not None:
+            values = self.table_tail_candidate_values(table, offset_name, tail_layout)
+            if values is not None:
+                return {
+                    "family": values["family"],
+                    "use": values["use"],
+                    "offset_family": tail_layout["family"],
+                    "offset_use": tail_layout["use"],
+                    "source": "heuristic",
+                }
+
+        return {
+            "family": None,
+            "use": None,
+            "offset_family": None,
+            "offset_use": None,
+            "source": "heuristic",
+        }
+
+    def get_name_offset(self, kind):
+        type_name = self.TYPE_NAMES.get(kind)
+        if type_name is None:
+            return None
+        offset_name = GefUtil.offsetof(type_name, "name")
+        if offset_name is not None:
+            return offset_name
+        if kind == "objects":
+            offset_key = GefUtil.offsetof("struct nft_object", "key")
+            offset_key_name = GefUtil.offsetof("struct nft_object_hash_key", "name")
+            if offset_key is not None and offset_key_name is not None:
+                return offset_key + offset_key_name
+        return None
+
+    def legacy_entry_name(self, entry, kind):
+        ptrsize = runtime.current_arch.ptrsize
+        stride = ptrsize * 2
+        if kind in ("sets", "objects"):
+            # the name follows list (and bindings of nft_set)
+            if kind == "sets":
+                offset_name = stride * 2
+            else:
+                offset_name = stride
+            if self.kversion >= "4.14":
+                return self.name_at(entry, offset_name)
+            return read_cstring_from_memory(entry + offset_name, 0x100, safe=True)
+        if kind != "chains":
+            return None
+
+        # The chain list node follows the rules head in every legacy layout.
+        # net was removed in v4.1; the other layout is tried next in case of a backport.
+        base = entry - stride
+        has_net = self.kversion < "4.1"
+        name = None
+        for net in (has_net, not has_net):
+            offset = stride * 2
+            if "3.13" <= self.kversion < "3.14":
+                offset += stride                 # rcu_head
+            offset += ptrsize * (2 if net else 1)  # net, table
+
+            if ptrsize == 8 or is_arm32():
+                u64_align = 8
+            else:
+                u64_align = 4
+            offset = align(offset, u64_align) + 8
+            if self.kversion < "3.16":
+                offset = align(offset + 1, 2) + 4  # flags, use, level
+            else:
+                offset += 4 + 2 + 1              # use, level, flags/genmask
+
+            if self.kversion >= "4.14":
+                offset = align(offset, ptrsize)
+                name = self.name_at(base, offset)
+            else:
+                name = read_cstring_from_memory(base + offset, 0x100, safe=True)
+            if self.looks_name(name):
+                return name
+        return name
+
+    def resolve_name(self, base, min_offset=0, max_offset=None, exclude=None):
+        if max_offset is None:
+            stop = self.MEMBER_SCAN
+        else:
+            stop = min(self.MEMBER_SCAN, max_offset)
+        key = (base, min_offset, stop, exclude)
+        if key in self.name_cache:
+            return self.name_cache[key]
+        for offset in range(min_offset, stop, runtime.current_arch.ptrsize):
+            pointer = read_int_from_memory(base + offset, safe=True)
+            # names are kmalloc()ed; odd values are rhashtable nulls markers (e.g. nft_chain.rhlhead)
+            if (not pointer or not KernelAddressHeuristicFinderUtil.is_kernel_space(pointer)
+                    or pointer & 1 or pointer == exclude):
+                continue
+            name = read_cstring_from_memory(pointer, 0x100, safe=True)
+            if self.looks_name(name):
+                self.name_cache[key] = (offset, name)
+                return self.name_cache[key]
+        self.name_cache[key] = None
+        return None
+
+    def resolve_table_offset(self, entry, target):
+        # Skip the embedded list_head itself; a one-element list would otherwise look like a backref.
+        key = (entry, target)
+        if key in self.backref_cache:
+            return self.backref_cache[key]
+        for offset in range(runtime.current_arch.ptrsize * 2, self.BACKREF_SCAN, runtime.current_arch.ptrsize):
+            if read_int_from_memory(entry + offset, safe=True) == target:
+                self.backref_cache[key] = offset
+                return offset
+        self.backref_cache[key] = None
+        return None
+
+    def hook_devices(self, value):
+        # v5.8~ keeps a list of struct nft_hook; older base chains have one dev_name[] and older
+        # flowtables an nf_hook_ops array.
+        hook_list = GefUtil.field(value, "hook_list")
+        if hook_list is not None:
+            head = int(hook_list.address)
+            entries, status = self.walk_list(head, maxent=0x100)
+            if status not in ("ok", "empty"):
+                return ["[broken hook list]"]
+            offset_list = GefUtil.offsetof("struct nft_hook", "list") or 0
+            devices = []
+            for entry in entries:
+                hook = GefUtil.typed_struct(entry - offset_list, "struct nft_hook")
+                name = self.field_string(hook, "ifname") or self.field_string(hook, "ops", "dev", "name")
+                devices.append(name or "?")
+            return devices
+
+        name = self.field_string(value, "dev_name")
+        if name:
+            return [name]
+
+        ops = GefUtil.field_int(value, "ops")
+        ops_len = GefUtil.field_int(value, "ops_len")
+        ops_size = GefUtil.sizeof("struct nf_hook_ops")
+        if not ops or not ops_len or not ops_size or not (0 < ops_len <= 0x100):
+            return []
+        devices = []
+        for index in range(ops_len):
+            hook_ops = GefUtil.typed_struct(ops + ops_size * index, "struct nf_hook_ops")
+            devices.append(self.field_string(hook_ops, "dev", "name") or "?")
+        return devices
+
+    def rule_layout_meta(self):
+        offset_header, _, handle_bits, dlen_shift, dlen_bits, _, _ = self.rules.old_rule_layouts()[0]
+        lines = [
+            self.member_meta("struct nft_rule", "list", 0),
+            self.bitfield_meta("struct nft_rule", "handle", (offset_header * 8, handle_bits)),
+            self.bitfield_meta("struct nft_rule", "genmask", (offset_header * 8 + handle_bits, 2)),
+            self.bitfield_meta("struct nft_rule", "dlen", (offset_header * 8 + dlen_shift, dlen_bits)),
+            self.member_meta("struct nft_rule", "data", offset_header + 8),
+            self.member_meta("struct nft_rule_blob", "size", 0),
+        ]
+        if GefUtil.offsetof("struct nft_rule_blob", "data") is None:
+            if is_arm32():
+                blob_offsets = [8, runtime.current_arch.ptrsize]
+            else:
+                blob_offsets = [runtime.current_arch.ptrsize, align(runtime.current_arch.ptrsize, 8)]
+            candidates = "/".join("+{:#x}".format(offset) for offset in dict.fromkeys(blob_offsets))
+            lines.append("  {:<28s} {:<20s} [heuristic]".format("nft_rule_blob.data", candidates))
+        else:
+            lines.append(self.member_meta("struct nft_rule_blob", "data"))
+        for member, shift, bits in (("is_last", 0, 1), ("dlen", 1, 12), ("handle", 13, 42)):
+            lines.append(self.bitfield_meta("struct nft_rule_dp", member, (shift, bits)))
+        lines.append(self.member_meta("struct nft_rule_dp", "data", 8))
+
+        if self.kversion < "4.1":
+            lines.append("  nft_set_ext               not available [kernel ABI]")
+            return lines
+        extension = self.sets.resolve_set_ext_layout()
+        ext_size = GefUtil.sizeof("struct nft_set_ext")
+        lines += [
+            self.member_meta("struct nft_set_ext", "genmask", 0),
+            self.offset_meta("nft_set_ext.offset", extension["offset"], extension["source"]),
+            "  {:<28s} {:<12s} [{}]".format(
+                "nft_set_ext.size", "{:#x}".format(ext_size or extension["offset"] + extension["count"]),
+                "type" if ext_size else "heuristic"),
+            "  {:<28s} count={:d}, key={}, key_end={}, data={}, flags={} [{}]".format(
+                "nft_set_ext indexes", extension["count"], extension["key"], extension["key_end"],
+                extension["data"], extension["flags"], extension["source"]),
+        ]
+        return lines
+
+    @staticmethod
+    def table_tail_layout_meta(layout):
+        if layout is None:
+            return None
+        fields = []
+        for member in ("hgenerator", "handle", "use", "state", "nlpid", "name"):
+            offset = layout.get(member)
+            if offset is not None:
+                fields.append("{:s}=+{:#x}".format(member, offset))
+        value = "{:s}: {:s}".format(layout["kind"], ", ".join(fields))
+        return "  {:<28s} {:s} [heuristic]".format("nft_table.tail-layout", value)
+
+    @staticmethod
+    def offset_meta(name, offset, source):
+        if offset is None:
+            value = "not found"
+        else:
+            value = "{:+#x}".format(offset)
+        return "  {:<28s} {:<12s} [{}]".format(name, value, source)
+
+    @staticmethod
+    def member_meta(type_name, member, default=None):
+        # the member offset from the type information, or the default layout
+        offset = GefUtil.offsetof(type_name, member)
+        name = type_name.split()[-1] + "." + member
+        if offset is None:
+            return KernelNftables.offset_meta(name, default, "heuristic")
+        return KernelNftables.offset_meta(name, offset, "type")
+
+    @staticmethod
+    def bitfield_meta(type_name, member, fallback=None):
+        field = GefUtil.member_bitfield(type_name, member)
+        source = "type"
+        if field is None:
+            field = fallback
+            source = "heuristic"
+        if field is None:
+            value = "not found"
+        else:
+            bitpos, bitsize = field
+            value = "bit {:#x}, {:d} bits".format(bitpos, bitsize)
+        return "  {:<28s} {:<20s} [{}]".format(type_name.split(" ")[-1] + "." + member, value, source)
+
+    @staticmethod
+    def read_bytes(address, size):
+        if not address or not size:
+            return None
+        return read_memory(address, size, safe=True)
+
+    def field_string(self, value, *path):
+        value = GefUtil.field(value, *path)
+        if value is None:
+            return None
+        try:
+            field_type = value.type.strip_typedefs()
+            if field_type.code == gdb.TYPE_CODE_PTR:
+                return read_cstring_from_memory(int(value), 0x100, safe=True)
+            if field_type.code == gdb.TYPE_CODE_ARRAY:
+                # v3.13 nft_table.name is a flexible array
+                return read_cstring_from_memory(int(value.address), field_type.sizeof or 0x100, safe=True)
+        except gdb.error:
+            pass
+        return None
+
+    def typed_udata(self, value):
+        pointer = GefUtil.field_int(value, "udata")
+        length = GefUtil.field_int(value, "udlen")
+        if not pointer or not length:
+            return None
+        return self.read_bytes(pointer, length)
+
+    @staticmethod
+    def looks_name(text):
+        # The kernel limit is 255 bytes. Identifier-like spelling is only a scoring hint.
+        if not text or not (1 <= len(text) <= 255):
+            return False
+        return all(0x20 <= ord(char) < 0x7f for char in text)
+
+    @staticmethod
+    def looks_identifier_name(text):
+        if not text:
+            return False
+        return all(char.isalnum() or char in "_.-:" for char in text)
+
+    def walk_list(self, head, maxent=None):
+        # Return the entries of a circular list and why the walk ended: "ok", "empty", "broken" or "limit".
+        # A broken or truncated list keeps the entries validated so far.
+        if maxent is None:
+            maxent = self.MAX_LIST_SCAN
+        key = (head, maxent)
+        if key in self.parsed_lists:
+            return self.parsed_lists[key]
+
+        ptrsize = runtime.current_arch.ptrsize
+        entries = []
+        first = read_int_from_memory(head, safe=True)
+        last = read_int_from_memory(head + ptrsize, safe=True)
+        if not first or not last:
+            status = "broken"
+        elif first == head or last == head:
+            if first == last:
+                status = "empty"
+            else:
+                status = "broken"
+        else:
+            status = "limit"
+            seen = {head}
+            current = first
+            while len(entries) < maxent:
+                if current in seen:
+                    if current == head:
+                        status = "ok"
+                    else:
+                        status = "broken"
+                    break
+                next_address = read_int_from_memory(current, safe=True)
+                prev = read_int_from_memory(current + ptrsize, safe=True)
+                if not next_address or not prev or read_int_from_memory(next_address + ptrsize, safe=True) != current \
+                        or read_int_from_memory(prev, safe=True) != current:
+                    status = "broken"
+                    break
+                seen.add(current)
+                entries.append(current)
+                current = next_address
+        self.parsed_lists[key] = (entries, status)
+        return entries, status
+
+    def list_head_plausible(self, head):
+        # Validate only the list head endpoints. This is cheap and independent of list length.
+        ptrsize = runtime.current_arch.ptrsize
+        next_address = read_int_from_memory(head, safe=True)
+        prev = read_int_from_memory(head + ptrsize, safe=True)
+        if next_address is None or prev is None:
+            return False
+        if next_address == head or prev == head:
+            return next_address == head and prev == head
+        if not next_address or not prev:
+            return False
+        return read_int_from_memory(next_address + ptrsize, safe=True) == head and read_int_from_memory(prev, safe=True) == head
+
+    def is_heap_ptr(self, pointer):
+        # Check the address before probing readability.
+        if not pointer or not KernelAddressHeuristicFinderUtil.is_kernel_space(pointer) or pointer % runtime.current_arch.ptrsize:
+            return False
+        return read_int_from_memory(pointer, safe=True) is not None
+
+    @staticmethod
+    def name_at(base, offset_name, maxlen=0x100):
+        # a char * member; only a kernel pointer can be a name
+        pointer = read_int_from_memory(base + offset_name, safe=True)
+        if not pointer or not KernelAddressHeuristicFinderUtil.is_kernel_space(pointer):
+            return None
+        return read_cstring_from_memory(pointer, maxlen, safe=True)
+
+    @staticmethod
+    def symbol_name(address):
+        name = Symbol.format(address, ksym="prefer", bracket="")
+        if not name or "+" in name:
+            return None
+        # `kmod -a` names module symbols "<module>.<symbol>"
+        module, unused, symbol = name.partition(".")
+        if symbol.startswith("nft_") and module.replace("_", "").isalnum():
+            return symbol
+        return name
+
+
+
+class KernelNftablesRule:
+    """Decode the chains, rules and expressions of nftables for KernelNftables.
+
+    struct nft_chain {
+        struct nft_rule_blob *blob_gen_0;     // struct nft_rule **rules_gen_0 (v5.0~v5.16)
+        struct nft_rule_blob *blob_gen_1;     // struct nft_rule **rules_gen_1 (v5.0~v5.16)
+        struct list_head rules;
+        struct list_head list;
+        struct rhlist_head rhlhead;           // v4.17~
+        struct nft_table *table;
+        u64 handle;
+        u32 use;
+        u8 flags:5, bound:1, genmask:2;
+        char *name;                           // char name[NFT_CHAIN_MAXNAMELEN] (~v4.13)
+        ...
+    };
+
+    struct nft_rule {                         // the datapath until v5.17, the control plane after it
+        struct list_head list;
+        u64 handle:42, genmask:2, dlen:12, udata:1;
+        unsigned char data[];                 // struct nft_expr {ops; data[];} * N
+    };
+
+    struct nft_rule_blob {                    // v5.17~
+        unsigned long size;
+        unsigned char data[];                 // struct nft_rule_dp {u64 is_last:1, dlen:12, handle:42; data[];} * N + trailer
+    };
+    """
+
+    NFT_CHAIN_BASE = 0x1
+    # the private data type of an expression is not always named after the expression type
+    EXPR_PRIVATE_TYPES = {
+        "counter": ("nft_counter_percpu_priv",),
+        "limit": ("nft_limit_priv", "nft_limit_priv_pkts"),
+        "last": ("nft_last_priv",),
+    }
+    XT_INFO_DUMP_MAX = 0x40
+    MAX_RULE_SCAN = 0x1_0000  # scan safety limit, not a kernel nftables limit
+
+    def __init__(self, knft):
+        self.knft = knft
+        self.expr_name_cache = {}
+        self.chain_blob_cache = {}
+        self.rule_blob_layouts = {}
+        self.rules_list_cache = {}
+        return
+
+    def chain_rules(self, entry, net):
+        # Return the rules {address, end, handle, exprs} of the datapath and the walk status.
+        blob = self.get_chain_rule_blob(entry, net)
+        if blob is not None:
+            rules, status = self.blob_rule_records(blob)
+            if status in ("broken", "limit"):
+                self.knft.partial_reasons.add("rule blob")
+            return rules, status
+        if self.knft.kversion >= "5.17":
+            self.knft.partial_reasons.add("active rule blob unavailable")
+        offset_rules = self.resolve_chain_rules_offset(entry)
+        if offset_rules is not None:
+            rules, status = self.decode_rule_list(entry, offset_rules)
+            if self.knft.kversion >= "5.17":
+                if status in ("ok", "empty"):
+                    status = "control-plane"
+                else:
+                    status = status + "; control-plane"
+            return rules, status
+        return None, None
+
+    def control_rules(self, entry):
+        # handle -> the control-plane nft_rule, which also keeps the genmask and userdata of a rule in the blob
+        offset_rules = self.resolve_chain_rules_offset(entry)
+        if offset_rules is None:
+            return None
+        rules = {}
+        for rule in self.knft.walk_list(entry + offset_rules, maxent=self.MAX_RULE_SCAN)[0]:
+            info = self.old_rule_header_info(rule, validate=True)
+            if info is None:
+                break
+            rules[info["handle"]] = rule
+        return rules
+
+    def chain_blob_range(self, entry, net):
+        blob = self.get_chain_rule_blob(entry, net)
+        if blob is None:
+            return None
+        size = self.blob_size(blob)
+        if size is not None:
+            offset_data = self.resolve_rule_blob_offset_data(blob, size)
+        else:
+            offset_data = None
+        if offset_data is None:
+            return blob, None
+        return blob, blob + offset_data + size + (GefUtil.offsetof("struct nft_rule_dp", "data") or 8)
+
+    def base_chain_range(self, entry):
+        offset_list = GefUtil.offsetof("struct nft_chain", "list")
+        offset_chain = GefUtil.offsetof("struct nft_base_chain", "chain")
+        size = GefUtil.sizeof("struct nft_base_chain")
+        if None in (offset_list, offset_chain, size):
+            return None
+        flags = GefUtil.field_int(GefUtil.typed_struct(entry - offset_list, "struct nft_chain"), "flags")
+        if flags is None or not flags & self.NFT_CHAIN_BASE:
+            return None
+        base = entry - offset_list - offset_chain
+        return base, base + size
+
+    def get_chain_attrs(self, entry):
+        offset_list = GefUtil.offsetof("struct nft_chain", "list")
+        if offset_list is None:
+            return None
+        chain = entry - offset_list
+        value = GefUtil.typed_struct(chain, "struct nft_chain")
+        if GefUtil.field(value, "handle") is None:
+            return None
+        attrs = {member: GefUtil.field_int(value, member) for member in ("handle", "use", "level", "flags", "bound", "genmask")}
+        attrs["udata"] = self.knft.typed_udata(value)
+        attrs["hook"] = None
+
+        offset_chain = GefUtil.offsetof("struct nft_base_chain", "chain")
+        if attrs["flags"] is None or not attrs["flags"] & self.NFT_CHAIN_BASE or offset_chain is None:
+            return attrs
+        base = GefUtil.typed_struct(chain - offset_chain, "struct nft_base_chain")
+        if base is None:
+            return attrs
+        attrs["hook"] = {
+            "type": self.knft.field_string(base, "type", "name"),
+            "hooknum": GefUtil.field_int(base, "ops", "hooknum"),
+            "priority": GefUtil.field_int(base, "ops", "priority"),
+            "policy": GefUtil.field_int(base, "policy"),
+            "base_chain": chain - offset_chain,
+            "devices": self.knft.hook_devices(base),
+        }
+        return attrs
+
+    def get_rule_attrs(self, rule):
+        info = self.old_rule_header_info(rule)
+        if info is None:
+            return None
+
+        udata = None
+        start = rule + info["offset_data"] + info["dlen"]
+        if info["ulen"]:
+            udata = self.knft.read_bytes(start, info["ulen"])
+        elif info["has_udata"]:
+            # struct nft_userdata {u8 len; data[len + 1]}
+            length = read_int8_from_memory(start, safe=True)
+            if length is not None:
+                udata = self.knft.read_bytes(start + 1, length + 1)
+            else:
+                udata = None
+        return {"genmask": info["genmask"], "udata": udata}
+
+    def get_expr_info(self, start, end, name, depth=0):
+        # The private data is decoded only with type information. Nested expressions are followed two levels deep.
+        info = {"address": start, "end": end, "name": name, "xt": None, "type_name": None, "value": None, "nested": []}
+        offset_data = GefUtil.offsetof("struct nft_expr", "data")
+        ops = read_int_from_memory(start, safe=True)
+        if offset_data is None or not ops:
+            return info
+        if name in ("match", "target"):
+            info["xt"] = self.get_xt_info(ops, name, start + offset_data, end - start - offset_data)
+            return info
+
+        type_name = self.resolve_expr_private_type(ops, name, end - start, offset_data)
+        if type_name:
+            value = GefUtil.typed_struct(start + offset_data, type_name)
+        else:
+            value = None
+        if value is None:
+            return info
+        info["type_name"] = type_name
+        info["value"] = value
+        if depth < 2:
+            info["nested"] = [self.get_nested_expr_info(address, depth + 1) for address in self.nested_expr_addresses(value)]
+        return info
+
+    def get_nested_expr_info(self, address, depth=0):
+        ops = read_int_from_memory(address, safe=True)
+        if ops:
+            size = self.expr_ops_size(ops)
+        else:
+            size = None
+        if size is None:
+            return {"address": address, "end": None, "name": "?", "xt": None, "type_name": None, "value": None, "nested": []}
+        return self.get_expr_info(address, address + size, self.expr_name(ops) or "?", depth)
+
+    def get_chain_rule_blob(self, entry, net):
+        # Preserve the slot order even when one generation is unreadable.
+        if entry in self.chain_blob_cache:
+            return self.chain_blob_cache[entry]
+
+        offset_list = GefUtil.offsetof("struct nft_chain", "list")
+        blob_offsets = [
+            GefUtil.offsetof("struct nft_chain", "blob_gen_0"),
+            GefUtil.offsetof("struct nft_chain", "blob_gen_1"),
+        ]
+        if self.knft.kversion < "5.17" and all(offset is None for offset in blob_offsets):
+            self.chain_blob_cache[entry] = None
+            return None
+        if offset_list is not None and any(offset is not None for offset in blob_offsets):
+            chain = entry - offset_list
+            blobs = [read_int_from_memory(chain + offset, safe=True) if offset is not None else None
+                     for offset in blob_offsets]
+        else:
+            ptrsize = runtime.current_arch.ptrsize
+            # blob_gen_0 and blob_gen_1 precede the rules and list heads
+            blobs = [read_int_from_memory(entry + offset, safe=True) for offset in (-ptrsize * 4, -ptrsize * 3)]
+        blob = self.current_blob(net, blobs)
+        self.chain_blob_cache[entry] = blob
+        return blob
+
+    def valid_blob(self, blob):
+        if not blob or not KernelAddressHeuristicFinderUtil.is_kernel_space(blob) or blob % runtime.current_arch.ptrsize:
+            return False
+        size = self.blob_size(blob)
+        if size is None:
+            return False
+        return self.resolve_rule_blob_offset_data(blob, size) is not None
+
+    def blob_size(self, blob):
+        value = GefUtil.typed_struct(blob, "struct nft_rule_blob")
+        size = GefUtil.field_int(value, "size")
+        if size is None:
+            size = read_int_from_memory(blob, safe=True)
+        return size
+
+    def resolve_rule_blob_offset_data(self, blob, size=None):
+        if blob in self.rule_blob_layouts:
+            return self.rule_blob_layouts[blob]["offset_data"]
+        if size is None:
+            size = self.blob_size(blob)
+        if size is None:
+            self.rule_blob_layouts[blob] = {"offset_data": None, "status": "broken"}
+            return None
+
+        offsets = [GefUtil.offsetof("struct nft_rule_blob", "data")]
+        if is_arm32():
+            offsets += [8, runtime.current_arch.ptrsize]
+        else:
+            offsets += [runtime.current_arch.ptrsize, align(runtime.current_arch.ptrsize, 8)]
+        offsets = list(dict.fromkeys(offset for offset in offsets if offset is not None))
+
+        limit_candidate = None
+        for offset_data in offsets:
+            trailer = self.blob_rule_header(blob + offset_data + size)
+            if trailer is None or not trailer["is_last"]:
+                continue
+
+            pos = 0
+            count = 0
+            valid = True
+            while pos < size and count < self.MAX_RULE_SCAN:
+                count += 1
+                header = self.blob_rule_header(blob + offset_data + pos)
+                if header is None or header["is_last"]:
+                    valid = False
+                    break
+                step = header["offset_data"] + header["dlen"]
+                if pos + step > size:
+                    valid = False
+                    break
+                pos += step
+
+            if not valid:
+                continue
+            if pos == size:
+                self.rule_blob_layouts[blob] = {"offset_data": offset_data, "status": "ok"}
+                return offset_data
+            if count == self.MAX_RULE_SCAN:
+                limit_candidate = offset_data
+
+        if limit_candidate is not None:
+            self.rule_blob_layouts[blob] = {"offset_data": limit_candidate, "status": "limit"}
+            return limit_candidate
+
+        self.rule_blob_layouts[blob] = {"offset_data": None, "status": "broken"}
+        return None
+
+    def blob_rule_header(self, address):
+        value = GefUtil.typed_struct(address, "struct nft_rule_dp")
+        is_last = GefUtil.field_int(value, "is_last")
+        dlen = GefUtil.field_int(value, "dlen")
+        handle = GefUtil.field_int(value, "handle")
+        offset_data = GefUtil.offsetof("struct nft_rule_dp", "data")
+        if None not in (is_last, dlen, handle, offset_data):
+            return {"is_last": is_last, "dlen": dlen, "handle": handle, "offset_data": offset_data, "source": "type"}
+
+        header = read_int64_from_memory(address, safe=True)
+        if header is None:
+            return None
+        return {
+            "is_last": header & 1,
+            "dlen": (header >> 1) & 0xfff,
+            "handle": (header >> 13) & ((1 << 42) - 1),
+            "offset_data": 8,
+            "source": "heuristic",
+        }
+
+    def current_blob(self, net, blobs):
+        generation = GefUtil.field_int(GefUtil.typed_struct(net, "struct net"), "nft", "gencursor")
+        if generation in (0, 1):
+            blob = blobs[generation]
+        elif blobs[0] == blobs[1]:
+            blob = blobs[0]
+        else:
+            return None
+        if self.valid_blob(blob):
+            return blob
+        else:
+            return None
+
+    def blob_rule_records(self, blob):
+        size = self.blob_size(blob)
+        if size is None:
+            return [], "broken"
+        offset_data = self.resolve_rule_blob_offset_data(blob, size)
+        if offset_data is None:
+            return [], self.rule_blob_layouts[blob]["status"]
+
+        records = []
+        offset = offset_data
+        end = offset_data + size
+        while offset < end and len(records) < self.MAX_RULE_SCAN:
+            header = self.blob_rule_header(blob + offset)
+            if header is None or header["is_last"]:
+                return records, "broken"
+            rule_end = offset + header["offset_data"] + header["dlen"]
+            if rule_end > end:
+                return records, "broken"
+            exprs, ok = self.decode_expr_records(blob, offset + header["offset_data"], header["dlen"])
+            records.append({"address": blob + offset, "end": blob + rule_end, "handle": header["handle"], "exprs": exprs})
+            if not ok:
+                return records, "broken"
+            offset = rule_end
+
+        if offset == end:
+            return records, "ok"
+        return records, "limit"
+
+    def decode_expr_records(self, base, start, dlen):
+        # dlen is bounded by the nft_rule header and expr_advance() must make positive progress, so
+        # no independent expression-count guard is needed.
+        records = []
+        offset = start
+        end = start + dlen
+        while offset < end:
+            ops = read_int_from_memory(base + offset, safe=True)
+            if not self.knft.is_heap_ptr(ops):
+                break
+            size = self.expr_advance(base, offset, end - offset)
+            if not size:
+                break
+            records.append({"address": base + offset, "end": base + offset + size, "name": self.expr_name(ops) or "?"})
+            offset += size
+        return records, offset == end
+
+    def expr_advance(self, base, offset, room):
+        ops = read_int_from_memory(base + offset, safe=True)
+        if not self.knft.is_heap_ptr(ops):
+            return None
+
+        # nft_expr_ops.size, or an unsigned int field that advances to the next expr on stripped kernels
+        offset_size = GefUtil.offsetof("struct nft_expr_ops", "size")
+        for size_offset in [offset_size] if offset_size is not None else range(0x08, 0x2c, 4):
+            size = read_int32_from_memory(ops + size_offset, safe=True)
+            if size is None or not (runtime.current_arch.ptrsize <= size <= 0x400) or size % runtime.current_arch.ptrsize:
+                continue
+            if size == room:
+                return size
+            if size < room and self.knft.is_heap_ptr(read_int_from_memory(base + offset + size, safe=True)):
+                return size
+        return None
+
+    def expr_name(self, ops):
+        if ops in self.expr_name_cache:
+            return self.expr_name_cache[ops]
+        self.expr_name_cache[ops] = None
+        if not self.knft.is_heap_ptr(ops):
+            return None
+
+        # ops->type->name, or a plausible type object and its lowercase name on stripped kernels
+        ptrsize = runtime.current_arch.ptrsize
+        offset_type = GefUtil.offsetof("struct nft_expr_ops", "type")
+        offset_name = GefUtil.offsetof("struct nft_expr_type", "name")
+        typed = offset_type is not None and offset_name is not None
+        if typed:
+            type_offsets, name_offsets = [offset_type], [offset_name]
+        else:
+            type_offsets, name_offsets = range(0, 0x100, ptrsize), range(ptrsize * 2, 0x40, ptrsize)
+        for offset in type_offsets:
+            expr_type = read_int_from_memory(ops + offset, safe=True)
+            if not expr_type or not KernelAddressHeuristicFinderUtil.is_kernel_space(expr_type):
+                continue
+            for name_offset in name_offsets:
+                name = self.knft.name_at(expr_type, name_offset, 24)
+                if not name or not 2 <= len(name) <= 20:
+                    continue
+                if not all(char.islower() or char.isdigit() or char == "_" for char in name):
+                    continue
+                # nft_expr_type.name follows its list member, unlike an address embedded in i386 code
+                if typed or self.knft.list_head_plausible(expr_type + name_offset - ptrsize * 2):
+                    self.expr_name_cache[ops] = name
+                    return name
+        return None
+
+    def resolve_chain_rules_offset(self, entry):
+        # Before the v5.17 rule-blob datapath, nft_chain.rules was used directly for evaluation.
+        # The control-plane list still exists later. Prefer its exact member offset when available.
+        if entry in self.rules_list_cache:
+            return self.rules_list_cache[entry]
+
+        ptrsize = runtime.current_arch.ptrsize
+        offset_list = GefUtil.offsetof("struct nft_chain", "list")
+        offset_rules_member = GefUtil.offsetof("struct nft_chain", "rules")
+        if offset_list is not None and offset_rules_member is not None:
+            offset_rules = offset_rules_member - offset_list
+            rules, status = self.knft.walk_list(entry + offset_rules, maxent=self.MAX_RULE_SCAN)
+            if status in ("broken", "limit"):
+                self.knft.partial_reasons.add("rule list")
+            if status != "ok" or self.old_rule_header_info(rules[0], validate=True) is not None:
+                self.rules_list_cache[entry] = offset_rules
+                return offset_rules
+
+        preferred = [-ptrsize * 2]
+        offsets = preferred + [offset for offset in range(-0x40, self.knft.MEMBER_SCAN, ptrsize) if offset not in preferred]
+        for offset in offsets:
+            rules, status = self.knft.walk_list(entry + offset, maxent=self.MAX_RULE_SCAN)
+            if offset == preferred[0] and status == "empty":
+                self.rules_list_cache[entry] = offset
+                return offset
+            if status != "ok" or not rules:
+                continue
+            info = self.old_rule_header_info(rules[0], validate=True)
+            if info is None:
+                continue
+            records, unused = self.decode_expr_records(rules[0], info["offset_data"], info["dlen"])
+            if any(record["name"] != "?" for record in records) or (offset == preferred[0] and info["dlen"] == 0):
+                self.rules_list_cache[entry] = offset
+                return offset
+
+        self.rules_list_cache[entry] = None
+        return None
+
+    def decode_rule_list(self, entry, offset_rules):
+        # Decode the linked nft_rule list using the real u64 header and dlen.
+        rules, status = self.knft.walk_list(entry + offset_rules, maxent=self.MAX_RULE_SCAN)
+        if status in ("broken", "limit"):
+            self.knft.partial_reasons.add("rule list")
+        decoded = []
+        for rule in rules:
+            info = self.old_rule_header_info(rule, validate=True)
+            if info is None:
+                return decoded, "broken"
+            exprs, unused = self.decode_expr_records(rule, info["offset_data"], info["dlen"])
+            end = rule + info["offset_data"] + info["dlen"]
+            decoded.append({"address": rule, "end": end, "handle": info["handle"], "exprs": exprs})
+        return decoded, status
+
+    def old_rule_header_info(self, rule, validate=False):
+        value = GefUtil.typed_struct(rule, "struct nft_rule")
+        offset_data = GefUtil.offsetof("struct nft_rule", "data")
+        handle = GefUtil.field_int(value, "handle")
+        genmask = GefUtil.field_int(value, "genmask")
+        dlen = GefUtil.field_int(value, "dlen")
+        if None not in (offset_data, handle, genmask, dlen):
+            info = {
+                "handle": handle,
+                "genmask": genmask,
+                "dlen": dlen,
+                "offset_data": offset_data,
+                "ulen": GefUtil.field_int(value, "ulen"),
+                "has_udata": GefUtil.field_int(value, "udata"),
+                "source": "type",
+            }
+            if not validate or self.decode_expr_records(rule, offset_data, dlen)[1]:
+                return info
+
+        for offset_header, offset_data, handle_bits, dlen_shift, dlen_bits, ulen_bits, udata_bit in self.old_rule_layouts():
+            header = read_int64_from_memory(rule + offset_header, safe=True)
+            if header is None:
+                continue
+            handle = header & ((1 << handle_bits) - 1)
+            genmask = (header >> handle_bits) & 0x3
+            dlen = (header >> dlen_shift) & ((1 << dlen_bits) - 1)
+            if validate and not self.decode_expr_records(rule, offset_data, dlen)[1]:
+                continue
+            return {
+                "handle": handle,
+                "genmask": genmask,
+                "dlen": dlen,
+                "offset_data": offset_data,
+                "ulen": (header >> 56) & 0xff if ulen_bits else None,
+                "has_udata": (header >> 56) & 1 if udata_bit else None,
+                "source": "heuristic",
+            }
+        return None
+
+    def old_rule_layouts(self):
+        ptrsize = runtime.current_arch.ptrsize
+        if self.knft.kversion < "3.14":
+            return [(ptrsize * 4, ptrsize * 4 + 8, 46, 48, 16, None, None)]
+        if self.knft.kversion < "3.15":
+            return [
+                (ptrsize * 2, ptrsize * 2 + 8, 46, 48, 16, None, None),
+                (ptrsize * 2, ptrsize * 2 + 8, 42, 44, 12, None, None),
+            ]
+        if self.knft.kversion < "4.1":
+            ulen = 8
+        else:
+            ulen = None
+        if self.knft.kversion >= "4.1":
+            has_udata = 1
+        else:
+            has_udata = None
+        return [
+            (ptrsize * 2, ptrsize * 2 + 8, 42, 44, 12, ulen, has_udata),
+            (ptrsize * 2, ptrsize * 2 + 8, 46, 48, 16, None, None),
+        ]
+
+    def get_xt_info(self, ops, name, private, room):
+        offset_data = GefUtil.offsetof("struct nft_expr_ops", "data")
+        if offset_data is None:
+            return None
+        if name == "match":
+            type_name, size_member = ("struct xt_match", "matchsize")
+        else:
+            type_name, size_member = ("struct xt_target", "targetsize")
+        value = GefUtil.typed_struct(read_int_from_memory(ops + offset_data, safe=True), type_name)
+        xt_name = self.knft.field_string(value, "name")
+        size = GefUtil.field_int(value, size_member)
+        if xt_name is None or size is None:
+            return None
+        info_addr = private
+        if align(size, 8) > room:
+            # large matches keep only a pointer to the info (struct nft_xt_match_priv)
+            info_addr = read_int_from_memory(private, safe=True)
+        info = b""
+        if size:
+            info = self.knft.read_bytes(info_addr, min(size, self.XT_INFO_DUMP_MAX))
+        return {
+            "type": type_name.split()[1],
+            "name": xt_name,
+            "revision": GefUtil.field_int(value, "revision"),
+            "size": size,
+            "info": info,
+        }
+
+    def resolve_expr_private_type(self, ops, name, size, offset_data):
+        expr_type = GefUtil.cached_lookup_type("struct nft_expr")
+        if expr_type is None:
+            return None
+        alignment = getattr(expr_type, "alignof", None) or 8
+
+        candidates = []
+        ops_name = self.knft.symbol_name(ops)
+        if ops_name and ops_name.startswith("nft_") and ops_name.endswith("_ops"):
+            stem = ops_name[:-4]
+            candidates += [stem + "_expr", stem, stem + "_priv"]
+        candidates += self.EXPR_PRIVATE_TYPES.get(name, ())
+        candidates += ["nft_{:s}_expr".format(name), "nft_{:s}".format(name), "nft_{:s}_priv".format(name)]
+
+        # Guessing only by name picks wrong types (struct nft_counter is not the counter private
+        # data), so the type must also reproduce ops->size = NFT_EXPR_SIZE(sizeof(priv)).
+        for candidate in dict.fromkeys(candidates):
+            type_name = "struct " + candidate
+            struct_type = GefUtil.cached_lookup_type(type_name)
+            if struct_type is None or struct_type.code != gdb.TYPE_CODE_STRUCT:
+                continue
+            if offset_data + align(struct_type.sizeof, alignment) == size:
+                return type_name
+        return None
+
+    @staticmethod
+    def nested_expr_addresses(value):
+
+        def is_expr_pointer(pointer_type):
+            return pointer_type.code == gdb.TYPE_CODE_PTR and pointer_type.target().strip_typedefs().tag == "nft_expr"
+
+        addresses = []
+        try:
+            fields = value.type.strip_typedefs().fields()
+        except (gdb.error, TypeError):
+            return addresses
+        for field in fields:
+            if not field.name:
+                continue
+            field_type = field.type.strip_typedefs()
+            try:
+                if is_expr_pointer(field_type):
+                    items = [value[field.name]]
+                elif field_type.code == gdb.TYPE_CODE_ARRAY and is_expr_pointer(field_type.target().strip_typedefs()):
+                    low, high = field_type.range()
+                    items = [value[field.name][index] for index in range(low, high + 1)]
+                else:
+                    continue
+                addresses += [int(item) for item in items if int(item)]
+            except gdb.error:
+                continue
+        return addresses
+
+    def expr_ops_size(self, ops):
+        offset_size = GefUtil.offsetof("struct nft_expr_ops", "size")
+        if offset_size is None:
+            return None
+        size = read_int32_from_memory(ops + offset_size, safe=True)
+        if size is None or not (runtime.current_arch.ptrsize <= size <= 0x400):
+            return None
+        return size
+
+
+
+class KernelNftablesSet:
+    """Decode the sets and their elements of nftables for KernelNftables.
+
+    struct nft_set {
+        struct list_head list;
+        struct list_head bindings;
+        ...
+        const struct nft_set_ops *ops;        // the walk callback tells the backend (hash, rhash, rbtree, bitmap, pipapo)
+        ...
+        unsigned char data[];                 // the private data of the backend
+    };
+
+    struct nft_set_ext {                      // v4.1~, in each element after the backend node
+        u8 genmask;
+        u8 offset[NFT_SET_EXT_NUM];           // the offsets of the key, key_end, data, flags, ...
+        char data[];
+    };
+    """
+
+    # the types and members shown by --meta for each set backend
+    SET_BACKEND_TYPES = {
+        "hash": (("struct nft_hash", ("buckets", "table", "hash", "hsize")),
+                 ("struct nft_hash_elem", ("node", "hnode", "ext", "key"))),
+        "rhash": (("struct nft_rhash", ("ht.tbl",)), ("struct nft_hash", ("ht.tbl",)),
+                  ("struct bucket_table", ("size", "buckets")),
+                  ("struct nft_rhash_elem", ("node", "ext", "key")),
+                  ("struct nft_hash_elem", ("node", "hnode", "ext", "key"))),
+        "rbtree": (("struct nft_rbtree", ("root",)),
+                   ("struct nft_rbtree_elem", ("node", "ext", "key")),
+                   ("struct rb_node", ("__rb_parent_color", "rb_right", "rb_left"))),
+        "bitmap": (("struct nft_bitmap", ("list",)),
+                   ("struct nft_bitmap_elem", ("head", "ext", "key"))),
+        "pipapo": (("struct nft_pipapo", ("match",)),
+                   ("struct nft_pipapo_match", ("field_count", "f")),
+                   ("struct nft_pipapo_field", ("rules", "mt")),
+                   ("struct nft_pipapo_elem", ("ext", "key"))),
+    }
+    MAX_SET_SCAN = 0x1_0000  # scan safety limit, not a kernel nftables limit
+
+    def __init__(self, knft):
+        self.knft = knft
+        self.parsed_sets = {}
+        return
+
+    def parse_set(self, entry, elements=True):
+        key = (entry, elements)
+        if key in self.parsed_sets:
+            return self.parsed_sets[key]
+        layout = self.resolve_set_layout(entry)
+        info = dict(layout)
+        info.update({"elements": [], "status": "unsupported", "private": None})
+        if not elements:
+            info["status"] = "disabled"
+            self.parsed_sets[key] = info
+            return info
+        if layout["backend"] is None and layout["offset_ops"] is None:
+            self.parsed_sets[key] = info
+            return info
+        if layout["nelems"] == 0:
+            info["status"] = "ok"
+            self.parsed_sets[key] = info
+            return info
+
+        best_score = None
+        if layout["backend"] is not None:
+            backends = [layout["backend"]]
+        elif layout["backend_candidates"]:
+            backends = layout["backend_candidates"]
+        else:
+            backends = ["rhash", "hash", "rbtree", "bitmap", "pipapo"]
+        expected = layout["nelems"]
+        done = False
+        for runtime_index, (private, klen, dlen) in enumerate(self.set_runtime_candidates(layout)):
+            for backend in backends:
+                elements, status = self.walk_set_backend(backend, private, expected)
+                decoded = []
+                for element in elements:
+                    record = self.read_set_element(element, backend, klen, dlen)
+                    if record is not None:
+                        decoded.append(record)
+                exact = expected is not None and len(decoded) == expected
+                score = (exact, bool(decoded), status == "ok", -runtime_index, len(decoded))
+                if best_score is None or score > best_score:
+                    best_score = score
+                    info.update({"elements": decoded, "status": status, "private": private,
+                                 "klen": klen, "dlen": dlen, "backend": backend})
+                if exact and status == "ok":
+                    done = True
+                    break
+            if done:
+                break
+        if info["status"] not in ("ok", "empty", "disabled", "unsupported"):
+            self.knft.partial_reasons.add("set elements")
+        self.parsed_sets[key] = info
+        return info
+
+    def get_set_attrs(self, entry):
+        offset_list = GefUtil.offsetof("struct nft_set", "list")
+        if offset_list is None:
+            return None
+        value = GefUtil.typed_struct(entry - offset_list, "struct nft_set")
+        if GefUtil.field(value, "klen") is None:
+            return None
+        members = (
+            "handle", "flags", "ktype", "klen", "dtype", "dlen", "objtype", "policy", "size", "timeout", "gc_int",
+            "use", "nelems", "genmask",
+        )
+        attrs = {member: GefUtil.field_int(value, member) for member in members}
+        attrs["concat"] = None
+        field_count = GefUtil.field_int(value, "field_count")
+        if field_count is not None and field_count > 1:
+            field_len = GefUtil.field(value, "field_len")
+            try:
+                attrs["concat"] = [int(field_len[index]) for index in range(field_count)]
+            except (gdb.error, TypeError):
+                attrs["concat"] = []
+        attrs["udata"] = self.knft.typed_udata(value)
+        rules = self.knft.rules
+        attrs["exprs"] = [rules.get_nested_expr_info(address) for address in rules.nested_expr_addresses(value)]
+        return attrs
+
+    def resolve_set_layout(self, entry):
+        offset_list = GefUtil.offsetof("struct nft_set", "list")
+        base = entry - (offset_list or 0)
+        offset_ops = GefUtil.offsetof("struct nft_set", "ops")
+        offset_data = GefUtil.offsetof("struct nft_set", "data")
+        offset_klen = GefUtil.offsetof("struct nft_set", "klen")
+        offset_dlen = GefUtil.offsetof("struct nft_set", "dlen")
+        offset_nelems = GefUtil.offsetof("struct nft_set", "nelems")
+
+        if offset_ops is not None:
+            ops = read_int_from_memory(base + offset_ops, safe=True)
+        else:
+            ops = None
+        backend, walk_name = self.set_ops_backend(ops)
+        if backend is None:
+            # ops is cacheline-aligned, but the cacheline size and the pre-runtime part of
+            # nft_set both vary. Locate it by the backend walk callback instead of guessing.
+            for offset in range(runtime.current_arch.ptrsize * 2, 0x300, runtime.current_arch.ptrsize):
+                candidate = read_int_from_memory(base + offset, safe=True)
+                candidate_backend, candidate_name = self.set_ops_backend(candidate)
+                if candidate_backend is None:
+                    continue
+                offset_ops, ops = offset, candidate
+                backend, walk_name = candidate_backend, candidate_name
+                break
+        if offset_ops is None:
+            # Module-local callback names are absent from the built-in kallsyms table on some
+            # kernels. nft_set_ops is still recognizable as a dense vector of code pointers;
+            # backend selection is then deferred until its private data has been validated.
+            for offset in range(0x20, 0x300, 0x20):
+                candidate = read_int_from_memory(base + offset, safe=True)
+                if self.set_ops_plausible(candidate):
+                    offset_ops, ops = offset, candidate
+                    break
+
+        if offset_klen is not None:
+            klen = read_int8_from_memory(base + offset_klen, safe=True)
+        else:
+            klen = None
+        if offset_dlen is not None:
+            dlen = read_int8_from_memory(base + offset_dlen, safe=True)
+        else:
+            dlen = None
+        if offset_nelems is not None:
+            nelems = read_int32_from_memory(base + offset_nelems, safe=True)
+        else:
+            nelems = None
+        if nelems == 0:
+            # Some kernels count elements only for sets with a maximum size.
+            offset_size = GefUtil.offsetof("struct nft_set", "size")
+            if offset_size is None or not read_int32_from_memory(base + offset_size, safe=True):
+                nelems = None
+        backend_candidates = None
+        if backend is None and ops is not None and self.knft.kversion >= "4.14":
+            update = read_int_from_memory(ops + runtime.current_arch.ptrsize, safe=True)
+            delete = read_int_from_memory(ops + runtime.current_arch.ptrsize * 2, safe=True)
+            if update and delete:
+                backend_candidates = ["rhash"]
+            elif not update and not delete:
+                backend_candidates = ["hash", "rbtree", "bitmap", "pipapo"]
+        return {
+            "base": base,
+            "ops": ops,
+            "offset_ops": offset_ops,
+            "offset_data": offset_data,
+            "offset_klen": offset_klen,
+            "offset_dlen": offset_dlen,
+            "klen": klen,
+            "dlen": dlen,
+            "nelems": nelems,
+            "backend": backend,
+            "backend_candidates": backend_candidates,
+            "walk": walk_name,
+        }
+
+    def set_ops_backend(self, ops):
+        if not ops or not KernelAddressHeuristicFinderUtil.is_kernel_space(ops):
+            return None, None
+
+        offset_walk = GefUtil.offsetof("struct nft_set_ops", "walk")
+        if offset_walk is not None:
+            offsets = [offset_walk]
+        else:
+            offsets = range(0, 0x180, runtime.current_arch.ptrsize)
+        for offset in offsets:
+            function = read_int_from_memory(ops + offset, safe=True)
+            name = self.knft.symbol_name(function)
+            if not name or not name.startswith("nft_") or "_walk" not in name:
+                continue
+            for backend in ("pipapo", "bitmap", "rbtree", "rhash"):
+                if backend in name:
+                    return backend, name
+            if "hash" in name:
+                # v3.19-v4.13 used rhashtable under the historical nft_hash name.
+                if "3.19" <= self.knft.kversion < "4.14":
+                    backend = "rhash"
+                else:
+                    backend = "hash"
+                return backend, name
+        return None, None
+
+    def set_ops_plausible(self, ops):
+        if not ops or not KernelAddressHeuristicFinderUtil.is_kernel_space(ops) or ops % runtime.current_arch.ptrsize:
+            return False
+        callbacks = 0
+        nearby_callbacks = 0
+        for offset in range(0, 0x60, runtime.current_arch.ptrsize):
+            function = read_int_from_memory(ops + offset, safe=True)
+            if (function and KernelAddressHeuristicFinderUtil.is_kernel_space(function)
+                    and read_int_from_memory(function, safe=True) is not None):
+                callbacks += 1
+                if abs(function - ops) < 0x4000000:
+                    nearby_callbacks += 1
+        return callbacks >= 8 and nearby_callbacks >= 8
+
+    def set_runtime_candidates(self, layout):
+        base = layout["base"]
+        candidates = []
+        if None not in (layout["offset_data"], layout["klen"]):
+            candidates.append((base + layout["offset_data"], layout["klen"], layout["dlen"] or 0))
+
+        offset_ops = layout["offset_ops"]
+        if offset_ops is None:
+            return candidates
+        # possible_net_t lived between ops and flags in v4.1-v4.8. From v5.11 the
+        # expression array, and from v5.13 the catchall list, precede runtime data.
+        fields = base + offset_ops + runtime.current_arch.ptrsize
+        if "4.1" <= self.knft.kversion < "4.9":
+            fields += runtime.current_arch.ptrsize
+        klen = read_int8_from_memory(fields + 2, safe=True)
+        dlen = read_int8_from_memory(fields + 3, safe=True)
+        if not klen or dlen is None:
+            return candidates
+        first = align(fields + 4, 8)
+        exprs = align_to_ptrsize(fields + 5)
+        if self.knft.kversion >= "5.13":
+            stops = [align(exprs + runtime.current_arch.ptrsize * 4, 8)]
+        elif self.knft.kversion >= "5.11":
+            stops = [align(exprs + runtime.current_arch.ptrsize * 2, 8)]
+        else:
+            stops = [first]
+        # Keep nearby variants after the mainline layout for distribution backports.
+        stops.extend(range(first, first + 0x58, 8))
+        for address in stops:
+            if (address, klen, dlen) not in candidates:
+                candidates.append((address, klen, dlen))
+        return candidates
+
+    def walk_set_backend(self, backend, private, expected=None):
+        if backend == "rhash":
+            return self.walk_rhash_set(private, expected)
+        walk = {
+            "hash": self.walk_hash_set,
+            "rbtree": self.walk_rbtree_set,
+            "bitmap": self.walk_bitmap_set,
+            "pipapo": self.walk_pipapo_set,
+        }.get(backend)
+        if walk:
+            return walk(private)
+        return ([], "unsupported")
+
+    def walk_hash_set(self, private):
+        offset_node = GefUtil.offsetof("struct nft_hash_elem", "node")
+        if offset_node is None:
+            offset_node = GefUtil.offsetof("struct nft_hash_elem", "hnode") or 0
+        offset_table = GefUtil.offsetof("struct nft_hash", "table")
+        offset_buckets = GefUtil.offsetof("struct nft_hash", "buckets")
+        if offset_table is not None and offset_buckets is not None:
+            heads = private + offset_table
+            buckets = read_int32_from_memory(private + offset_buckets, safe=True)
+        elif GefUtil.offsetof("struct nft_hash", "hash") is not None \
+                and GefUtil.offsetof("struct nft_hash", "hsize") is not None:
+            offset_hash = GefUtil.offsetof("struct nft_hash", "hash")
+            offset_hsize = GefUtil.offsetof("struct nft_hash", "hsize")
+            heads = read_int_from_memory(private + offset_hash, safe=True)
+            buckets = read_int32_from_memory(private + offset_hsize, safe=True)
+        elif self.knft.kversion < "3.19":
+            heads = read_int_from_memory(private, safe=True)
+            buckets = read_int32_from_memory(private + runtime.current_arch.ptrsize, safe=True)
+        else:
+            heads = private + 8
+            buckets = read_int32_from_memory(private + 4, safe=True)
+        if not heads or buckets is None or not (1 <= buckets <= self.MAX_SET_SCAN):
+            return [], "broken"
+        return self.walk_hlist(heads, buckets, offset_node=offset_node)
+
+    def walk_rhash_set(self, private, expected=None):
+        offset_table = GefUtil.offsetof("struct nft_rhash", "ht.tbl")
+        if offset_table is None:
+            offset_table = GefUtil.offsetof("struct nft_hash", "ht.tbl")
+        if offset_table is None:
+            table = read_int_from_memory(private, safe=True)
+        else:
+            table = read_int_from_memory(private + offset_table, safe=True)
+        if not table or not KernelAddressHeuristicFinderUtil.is_kernel_space(table):
+            return [], "broken"
+        table_value = GefUtil.typed_struct(table, "struct bucket_table")
+        size = GefUtil.field_int(table_value, "size")
+        if size is None:
+            offset_size = GefUtil.offsetof("struct bucket_table", "size") or 0
+            if "3.19" <= self.knft.kversion < "4.0":
+                size = read_int_from_memory(table + offset_size, safe=True)
+            else:
+                size = read_int32_from_memory(table + offset_size, safe=True)
+        if size is None or not (1 <= size <= self.MAX_SET_SCAN) or size & (size - 1):
+            return [], "broken"
+
+        offset_node = GefUtil.offsetof("struct nft_rhash_elem", "node")
+        if offset_node is None:
+            offset_node = GefUtil.offsetof("struct nft_hash_elem", "node") or 0
+        offset_buckets = GefUtil.offsetof("struct bucket_table", "buckets")
+        if offset_buckets is not None:
+            return self.walk_hlist(table + offset_buckets, size, offset_node=offset_node, nulls=True)
+
+        # A small bucket array is followed by the neighbor slab object, often the bucket_table of another set,
+        # so a later offset can walk valid chains of another set. Prefer the expected count, then the nearest offset.
+        best = ([], "broken")
+        best_score = None
+        for index, offset in enumerate((runtime.current_arch.ptrsize, 0x20, 0x40, 0x80, 0x100)):
+            elements, status = self.walk_hlist(table + offset, size, offset_node=offset_node, nulls=True)
+            if status not in ("ok", "limit"):
+                continue
+            score = (expected is not None and len(elements) == expected, bool(elements), -index)
+            if best_score is None or score > best_score:
+                best, best_score = (elements, status), score
+        return best
+
+    def walk_hlist(self, heads, buckets, offset_node=0, nulls=False):
+        elements = []
+        seen = set()
+        for index in range(buckets):
+            head = heads + index * runtime.current_arch.ptrsize
+            current = read_int_from_memory(head, safe=True)
+            while current and len(elements) < self.MAX_SET_SCAN:
+                if current & 1:
+                    # the rhashtable nulls marker is (bucket index << 1) | 1 (~v4.18), 1 (v4.19~v4.20) or bucket address | 1 (v5.0~)
+                    if nulls and current not in ((index << 1) | 1, 1, head | 1):
+                        return elements, "broken"
+                    break
+                if current in seen or not KernelAddressHeuristicFinderUtil.is_kernel_space(current):
+                    return elements, "broken"
+                seen.add(current)
+                elements.append(current - offset_node)
+                current = read_int_from_memory(current, safe=True)
+                if current is None:
+                    return elements, "broken"
+                # a v4.0~ rhashtable chain ends with the nulls marker, not NULL
+                if nulls and not current and self.knft.kversion >= "4.0":
+                    return elements, "broken"
+            if len(elements) == self.MAX_SET_SCAN:
+                return elements, "limit"
+        return elements, "ok"
+
+    def walk_rbtree_set(self, private):
+        offset_node = GefUtil.offsetof("struct nft_rbtree_elem", "node") or 0
+        value = GefUtil.typed_struct(private, "struct nft_rbtree")
+        root = GefUtil.field_int(value, "root", "rb_node")
+        if root is None:
+            root = read_int_from_memory(private, safe=True)
+        if root is None:
+            return [], "broken"
+        if not root:
+            return [], "ok"
+
+        offset_parent = GefUtil.offsetof("struct rb_node", "__rb_parent_color") or 0
+        offset_right = GefUtil.offsetof("struct rb_node", "rb_right") or runtime.current_arch.ptrsize
+        offset_left = GefUtil.offsetof("struct rb_node", "rb_left") or runtime.current_arch.ptrsize * 2
+        nodes = []
+        seen = set()
+        stack = [(root, 0)]
+        while stack and len(nodes) < self.MAX_SET_SCAN:
+            node, parent = stack.pop()
+            if node in seen or not KernelAddressHeuristicFinderUtil.is_kernel_space(node) or node % runtime.current_arch.ptrsize:
+                return nodes, "broken"
+            parent_color = read_int_from_memory(node + offset_parent, safe=True)
+            right = read_int_from_memory(node + offset_right, safe=True)
+            left = read_int_from_memory(node + offset_left, safe=True)
+            if None in (parent_color, right, left) or parent_color & ~3 != parent:
+                return nodes, "broken"
+            seen.add(node)
+            nodes.append(node - offset_node)
+            if right:
+                stack.append((right, node))
+            if left:
+                stack.append((left, node))
+        if stack:
+            return (nodes, "limit")
+        return (nodes, "ok")
+
+    def walk_bitmap_set(self, private):
+        offset_list = GefUtil.offsetof("struct nft_bitmap", "list") or 0
+        offset_head = GefUtil.offsetof("struct nft_bitmap_elem", "head") or 0
+        head = private + offset_list
+        entries, status = self.knft.walk_list(head, maxent=self.MAX_SET_SCAN)
+        return [entry - offset_head for entry in entries], status
+
+    def walk_pipapo_set(self, private):
+        typed = self.walk_pipapo_set_typed(private)
+        if typed is not None:
+            return typed
+
+        match = read_int_from_memory(private, safe=True)
+        if not match or not KernelAddressHeuristicFinderUtil.is_kernel_space(match):
+            return [], "broken"
+        count_values = [(read_int32_from_memory(match, safe=True), 4), (read_int8_from_memory(match, safe=True), 1)]
+        best = ([], "broken")
+        # Locate the last field by its rules count and mapping-table pointer. This covers the
+        # aligned x86 layout and the compact 32-bit/ARM layouts without baking in CONFIG choices.
+        for count, count_size in count_values:
+            if count is None or not (1 <= count <= 16):
+                continue
+            for offset_fields in range(align_to_ptrsize(count_size), 0x60, runtime.current_arch.ptrsize):
+                for field_size in range(runtime.current_arch.ptrsize * 4, runtime.current_arch.ptrsize * 8 + 1, runtime.current_arch.ptrsize):
+                    field = match + offset_fields + (count - 1) * field_size
+                    for offset_rules in range(0, min(field_size, 0x18), 4):
+                        rules = read_int32_from_memory(field + offset_rules, safe=True)
+                        if rules is None or not (1 <= rules <= self.MAX_SET_SCAN * 0x100):
+                            continue
+                        for offset_table in range(align_to_ptrsize(offset_rules + 4),
+                                                  field_size, runtime.current_arch.ptrsize):
+                            mapping = read_int_from_memory(field + offset_table, safe=True)
+                            elements, status = self.walk_pipapo_mapping(mapping, rules, runtime.current_arch.ptrsize)
+                            if status in ("ok", "limit") and len(elements) > len(best[0]):
+                                best = elements, status
+        return best
+
+    def walk_pipapo_set_typed(self, private):
+        offset_match = GefUtil.offsetof("struct nft_pipapo", "match")
+        offset_fields = GefUtil.offsetof("struct nft_pipapo_match", "f")
+        field_size = GefUtil.sizeof("struct nft_pipapo_field")
+        bucket_size = GefUtil.sizeof("union nft_pipapo_map_bucket") or runtime.current_arch.ptrsize
+        members = (("struct nft_pipapo_match", "field_count"), ("struct nft_pipapo_field", "rules"),
+                   ("struct nft_pipapo_field", "mt"))
+        if None in (offset_match, offset_fields, field_size) or any(GefUtil.offsetof(*member) is None for member in members):
+            return None
+        match = read_int_from_memory(private + offset_match, safe=True)
+        if not match:
+            return [], "ok"
+        count = GefUtil.field_int(GefUtil.typed_struct(match, "struct nft_pipapo_match"), "field_count")
+        if count is None or not (1 <= count <= 16):
+            return [], "broken"
+        field = GefUtil.typed_struct(match + offset_fields + (count - 1) * field_size, "struct nft_pipapo_field")
+        return self.walk_pipapo_mapping(GefUtil.field_int(field, "mt"), GefUtil.field_int(field, "rules"), bucket_size)
+
+    def walk_pipapo_mapping(self, mapping, rules, stride):
+        if not mapping or rules is None or not (0 <= rules <= self.MAX_SET_SCAN * 0x100):
+            return [], "broken"
+        elements = []
+        seen = set()
+        for index in range(rules):
+            element = read_int_from_memory(mapping + index * stride, safe=True)
+            if not self.knft.is_heap_ptr(element):
+                return elements, "broken"
+            if element in seen:
+                continue
+            seen.add(element)
+            elements.append(element)
+            if len(elements) == self.MAX_SET_SCAN:
+                return elements, "limit"
+        return elements, "ok"
+
+    def read_set_element(self, element, backend, klen, dlen):
+        if not (1 <= klen <= 0xff):
+            return None
+
+        # v3.13~v4.0 predate nft_set_ext. Prefer typed members, then the stable legacy layout:
+        # {node; u16 flags (rbtree only); struct nft_data key; struct nft_data data[];}, and nft_data is u64-aligned.
+        offset_key = offset_data = offset_flags = None
+        for type_name in self.set_element_type_names(backend):
+            offset_key = GefUtil.offsetof(type_name, "key")
+            if offset_key is not None:
+                offset_data = GefUtil.offsetof(type_name, "data")
+                offset_flags = GefUtil.offsetof(type_name, "flags")
+                break
+        if offset_key is None and self.knft.kversion < "4.1":
+            ptrsize = runtime.current_arch.ptrsize
+            if backend == "rhash":
+                offset_key = ptrsize
+            elif backend == "hash":
+                offset_key = ptrsize * 2
+            elif backend == "rbtree":
+                offset_flags = ptrsize * 3
+                offset_key = offset_flags + 2
+            else:
+                return None
+            offset_key = align(offset_key, 8 if ptrsize == 8 or is_arm32() else 4)
+            offset_data = offset_key + 16
+        if offset_key is not None:
+            key = self.knft.read_bytes(element + offset_key, klen)
+            if key is None:
+                return None
+            if dlen and offset_data is not None:
+                data = self.knft.read_bytes(element + offset_data, dlen)
+            else:
+                data = None
+            if offset_flags is not None:
+                flags = read_int16_from_memory(element + offset_flags, safe=True)
+            else:
+                flags = None
+            end = element + max(offset_key + klen, (offset_data or 0) + (dlen or 0))
+            return {"address": element, "end": end, "key": key, "key_end": None, "data": data, "flags": flags}
+
+        layout = self.resolve_set_ext_layout()
+        ext_floor = max(layout["offset"] + layout["count"], layout["size"] or 0)
+        for extension in self.set_element_ext_candidates(element, backend):
+            # an unlinked llist_node (nft_rhash_elem.walk_node) points to itself
+            if read_int_from_memory(extension, safe=True) == extension:
+                continue
+            header = self.knft.read_bytes(extension, layout["offset"] + layout["count"])
+            # genmask holds two generation bits and the busy/dead bit
+            if header is None or header[0] >= 8:
+                continue
+            offsets = header[layout["offset"]:]
+            offset_key = offsets[layout["key"]]
+            if offset_key < ext_floor:
+                continue
+            # present extensions do not overlap, which the repeated 0xff of a kernel pointer in front of ext fails
+            present = [value for value in offsets[:offset_key - layout["offset"]] if value]
+            if len(set(present)) != len(present):
+                continue
+            key = self.knft.read_bytes(extension + offset_key, klen)
+            if key is None:
+                continue
+
+            if layout["key_end"] is not None:
+                offset_end = offsets[layout["key_end"]]
+            else:
+                offset_end = 0
+            offset_data = offsets[layout["data"]]
+            offset_flags = offsets[layout["flags"]]
+            if offset_end:
+                key_end = self.knft.read_bytes(extension + offset_end, klen)
+            else:
+                key_end = None
+            if dlen and offset_data:
+                data = self.knft.read_bytes(extension + offset_data, dlen)
+            else:
+                data = None
+            if offset_flags:
+                flags = read_int8_from_memory(extension + offset_flags, safe=True)
+            else:
+                flags = None
+            end = extension + max([offset_key + klen, offset_data + (dlen or 0), offset_flags + 1])
+            return {"address": element, "end": end, "key": key, "key_end": key_end, "data": data, "flags": flags}
+        return None
+
+    @staticmethod
+    def set_element_type_names(backend):
+        return {
+            "hash": ("struct nft_hash_elem",),
+            "rhash": ("struct nft_rhash_elem", "struct nft_hash_elem"),
+            "rbtree": ("struct nft_rbtree_elem",),
+            "bitmap": ("struct nft_bitmap_elem",),
+            "pipapo": ("struct nft_pipapo_elem",),
+        }.get(backend, ())
+
+    def set_element_ext_candidates(self, element, backend):
+        candidates = []
+        for type_name in self.set_element_type_names(backend):
+            offset = GefUtil.offsetof(type_name, "ext")
+            if offset is not None and element + offset not in candidates:
+                candidates.append(element + offset)
+
+        ptrsize = runtime.current_arch.ptrsize
+        starts = {
+            "hash": ptrsize * 2,
+            "rhash": ptrsize,
+            "rbtree": ptrsize * 3,
+            "bitmap": ptrsize * 2,
+            "pipapo": 0,
+        }
+        start = starts.get(backend, 0)
+        for offset in range(start, start + 0x40, max(min(ptrsize, 8), 4)):
+            address = element + offset
+            if address not in candidates:
+                candidates.append(address)
+        return candidates
+
+    def resolve_set_ext_layout(self):
+        offset = GefUtil.offsetof("struct nft_set_ext", "offset")
+        ext_num = GefUtil.enum_value("enum nft_set_extensions", "NFT_SET_EXT_NUM")
+        if ext_num is None:
+            ext_num = GefUtil.member_type_size("struct nft_set_ext", "offset")
+        if ext_num is None:
+            if self.knft.kversion >= "5.6":
+                ext_num = 9
+            elif self.knft.kversion >= "4.10":
+                ext_num = 8
+            else:
+                ext_num = 7
+        source = "heuristic"
+        if offset is not None and GefUtil.member_type_size("struct nft_set_ext", "offset") is not None:
+            source = "type"
+        indices = {
+            "key": GefUtil.enum_value("enum nft_set_extensions", "NFT_SET_EXT_KEY"),
+            "key_end": GefUtil.enum_value("enum nft_set_extensions", "NFT_SET_EXT_KEY_END"),
+            "data": GefUtil.enum_value("enum nft_set_extensions", "NFT_SET_EXT_DATA"),
+            "flags": GefUtil.enum_value("enum nft_set_extensions", "NFT_SET_EXT_FLAGS"),
+        }
+        if indices["key"] is None:
+            indices["key"] = 0
+        if indices["data"] is None:
+            if ext_num >= 9:
+                indices["data"] = 2
+            else:
+                indices["data"] = 1
+        if indices["flags"] is None:
+            indices["flags"] = indices["data"] + 1
+        if indices["key_end"] is None and ext_num >= 9:
+            indices["key_end"] = 1
+        indices.update({
+            "offset": offset if offset is not None else 1,
+            "count": ext_num,
+            "size": GefUtil.sizeof("struct nft_set_ext"),
+            "source": source,
+        })
+        return indices
