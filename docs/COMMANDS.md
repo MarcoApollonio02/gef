@@ -552,13 +552,14 @@ regdump-break 0x55555555aab9 -t "state changed" -r rax
 ### Syntax
 
 ```text
-usage: continue-for-qemu-user [-h] [ARGS ...]
+usage: continue-for-qemu-user [-h] [-a] [IGNORE-COUNT]
 
 positional arguments:
-  ARGS        An array of arguments to pass as is to the continue command. (default: None)
+  IGNORE-COUNT  Ignore the current breakpoint N-1 times.
 
 options:
-  -h, --help  show this help message and exit
+  -h, --help    show this help message and exit
+  -a            Continue all stopped threads in non-stop mode.
 ```
 
 ### Notes
@@ -567,7 +568,7 @@ options:
 Only when qemu-user or pin, the `c` command is redirected to `continue-for-qemu-user`.
 This setting is done only once, when hook_stop_handler is called for the first time.
 Nested `c` command causes a problem, so in that case gef executes the original continue command instead.
-Internally, SIGINT is monitored in a forked child process (default) or another thread.
+Internally, SIGINT is monitored in a forked child process.
 ```
 
 ## down
@@ -1791,7 +1792,7 @@ hijack-fd 2 /tmp/gef/stderr.txt
 hijack-fd 2 localhost:8000  # determined as the socket by the presence of `:`.
 ```
 
-## killthreads
+## kill-threads
 
 Invoke pthread_exit(0) for a specific THREAD_ID.
 
@@ -1799,7 +1800,7 @@ Invoke pthread_exit(0) for a specific THREAD_ID.
 ### Syntax
 
 ```text
-usage: killthreads [-h] [-a] [-e EXCLUDE] [-c] [THREAD_ID ...]
+usage: kill-threads [-h] [-a] [-e EXCLUDE] [-c] [THREAD_ID ...]
 
 positional arguments:
   THREAD_ID             the thread id (not TID) to kill.
@@ -1815,7 +1816,7 @@ options:
 ### Examples
 
 ```gdb
-killthreads 2 3   # kill threads that `Thread Id` is 2 or 3
+kill-threads 2 3   # kill threads that `Thread Id` is 2 or 3
 ```
 
 ## mmap

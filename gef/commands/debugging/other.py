@@ -281,76 +281,23 @@ class ContinueForQemuUserCommand(GenericCommand):
     _category_ = "01-c. Debugging Support - Basic Command Extension"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
-    parser.add_argument("args", metavar="ARGS", nargs="*",
-                        help="An array of arguments to pass as is to the continue command. (default: %(default)s)")
+    parser.add_argument("-a", dest="all_threads", action="count", default=0,
+                        help="Continue all stopped threads in non-stop mode.")
+    parser.add_argument("ignore_count", metavar="IGNORE-COUNT", nargs="?",
+                        help="Ignore the current breakpoint N-1 times.")
     _syntax_ = parser.format_help()
 
     _note_ = [
         "Only when qemu-user or pin, the `c` command is redirected to `continue-for-qemu-user`.",
         "This setting is done only once, when hook_stop_handler is called for the first time.",
         "Nested `c` command causes a problem, so in that case gef executes the original continue command instead.",
-        "Internally, SIGINT is monitored in a forked child process (default) or another thread.",
+        "Internally, SIGINT is monitored in a forked child process.",
     ]
     _note_ = "\n".join(_note_)
 
     nested = False
 
-    def __init__(self):
-        super().__init__()
-        # In the previous old implementation, Ctrl+C signal was monitored by thread. It was quite stable.
-        # However, if you use this method before libc.so is loaded, gdb will crash on non-x86 architectures.
-        # This is because the code executes gdb.execute("continue") in a non-main thread.
-        # However, signals can only be monitored in the main thread, so there was no way to avoid this.
-        # In the new implementation, Ctrl+C signal is monitored by forked child process.
-        # It seems to work well so far, but there may be cases where it doesn't work properly.
-        self.add_setting("use_fork", True, "Ctrl+C is monitored by forked process. If False, monitored by thread.")
-        return
-
-    def continue_for_qemu_thread(self):
-        import signal
-        import threading
-        thread_started = False
-        thread_finished = False
-
-        pid = Pid.get_pid()
-
-        def continue_thread():
-            nonlocal thread_started, thread_finished
-            thread_started = True
-            try:
-                gdb.execute("continue")
-            except gdb.error:
-                exc_type, exc_value, exc_traceback = sys.exc_info()
-                err(exc_value)
-            thread_finished = True
-            return
-
-        def sig_handler(_signum, _frame):
-            # do not use get_pid() in this func.
-            # get_pid() uses `maintenance packet` command internally,
-            # but it cannot be used when the non-static program is running.
-            os.kill(pid, signal.SIGTRAP)
-            return
-
-        th = threading.Thread(target=continue_thread, daemon=True)
-        th.start()
-        while thread_started is False:
-            time.sleep(0.1)
-        old = signal.signal(signal.SIGINT, sig_handler)
-        while thread_finished is False:
-            time.sleep(0.1)
-        th.join()
-        signal.signal(signal.SIGINT, old)
-        return
-
-    def pid_is_alive(self, pid):
-        try:
-            os.kill(pid, 0)
-        except OSError:
-            return False
-        return True
-
-    def continue_for_qemu_fork(self):
+    def continue_for_qemu_fork(self, command):
         import signal
 
         parent_pid = Pid.get_pid()
@@ -360,53 +307,70 @@ class ContinueForQemuUserCommand(GenericCommand):
 
             # child
             def sig_handler(_signum, _frame):
-                nonlocal signal_monitoring
-                os.kill(parent_pid, signal.SIGTRAP)
-                signal_monitoring = False
+                nonlocal signal_received
+                signal_received = True
                 return
 
-            signal_monitoring = True
-            old = signal.signal(signal.SIGINT, sig_handler)
-            while signal_monitoring:
+            signal_received = False
+            signal.signal(signal.SIGINT, sig_handler)
+            while True:
+                if signal_received:
+                    os.kill(parent_pid, signal.SIGTRAP)
                 time.sleep(0.1)
-            signal.signal(signal.SIGINT, old)
-            os._exit(0)
 
-        # parent
         try:
-            gdb.execute("continue")
+            gdb.execute(command)
         except gdb.error:
             exc_type, exc_value, exc_traceback = sys.exc_info()
             err(exc_value)
-
-        # clean up
-        try:
-            if self.pid_is_alive(child_pid):
-                os.kill(child_pid, signal.SIGKILL)
-            os.waitpid(child_pid, os.WNOHANG)
-        except (ProcessLookupError, ChildProcessError):
-            pass
+        finally:
+            try:
+                while True:
+                    try:
+                        os.kill(child_pid, signal.SIGKILL)
+                        break
+                    except InterruptedError:
+                        continue
+                    except ProcessLookupError:
+                        break
+            finally:
+                while True:
+                    try:
+                        os.waitpid(child_pid, 0)
+                        break
+                    except InterruptedError:
+                        continue
+                    except ChildProcessError:
+                        break
         return
 
     @parse_args
     @only_if_gdb_running
     @only_if_specific_gdb_mode(mode=("qemu-user", "pin"))
     def do_invoke(self, args):
+        if args.all_threads > 1 or (args.all_threads and args.ignore_count is not None):
+            err("`-a` cannot be used more than once or with an ignore count.")
+            return
+
+        command = "continue"
+        if args.all_threads:
+            command += " -a"
+        elif args.ignore_count is not None:
+            command += " " + args.ignore_count
+
         if is_qemu_user() or is_pin():
             if Pid.get_pid():
                 if not self.nested:
                     self.nested = True
-                    if Config.get_gef_setting("continue_for_qemu_user.use_fork"):
-                        self.continue_for_qemu_fork()
-                    else:
-                        self.continue_for_qemu_thread()
-                    self.nested = False
+                    try:
+                        self.continue_for_qemu_fork(command)
+                    finally:
+                        self.nested = False
                     return
 
         # fall back to original continue command
         try:
-            cmd = "continue " + " ".join(args.args)
-            gdb.execute(cmd.rstrip())
+            gdb.execute(command)
         except gdb.error:
             exc_type, exc_value, exc_traceback = sys.exc_info()
             err(exc_value)

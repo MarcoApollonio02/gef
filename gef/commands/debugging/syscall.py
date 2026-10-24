@@ -13,6 +13,7 @@ import gdb
 
 from gef.commands.base import (
     BufferingOutput,
+    ContextManager,
     GenericCommand,
     exclude_specific_arch,
     exclude_specific_gdb_mode,
@@ -693,7 +694,7 @@ class XtapCommand(GenericCommand):
 class KillThreadsCommand(GenericCommand):
     """Invoke pthread_exit(0) for a specific THREAD_ID."""
 
-    _cmdline_ = "killthreads"
+    _cmdline_ = "kill-threads"
     _category_ = "01-g. Debugging Support - Syscall"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
@@ -722,7 +723,6 @@ class KillThreadsCommand(GenericCommand):
 
         # list target thread id
         orig_thread = gdb.selected_thread()
-        orig_frame = gdb.selected_frame()
         target_threads = []
         for th in gdb.selected_inferior().threads():
             if th.num == orig_thread.num:
@@ -745,21 +745,14 @@ class KillThreadsCommand(GenericCommand):
 
         # kill
         if args.commit:
-            # backup
-            sched_lock = gdb.parameter("scheduler-locking")
-            # change temporarily
-            gdb.execute("set scheduler-locking on", to_string=True)
-            # kill
-            for th in target_threads:
-                th.switch()
-                try:
-                    gdb.execute("call pthread_exit(0)")
-                except gdb.error:
-                    pass
-            # restore
-            orig_thread.switch()
-            orig_frame.select()
-            gdb.execute("set scheduler-locking {:s}".format(sched_lock), to_string=True)
+            with ContextManager.gdb_parameter("scheduler-locking", "on"):
+                with ContextManager.threads(target_threads) as threads:
+                    # kill
+                    for _thread in threads:
+                        try:
+                            gdb.execute("call (void)pthread_exit(0)")
+                        except (gdb.error, RuntimeError):
+                            pass
         else:
             warn('This dry run mode skips killing; add "--commit" to proceed')
         return
