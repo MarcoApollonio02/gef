@@ -4215,13 +4215,13 @@ The base command to write specified values to the specified address.
 ### Syntax
 
 ```text
-usage: patch [-h] {byte,word,dword,qword,string,hex,pattern,nop,inf,trap,ret,syscall,range-replace,history,revert} ...
+usage: patch [-h] {byte,word,dword,qword,string,hex,pattern,nop,inf,trap,ret,syscall,range-replace,history,revert,undo,redo} ...
 
 options:
   -h, --help            show this help message and exit
 
 command:
-  {byte,word,dword,qword,string,hex,pattern,nop,inf,trap,ret,syscall,range-replace,history,revert}
+  {byte,word,dword,qword,string,hex,pattern,nop,inf,trap,ret,syscall,range-replace,history,revert,undo,redo}
 ```
 
 ## patch byte
@@ -4315,12 +4315,13 @@ Display the patch history stack.
 ### Syntax
 
 ```text
-usage: patch history [-h] [-n] [-v]
+usage: patch history [-h] [-n] [-v] [--redo]
 
 options:
   -h, --help      show this help message and exit
   -n, --no-pager  do not use the pager.
   -v, --verbose   verbose output.
+  --redo          display patches available to redo.
 ```
 
 ## patch inf
@@ -4331,14 +4332,15 @@ Patch the instruction(s) at the given address with an infinite loop.
 ### Syntax
 
 ```text
-usage: patch inf [-h] [--phys] [LOCATION]
+usage: patch inf [-h] [--mode {arm,thumb}] [--phys] [LOCATION]
 
 positional arguments:
-  LOCATION    the memory address to patch. (default: current_arch.pc)
+  LOCATION            the memory address to patch. (default: current_arch.pc)
 
 options:
-  -h, --help  show this help message and exit
-  --phys      treat LOCATION as a physical address (qemu-system only).
+  -h, --help          show this help message and exit
+  --mode {arm,thumb}  select the instruction mode at LOCATION (ARM32 only).
+  --phys              treat LOCATION as a physical address (qemu-system only).
 ```
 
 ### Examples
@@ -4356,16 +4358,17 @@ Patch the instruction(s) at the given address with NOP.
 ### Syntax
 
 ```text
-usage: patch nop [-h] [--phys] [-b BYTE_LENGTH | -i INST_COUNT] [LOCATION]
+usage: patch nop [-h] [--mode {arm,thumb}] [--phys] [-b BYTE_LENGTH | -i INST_COUNT] [LOCATION]
 
 positional arguments:
-  LOCATION        the memory address to patch. (default: current_arch.pc)
+  LOCATION            the memory address to patch. (default: current_arch.pc)
 
 options:
-  -h, --help      show this help message and exit
-  --phys          treat LOCATION as a physical address (qemu-system only).
-  -b BYTE_LENGTH  the patch length in bytes. (default: None)
-  -i INST_COUNT   the number of instructions to patch. (default: 1)
+  -h, --help          show this help message and exit
+  --mode {arm,thumb}  select the instruction mode at LOCATION (ARM32 only).
+  --phys              treat LOCATION as a physical address (qemu-system only).
+  -b BYTE_LENGTH      the patch length in bytes. (default: None)
+  -i INST_COUNT       the number of instructions to patch. (default: 1)
 ```
 
 ### Examples
@@ -4457,6 +4460,38 @@ options:
 patch range-replace 0x400000 0x401000 "ebfe" "9090"
 ```
 
+## patch redo
+
+Reapply the most recently undone patch groups.
+
+
+### Syntax
+
+```text
+usage: patch redo [-h] [--all | COUNT]
+
+positional arguments:
+  COUNT       the number of patch groups to redo. (default: 1)
+
+options:
+  -h, --help  show this help message and exit
+  --all       redo all undone patch groups.
+```
+
+### Examples
+
+```gdb
+patch redo        # redo the last undone patch command.
+patch redo 2      # redo the next two undone patch commands.
+patch redo --all  # redo all undone patch commands.
+```
+
+### Notes
+
+```text
+A new patch or a successful patch revert discards the redo history for the current target.
+```
+
 ## patch ret
 
 Patch the instruction(s) at the given address with return.
@@ -4465,14 +4500,19 @@ Patch the instruction(s) at the given address with return.
 ### Syntax
 
 ```text
-usage: patch ret [-h] [--phys] [LOCATION]
+usage: patch ret [-h] [--mode {arm,thumb}] [--phys] [--return-mode {leaf,windowed}] [--interworking | --no-interworking] [LOCATION]
 
 positional arguments:
-  LOCATION    the memory address to patch. (default: current_arch.pc)
+  LOCATION              the memory address to patch. (default: current_arch.pc)
 
 options:
-  -h, --help  show this help message and exit
-  --phys      treat LOCATION as a physical address (qemu-system only).
+  -h, --help            show this help message and exit
+  --mode {arm,thumb}    select the instruction mode at LOCATION (ARM32 only).
+  --phys                treat LOCATION as a physical address (qemu-system only).
+  --return-mode {leaf,windowed}
+                        select the SPARC return form: retl/nop or ret/restore.
+  --interworking        use BX LR when ARM interworking support cannot be detected.
+  --no-interworking     use MOV PC, LR for ARM CPUs without interworking support.
 ```
 
 ### Examples
@@ -4542,14 +4582,15 @@ Patch the instruction(s) at the given address with syscall instruction.
 ### Syntax
 
 ```text
-usage: patch syscall [-h] [--phys] [LOCATION]
+usage: patch syscall [-h] [--mode {arm,thumb}] [--phys] [LOCATION]
 
 positional arguments:
-  LOCATION    the memory address to patch. (default: current_arch.pc)
+  LOCATION            the memory address to patch. (default: current_arch.pc)
 
 options:
-  -h, --help  show this help message and exit
-  --phys      treat LOCATION as a physical address (qemu-system only).
+  -h, --help          show this help message and exit
+  --mode {arm,thumb}  select the instruction mode at LOCATION (ARM32 only).
+  --phys              treat LOCATION as a physical address (qemu-system only).
 ```
 
 ### Examples
@@ -4566,20 +4607,53 @@ Patch the instruction(s) at the given address with breakpoint or trap (if availa
 ### Syntax
 
 ```text
-usage: patch trap [-h] [--phys] [LOCATION]
+usage: patch trap [-h] [--mode {arm,thumb}] [--phys] [LOCATION]
 
 positional arguments:
-  LOCATION    the memory address to patch. (default: current_arch.pc)
+  LOCATION            the memory address to patch. (default: current_arch.pc)
 
 options:
-  -h, --help  show this help message and exit
-  --phys      treat LOCATION as a physical address (qemu-system only).
+  -h, --help          show this help message and exit
+  --mode {arm,thumb}  select the instruction mode at LOCATION (ARM32 only).
+  --phys              treat LOCATION as a physical address (qemu-system only).
 ```
 
 ### Examples
 
 ```gdb
 patch trap $pc
+```
+
+## patch undo
+
+Undo the most recent patch groups.
+
+
+### Syntax
+
+```text
+usage: patch undo [-h] [--all | COUNT]
+
+positional arguments:
+  COUNT       the number of patch groups to undo. (default: 1)
+
+options:
+  -h, --help  show this help message and exit
+  --all       undo all patch groups.
+```
+
+### Examples
+
+```gdb
+patch undo        # undo the last patch command.
+patch undo 2      # undo the last two patch commands.
+patch undo --all  # undo all patch commands.
+```
+
+### Notes
+
+```text
+A new patch or a successful patch revert discards the redo history for the current target.
 ```
 
 ## patch word
@@ -4644,13 +4718,40 @@ The base command to decode baseN.
 ### Syntax
 
 ```text
-usage: base-n-decode [-h] {memory,value} ...
+usage: base-n-decode [-h] {memory,file,value} ...
+
+options:
+  -h, --help           show this help message and exit
+
+command:
+  {memory,file,value}
+```
+
+## base-n-decode file
+
+Decode baseN from file.
+
+
+### Syntax
+
+```text
+usage: base-n-decode file [-h] [-n] FILE [START_POS] [SIZE]
+
+positional arguments:
+  FILE            the filepath for baseN decoding.
+  START_POS       the start position for baseN decoding.
+  SIZE            the size for baseN decoding.
 
 options:
   -h, --help      show this help message and exit
+  -n, --no-pager  do not use the pager.
+```
 
-command:
-  {memory,value}
+### Examples
+
+```gdb
+base-n-decode file /tmp/data.bin
+base-n-decode file /tmp/data.bin 0x10 0x20
 ```
 
 ## base-n-decode memory
@@ -4712,13 +4813,40 @@ The base command to encode baseN.
 ### Syntax
 
 ```text
-usage: base-n-encode [-h] {memory,value} ...
+usage: base-n-encode [-h] {memory,file,value} ...
+
+options:
+  -h, --help           show this help message and exit
+
+command:
+  {memory,file,value}
+```
+
+## base-n-encode file
+
+Encode baseN from file.
+
+
+### Syntax
+
+```text
+usage: base-n-encode file [-h] [-n] FILE [START_POS] [SIZE]
+
+positional arguments:
+  FILE            the filepath for baseN encoding.
+  START_POS       the start position for baseN encoding.
+  SIZE            the size for baseN encoding.
 
 options:
   -h, --help      show this help message and exit
+  -n, --no-pager  do not use the pager.
+```
 
-command:
-  {memory,value}
+### Examples
+
+```gdb
+base-n-encode file /tmp/data.bin
+base-n-encode file /tmp/data.bin 0x10 0x20
 ```
 
 ## base-n-encode memory
@@ -5604,6 +5732,51 @@ positional arguments:
 options:
   -h, --help            show this help message and exit
   -b, --decode-barcode  decode barcode if found.
+```
+
+## stack-recover
+
+Heuristically recover the call chain from the stack when `bt` is unusable.
+
+
+### Syntax
+
+```text
+usage: stack-recover [-h] [-l LENGTH] [-v] [-n] [ADDRESS]
+
+positional arguments:
+  ADDRESS              the stack address to start scanning from. (default: current_arch.sp)
+
+options:
+  -h, --help           show this help message and exit
+  -l, --length LENGTH  the number of bytes to scan. (default: up to the end of the stack)
+  -v, --verbose        also show the code pointers that are not adopted.
+  -n, --no-pager       do not use the pager.
+```
+
+### Examples
+
+```gdb
+stack-recover                         # scan from $sp to the end of the stack
+stack-recover 0x7fffffffe000 -l 0x800 # scan 0x800 bytes from the specified address
+stack-recover -v                      # also show rejected candidates
+```
+
+### Notes
+
+```text
+The link register and each code pointer on the stack are candidates only if the instruction
+before it is a call. Among them, the most consistent chain is selected by scoring:
+  - the direct call target matches the function of the callee frame (strong).
+  - the call target is unknown (indirect call, PLT, thunk) (weak).
+  - the direct call target differs, i.e., some frames may be missing (penalty).
+  - a saved frame pointer links to the frame (bonus; x86, ARM, RISC-V, LoongArch).
+  - the frame is inside the callee frame according to its frame pointer (penalty).
+  - the same function appears again across an unconfirmed link (penalty; stale sub-chain).
+confidence=high:   the call target matches the callee, or a frame pointer links to it.
+confidence=medium: the call target is unknown, or the caller is confirmed by the next frame.
+confidence=low:    only the preceding call instruction supports it.
+On SPARC, frames still held in the register windows are not found.
 ```
 
 ## vdump

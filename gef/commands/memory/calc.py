@@ -3263,6 +3263,7 @@ class BaseNDecodeCommand(GenericCommand, BufferingOutput):
     else:
         subparsers = parser.add_subparsers(title="command")
     subparsers.add_parser("memory")
+    subparsers.add_parser("file")
     subparsers.add_parser("value")
     _syntax_ = parser.format_help()
 
@@ -3345,6 +3346,70 @@ class BaseNDecodeMemoryCommand(BaseNDecodeCommand):
 
 
 @register_command
+class BaseNDecodeFileCommand(BaseNDecodeCommand):
+    """Decode baseN from file."""
+
+    _cmdline_ = "base-n-decode file"
+    _category_ = "03-e. Memory - Calculation"
+
+    parser = argparse.ArgumentParser(prog=_cmdline_)
+    parser.add_argument("filename", metavar="FILE", help="the filepath for baseN decoding.")
+    parser.add_argument("start", metavar="START_POS", nargs="?", default=0, type=AddressUtil.parse_address,
+                        help="the start position for baseN decoding.")
+    parser.add_argument("size", metavar="SIZE", nargs="?", type=AddressUtil.parse_address,
+                        help="the size for baseN decoding.")
+    parser.add_argument("-n", "--no-pager", action="store_true", help="do not use the pager.")
+    _syntax_ = parser.format_help()
+
+    _example_ = [
+        "{0:s} /tmp/data.bin",
+        "{0:s} /tmp/data.bin 0x10 0x20",
+    ]
+    _example_ = "\n".join(_example_).format(_cmdline_)
+
+    def __init__(self):
+        super().__init__(prefix=False, complete=gdb.COMPLETE_FILENAME)
+        return
+
+    @parse_args
+    @ModuleLoader.load_codext
+    def do_invoke(self, args):
+        if args.start < 0 or (args.size is not None and args.size < 0):
+            err("Invalid range")
+            return
+        if not os.path.exists(args.filename):
+            err("File not found")
+            return
+        if not os.path.isfile(args.filename):
+            err("Not a regular file")
+            return
+        try:
+            with open(args.filename, "rb") as f:
+                file_size = os.fstat(f.fileno()).st_size
+                size = max(0, file_size - args.start)
+                if args.size is not None:
+                    size = min(size, args.size)
+                f.seek(min(args.start, file_size))
+                value = f.read(size)
+        except OSError as exc:
+            err(str(exc))
+            return
+
+        self.out = []
+        self.out.append("Path: {:s}".format(args.filename))
+        self.out.append("FileSize: {:#x}".format(file_size))
+        for bname, bfunc in self.get_valid_base_decode_funcs():
+            try:
+                b = bfunc(value)
+                self.out.append("{:17s}: {!s}".format(bname, b))
+            except ValueError:
+                self.out.append("{:17s}: ERROR".format(bname))
+        self.print_output(check_terminal_size=True)
+        return
+
+
+
+@register_command
 class BaseNDecodeValueCommand(BaseNDecodeCommand):
     """Decode baseN from specified values."""
 
@@ -3406,6 +3471,7 @@ class BaseNEncodeCommand(GenericCommand, BufferingOutput):
     else:
         subparsers = parser.add_subparsers(title="command")
     subparsers.add_parser("memory")
+    subparsers.add_parser("file")
     subparsers.add_parser("value")
     _syntax_ = parser.format_help()
 
@@ -3482,6 +3548,73 @@ class BaseNEncodeMemoryCommand(BaseNEncodeCommand):
                 continue
             try:
                 b = bfunc(mem)
+                self.out.append("{:17s}: {!s}".format(bname, b))
+            except ValueError:
+                self.out.append("{:17s}: ERROR".format(bname))
+        self.print_output(check_terminal_size=True)
+        return
+
+
+
+@register_command
+class BaseNEncodeFileCommand(BaseNEncodeCommand):
+    """Encode baseN from file."""
+
+    _cmdline_ = "base-n-encode file"
+    _category_ = "03-e. Memory - Calculation"
+
+    parser = argparse.ArgumentParser(prog=_cmdline_)
+    parser.add_argument("filename", metavar="FILE", help="the filepath for baseN encoding.")
+    parser.add_argument("start", metavar="START_POS", nargs="?", default=0, type=AddressUtil.parse_address,
+                        help="the start position for baseN encoding.")
+    parser.add_argument("size", metavar="SIZE", nargs="?", type=AddressUtil.parse_address,
+                        help="the size for baseN encoding.")
+    parser.add_argument("-n", "--no-pager", action="store_true", help="do not use the pager.")
+    _syntax_ = parser.format_help()
+
+    _example_ = [
+        "{0:s} /tmp/data.bin",
+        "{0:s} /tmp/data.bin 0x10 0x20",
+    ]
+    _example_ = "\n".join(_example_).format(_cmdline_)
+
+    def __init__(self):
+        super().__init__(prefix=False, complete=gdb.COMPLETE_FILENAME)
+        return
+
+    @parse_args
+    @ModuleLoader.load_codext
+    def do_invoke(self, args):
+        if args.start < 0 or (args.size is not None and args.size < 0):
+            err("Invalid range")
+            return
+        if not os.path.exists(args.filename):
+            err("File not found")
+            return
+        if not os.path.isfile(args.filename):
+            err("Not a regular file")
+            return
+        try:
+            with open(args.filename, "rb") as f:
+                file_size = os.fstat(f.fileno()).st_size
+                size = max(0, file_size - args.start)
+                if args.size is not None:
+                    size = min(size, args.size)
+                f.seek(min(args.start, file_size))
+                value = f.read(size)
+        except OSError as exc:
+            err(str(exc))
+            return
+
+        self.out = []
+        self.out.append("Path: {:s}".format(args.filename))
+        self.out.append("FileSize: {:#x}".format(file_size))
+        for bname, bfunc in self.get_valid_base_encode_funcs():
+            if bname == "base1":
+                self.out.append("{:17s}: Skipped because too long".format(bname))
+                continue
+            try:
+                b = bfunc(value)
                 self.out.append("{:17s}: {!s}".format(bname, b))
             except ValueError:
                 self.out.append("{:17s}: ERROR".format(bname))

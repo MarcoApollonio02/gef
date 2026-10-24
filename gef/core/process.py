@@ -372,6 +372,11 @@ def is_x86_32():
     return runtime.current_arch and runtime.current_arch.arch == "X86" and runtime.current_arch.mode == "32"
 
 
+def is_x86():
+    """Architecture determination function for x86-32 or x86-64 or x86_16."""
+    return is_x86_32() or is_x86_64() or is_x86_16()
+
+
 def is_x86_16():
     """Architecture determination function for x86-16."""
     return runtime.current_arch and runtime.current_arch.arch == "X86" and runtime.current_arch.mode == "16"

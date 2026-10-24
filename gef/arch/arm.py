@@ -3,6 +3,7 @@
 import abc
 import ctypes
 import enum
+import re
 import struct
 
 import gdb
@@ -10,6 +11,7 @@ import gdb
 from gef.core import runtime
 from gef.core.arch_base import Architecture
 from gef.core.address import AddressUtil
+from gef.core.auxv import Auxv
 from gef.core.color import Color
 from gef.core.elf import Elf
 from gef.core.exec import ExecAsm
@@ -17,7 +19,7 @@ from gef.core.memory import (read_int_from_memory, read_cstring_from_memory,
                              read_int32_from_memory,
                              read_memory, write_memory, is_valid_addr,
                              u8, u16, u32, u64)
-from gef.core.process import (is_alive, is_in_kernel, is_in_secure, is_rr,
+from gef.core.process import (get_arch, is_alive, is_in_kernel, is_in_secure, is_rr,
                               is_support_secure_world)
 from gef.core.registers import get_register
 from gef.core.utils import GefUtil
@@ -169,6 +171,36 @@ class ARM(Architecture):
     keystone_support = True
     capstone_support = True
     unicorn_support = True
+
+    def supports_interworking(self):
+        if self.is_cortex_m() or self.is_thumb():
+            return True
+        arch = get_arch().lower()
+        if arch in ("armv2", "armv2a", "armv3", "armv4"):
+            return False
+        auxv = Auxv.get_auxiliary_values()
+        if auxv and "AT_HWCAP" in auxv:
+            return bool(auxv["AT_HWCAP"] & (1 << 2)) # HWCAP_THUMB
+        if re.match(r"armv(?:4t|5t|[6-8])", arch):
+            return True
+        return None
+
+    def get_mode_insn(self, name, thumb, interworking=None):
+        if name == "ret" and not thumb:
+            if interworking is None:
+                interworking = self.supports_interworking()
+            if interworking is None:
+                return None
+            if not interworking:
+                return b"\x0e\xf0\xa0\xe1" # mov pc, lr
+        insns = {
+            "nop": (b"\x01\x10\xa0\xe1", b"\x00\xbf"),
+            "infloop": (b"\xfe\xff\xff\xea", b"\xfe\xe7"),
+            "trap": (b"\x70\x00\x20\xe1", b"\x00\xbe"),
+            "ret": (b"\x1e\xff\x2f\xe1", b"\x70\x47"),
+            "syscall": (b"\x00\x00\x00\xef", b"\x00\xdf"),
+        }
+        return insns[name][int(thumb)]
 
     # http://infocenter.arm.com/help/index.jsp?topic=/com.arm.doc.dui0041c/Caccegih.html
     @property
