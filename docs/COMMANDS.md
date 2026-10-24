@@ -7192,6 +7192,118 @@ Simplified Hoard structure:
 * `reapableObjects` is displayed as the number of unused objects left.
 ```
 
+## jemalloc-heap-dump
+
+jemalloc (v3.0~) arena/bin/slab(run)/large/tcache viewer.
+
+
+### Syntax
+
+```text
+usage: jemalloc-heap-dump [-h] [-hh] [-A ARENAS] [-V JEMALLOC_VERSION] [-i ARENA_INDEX] [-b BIN_INDEX] [-x ADDRESS] [-t] [-n] [-q] [-v] [--meta]
+
+options:
+  -h, --help            show this help message and exit
+  -hh, --help-simple    show help without ASCII diagram.
+  -A, --arenas ARENAS   the address of je_arenas (the arena pointer array; v5.x only).
+  -V, --jemalloc-version JEMALLOC_VERSION
+                        the jemalloc version (e.g. 5.3.0) if the embedded version string is not found.
+  -i, --arena-index ARENA_INDEX
+                        dump only the specified arena and the tcaches bound to it.
+  -b, --bin-index BIN_INDEX
+                        dump only the specified size class index (small or large).
+  -x, --address ADDRESS
+                        show the arena, size class, slab region and state of this address.
+  -t, --tcache          also dump the tcache of each thread.
+  -n, --no-pager        do not use the pager.
+  -q, --quiet           quiet mode.
+  -v, --verbose         also dump the state of each region.
+  --meta                display offset information.
+```
+
+### Examples
+
+```gdb
+jemalloc-heap-dump                    # dump small and large allocations of all arenas
+jemalloc-heap-dump -t -i 0            # dump arena[0] and the tcaches bound to it
+jemalloc-heap-dump -t -b 1            # dump bin[1] (size=0x10) of all arenas and tcaches
+jemalloc-heap-dump -x 0x7ffff701d008  # show which region the address belongs to
+```
+
+### Notes
+
+```text
+Simplified jemalloc (v5.x) structure:
+
++-je_arenas[]-+    +-arena_t-----------------+
+| arena[0]    |--->| ...                     |
+| arena[1]    |    | bins[] (v5.2: bins_t)   |
+| ...         |    |  bin_t                  |
++-------------+    |   slabcur               |---------------------------+
+                   |   slabs_nonfull         |--> pairing heap of slabs  |
+                   |   slabs_full            |--> list of slabs          |
+                   |  ...                    |                           |
+                   +-------------------------+                           |
+                                                                         |
+  +----------------------------------------------------------------------+
+  |
+  v
++-extent_t (v5.0~v5.2) / edata_t (v5.3~)-+       +-slab------+
+| e_bits (arena, slab, szind, nfree)     |       | region[0] |
+| e_addr                                 |------>| region[1] |
+| e_size_esn                             |       | ...       |
+| ...                                    |       +-----------+
+| slab_data.bitmap[] (bit=1 means free)  |
++----------------------------------------+
+
++-tsd (TLS)-------------------------------------+
+| tcache.bins_small[] (~v5.2) / bins[] (v5.3~)  |
+|  v5.0~v5.2: avail      -> objs[-ncached..-1]  |
+|  v5.3~    : stack_head -> objs[0..ncached-1]  |
++-----------------------------------------------+
+
+Simplified jemalloc (v3.x/v4.x) structure:
+
++-arena_t-------------+    +-chunk (v3.x: 4MB, v4.x: 2MB)-----------------+
+| ind                 |<---| arena_chunk_t                                |
+| ...                 |    |  arena                                       |
+| bins[]              |    |  map[] / map_bits[] (page state, bin index)  |
+|  arena_bin_t        |    |  map_misc[] (v4.x)                           |
+|   runcur            |--->|   arena_run_t (v4.x: binind, nfree, bitmap)  |
+|   runs (nonfull)    |    |  ...                                         |
++---------------------+    | run pages                                    |
+                           |  arena_run_t (v3.x: bin, nextind, nfree)     |
+                           |  bitmap (v3.x)                               |
+                           |  region[0], region[1], ...                   |
+                           +----------------------------------------------+
+
++-TLS--------------------------------------------------------+
+| tcache_tls (v3.x) / tsd.tcache (v4.x) --> tcache_t.tbins[] |
+|  v3.x~v4.0: avail[0..ncached-1]                            |
+|  v4.1~    : avail -> objs[-ncached..-1]                    |
++------------------------------------------------------------+
+
+* Objects cached in tcache are marked as used in the slab/run bitmap.
+* Full slabs/runs are not linked from the bin. GEF finds them by scanning the
+  writable memory (v5.x shows them as `unlinked`).
+* The offsets vary with the version and the build config.
+  GEF uses debug types if available, else built-in values for the version and
+  the architecture, and derives the arena layout from memory if they disagree.
+* v5.x: if symbols are not available, GEF scans the writable memory for je_arenas.
+* v3.x/v4.x: GEF finds the chunks by scanning memory and reads their arena,
+  so je_arenas is not needed.
+* The page size of jemalloc (--with-lg-page) may differ from that of the system.
+  v3.x/v4.x: GEF uses chunk_npages if debug symbols are available,
+  else derives it from the runs in the chunk page map.
+  v5.x: GEF derives it from the slabs (ARM64 uses 64KB by default since v5.3.1).
+* Large allocations: v3.x/v4.x read the chunk page map; v5.x reads the rtree.
+  v4.x displays the run range: cache-oblivious allocation addresses are randomized within its first page.
+  v4.x/v5.x assume cache-oblivious padding unless debug symbols specify otherwise.
+  v5.3.1~: when large size classes are disabled, the size class index is an upper bound;
+  the displayed allocation size comes from the extent itself.
+* v3.x/v4.x huge allocations (outside arena chunks) and jemalloc v2.x or older are not supported.
+```
+
 ## mimalloc-heap-dump
 
 mimalloc heap free-list viewer (x64 only).
@@ -7497,22 +7609,22 @@ Simplified SSMalloc structure:
 * Allocation from a `dchunk_t` pops `free_head` first; if it is empty, allocation advances `free_mem`.
 ```
 
-## tcmalloc-dump
+## tcmalloc-heap-dump
 
-tcmalloc (google-perftools/gperftools) free-list viewer (x64 only).
+tcmalloc (google-perftools/gperftools) free-list viewer.
 
 
 ### Syntax
 
 ```text
-usage: tcmalloc-dump [-h] [-hh] [-c] [-f] [-n] [-q]
+usage: tcmalloc-heap-dump [-h] [-hh] [-c] [-f] [-n] [-q]
 
 options:
   -h, --help            show this help message and exit
   -hh, --help-simple    show help without ASCII diagram.
   -c, --central         show central cache instead of thread caches.
   -f, --force-heuristic
-                        use heuristic detection.
+                        use heuristic address detection.
   -n, --no-pager        do not use the pager.
   -q, --quiet           quiet mode.
 ```
@@ -7520,13 +7632,18 @@ options:
 ### Examples
 
 ```gdb
-tcmalloc-dump            # print freelist of thread cache for all thread
-tcmalloc-dump --central  # print freelist of central cache
+tcmalloc-heap-dump            # print freelist of thread cache for all thread
+tcmalloc-heap-dump --central  # print freelist of central cache
 ```
 
 ### Notes
 
 ```text
+Debug types are optional; without them, known gperftools layouts are validated against target memory.
+Without symbols, SizeMap and cache addresses are detected from writable memory and TLS.
+Google's separate google/tcmalloc allocator is not supported.
+--central shows transfer-cache chains, not all free objects in spans.
+
 Simplified tcmalloc/gperftools heap structure:
 
 Static Area (Central Cache)
@@ -7534,7 +7651,7 @@ Static Area (Central Cache)
 | Static::sizemap_             |
 |  class_to_size_[class]       |
 +------------------------------+
-| Static::central_cache_[128]  |
+| Static::central_cache_[N]    |
 |  CentralFreeList[class]      |
 |   empty_ / nonempty_         |
 |   tc_slots_[slot].head       |---> free obj -> free obj -> NULL
@@ -7545,10 +7662,10 @@ Static Area (Central Cache)
 
 Thread cache list
 +----------------------------+  +-->+-ThreadCache---------+       +-ThreadCache---------+
-| ThreadCache::thread_heaps_ |--+   | list_[128]          |    +->| list_[128]          |    +-> ...
+| ThreadCache::thread_heaps_ |--+   | list_[N]            |    +->| list_[N]            |    +-> ...
 +----------------------------+      |  FreeList::list_    |--+ |  |  FreeList::list_    |--+ |
                                     |  FreeList::length_  |  | |  |  FreeList::length_  |  | |
-                                    |  FreeList::size_    |  | |  |  FreeList::size_    |  | |
+                                    |  SizeMap[class]     |  | |  |  SizeMap[class ]    |  | |
                                     | next_               |----+  | next_               |----+
                                     | prev_               |  |    | prev_               |  |
                                     +---------------------+  |    +---------------------+  |

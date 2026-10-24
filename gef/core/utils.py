@@ -382,6 +382,73 @@ class GefUtil:
             return None
 
     @staticmethod
+    def cached_lookup_type(type_name):
+        """Look up a GDB type by name and strip typedefs, returning None on failure."""
+        try:
+            return gdb.lookup_type(type_name).strip_typedefs()
+        except RuntimeError:
+            return None
+
+    @staticmethod
+    def lookup_field(type_name, member):
+        """Return a named GDB field, or None. Accept a type name or a gdb.Type."""
+        try:
+            if isinstance(type_name, gdb.Type):
+                struct_type = type_name.strip_typedefs()
+            else:
+                struct_type = GefUtil.cached_lookup_type(type_name)
+            if struct_type is None:
+                return None
+            return struct_type[member]
+        except (gdb.error, KeyError, TypeError):
+            return None
+
+    @staticmethod
+    def type_size(type_name):
+        """Return the size of an exact GDB type name or gdb.Type, or None if unavailable."""
+        try:
+            if isinstance(type_name, gdb.Type):
+                struct_type = type_name.strip_typedefs()
+            else:
+                struct_type = GefUtil.cached_lookup_type(type_name)
+            if struct_type is None:
+                return None
+            return int(struct_type.sizeof)
+        except (gdb.error, TypeError):
+            return None
+
+    @staticmethod
+    def member_type_size(type_name, member):
+        """Return a named field's size in bytes, or None if unavailable."""
+        field = GefUtil.lookup_field(type_name, member)
+        if field is None or field.type is None:
+            return None
+        return GefUtil.type_size(field.type)
+
+    @staticmethod
+    def member_offset(type_name, member):
+        """Return a named field's byte offset, or None for missing fields or bitfields."""
+        try:
+            field = GefUtil.lookup_field(type_name, member)
+            if field is None or field.bitpos is None or field.bitpos % 8 or field.bitsize:
+                return None
+            return field.bitpos // 8
+        except (gdb.error, AttributeError, TypeError):
+            return None
+
+    @staticmethod
+    @Cache.cache_this_session(per_inferior=True, until_new_objfile=True)
+    def sizeof(name):
+        """Return sizeof(name) from the loaded debug information, or None if unavailable or 0 (incomplete type).
+        `name` is a C type or expression such as `struct file`; a bare name means a struct."""
+        if " " not in name:
+            name = "struct " + name
+        try:
+            return to_unsigned_long(gdb.parse_and_eval("sizeof({:s})".format(name))) or None
+        except gdb.error:
+            return None
+
+    @staticmethod
     def get_tqdm(use_tqdm=True):
         """Return the tqdm progress bar if available and enabled;
         otherwise returns a passthrough function."""

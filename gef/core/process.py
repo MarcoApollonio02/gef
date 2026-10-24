@@ -527,6 +527,41 @@ def is_csky():
     return runtime.current_arch and runtime.current_arch.arch == "CSKY"
 
 
+ARCH_CHECKERS = {
+    "x86_32": is_x86_32,
+    "x86_64": is_x86_64,
+    "x86_16": is_x86_16,
+    "ARM32": is_arm32,
+    "ARM32M": is_arm32_cortex_m,
+    "ARM64": is_arm64,
+    "MIPS32": is_mips32,
+    "MIPS64": is_mips64,
+    "MIPSN32": is_mipsn32,
+    "PPC32": is_ppc32,
+    "PPC64": is_ppc64,
+    "SPARC32": is_sparc32,
+    "SPARC32PLUS": is_sparc32plus,
+    "SPARC64": is_sparc64,
+    "RISCV32": is_riscv32,
+    "RISCV64": is_riscv64,
+    "S390X": is_s390x,
+    "SH4": is_sh4,
+    "M68K": is_m68k,
+    "ALPHA": is_alpha,
+    "HPPA32": is_hppa32,
+    "HPPA64": is_hppa64,
+    "OR1K": is_or1k,
+    "NIOS2": is_nios2,
+    "MICROBLAZE": is_microblaze,
+    "XTENSA": is_xtensa,
+    "CRIS": is_cris,
+    "LOONGARCH64": is_loongarch64,
+    "ARC32": is_arc32,
+    "ARC64": is_arc64,
+    "CSKY": is_csky,
+}
+
+
 @Cache.cache_until_next
 def get_arch():
     """Return the binary's architecture."""
