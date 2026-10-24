@@ -140,6 +140,24 @@ class Symbol:
             return None
 
     @staticmethod
+    def resolve_kdb_address(name):
+        """resolve_kdb_address("_stext") -> 0xffffffff81000000.
+        resolve_kdb_address("missing") -> None.
+        """
+        if not is_kdb():
+            return None
+        text = gdb.execute("monitor {:s}".format(name), to_string=True)
+        match = re.search(re.escape(name) + r" = 0x([0-9a-fA-F]+)\b", text)
+        if not match:
+            return None
+        address = int(match.group(1), 16)
+        if is_valid_addr(address):
+            return address
+        else:
+            return None
+
+
+    @staticmethod
     @Cache.cache_this_session(until_new_objfile=True)
     def lookup_gdb(address):
         """lookup_gdb(0x401042) -> ("main", 0x42).

@@ -2909,6 +2909,450 @@ class Kernel:
 
 
 
+    @staticmethod
+    def get_ith_parameter(i, asmlinkage=False):
+        if is_x86_32() and not asmlinkage:
+            if i < 3:
+                key = ["$eax", "$edx", "$ecx"][i]
+                value = get_register(key)
+            else:
+                offset = runtime.current_arch.ptrsize * (i - 2)
+                key, value = "[sp + {:#x}]".format(offset), read_int_from_memory(runtime.current_arch.sp + offset)
+        else:
+            key, value = runtime.current_arch.get_ith_parameter(i)
+        if value is None:
+            raise gdb.error("Argument {:d} ({:s}) is unavailable".format(i, key))
+        return key, value
+
+    @staticmethod
+    def get_return_address():
+        """Read the return address at a normal function entry."""
+        if is_x86():
+            return read_int_from_memory(runtime.current_arch.sp)
+        if is_arm64():
+            return get_register("$x30")
+        if is_arm32():
+            lr = get_register("$lr")
+            if lr is not None:
+                return lr & ~1
+            return None
+        return None
+
+    @staticmethod
+    def get_call_context(task_addr, at_return=False):
+        thread = gdb.selected_thread()
+        connection = getattr(thread.inferior, "connection_num", None) or thread.inferior.num
+        if task_addr:
+            identity = ("task", connection, task_addr)
+        else:
+            identity = ("thread", thread.inferior.num, thread.ptid)
+        sp = runtime.current_arch.sp
+        if at_return and is_x86():
+            sp -= runtime.current_arch.ptrsize
+        return identity, sp
+
+    @staticmethod
+    def get_interrupt_context():
+        thread = gdb.selected_thread()
+        if is_x86():
+            reg, mask = "$eflags", 0x200
+        elif is_arm32():
+            reg, mask = "$cpsr", 0x1df
+        elif is_arm64():
+            reg, mask = "$cpsr", 0x3cf
+        else:
+            return thread.inferior.num, thread.ptid, None
+        state = get_register(reg)
+        return thread.inferior.num, thread.ptid, state & mask if state is not None else None
+
+    @staticmethod
+    def version():
+        """Return the version of the running kernel, or the one specified by `kversion VERSION`."""
+        override = KernelVersion.get_override()
+        if override is not None:
+            return override
+        return KernelVersion.detect()
+
+    @staticmethod
+    @Cache.cache_this_session(cache_None=False, per_inferior=True)
+    def cmdline():
+
+        def get_saved_command_line_candidates():
+            if is_kdb():
+                yield Symbol.resolve_kdb_address("saved_command_line")
+            # cmdline_proc_show used by the heuristic does not exist when CONFIG_PROC_FS=n
+            if KernelAddressHeuristicFinder.USE_DIRECTLY:
+                yield Ksym.get_addr("saved_command_line")
+            yield KernelAddressHeuristicFinder.get_saved_command_line()
+
+        if is_kgdb(): # read_memory when kgdb is very slow
+            block_size = 64
+        else:
+            block_size = get_pagesize()
+        max_length = 0x10000
+        seen = set()
+        for saved_command_line in get_saved_command_line_candidates():
+            if saved_command_line is None or saved_command_line in seen:
+                continue
+            seen.add(saved_command_line)
+
+            ptr = read_int_from_memory(saved_command_line, safe=True)
+            if not ptr:
+                continue
+            data = b""
+            while len(data) < max_length and b"\0" not in data:
+                addr = ptr + len(data)
+                try:
+                    data += read_memory(addr, min(block_size - addr % block_size, max_length - len(data)))
+                except gdb.error:
+                    break
+            if not data:
+                continue
+
+            # keep non-printable bytes visible instead of failing (e.g., non-ASCII boot arguments)
+            complete = b"\0" in data
+            data = data.split(b"\0")[0]
+            cmdline = "".join(chr(c) if chr(c) in String.STRING_PRINTABLE else "\\x{:02x}".format(c) for c in data)
+            Kcmdline = collections.namedtuple("Kcmdline", ["address", "cmdline", "complete"])
+            return Kcmdline(ptr, cmdline, complete)
+        return None
+
+    @staticmethod
+    def layout(use_iomem=True):
+        """Return the kernel memory layout. See `KernelLayout.current()`."""
+        return KernelLayout.current(use_iomem)
+
+    @staticmethod
+    def per_cpu():
+        """Return the per-cpu resolver of the selected CPU."""
+        return KernelPerCpu.get_instance()
+
+    @staticmethod
+    def path():
+        """Return the pathname resolver."""
+        return KernelPath.get_instance()
+
+    @staticmethod
+    def file_system():
+        """Return the file system resolver."""
+        return KernelFileSystem.get_instance()
+
+    @staticmethod
+    def task(init_task=None):
+        """Return the task_struct resolver."""
+        return KernelTask.get_instance(init_task)
+
+    @staticmethod
+    def cred():
+        """Return the `struct cred` resolver."""
+        return KernelCred.get_instance()
+
+    @staticmethod
+    def mm():
+        """Return the VMA resolver."""
+        return KernelMM.get_instance()
+
+    @staticmethod
+    def pipe():
+        """Return the pipe resolver."""
+        return KernelPipe.get_instance()
+
+    @staticmethod
+    def socket():
+        """Return the socket resolver."""
+        return KernelSocket.get_instance()
+
+    @staticmethod
+    def skb():
+        """Return the sk_buff resolver."""
+        return KernelSkbuff.get_instance()
+
+    @staticmethod
+    def ipcs():
+        """Return the System V IPC resolver."""
+        return KernelIpcs.get_instance()
+
+    @staticmethod
+    def dmabuf():
+        """Return the DMA-BUF resolver."""
+        return KernelDmabuf.get_instance()
+
+    @staticmethod
+    def bpf():
+        """Return the BPF resolver."""
+        return KernelBpf.get_instance()
+
+    @staticmethod
+    def seccomp():
+        """Return the seccomp resolver."""
+        return KernelSeccomp.get_instance()
+
+    @staticmethod
+    def modules():
+        """Return the kernel module resolver."""
+        return KernelModule.get_instance()
+
+    @staticmethod
+    def sysctl():
+        """Return the sysctl resolver."""
+        return KernelSysctl.get_instance()
+
+    @staticmethod
+    def nftables():
+        """Return the nftables resolver."""
+        return KernelNftables.get_instance()
+
+    @staticmethod
+    def sched():
+        """Return the scheduling-field resolver."""
+        return KernelSched.get_instance()
+
+    @staticmethod
+    def slub(no_xor=False, byte_swap=None, offset_random=None, offset_node=None):
+        """Return the SLUB resolver."""
+        return KernelSlub.get_instance(no_xor, byte_swap, offset_random, offset_node)
+
+    @staticmethod
+    def slub_tiny():
+        """Return the SLUB-TINY resolver."""
+        return KernelSlubTiny.get_instance()
+
+    @staticmethod
+    def slab():
+        """Return the SLAB resolver."""
+        return KernelSlab.get_instance()
+
+    @staticmethod
+    def slob():
+        """Return the SLOB resolver."""
+        return KernelSlob.get_instance()
+
+    @staticmethod
+    def buddy(migrate_pcptypes=3):
+        """Return the buddy allocator resolver."""
+        return KernelBuddy.get_instance(migrate_pcptypes)
+
+    @staticmethod
+    def export_meta(command, meta, demote_err=False):
+        """Convert the meta lines recorded by a kernel resolver into the (printer, line) pairs of `command`."""
+        if demote_err:
+            err = command.quiet_warn
+        else:
+            err = command.quiet_err
+        level_map = {"info": command.quiet_info, "warn": command.quiet_warn, "err": err}
+        return [(level_map[level], line) for level, line in meta]
+
+    @staticmethod
+    @Cache.cache_this_session(cache_None=False, per_inferior=True)
+    def get_slab_type():
+        if not is_alive():
+            return None
+        # Cases where ksymaddr-remote is not working properly
+        if not Ksym.get_addr("commit_creds"):
+            return "Unknown"
+
+        if Ksym.get_addrs("slub_", match="in"):
+            kversion = Kernel.version()
+            if kversion < "6.2":
+                return "SLUB"
+            elif kversion < "7.0":
+                # care for both deactivate_slab and deactivate_slab.cold
+                if Ksym.get_addrs("deactivate_slab", match="in"):
+                    return "SLUB"
+                else:
+                    return "SLUB_TINY"
+            else: # kversion >= "7.0"
+                # If CONFIG_SLUB_TINY=y, calculate_sheaf_capacity is a small function that returns 0.
+                calculate_sheaf_capacity_size = Ksym.get_func_size("calculate_sheaf_capacity")
+                if calculate_sheaf_capacity_size is None:
+                    return "SLUB"
+                if calculate_sheaf_capacity_size <= 0x20:
+                    return "SLUB_TINY"
+                else:
+                    return "SLUB"
+
+        # care for both cache_reap and cache_reap.cold
+        if Ksym.get_addrs("cache_reap", match="in"):
+            return "SLAB"
+
+        if Ksym.get_addrs("slob_", match="in"):
+            return "SLOB"
+        return "Unknown"
+
+    @staticmethod
+    @Cache.cache_this_session(per_inferior=True)
+    def slab_page_str():
+        kversion = Kernel.version()
+        if kversion < "5.17":
+            return "page"
+        else:
+            return "slab"
+
+    @staticmethod
+    @Cache.cache_this_session(cache_None=False, per_inferior=True)
+    def get_page_virt_pair():
+        if not is_alive():
+            return None
+        allocator = Kernel.get_slab_type()
+
+        kversion = Kernel.version()
+        if is_kgdb() and allocator in ("SLAB", "SLUB_TINY") and kversion and kversion >= "3.13":
+            if allocator == "SLAB":
+                resolver = Kernel.slab()
+                if resolver.initialize():
+                    caches = resolver.walk_caches(["kmalloc-256"], [], simple=True)
+                    for cache in caches[1:]:
+                        for node in cache.get("nodes", []):
+                            for page in node.values():
+                                for entry in page:
+                                    if entry.get("s_mem_base"):
+                                        return entry["address"], entry["s_mem_base"]
+            else:
+                resolver = Kernel.slub_tiny()
+                if resolver.initialize():
+                    for size in (8, 16, 32, 64, 128, 192, 256, 512):
+                        caches = resolver.walk_caches(["kmalloc-{:d}".format(size)], simple=True, skip_page2virt=True)
+                        for cache in caches[1:]:
+                            for node in cache.get("nodes", []):
+                                for page in node:
+                                    if page.get("virt_addr"):
+                                        return page["address"], page["virt_addr"]
+            return False
+
+        if allocator in ["SLUB", "SLUB_TINY"]:
+            # get valid page and vaddr pair
+            command = {"SLUB": "slub-dump --node --skip-sheaf", "SLUB_TINY": "slub-tiny-dump"}[allocator]
+            for n in [8, 16, 32, 64, 128, 192, 256, 512]:
+                # this function calls slub-dump, but it called from slub-dump itself.
+                # * get_page_virt_pair
+                #   -> slub-dump    <-- first
+                #     -> page2virt
+                #       -> get_VMEMMAP_START
+                #         -> get_page_virt_pair
+                #           -> slub-dump    <-- recursively
+                # To avoid infinite recursion, must add the `--skip-page2virt` option
+                # when calling slub-dump from page2virt.
+                ret = gdb.execute(
+                    "{:s} --simple --no-pager --quiet --skip-page2virt kmalloc-{:d}".format(command, n),
+                    to_string=True,
+                )
+                r1 = re.findall(r"(?:active|partial|node) page: (0x\S\S+)", Color.remove_color(ret))
+                r2 = re.findall(r"virtual address: (0x\S+|\?\?\?)", Color.remove_color(ret))
+                valid_pairs = [(p, v) for p, v in zip(r1, r2) if v != "???"]
+                if valid_pairs:
+                    page = int(valid_pairs[0][0], 16)
+                    vaddr = int(valid_pairs[0][1], 16)
+                    break
+            else:
+                return False
+
+        elif allocator == "SLAB":
+            if Kernel.version() < "3.13":
+                return Kernel.slab().get_legacy_page_virt_pair()
+            # get valid page and vaddr pair
+            ret = gdb.execute("slab-dump --simple --cpu 0 --no-pager --quiet kmalloc-256", to_string=True)
+            r1 = re.search(r"node\[\d+\]\.slabs_(?:partial|full): (0x\S+)", Color.remove_color(ret))
+            r2 = re.search(r"virtual address \(s_mem & ~0x[0-9a-f]+\): (0x\S+)", Color.remove_color(ret))
+            if not r1 or not r2:
+                return False
+            page = int(r1.group(1), 16)
+            vaddr = int(r2.group(1), 16)
+
+        elif allocator == "SLOB":
+            # get valid page and vaddr pair
+            ret = gdb.execute("slob-dump --simple --large --no-pager --quiet", to_string=True)
+            r1 = re.search(r"page: (0x\S+)", Color.remove_color(ret))
+            r2 = re.search(r"virtual address: (0x\S+)", Color.remove_color(ret))
+            if not r1 or not r2:
+                return False
+            page = int(r1.group(1), 16)
+            vaddr = int(r2.group(1), 16)
+
+        else:
+            return False
+
+        return page, vaddr
+
+    @staticmethod
+    @Cache.cache_until_next(per_inferior=True)
+    def get_slab_contains(addr, allow_unaligned=False, keep_color=False):
+        if not is_valid_addr(addr):
+            return None
+        ret = gdb.execute("slab-contains --quiet {:#x}".format(addr), to_string=True).strip()
+        ret_plain = Color.remove_color(ret)
+        # an unsupported architecture or allocator prints a message instead
+        if not re.search(r"^name: ", ret_plain, re.M):
+            return None
+        if "before first object" in ret_plain or "after last object" in ret_plain:
+            return None
+        if not allow_unaligned and "remarks: unaligned" in ret_plain:
+            return None
+        if keep_color:
+            return ret
+        return ret_plain
+
+    @staticmethod
+    @Cache.cache_until_next(per_inferior=True)
+    def get_slab_object(addr):
+        """Return the dict of the slab object that contains `addr` resolved as `slab-contains`, or None."""
+        if Kernel.get_slab_type() not in ["SLUB", "SLUB_TINY", "SLAB"] or not (is_x86() or is_arm32() or is_arm64()):
+            return None
+        obj = __gef_command_instances__["slab-contains"].get_slab_object(addr)
+        if obj["error"]:
+            return None
+        return obj
+
+    @staticmethod
+    def get_slab_caches(target_names=()):
+        """Return (allocator, [kmem_cache, ...]) parsed by the resolver of the running allocator.
+        Each kmem_cache is an allocator-specific dict. The list is None if they cannot be parsed."""
+        allocator = Kernel.get_slab_type()
+        resolver_factory = {
+            "SLUB": Kernel.slub, "SLUB_TINY": Kernel.slub_tiny, "SLAB": Kernel.slab, "SLOB": Kernel.slob,
+        }.get(allocator)
+        if resolver_factory is None or not (is_x86() or is_arm32() or is_arm64()):
+            return allocator, None
+        try:
+            return allocator, resolver_factory().get_kmem_caches(target_names)
+        except gdb.error:
+            return allocator, None
+
+    @staticmethod
+    def page2virt(page):
+        ret = gdb.execute("page2virt {:#x}".format(page), to_string=True)
+        for line in ret.splitlines():
+            r = re.search(r"Virt: (\S+)", line)
+            if r:
+                virt = int(r.group(1), 16)
+                if KernelAddressHeuristicFinderUtil.is_kernel_space(virt):
+                    return virt
+        return None
+
+    @staticmethod
+    def page2phys(page):
+        ret = gdb.execute("page2phys {:#x}".format(page), to_string=True)
+        r = re.search(r"Phys: (\S+)", ret)
+        if r:
+            return int(r.group(1), 16)
+        return None
+
+    @staticmethod
+    def virt2page(virt):
+        ret = gdb.execute("virt2page {:#x}".format(virt), to_string=True)
+        r = re.search(r"Page: (\S+)", ret)
+        if r:
+            return int(r.group(1), 16)
+        return None
+
+    @staticmethod
+    def phys2page(phys):
+        ret = gdb.execute("phys2page {:#x}".format(phys), to_string=True)
+        r = re.search(r"Page: (\S+)", ret)
+        if r:
+            return int(r.group(1), 16)
+        return None
+
+
 class KernelListHead:
     """Parse Linux circular doubly-linked lists.
 
@@ -7898,4 +8342,557 @@ class Ksym:
             Ksym.Config.updates = updates
         return result
 
+
+class KernelLayout:
+    """Resolved kernel memory layout."""
+
+    fields = (
+        "maps",
+        "text_base", "text_end",
+        "ro_base", "ro_end",
+        "rw_base", "rw_end",
+        "rwx",
+    )
+
+    # Keep this uncached so the kallsyms refinement can change later.
+    @staticmethod
+    def current(use_iomem=True):
+        """Resolve the kernel memory layout.
+        It is refined in two stages. `resolve()` uses the page-table mappings and the iomem resource tree,
+        and is cached for each `use_iomem`. `refine_by_kallsyms()` is applied on each call,
+        because kallsyms may become available after the base layout has already been cached.
+        `use_iomem` controls whether the iomem resource tree is used to refine the kernel text base
+        and .data/.bss range. GEF internals disable it while resolving symbols and resources
+        to avoid circular dependencies.
+        """
+        return KernelLayout.resolve(use_iomem).refine_by_kallsyms()
+
+    def __init__(self, maps=None,
+                 text_base=None, text_end=None,
+                 ro_base=None, ro_end=None,
+                 rw_base=None, rw_end=None,
+                 rwx=False):
+        if maps is not None:
+            self.maps = maps
+        else:
+            self.maps = []
+        self.text_base = text_base
+        self.text_end = text_end
+        self.ro_base = ro_base
+        self.ro_end = ro_end
+        self.rw_base = rw_base
+        self.rw_end = rw_end
+        self.rwx = rwx
+        return
+
+    @property
+    def text_size(self):
+        """Return the size of the kernel text area."""
+        if self.text_base is None or self.text_end is None:
+            return None
+        return self.text_end - self.text_base
+
+    @property
+    def ro_size(self):
+        """Return the size of the kernel read-only area."""
+        if self.ro_base is None or self.ro_end is None:
+            return None
+        return self.ro_end - self.ro_base
+
+    @property
+    def rw_size(self):
+        """Return the size of the kernel read-write area."""
+        if self.rw_base is None or self.rw_end is None:
+            return None
+        return self.rw_end - self.rw_base
+
+    @property
+    def is_complete(self):
+        """Return whether every part of the kernel memory layout is resolved."""
+        return bool(self.maps) and all(
+            getattr(self, field) is not None for field in self.fields if field != "maps"
+        )
+
+    def replace(self, **changes):
+        """Return a copy with the specified fields replaced."""
+        values = {field: getattr(self, field) for field in self.fields}
+        values.update(changes)
+        return type(self)(**values)
+
+    # No caching intentionally
+    @staticmethod
+    def get_exception_vector():
+        """Return the runtime address of an exception entry in the kernel text, or None.
+        x86: the #DE handler, ARM32: a handler of the vector page, ARM64: `VBAR`, RISC-V: `stvec`."""
+
+        # This function is designed for the case where the symbol is not available.
+        # Do not use Ksym.get_addr.
+
+        if is_x86():
+            if is_qemu_system():
+                # [5.8~]
+                # 0   #DE: Divide-by-zero ... 0x0010:0xffffffff82c01030 <asm_exc_divide_error>
+                # [~5.7]
+                # 0   #DE: Divide-by-zero ... 0x0010:0xffffffff8178cfc0 <divide_error>
+                res = gdb.execute("idtinfo -n", to_string=True)
+                r = re.search(r"Divide-by-zero.+\S+:(\S+)\s+<", res)
+                if r:
+                    div0_handler = int(r.group(1), 16)
+                    if is_valid_addr(div0_handler):
+                        return div0_handler
+
+            elif is_vmware():
+                base, limit = GefUtil.get_x86_descriptor_table_register("idtr")
+                if base is not None:
+                    idt_data = read_memory(base, min(limit + 1, runtime.current_arch.ptrsize * 2 * 256))
+                    entries = slice_unpack(idt_data, runtime.current_arch.ptrsize * 2)
+                    # Late import: command modules sit above core in the layering.
+                    from gef.commands.kernel.register import IdtInfoCommand
+
+                    idt0 = IdtInfoCommand.idt_unpack(entries[0])
+                    div0_handler = idt0.offset
+                    if is_valid_addr(div0_handler):
+                        return div0_handler
+
+            elif is_kdb(): # not kgdb
+                r = Symbol.resolve_kdb_address("asm_exc_divide_error")
+                if r:
+                    return r
+                r = Symbol.resolve_kdb_address("divide_error")
+                if r:
+                    return r
+
+        elif is_arm32():
+            # The vector page is copied independently of the kernel image. Its
+            # second page starts with pointers to core exception handlers, so it
+            # remains a reliable hint even when execution is stopped in a module.
+            # A kernel running in the secure state (e.g., vexpress-a9 without firmware) uses the banked
+            # secure registers, so they are tried too.
+            vector_bases = []
+            for sctlr_regs, vbar_regs in [
+                (("$SCTLR", "$SCTLR_EL1"), ("$VBAR", "$VBAR_EL1")),
+                (("$SCTLR_S", "$SCTLR_EL1_S"), ("$VBAR_S", "$VBAR_EL1_S")),
+            ]:
+                sctlr = get_register(sctlr_regs[0])
+                if sctlr is None:
+                    sctlr = get_register(sctlr_regs[1])
+                vbar = get_register(vbar_regs[0])
+                if vbar is None:
+                    vbar = get_register(vbar_regs[1])
+                # SCTLR.V overrides VBAR and selects the high-vector page.
+                vector_bases.append(0xffff_0000 if (sctlr or 0) & (1 << 13) else (vbar or 0))
+            for vector_base in dict.fromkeys(vector_bases):
+                data = read_memory(vector_base + get_pagesize(), 0x10, safe=True)
+                if data is None:
+                    continue
+                for handler in slice_unpack(data, 4):
+                    if 0x4000_0000 <= handler < 0xff00_0000 and handler & 3 == 0 and is_valid_addr(handler):
+                        return handler
+
+        elif is_arm64():
+            # `VBAR` register has interrupt vector address
+            vbar = get_register("$VBAR")
+            if vbar is None:
+                vbar = get_register("$VBAR_EL1")
+            if is_valid_addr(vbar):
+                return vbar
+
+        elif is_riscv32() or is_riscv64():
+            # `stvec` register has interrupt vector address
+            stvec = get_register("stvec")
+            if is_valid_addr(stvec):
+                return stvec
+
+        return None
+
+    @staticmethod
+    @Cache.cache_this_session(per_inferior=True)
+    def resolve(use_iomem=True):
+        """Resolve the layout from the page-table mappings, and refine it from the iomem resource tree
+        if `use_iomem`. The result is cached for each `use_iomem`."""
+        dic = {
+            "maps": [], "text_base": None, "text_end": None, "ro_base": None, "ro_end": None,
+            "rw_base": None, "rw_end": None, "rwx": False,
+        }
+
+        if is_kdb():
+            # no-symbol, but monitor may be used
+            # The head of newer ARM64 (`_text` to `_stext`) is not mapped
+            dic["text_base"] = Symbol.resolve_kdb_address("_text")
+            if not dic["text_base"] or not is_valid_addr(dic["text_base"]):
+                dic["text_base"] = Symbol.resolve_kdb_address("_stext")
+            dic["text_end"] = Symbol.resolve_kdb_address("_etext")
+            dic["rw_base"] = Symbol.resolve_kdb_address("_sdata")
+            dic["rw_end"] = Symbol.resolve_kdb_address("_edata")
+            dic["ro_base"] = Symbol.resolve_kdb_address("__start_rodata")
+            dic["ro_end"] = Symbol.resolve_kdb_address("__end_rodata_aligned") or Symbol.resolve_kdb_address("__end_rodata")
+            return KernelLayout.build(dic, use_iomem)
+
+        if is_kgdb():
+            # use symbol
+            # The head of newer ARM64 (`_text` to `_stext`) is not mapped
+            dic["text_base"] = Ksym.get_addr("_text")
+            if not dic["text_base"] or not is_valid_addr(dic["text_base"]):
+                dic["text_base"] = Ksym.get_addr("_stext")
+            dic["text_end"] = Ksym.get_addr("_etext")
+            dic["rw_base"] = Ksym.get_addr("_sdata")
+            dic["rw_end"] = Ksym.get_addr("_edata")
+            dic["ro_base"] = Ksym.get_addr("__start_rodata")
+            dic["ro_end"] = Ksym.get_addr("__end_rodata_aligned") or Ksym.get_addr("__end_rodata")
+            return KernelLayout.build(dic, use_iomem)
+
+        # Could not find the maps, so fast return
+        dic["maps"] = AddrMap.get_maps(scope="kernel")
+        if not dic["maps"]:
+            return KernelLayout.build(dic, use_iomem)
+
+        # 1a. search for the kernel base exact way
+        if is_x86():
+            div0_handler = KernelLayout.get_exception_vector()
+            if div0_handler is not None:
+                for i, entry in enumerate(dic["maps"]):
+                    if entry.contains_virtual(div0_handler):
+                        dic["text_base"] = entry.vstart
+                        dic["text_end"] = entry.vend
+                        text_base_map_index = i
+                        break
+
+        elif is_arm32():
+            vector_handler = KernelLayout.get_exception_vector()
+            if vector_handler is not None:
+                for i, entry in enumerate(dic["maps"]):
+                    if entry.contains_virtual(vector_handler):
+                        dic["text_base"] = entry.vstart
+                        dic["text_end"] = entry.vend
+                        text_base_map_index = i
+                        break
+
+        elif is_arm64():
+            vbar = KernelLayout.get_exception_vector()
+            if vbar is not None:
+                for i, entry in enumerate(dic["maps"]):
+                    if entry.contains_virtual(vbar):
+                        dic["text_base"] = entry.vstart
+                        dic["text_end"] = entry.vend
+                        text_base_map_index = i
+                        break
+
+        elif is_riscv64() or is_riscv32():
+            stvec = KernelLayout.get_exception_vector()
+            if stvec is not None:
+                for i, entry in enumerate(dic["maps"]):
+                    if entry.contains_virtual(stvec):
+                        dic["text_base"] = entry.vstart
+                        dic["text_end"] = entry.vend
+                        text_base_map_index = i
+                        break
+
+        # 1b. search for the kernel base heuristic way
+        if dic["text_base"] is None:
+            # .text is usually noticeably larger than other areas.
+            # It just determines this size heuristically and detects it, but it works well in most cases.
+            TEXT_REGION_MIN_SIZE = 0x100000
+
+            for i, entry in enumerate(dic["maps"]):
+                if str(entry.permission) == "r-x" and entry.vsize >= TEXT_REGION_MIN_SIZE:
+                    dic["text_base"] = entry.vstart
+                    dic["text_end"] = entry.vend
+                    text_base_map_index = i
+                    break
+            else:
+                # not found, maybe old kernel
+                for i, entry in enumerate(dic["maps"]):
+                    if str(entry.permission) == "rwx" and entry.vsize >= TEXT_REGION_MIN_SIZE:
+                        dic["text_base"] = entry.vstart
+                        dic["text_end"] = entry.vend
+                        text_base_map_index = i
+                        break
+                else:
+                    # Not found, so fast return
+                    return KernelLayout.build(dic, use_iomem)
+
+        # 2a. search for the kernel RO base
+        # If the `-enable-kvm` option for qemu-system is not enabled,
+        # there might be multiple 'r-- but non-.rodata' regions between .text and .rodata.
+        #   [  .text    ]
+        #   [  .text    ]
+        #   [ ??? (r--) ]
+        #   [ ??? (r--) ]
+        #   [ ??? (r--) ]
+        #   [ .rodata   ] <- near the top of this area has "Linux version"
+        #   [ .rodata   ]
+        # In other words, .rodata may not be located immediately after .text.
+        # This has been observed on qemu with Debian 11 on x86_64.
+        # Therefore, detection based solely on location may produce incorrect results.
+        # As a result, detection also checks for the presence of the string "Linux version"
+        # near the beginning of the .rodata page.
+        for i, entry in enumerate(dic["maps"][text_base_map_index + 1:]):
+            if str(entry.permission) == "r--":
+                if dic["ro_base"] is None:
+                    if not is_valid_addr(entry.vstart):
+                        continue
+                    data = read_memory(entry.vstart, get_pagesize())
+                    if b"Linux version" in data:
+                        dic["ro_base"] = entry.vstart
+                        dic["ro_end"] = entry.vend
+                        ro_base_map_index = text_base_map_index + 1 + i
+                elif dic["ro_end"] == entry.vstart:
+                    # merge contiguous region.
+                    # This is important because .rodata may be split into GLOBAL and non-GLOBAL areas.
+                    dic["ro_end"] = entry.vend
+                    ro_base_map_index = text_base_map_index + 1 + i
+                else:
+                    break
+
+        # 2b. search for the kernel RO base by region size
+        # Some kernels do not have the string "Linux version" at the beginning of the .rodata.
+        #   [  .text    ]
+        #   [  .text    ]
+        #   [ ??? (r--) ]
+        #   [ ??? (r--) ]
+        #   [ ??? (r--) ]
+        #   [ .rodata   ] <- There is no "Linux Version" near the top of this area.
+        #   [ .rodata   ] <- but these .rodata total is large enough to determine .rodata.
+        #   [ .rodata   ]
+        if dic["ro_base"] is None:
+            RO_REGION_MIN_SIZE = 0x100000
+            for i, entry in enumerate(dic["maps"][text_base_map_index + 1:]):
+                if str(entry.permission) == "r--":
+                    if dic["ro_base"] is None:
+                        if entry.vsize >= RO_REGION_MIN_SIZE:
+                            dic["ro_base"] = entry.vstart
+                            dic["ro_end"] = entry.vend
+                            ro_base_map_index = text_base_map_index + 1 + i
+                    elif dic["ro_end"] == entry.vstart:
+                        # merge contiguous region.
+                        # This is important because .rodata may be split into GLOBAL and non-GLOBAL areas.
+                        dic["ro_end"] = entry.vend
+                        ro_base_map_index = text_base_map_index + 1 + i
+                    else:
+                        break
+
+        # 2c. search for the kernel RO base for old kernel
+        # If it can not detect .rodata, maybe it is an old kernel (32-bit?).
+        # Old kernel is no-NX, so .rodata is RWX.
+        # Detected .text range includes .rodata, so use heuristic search and split.
+        #   [  .text  ] <- maybe .text is larger than 0x8000 (it fails in certain cases if 0x7000)
+        #   [  .text  ]
+        #   [  .text  ]
+        #   [  .text  ] <- end of this area has [0x00, 0x00, 0x00, ...]
+        #   [ .rodata ] <- near the top of this area has "Linux version"
+        #   [ .rodata ]
+        #   [ .rodata ]
+        if dic["ro_base"] is None:
+            dic["rwx"] = True
+            start = dic["text_base"] + get_pagesize() * 8
+            end = dic["text_end"]
+
+            # .rodata may start in the middle of the page where .text ends (e.g., RISC-V v5.4), so that page
+            # is not preceded by zeros, and the first record of the printk buffer (.bss) is picked instead.
+            # linux_banner ends with a newline and NUL unlike the record, so the page containing it is tried first.
+            ro_base = None
+            chunk_size = 0x10_0000
+            for addr in range(start, end, chunk_size):
+                # read a little more to find the banner across the chunk boundary
+                data = read_memory(addr, min(chunk_size + 0x200, end - addr), safe=True)
+                if data is None:
+                    continue
+                r = re.search(rb"Linux version \d+\.\d+\.\d+[ -~]+\n\0", data)
+                if r and r.start() < chunk_size:
+                    ro_base = (addr + r.start()) & get_pagesize_mask_high()
+                    break
+
+            if ro_base is None:
+                block_size = 0x20
+                zero_data = b"\0" * block_size
+                for addr in range(start, end, get_pagesize()):
+                    data_prev = read_memory(addr - block_size, block_size)
+                    if data_prev == zero_data:
+                        data = read_memory(addr, get_pagesize())
+                        if b"Linux version" in data:
+                            ro_base = addr
+                            break
+                else:
+                    # Not found, so fast return
+                    return KernelLayout.build(dic, use_iomem)
+
+            dic["ro_base"] = ro_base
+            # Without strict RWX, old RISC-V kernels (e.g., v5.4) map the image in the linear map, and this mapping
+            # continues up to the end of RAM. Cap .rodata to a plausible size, otherwise the kallsyms scan takes
+            # minutes. The end is refined later from kallsyms.
+            dic["ro_end"] = min(end, ro_base + max((ro_base - dic["text_base"]) * 2, 0x100_0000))
+            dic["text_end"] = ro_base
+            # In this case, rw_base is not detected from the mapping,
+            # but it is refined later from the iomem resource tree or kallsyms.
+            dic["rw_base"] = 0
+            dic["rw_end"] = 0
+
+        else:
+            # 3. Search for the kernel RW base.
+            # If ro_base can be detected, the RW area is searched starting after ro_base.
+            # TODO: A fixed size is currently used, but better algorithms may exist.
+            RW_REGION_MIN_SIZE = 0x20000
+            if dic["ro_base"] is not None:
+                # x86_64 aligns the end of .rodata to 2 MiB and frees the gap before `_sdata`,
+                # but the gap may remain mapped as RW. So .data starts at the next 2 MiB boundary.
+                if is_x86_64():
+                    rw_search_base = align(dic["ro_end"], 0x200000)
+                else:
+                    rw_search_base = dic["ro_end"]
+                for entry in dic["maps"][ro_base_map_index + 1:]:
+                    if dic["rw_base"] is None:
+                        vstart = max(entry.vstart, rw_search_base)
+                        if str(entry.permission) in ("rw-", "rwx") and entry.vend - vstart >= RW_REGION_MIN_SIZE:
+                            dic["rw_base"] = vstart
+                            dic["rw_end"] = entry.vend
+                    elif dic["rw_end"] == entry.vstart:
+                        # merge contiguous region.
+                        # This is important because a page that was freed from an alignment gap
+                        # of the image and later reused may get its permission changed, which
+                        # splits .data/.bss into pieces at a boot-dependent offset.
+                        dic["rw_end"] = entry.vend
+                    else:
+                        break
+
+        return KernelLayout.build(dic, use_iomem)
+
+    @classmethod
+    def build(cls, values, use_iomem=True):
+        """Build a Layout and optionally refine it from the iomem resource tree."""
+        klayout = cls(**values)
+        if use_iomem:
+            return klayout.refine_by_iomem()
+        return klayout
+
+    def refine_by_iomem(self):
+        """Return a copy whose text base and data range are refined from the iomem resource tree."""
+        if not (is_qemu_system() or is_vmware()) or not self.ro_base:
+            return self
+
+        klayout = self
+        try:
+            res = gdb.execute("kdevio --quiet --no-pager", to_string=True)
+            resources = re.findall(r"\s(0x[0-9a-f]+)-(0x[0-9a-f]+)\s+Kernel (code|data|bss)\s", Color.remove_color(res))
+
+            # The page-table mapping of ARM32 (and x86_32 without NX) may start before `_text`,
+            # e.g. at PAGE_OFFSET with swapper_pg_dir. "Kernel code" starts at `_text` there.
+            # ARM64 is excluded since its "Kernel code" starts at `_stext` on newer kernels.
+            code = next((x for x in resources if x[2] == "code"), None)
+            if code and (is_arm32() or is_x86()):
+                phys_text_base = AddrMap.v2p(self.text_base)
+                if phys_text_base is not None:
+                    text_base = AddressUtil.normalize_address(self.text_base + int(code[0], 16) - phys_text_base)
+                    if self.text_base < text_base < self.text_end:
+                        klayout = klayout.replace(text_base=text_base)
+
+            data = next((x for x in resources if x[2] == "data"), None)
+            if data is None:
+                return klayout
+
+            phys_start = int(data[0], 16)
+            phys_end = max(int(x[1], 16) for x in resources if x[2] != "code")
+            phys_ro_base = AddrMap.v2p(self.ro_base)
+            if phys_ro_base is None:
+                return klayout
+
+            rw_base = AddressUtil.normalize_address(self.ro_base + phys_start - phys_ro_base)
+            rw_end = AddressUtil.normalize_address(rw_base + phys_end - phys_start + 1)
+            if self.rwx and self.ro_base < rw_base < self.ro_end:
+                # .data is in the same RWX mapping as .rodata
+                klayout = klayout.replace(ro_end=rw_base)
+            elif not self.rw_base and rw_base < self.ro_end:
+                # "Kernel data" of old x86 kernels starts at `_etext`, so it contains .rodata
+                rw_base = self.ro_end
+            if klayout.ro_end <= rw_base < rw_end and is_valid_addr(rw_end - 1):
+                return klayout.replace(rw_base=rw_base, rw_end=rw_end)
+        except (gdb.error, gdb.MemoryError, StopIteration, ValueError):
+            pass
+        return klayout
+
+    def refine_by_kallsyms(self):
+        """Return a copy whose text base, no-NX .rodata end and data range are refined from already parsed kallsyms."""
+        # Late imports: commands sit above core, and pagewalk imports this module.
+        from gef.commands.base import ContextManager
+
+        from gef.core.pagewalk import KernelAddressHeuristicFinderUtil
+
+        # Do not trigger a parse here: kallsyms parsing itself needs the unrefined layout.
+        ret = Ksym.peek()
+        if ret is None:
+            return self
+
+        _, kallsyms_map = ret
+
+        def lookup(symbols, start, end):
+            for symbol in symbols:
+                addr = next((addr for addr in kallsyms_map.get(symbol, []) if start <= addr < end), None)
+                if addr is not None:
+                    return addr
+            return None
+
+        base = self
+        # The no-NX .rodata end is only a guess from the mapping
+        if base.rwx and base.ro_base:
+            ro_end = lookup(("__end_rodata", "_edata"), base.ro_base + 1, base.ro_end)
+            if ro_end is not None:
+                base = base.replace(ro_end=ro_end)
+        if not base.text_base or not base.ro_base:
+            return base
+
+        klayout = base
+        if is_arm32() or is_x86():
+            text_base = lookup(("_text",), base.text_base, base.text_end)
+            # `_text` is not in kallsyms of ARM32 without CONFIG_KALLSYMS_ALL. Then `_stext`
+            # is better than PAGE_OFFSET, but not than `_text` from the iomem.
+            if text_base is None and is_arm32() and any(entry.vstart == base.text_base for entry in base.maps):
+                text_base = lookup(("_stext",), base.text_base, base.text_end)
+            if text_base is not None:
+                klayout = klayout.replace(text_base=text_base)
+
+        if not base.rw_base:
+            vmem_end = AddressUtil.get_vmem_end()
+            # RISC-V puts `_sdata` right before .rodata, i.e., in the page of ro_base in the RWX layout.
+            # Then the start of .data is `init_thread_union` (only with CONFIG_KALLSYMS_ALL=y).
+            rw_base = lookup(("_sdata",), base.ro_base + get_pagesize(), vmem_end)
+            if rw_base is None and (is_riscv32() or is_riscv64()):
+                rw_base = lookup(("__start_init_task", "init_thread_union"), base.ro_base + get_pagesize(), vmem_end)
+            if rw_base is None and is_riscv64() and base.rwx:
+                # The boot task's stack is init_thread_union, the first object after .rodata.
+                with ContextManager.threads(KernelPerCpu.get_cpu_threads()) as threads:
+                    for _ in threads:
+                        task = KernelAddressHeuristicFinder.get_current_task_for_current_thread()
+                        if task is None or not base.ro_base < task < base.ro_end:
+                            continue
+                        data = read_memory(task, get_pagesize(), safe=True)
+                        if data is None or b"swapper/0\0" not in data:
+                            continue
+                        words = slice_unpack(data, runtime.current_arch.ptrsize)
+                        if words.count(task) < 3:
+                            continue
+                        stacks = {value for value in words[:0x20]
+                                  if base.ro_base < value < task and value % get_pagesize() == 0}
+                        if len(stacks) == 1:
+                            rw_base = stacks.pop()
+                            break
+            # .data may be in the same RWX mapping as .rodata
+            if rw_base is not None and (base.rwx or base.ro_end <= rw_base):
+                rw_end = lookup(("_end", "__bss_stop", "_edata"), rw_base + 1, vmem_end)
+                if rw_end is None and is_riscv64() and base.rwx:
+                    # module_alloc uses PFN_ALIGN(_end - SZ_2G); recover the value before alignment.
+                    addr = lookup(("module_alloc",), base.text_base, base.text_end)
+                    if addr is not None:
+                        res = KernelAddressHeuristicFinderUtil.disassemble_until_next_symbol(addr, 16)
+                        for value in KernelAddressHeuristicFinderUtil.riscv_auipc_addi(res):
+                            end = AddressUtil.normalize_address(value + 0x80000000 - get_pagesize() + 1)
+                            if rw_base < end <= base.text_base + 0x10000000 and is_valid_addr(end - 1):
+                                rw_end = end
+                                break
+                if rw_end is not None and is_valid_addr(rw_end - 1):
+                    klayout = klayout.replace(ro_end=min(base.ro_end, rw_base), rw_base=rw_base, rw_end=rw_end)
+        else:
+            # The RW mapping of x86_64 may start at the freed huge-page alignment gap after .rodata
+            rw_base = lookup(("_sdata",), base.rw_base + 1, base.rw_end)
+            if rw_base is not None:
+                klayout = klayout.replace(rw_base=rw_base)
+        return klayout
 

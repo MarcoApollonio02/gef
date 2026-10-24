@@ -421,6 +421,44 @@ class GefUtil:
             return None
 
     @staticmethod
+    @Cache.cache_until_next(per_cpu=True, per_inferior=True)
+    def get_x86_descriptor_mode():
+        """Return the CPU mode that determines GDT/IDT formats."""
+        if is_qemu_system() or is_vmware():
+            cr0 = get_register("cr0", use_monitor=True)
+            if cr0 is None:
+                raise gdb.error("Could not read CR0")
+            if not cr0 & 1:
+                return "real"
+            efer = get_register("efer", use_monitor=True)
+            if efer is not None and efer & (1 << 10):
+                return "long"
+            return "protected"
+        if is_x86_64() or is_emulated32():
+            return "long"
+        return "protected"
+
+    @staticmethod
+    def get_x86_descriptor_table_register(name):
+        """Return (base, limit) of `gdtr` or `idtr`, or (None, None)."""
+        if is_qemu_system():
+            res = gdb.execute("monitor info registers", to_string=True)
+            return QemuMonitor.parse_x86_descriptor_table_register(res, name[:-1].upper())
+        if is_vmware():
+            res = gdb.execute("monitor r {:s}".format(name), to_string=True)
+            r = re.search(r"{:s} base=(\S+) limit=(\S+)".format(name), res)
+            if r:
+                return int(r.group(1), 16), int(r.group(2), 16)
+        return None, None
+
+    @staticmethod
+    def read_x86_descriptor_table(base, size):
+        """Read a CPU table whose linear address may exceed the current code's address size."""
+        if GefUtil.get_x86_descriptor_mode() == "long" and base + size > AddressUtil.get_vmem_end():
+            return gdb.selected_inferior().read_memory(base, size).tobytes()
+        return read_memory(base, size)
+
+    @staticmethod
     def get_unpack(size=None):
         """Return an integer unpacker for a byte size, defaulting to the current pointer size."""
         if size is None:
