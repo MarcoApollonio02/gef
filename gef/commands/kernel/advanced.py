@@ -29,7 +29,7 @@ from gef.core.cache import Cache
 from gef.core.color import Color, err, info, titlify, warn
 from gef.core.config import Config
 from gef.core.instruction import Disasm, get_insn, get_insn_next
-from gef.core.kernel import Kernel
+from gef.core.kernel import Kernel, Ksym
 from gef.core.memory import (
     is_ascii_string,
     is_double_link_list,
@@ -5666,6 +5666,7 @@ class KernelDmesgCommand(GenericCommand, BufferingOutput):
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("-hh", "--help-simple", action="store_true", help="show help without ASCII diagram.")
     parser.add_argument("-c", "--use-cache", action="store_true", help="use previous result.")
+    parser.add_argument("--meta", action="store_true", help="display offset information.")
     parser.add_argument("-n", "--no-pager", action="store_true", help="do not use the pager.")
     parser.add_argument("-q", "--quiet", action="store_true", help="enable quiet mode.")
     _syntax_ = parser.format_help()
@@ -5676,9 +5677,11 @@ class KernelDmesgCommand(GenericCommand, BufferingOutput):
     _example_ = "\n".join(_example_).format(_cmdline_)
 
     _note_ = [
-        "The information such as [T1] is the thread ID.",
+        "The information such as [T1] or [C0] is the caller context ID.",
         "Originally, this information is displayed when CONFIG_PRINTK_CALLER=y.",
         "However it is always displayed because it is useful.",
+        "",
+        "prb points to the active ringbuffer; it may point to storage other than printk_rb_static.",
         "",
         "Simplified dmesg structure (5.10~):",
         "",
@@ -5719,7 +5722,7 @@ class KernelDmesgCommand(GenericCommand, BufferingOutput):
         "  2-A. (Seq-based printk_info): Preserving text data length, time, thread ID, etc. for each entry.",
         "  2-B. (Id-based printk_info): Preserving seq for ring buffer reuse.",
         "",
-        "Simplified dmesg structure (~5.10):",
+        "Simplified dmesg structure (3.5~5.9):",
         "",
         "+-----------+",
         "| __log_buf |-------->+-log_buffer-----+   ^     ^",
@@ -5745,343 +5748,117 @@ class KernelDmesgCommand(GenericCommand, BufferingOutput):
         "                      | ...            |         |",
         "                      | text[text_len] |         |",
         "                      +----------------+         v",
+        "",
+        "Simplified dmesg structure (~3.4):",
+        "",
+        "+-----------+",
+        "| log_buf   |-------->+-log_buffer-----+         ^",
+        "+-----------+         | text bytes     |         |",
+        "                      | ...            |         |",
+        "                      | text bytes     |         |",
+        "+-----------+         |                |         |    +-------------+",
+        "| log_end   |-------->| next write     |         |<---| log_buf_len |",
+        "+-----------+         | text bytes     |         |    +-------------+",
+        " % log_buf_len        | ...            |         |",
+        "                      | text bytes     |         |",
+        "                      +----------------+         v",
+        "The buffer is one circular byte array; there are no per-record headers.",
+        "log_end is a byte counter; its position in the buffer is log_end % log_buf_len.",
+        "log_buf points to active storage, which may differ from the initial __log_buf.",
     ]
     _note_ = "\n".join(_note_)
 
-    def dump_printk_ringbuffer(self, ring_buffer_name, ring_buffer_address):
-        """
-        # [v5.10~]
-        struct printk_ringbuffer {
-            struct prb_desc_ring {
-                unsigned int count_bits;
-                struct prb_desc* descs;
-                struct printk_info* infos;
-                atomic_long_t head_id;
-                atomic_long_t tail_id;
-                atomic_long_t last_finalized_id; // v5.18~
-            } desc_ring;
-            struct prb_data_ring {
-                unsigned int size_bits;
-                char* data;
-                atomic_long_t head_lpos;
-                atomic_long_t tail_lpos;
-            } text_data_ring;
-            atomic_long_t fail;
-        };
-        """
-
-        current = ring_buffer_address
-        rb = {}
-        rb["desc_ring"] = {}
-        rb["desc_ring"]["count_bits"] = read_int_from_memory(current)
-        current += runtime.current_arch.ptrsize
-        rb["desc_ring"]["descs"] = read_int_from_memory(current)
-        current += runtime.current_arch.ptrsize
-        rb["desc_ring"]["infos"] = read_int_from_memory(current)
-        current += runtime.current_arch.ptrsize
-        rb["desc_ring"]["head_id"] = read_int_from_memory(current)
-        current += runtime.current_arch.ptrsize
-        rb["desc_ring"]["tail_id"] = read_int_from_memory(current)
-        current += runtime.current_arch.ptrsize
-        rb["text_data_ring"] = {}
-        size_bits = read_int_from_memory(current)
-        if size_bits > runtime.current_arch.ptrsize * 8:
-            current += runtime.current_arch.ptrsize # last_finalized_id
-            size_bits = read_int_from_memory(current)
-        rb["text_data_ring"]["size_bits"] = size_bits
-        current += runtime.current_arch.ptrsize
-        rb["text_data_ring"]["data"] = read_int_from_memory(current)
-        current += runtime.current_arch.ptrsize
-        rb["text_data_ring"]["head_lpos"] = read_int_from_memory(current)
-        current += runtime.current_arch.ptrsize
-        rb["text_data_ring"]["tail_lpos"] = read_int_from_memory(current)
-        current += runtime.current_arch.ptrsize
-        rb["fail"] = read_int_from_memory(current)
-
-        self.quiet_info("name: {:s}".format(ring_buffer_name))
-        self.quiet_info("address: {:#x}".format(ring_buffer_address))
-        self.quiet_info("desc_ring.count_bits: {:#x}".format(rb["desc_ring"]["count_bits"]))
-        self.quiet_info("desc_ring.descs: {:#x}".format(rb["desc_ring"]["descs"]))
-        self.quiet_info("desc_ring.infos: {:#x}".format(rb["desc_ring"]["infos"]))
-        self.quiet_info("desc_ring.head_id: {:#x}".format(rb["desc_ring"]["head_id"]))
-        self.quiet_info("desc_ring.tail_id: {:#x}".format(rb["desc_ring"]["tail_id"]))
-        self.quiet_info("text_data_ring.size_bits: {:#x}".format(rb["text_data_ring"]["size_bits"]))
-        self.quiet_info("text_data_ring.data: {:#x}".format(rb["text_data_ring"]["data"]))
-        self.quiet_info("text_data_ring.head_lpos: {:#x}".format(rb["text_data_ring"]["head_lpos"]))
-        self.quiet_info("text_data_ring.tail_lpos: {:#x}".format(rb["text_data_ring"]["tail_lpos"]))
-        self.quiet_info("fail: {:#x}".format(rb["fail"]))
-
-        def read_desc_i(descs_addr, seq):
-            """
-            struct prb_desc {
-                atomic_long_t state_var;
-                struct prb_data_blk_lpos {
-                    unsigned long begin;
-                    unsigned long next;
-                } text_blk_lpos;
-            };
-            """
-            sizeof_desc = runtime.current_arch.ptrsize * 3
-            current = descs_addr + sizeof_desc * seq
-            if not is_valid_addr(current):
-                return False
-            desc = {}
-            desc["state_var"] = read_int_from_memory(current)
-            desc["text_blk_lpos"] = {}
-            current += runtime.current_arch.ptrsize
-            desc["text_blk_lpos"]["begin"] = read_int_from_memory(current)
-            current += runtime.current_arch.ptrsize
-            desc["text_blk_lpos"]["next"] = read_int_from_memory(current)
-            current += runtime.current_arch.ptrsize
-            return desc
-
-        kversion = Kernel.kernel_version()
-        if "7.0" <= kversion:
-            pmsg_load_execution_ctx_size = Kernel.get_func_size_kallsyms("pmsg_load_execution_ctx")
-            if pmsg_load_execution_ctx_size and pmsg_load_execution_ctx_size >= 0x20:
-                # CONFIG_PRINTK_EXECUTION_CTX=y
-                sizeof_info = align_to_ptrsize(8 + 8 + 2 + 1 + 1 + 4 + 4 + 16 + 16 + 48)
-            else:
-                # CONFIG_PRINTK_EXECUTION_CTX=n
-                sizeof_info = 8 + 8 + 2 + 1 + 1 + 4 + 16 + 48
-        else:
-            sizeof_info = 8 + 8 + 2 + 1 + 1 + 4 + 16 + 48
-
-        def read_info_i(infos_addr, seq):
-            """
-            struct printk_info {
-                u64 seq;        /* sequence number */
-                u64 ts_nsec;    /* timestamp in nanoseconds */
-                u16 text_len;   /* length of text message */
-                u8 facility;    /* syslog facility */
-                u8 flags:5;     /* internal record flags */
-                u8 level:3;     /* syslog level */
-                u32 caller_id;  /* thread id or processor id */
-            #ifdef CONFIG_PRINTK_EXECUTION_CTX // v7.0~
-                u32 caller_id2; /* caller_id complement */
-                char comm[TASK_COMM_LEN]; // 16
-            #endif
-                struct dev_printk_info {
-                    char subsystem[PRINTK_INFO_SUBSYSTEM_LEN]; // 16
-                    char device[PRINTK_INFO_DEVICE_LEN]; // 48
-                } dev_info;
-            };
-            """
-            current = infos_addr + sizeof_info * seq
-            if not is_valid_addr(current):
-                return False
-            info = {}
-            info["seq"] = read_int64_from_memory(current)
-            current += 8
-            info["ts_nsec"] = read_int64_from_memory(current)
-            current += 8
-            info["text_len"] = read_int16_from_memory(current)
-            current += 2
-            info["facility"] = read_int8_from_memory(current)
-            current += 1
-            info["flags"] = read_int8_from_memory(current) & 0b11111
-            info["level"] = (read_int8_from_memory(current) >> 5) & 0b111
-            current += 1
-            info["caller_id"] = read_int32_from_memory(current)
-            current += 4
-            info["dev_info"] = {}
-            info["dev_info"]["subsystem"] = read_memory(current, 16)
-            current += 16
-            info["dev_info"]["device"] = read_memory(current, 48)
-            current += 48
-            return info
-
-        seq_mask = (1 << rb["desc_ring"]["count_bits"]) - 1
-        state_var_id_mask = ~(3 << (runtime.current_arch.ptrsize * 8 - 2))
-        get_desc_state = lambda sv: (sv >> (runtime.current_arch.ptrsize * 8 - 2)) & 3
-        size_bits = rb["text_data_ring"]["size_bits"]
-        data_size_mask = (1 << size_bits) - 1
-
-        info("Wait for reading records...")
-
-        DESC_RESERVED = 0
-        DESC_COMMITTED = 1
-        DESC_FINALIZED = 2
-        DESC_REUSABLE = 3
-
-        seq = 0
-        while True:
-            # prb_read
-            # - Read prb_desc and printk_info based on seq number.
-            seq_based_desc = read_desc_i(rb["desc_ring"]["descs"], seq & seq_mask)
-            seq_based_info = read_info_i(rb["desc_ring"]["infos"], seq & seq_mask)
-
-            # desc_read_finalized_seq, desc_read
-            # - Read prb_desc and printk_info based on id number.
-            id = seq_based_desc["state_var"] & state_var_id_mask
-            id_based_desc = read_desc_i(rb["desc_ring"]["descs"], id & seq_mask)
-            id_based_info = read_info_i(rb["desc_ring"]["infos"], id & seq_mask)
-            # - Determine whether it is the last entry based on the state and seq values.
-            if (id_based_desc["state_var"] & state_var_id_mask) != id: # desc_miss
-                break
-            state = get_desc_state(id_based_desc["state_var"])
-            if state == DESC_RESERVED:
-                break
-            if state == DESC_REUSABLE:
-                if (id_based_desc["text_blk_lpos"]["begin"], id_based_desc["text_blk_lpos"]["next"]) == (1, 1):
-                    break
-                seq += 1
+    def get_vmcoreinfo(self):
+        """Read size and offset metadata from the running kernel."""
+        values = {}
+        size_addr = Ksym.get_addr("vmcoreinfo_size")
+        data_addr = Ksym.get_addr("vmcoreinfo_data")
+        if not size_addr or not data_addr:
+            return values
+        size = read_int_from_memory(size_addr, safe=True)
+        if not size or size > 0x10000:
+            return values
+        try:
+            prefix = b"OSRELEASE="[:runtime.current_arch.ptrsize]
+            if read_memory(data_addr, len(prefix)) != prefix:
+                data_addr = read_int_from_memory(data_addr, safe=True)
+                if not data_addr:
+                    return values
+            text = read_memory(data_addr, size).decode("ascii", errors="ignore")
+        except gdb.error:
+            return values
+        if not text.startswith("OSRELEASE="):
+            return values
+        for line in text.splitlines():
+            match = re.match(r"(SIZE|OFFSET)\(([^)]+)\)=(\S+)", line)
+            if not match:
                 continue
-            if state not in (DESC_COMMITTED, DESC_FINALIZED):
-                break
-            if id_based_info["seq"] != seq:
-                if seq == 0:
-                    # ring buffer is already looping
-                    seq = id_based_info["seq"]
-                else:
-                    break
-
-            # copy_data, get_data
-            # - Calculates the start address of text data from the begin and next values.
-            begin = id_based_desc["text_blk_lpos"]["begin"]
-            next = id_based_desc["text_blk_lpos"]["next"]
-            if (begin >> size_bits) == (next >> size_bits) and (begin < next):
-                src = rb["text_data_ring"]["data"] + (begin & data_size_mask)
-            elif ((begin + (1 << size_bits)) >> size_bits) == (next >> size_bits):
-                src = rb["text_data_ring"]["data"]
-            else:
-                raise
-            size = seq_based_info["text_len"]
-            src += runtime.current_arch.ptrsize
-            if size:
-                entry = String.bytes2str(read_memory(src, size))
-            else:
-                entry = ""
-
-            # timestamp
-            sec = seq_based_info["ts_nsec"] // 1000 // 1000 // 1000
-            nsec = seq_based_info["ts_nsec"] % (1000 * 1000 * 1000)
-            nsec_str = "{:09d}".format(nsec)[:6]
-            # thread id. This is displayed when CONFIG_PRINTK_CALLER=y, but always displayed because it is useful.
-            caller_id_str = "T{:d}".format(seq_based_info["caller_id"])
-            # output
-            formatted_entry = "[{:5d}.{:s}] [{:>6s}] {:s}".format(sec, nsec_str, caller_id_str, entry)
-            self.out.append(formatted_entry)
-
-            seq += 1
-        return
-
-    def dump_printk_log_buffer(self, log_first_idx, log_end_idx, buf_start, buf_end):
-        """
-        # [~v5.9]
-        struct printk_log {
-            u64 ts_nsec;        /* timestamp in nanoseconds */
-            u16 len;            /* length of entire record */
-            u16 text_len;       /* length of text buffer */
-            u16 dict_len;       /* length of dictionary buffer */
-            u8 facility;        /* syslog facility */
-            u8 flags:5;         /* internal record flags */
-            u8 level:3;         /* syslog level */
-        #ifdef CONFIG_PRINTK_CALLER
-            u32 caller_id;      /* thread id or processor id */
-        #endif
-        };
-        """
-
-        CONFIG_PRINTK_CALLER = Symbol.get_ksymaddr("print_caller") is not None
-        length_of_caller_id = 4 if CONFIG_PRINTK_CALLER else 0
-        sizeof_printk_log = 16 + length_of_caller_id
-
-        pos = buf_start + log_first_idx
-        log_end_pos = buf_start + log_end_idx
-
-        while pos != log_end_pos:
-            x = read_memory(pos, 16)
-            ts_nsec = u64(x[:8])
-            rec_len = u16(x[8:10])
-
-            if rec_len == 0:
-                pos = buf_start
+            name = match.group(2)
+            if name.startswith("struct "):
+                name = name[7:]
+            name = name.replace(",", ".").replace(" ", "")
+            try:
+                values[(match.group(1), name)] = int(match.group(3), 0)
+            except ValueError:
                 continue
-
-            text_len = u16(x[10:12])
-            #dict_len = u16(x[12:14])
-            #facility = u8(x[14:15])
-            #flags = (u8(x[15:16]) >> 0) & 0b11111
-            #level = (u8(x[15:16]) >> 5) & 0b111
-            text = read_memory(pos + sizeof_printk_log, text_len)
-
-            sec = ts_nsec // 1000 // 1000 // 1000
-            nsec = ts_nsec % (1000 * 1000 * 1000)
-            nsec_str = "{:09d}".format(nsec)[:6]
-
-            # split from multi-line message
-            for t in String.bytes2str(text).splitlines():
-                formatted_entry = "[{:5d}.{:s}] {:s}".format(sec, nsec_str, t)
-                self.out.append(formatted_entry)
-
-            pos += rec_len
-            if pos >= buf_end:
-                break # something is wrong
-        return
+        return values
 
     @parse_args
     @only_if_gdb_running
-    @only_if_specific_gdb_mode(mode=("qemu-system", "vmware"))
-    @only_if_specific_arch(arch=("x86_32", "x86_64", "ARM32", "ARM64"))
+    @only_if_specific_gdb_mode(mode=("qemu-system", "vmware", "kgdb"))
+    @only_if_specific_arch(arch=("x86_32", "x86_64", "ARM32", "ARM64", "RISCV32", "RISCV64"))
     @only_if_in_kernel_or_kpti_disabled
     def do_invoke(self, args):
+        if args.use_cache and not args.meta:
+            if hasattr(self, "cache") and self.cache:
+                self.out = self.cache[::]
+                self.print_output()
+                return
+
         self.quiet_info("Wait for memory scan")
 
-        if args.use_cache and hasattr(self, "cache") and self.cache:
-            self.out = self.cache[::]
-            self.print_output()
-            return
-
         self.out = []
-
-        kversion = Kernel.kernel_version()
-        if kversion is None:
-            err("Could not find Linux kernel")
-            return
-        if "5.10" <= kversion:
-            # new structure
-            printk_rb_static = KernelAddressHeuristicFinder.get_printk_rb_static()
-            if printk_rb_static is None:
-                err("Could not find printk_rb_static")
+        kversion = Kernel.version()
+        vmcoreinfo = self.get_vmcoreinfo()
+        has_ringbuffer_type = GefUtil.cached_lookup_type("struct printk_ringbuffer") is not None
+        is_modern = (
+            has_ringbuffer_type
+            or ("SIZE", "printk_ringbuffer") in vmcoreinfo
+            or (kversion is not None and kversion >= "5.10")
+        )
+        is_legacy_text = kversion is not None and kversion < "3.5"
+        if kversion is None and not is_modern:
+            log_end_addr = Ksym.get_addr("log_end")
+            log_buf_len_addr = Ksym.get_addr("log_buf_len")
+            is_legacy_text = bool((log_end_addr and log_buf_len_addr) or Ksym.get_addr("emit_log_char"))
+            has_log_type = GefUtil.cached_lookup_type("struct printk_log") is not None
+            if not has_log_type and ("SIZE", "printk_log") not in vmcoreinfo and not is_legacy_text:
+                err("Could not determine the Linux printk layout")
                 return
-            self.dump_printk_ringbuffer("printk_rb_static", printk_rb_static)
 
+        if is_modern:
+            ring = KernelDmesgModernRing(vmcoreinfo)
+        elif is_legacy_text:
+            ring = KernelDmesgOldestRing(vmcoreinfo)
         else:
-            # old structure
-            log_first_idx_ptr = KernelAddressHeuristicFinder.get_log_first_idx()
-            if log_first_idx_ptr is None:
-                err("Could not find log_first_idx")
-                return
-            self.quiet_info("log_first_idx: {:#x}".format(log_first_idx_ptr))
+            ring = KernelDmesgLegacyRing(vmcoreinfo)
+        if not ring.resolve():
+            return
 
-            log_next_idx_ptr = KernelAddressHeuristicFinder.get_log_next_idx()
-            if log_next_idx_ptr is None:
-                err("Could not find log_next_idx")
-                return
-            self.quiet_info("log_next_idx: {:#x}".format(log_next_idx_ptr))
+        if args.meta:
+            for message in ring.details:
+                self.quiet_info(message)
+            for message in ring.warnings:
+                self.quiet_warn(message)
+            return
 
-            log_buf_start = KernelAddressHeuristicFinder.get___log_buf()
-            if log_buf_start is None:
-                err("Could not find __log_buf")
-                return
-            self.quiet_info("__log_buf: {:#x}".format(log_buf_start))
+        partial = ring.dump()
+        self.out = ring.out
+        if partial:
+            self.warn_add_out(ring.partial_warning)
 
-            log_buf_len_ptr = KernelAddressHeuristicFinder.get_log_buf_len()
-            if log_buf_len_ptr is None:
-                err("Could not find log_buf_len")
-                return
-            self.quiet_info("log_buf_len: {:#x}".format(log_buf_len_ptr))
-
-            log_first_idx = read_int32_from_memory(log_first_idx_ptr)
-            log_next_idx = read_int32_from_memory(log_next_idx_ptr)
-            log_buf_len = read_int32_from_memory(log_buf_len_ptr)
-            log_buf_end = log_buf_start + log_buf_len
-            self.quiet_info("*log_first_idx: {:#x}".format(log_first_idx))
-            self.quiet_info("*log_next_idx: {:#x}".format(log_next_idx))
-            self.quiet_info("*log_buf_len: {:#x}".format(log_buf_len))
-            self.dump_printk_log_buffer(log_first_idx, log_next_idx, log_buf_start, log_buf_end)
-
+        if not self.out:
+            self.out.append("No retained printk records")
         self.print_output()
         self.cache = self.out[::]
         return
