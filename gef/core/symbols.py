@@ -133,6 +133,7 @@ class Symbol:
         """resolve_address("main") -> 0x401000.
         resolve_address("missing") -> None.
         """
+        from gef.core.registers import to_unsigned_long
         try:
             return to_unsigned_long(gdb.parse_and_eval("&{:s}".format(name)))
         except (gdb.error, OverflowError, ValueError):

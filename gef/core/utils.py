@@ -90,6 +90,7 @@ def cperf(f): # noqa
 
 
 
+@Cache.cache_this_session(until_new_objfile=True)
 def get_libc_version(verbose=False, silent=False):
     """Detect and return the glibc version as a tuple, using cache, configuration,
     process maps, or system fallback."""
