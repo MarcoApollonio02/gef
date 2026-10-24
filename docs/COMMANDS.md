@@ -9924,6 +9924,54 @@ syscall-table-view --filter write
 ```
 
 # 06-h. Qemu-system/KGDB Cooperation - Linux Allocator
+## buddy-contains
+
+Resolves which buddy block an address belongs to.
+
+
+### Syntax
+
+```text
+usage: buddy-contains [-h] [-p] [-L] [-Q] [-M] [--MIGRATE_PCPTYPES {3,4}] [--meta] [-r] [-q] ADDRESS
+
+positional arguments:
+  ADDRESS               target address.
+
+options:
+  -h, --help            show this help message and exit
+  -p, --page            interpret ADDRESS as a `struct page` address instead of a virtual address.
+  -L, --skip-free-list  do not walk the free lists use struct page metadata only. pcp free pages and zone/mtype/cpu cannot be reported in this mode.
+  -Q, --skip-phys       skip virt -> phys translation.
+  -M, --use-physmap     use physmap for virt -> phys translation (x64/arm64 only).
+  --MIGRATE_PCPTYPES {3,4}
+                        use specify value; linux: 3, android: 4 (2023~).
+  --meta                display offset information.
+  -r, --rescan          do not use cache.
+  -q, --quiet           show result only.
+```
+
+### Examples
+
+```gdb
+buddy-contains 0xffff96a7c2144000
+buddy-contains -p 0xffffca7640004040    # ADDRESS is a struct page
+buddy-contains -L 0xffff96a7c2144000    # Skip free lists
+```
+
+### Notes
+
+```text
+Given an address, resolves which buddy allocator block contains it.
+
+A free block of order N is described by its head page only, page->private holds the
+order and PG_buddy is set on the head, while the tail pages carry neither. So a page
+that was merged into a higher order block cannot be identified from its own struct
+
+Two modes:
+  default: walk the free lists like buddy-dump and locate the block.
+  -L     : read struct page flags only but cannot report pcp free pages.
+```
+
 ## buddy-dump
 
 Dump the zone of the page allocator (buddy allocator) free-list.
@@ -9933,7 +9981,7 @@ Dump the zone of the page allocator (buddy allocator) free-list.
 ### Syntax
 
 ```text
-usage: buddy-dump [-h] [-hh] [-z {DMA,DMA32,Normal,HighMem,Movable,Device}] [-o ORDER_FILTER] [-m MTYPE_FILTER] [-p PCP_INDEX_FILTER] [-P] [-F] [--cpu CPU] [-s] [-S] [-Q] [-M] [--MIGRATE_PCPTYPES {3,4}] [-r] [-c N] [-v] [-vv] [-n] [-q]
+usage: buddy-dump [-h] [-hh] [-z {DMA,DMA32,Normal,HighMem,Movable,Device}] [-o ORDER_FILTER] [-m MTYPE_FILTER] [-p PCP_INDEX_FILTER] [-P] [-F] [--cpu CPU] [-s] [-S] [-Q] [-M] [--MIGRATE_PCPTYPES {3,4}] [--meta] [-r] [-c N] [-v] [-vv] [-n] [-q]
 
 options:
   -h, --help            show this help message and exit
@@ -9955,6 +10003,7 @@ options:
   -M, --use-physmap     use physmap for virt -> phys translation to speed up (when KGDB mode, x64/arm64 only).
   --MIGRATE_PCPTYPES {3,4}
                         use specify value; linux: 3, android: 4 (2023~).
+  --meta                display offset information.
   -r, --rescan          do not use cache.
   -c, --count N         max entries to read per list (default: 5, 0=unlimited). -s/-S/-v/-vv override this to 0.
   -v, --verbose         show all entries for non-sort mode. equivalent to -c 0.
