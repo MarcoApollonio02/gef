@@ -2747,121 +2747,9 @@ class Kernel:
                 return first_func_size
         return None
 
-    @staticmethod
-    @Cache.cache_this_session
-    def get_slab_type():
-        # Cases where ksymaddr-remote is not working properly
-        if not Symbol.get_ksymaddr("commit_creds"):
-            return "Unknown"
 
-        if gdb.execute("ksymaddr-remote --quiet --no-pager slub_", to_string=True):
-            kversion = Kernel.kernel_version()
-            if kversion < "6.2":
-                return "SLUB"
-            elif kversion < "7.0":
-                # care for both deactivate_slab and deactivate_slab.cold
-                if gdb.execute("ksymaddr-remote --quiet --no-pager deactivate_slab", to_string=True):
-                    return "SLUB"
-                else:
-                    return "SLUB_TINY"
-            else: # kversion >= "7.0"
-                # If CONFIG_SLUB_TINY=y, calculate_sheaf_capacity is a small function that returns 0.
-                calculate_sheaf_capacity_size = Kernel.get_func_size_kallsyms("calculate_sheaf_capacity")
-                if calculate_sheaf_capacity_size is None:
-                    return "Unknown"
-                if calculate_sheaf_capacity_size <= 0x20:
-                    return "SLUB_TINY"
-                else:
-                    return "SLUB"
 
-        # care for both cache_reap and cache_reap.cold
-        if gdb.execute("ksymaddr-remote --quiet --no-pager cache_reap", to_string=True):
-            return "SLAB"
 
-        if gdb.execute("ksymaddr-remote --quiet --no-pager slob_", to_string=True):
-            return "SLOB"
-        return "Unknown"
-
-    @staticmethod
-    @Cache.cache_this_session
-    def slab_page_str():
-        kversion = Kernel.kernel_version()
-        if kversion < "5.17":
-            return "page"
-        else:
-            return "slab"
-
-    @staticmethod
-    @Cache.cache_this_session
-    def get_page_virt_pair():
-        allocator = Kernel.get_slab_type()
-
-        if allocator in ["SLUB", "SLUB_TINY"]:
-            # get valid page and vaddr pair
-            command = {"SLUB": "slub-dump --node --skip-sheaf", "SLUB_TINY": "slub-tiny-dump"}[allocator]
-            for n in [8, 16, 32, 64, 128, 192, 256, 512]:
-                # this function calls slub-dump, but it called from slub-dump itself.
-                # * get_page_virt_pair
-                #   -> slub-dump    <-- first
-                #     -> page2virt
-                #       -> get_VMEMMAP_START
-                #         -> get_page_virt_pair
-                #           -> slub-dump    <-- recursively
-                # To avoid infinite recursion, must add the `--skip-page2virt` option
-                # when calling slub-dump from page2virt.
-                ret = gdb.execute(
-                    "{:s} --simple --no-pager --quiet --skip-page2virt kmalloc-{:d}".format(command, n),
-                    to_string=True,
-                )
-                r1 = re.findall(r"(?:active|partial|node) page: (0x\S\S+)", Color.remove_color(ret))
-                r2 = re.findall(r"virtual address: (0x\S+|\?\?\?)", Color.remove_color(ret))
-                valid_pairs = [(p, v) for p, v in zip(r1, r2) if v != "???"]
-                if valid_pairs:
-                    page = int(valid_pairs[0][0], 16)
-                    vaddr = int(valid_pairs[0][1], 16)
-                    break
-            else:
-                return False
-
-        elif allocator == "SLAB":
-            # get valid page and vaddr pair
-            ret = gdb.execute("slab-dump --simple --cpu 0 --no-pager --quiet kmalloc-256", to_string=True)
-            r1 = re.search(r"node\[\d+\]\.slabs_(?:partial|full): (0x\S+)", Color.remove_color(ret))
-            r2 = re.search(r"virtual address \(s_mem & ~0xfff\): (0x\S+)", Color.remove_color(ret))
-            if not r1 or not r2:
-                return False
-            page = int(r1.group(1), 16)
-            vaddr = int(r2.group(1), 16)
-
-        elif allocator == "SLOB":
-            # get valid page and vaddr pair
-            ret = gdb.execute("slob-dump --simple --large --no-pager --quiet", to_string=True)
-            r1 = re.search(r"page: (0x\S+)", Color.remove_color(ret))
-            r2 = re.search(r"virtual address: (0x\S+)", Color.remove_color(ret))
-            if not r1 or not r2:
-                return False
-            page = int(r1.group(1), 16)
-            vaddr = int(r2.group(1), 16)
-
-        else:
-            return False
-
-        return page, vaddr
-
-    @staticmethod
-    @Cache.cache_until_next
-    def get_slab_contains(addr, allow_unaligned=False, keep_color=False):
-        if not is_valid_addr(addr):
-            return None
-        ret = gdb.execute("slab-contains --quiet {:#x}".format(addr), to_string=True).strip()
-        if not ret:
-            return None
-        ret_plain = Color.remove_color(ret)
-        if not allow_unaligned and "remarks: unaligned" in ret_plain:
-            return None
-        if keep_color:
-            return ret
-        return ret_plain
 
     @staticmethod
     @Cache.cache_until_next
@@ -2888,24 +2776,7 @@ class Kernel:
             return int(r.group(1), 16)
         return None
 
-    @staticmethod
-    def page2virt(page):
-        ret = gdb.execute("page2virt {:#x}".format(page), to_string=True)
-        for line in ret.splitlines():
-            r = re.search(r"Virt: (\S+)", line)
-            if r:
-                virt = int(r.group(1), 16)
-                if AddressUtil.is_msb_on(virt):
-                    return virt
-        return None
 
-    @staticmethod
-    def virt2page(virt):
-        ret = gdb.execute("virt2page {:#x}".format(virt), to_string=True)
-        r = re.search(r"Page: (\S+)", ret)
-        if r:
-            return int(r.group(1), 16)
-        return None
 
 
 
