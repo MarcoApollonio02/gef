@@ -13,7 +13,9 @@ import sys
 
 import gdb
 
+from gef.arch.x86 import X86
 from gef.commands.base import (
+    ContextManager,
     GenericCommand,
     exclude_specific_gdb_mode,
     only_if_gdb_running,
@@ -23,21 +25,41 @@ from gef.commands.base import (
     register_command,
     require_arch_set,
 )
-from gef.commands.debugging.context import SyscallArgsCommand
+from gef.commands.debugging.context import DereferenceCommand, SyscallArgsCommand
 from gef.core import runtime
 from gef.core.address import AddressUtil, Permission
 from gef.core.cache import Cache
-from gef.core.color import Color, err, info, warn
+from gef.core.color import Color, err, gef_print, info, warn
+from gef.core.config import Config
 from gef.core.events import EventHandler, EventHooking
 from gef.core.instruction import Disasm, get_insn
+from gef.core.memory import MemoryCache, read_cstring_from_memory
 from gef.core.process import (
     Path,
     ProcessMap,
     is_alive,
+    is_alpha,
+    is_arm32,
+    is_arm32_cortex_m,
+    is_arm64,
+    is_cris,
+    is_csky,
     is_in_secure,
+    is_kgdb,
+    is_m68k,
+    is_microblaze,
+    is_nios2,
+    is_or1k,
+    is_qemu_system,
     is_remote_debug,
+    is_s390x,
+    is_sh4,
     is_support_secure_world,
+    is_vmware,
+    is_x86,
+    is_xtensa,
 )
+from gef.core.registers import get_register
 from gef.core.strings import String
 from gef.core.syscall import Syscall
 from gef.core.utils import GefUtil
@@ -208,6 +230,54 @@ class ExecUntilCommand(GenericCommand):
             else:
                 return False # non-conditional, so always jump
         raise
+
+    @staticmethod
+    def is_caught_syscall():
+        caught = []
+        for line in gdb.execute("info breakpoints", to_string=True).splitlines():
+            m = re.match(r"\d+\s+catchpoint\s+\S+\s+y\s+syscalls? \"(.+)\"", line)
+            if m:
+                caught += [x.strip() for x in m.group(1).split(",")]
+        if not caught:
+            return False
+        _reg, nr = SyscallArgsCommand.get_nr()
+        names = ["<any syscall>", str(nr)]
+        syscall_table = Syscall.get_syscall_table(current_insn=True)
+        if syscall_table and nr in syscall_table.nr_table:
+            names.append(syscall_table.nr_table[nr].name)
+        return any(name in caught for name in names)
+
+    @staticmethod
+    def requires_continue(insn):
+        # A single-step never stops at syscall entry, and some hypervisors drop x86 watchpoint hits during it.
+        if is_qemu_system() or is_kgdb() or is_vmware():
+            return False
+        if runtime.current_arch.is_syscall(insn):
+            return not runtime.current_arch.has_syscall_delay_slot and ExecUntilCommand.is_caught_syscall()
+        if not is_x86() or insn.is_branch:
+            return False
+        watchpoint_types = (gdb.BP_HARDWARE_WATCHPOINT, gdb.BP_READ_WATCHPOINT, gdb.BP_ACCESS_WATCHPOINT)
+        if not any(bp.enabled and bp.type in watchpoint_types for bp in gdb.breakpoints()):
+            return False
+        return ExecUntilMemaccessCommand.is_memory_access(insn)
+
+    @staticmethod
+    def is_user_stop(event):
+        # Late import: gef.commands.debugging.other consumes this module's family.
+        from gef.commands.debugging.other import SecondBreakpoint, SimpleInternalTemporaryBreakpoint
+
+        if isinstance(event, gdb.SignalEvent):
+            return True
+        reason = getattr(event, "details", {}).get("reason")
+        if reason in ("end-stepping-range", "function-finished"):
+            return False
+        if isinstance(event, gdb.BreakpointEvent):
+            return any(not isinstance(bp, (SimpleInternalTemporaryBreakpoint, SecondBreakpoint))
+                       for bp in event.breakpoints)
+        if reason is not None:
+            return True
+        stop = GefUtil.get_stop_reason()
+        return stop is None or not stop["stepped"]
 
     def get_breakpoint_list(self):
         lines = gdb.execute("info breakpoints", to_string=True).splitlines()
@@ -576,6 +646,79 @@ class ExecUntilMemaccessCommand(ExecUntilCommand):
     def __init__(self):
         super().__init__(prefix=False)
         return
+
+    @staticmethod
+    def is_memory_access(insn):
+        operands = insn.split_last_operands(insn.operands)[0]
+        operand = re.sub(r"<[^>]*>", "", ",".join(operands))
+        mnemo = insn.mnemonic.lower()
+        if is_x86():
+            mnemo, operand = X86.get_mnemonic_operands(insn, operands)
+            operand = re.sub(r"<[^>]*>", "", operand)
+            if mnemo in ("lea", "leaw", "leal", "leaq") or mnemo.startswith("nop"):
+                return False
+            if mnemo.startswith(("push", "pop", "call", "ret", "iret", "enter", "leave", "xlat")):
+                return True
+            if re.fullmatch(r"(?:movs|cmps|scas|lods|stos|ins|outs)[bwlqd]?", mnemo) \
+                    and not re.search(r"\b[xyz]mm\d+\b", operand):
+                return True
+            return "[" in operand or "(" in operand or bool(re.search(r"\b(?:[cdefgs]s):", operand))
+        if is_arm32() or is_arm32_cortex_m():
+            return mnemo.startswith(("ldr", "str", "ldm", "stm", "ldrex", "strex", "push", "pop",
+                                     "vld", "vst", "vpush", "vpop", "swp", "tbb", "tbh"))
+        if is_arm64():
+            return mnemo.startswith(("ld", "st", "cas", "swp"))
+        if runtime.current_arch.arch == "RISCV":
+            return bool(re.fullmatch(r"(?:c\.)?(?:f?[ls][bdhwq](?:u|sp)?|(?:amo\w+|lr|sc)\.[wd](?:\.\w+)?)"
+                                     r"|v[ls](?:e\d|[su]x|se|[ls]eg|[1248]r|m).*", mnemo))
+        if runtime.current_arch.arch == "MIPS":
+            return bool(re.fullmatch(r"[ls][bdhw](?:u|l|r)?|ll[d]?|sc[d]?|[ls][dw]c[123]|[ls][dw]xc1|u[ls][hw]",
+                                     mnemo))
+        if is_or1k():
+            return bool(re.fullmatch(r"l\.(?:l[bhw][sz]|s[bhw]|lwa|swa)", mnemo))
+        if runtime.current_arch.arch == "SPARC":
+            return mnemo != "stbar" and mnemo.startswith(("ld", "st", "cas", "swap"))
+        if runtime.current_arch.arch in ("PPC", "LOONGARCH"):
+            return mnemo != "lwsync" and mnemo.startswith(("ld", "st", "lb", "lh", "lw", "lq", "lf", "lv", "lx", "fld", "fst",
+                                     "vld", "vst", "xvld", "xvst", "ll.", "sc.", "am", "cas", "swap"))
+        if is_s390x():
+            if re.fullmatch(r"(?:l(?:g|gf|lgf|h|gh|lh|lgh)?|st[gh]?|c(?:g|gf|h|gh|l|lg|lgf|lh|lgh)?|pfd|ex)rl"
+                            r"|(?:mv|cl)cl[eu]?|mvst|clst|srstu?|cksm|cuse", mnemo):
+                return True
+            if re.fullmatch(r"la[ey]?|laey|lcbb|ecag|nop|s[lr][al][gk]?|s[lr]d[al]|rllg?|v(?:es(?:l|ra|rl)|erll|lgv|lvg)[bhfg]?"
+                            r"|b(?!i).*|cl?g?[ri]b\w*", mnemo):
+                return False
+            return "(" in operand
+        if is_sh4():
+            return mnemo not in ("jmp", "jsr", "mova") and (mnemo.startswith("mov.") or "@" in operand)
+        if is_m68k():
+            if mnemo.startswith(("pea", "link", "unlk", "rt")) or runtime.current_arch.is_call(insn):
+                return True
+            if mnemo.startswith("lea") or runtime.current_arch.is_jump(insn):
+                return False
+            return "@" in operand or bool(re.search(r"(?:^|,)\s*0x[0-9a-f]+\s*(?:,|$)", operand))
+        if is_alpha():
+            return bool(re.fullmatch(r"ld(?:[bw]u|[lq](?:_[lu])?|[fgst])|st(?:[bwlq]|[lq]_[cu]|[fgst])", mnemo))
+        if runtime.current_arch.arch == "HPPA":
+            return bool(re.fullmatch(r"f?(?:ld|st)(?:[bhwd]|c[wd]|d?by)[asxm]{0,2}", mnemo.split(",")[0]))
+        if is_nios2():
+            return mnemo.startswith(("ld", "st", "push.n", "pop.n"))
+        if is_microblaze():
+            return bool(re.fullmatch(r"(?:l(?:bu|hu|w|l)|s[bhwl])(?:i|r|x|ea)?", mnemo))
+        if is_xtensa():
+            return bool(re.fullmatch(r"(?:l(?:8ui|16[su]i|32(?:i|r|ai|e|ex)|d(?:inc|dec))|s(?:8i|16i|32(?:i|ri|c1i|e|ex|nb)))"
+                                     r"(?:\.n)?|[ls]s[ix]u?", mnemo))
+        if is_cris():
+            return mnemo in ("push", "pop") or "[" in operand
+        if runtime.current_arch.arch == "ARC":
+            return bool(re.fullmatch(r"(?:ld|st)(?:[bhwdl]|dl)?(?:_s)?|(?:push|pop)l?_s|enter_s|leave_s|ex"
+                                     r"|(?:llock|scond)[dl]?|prefetchw?", mnemo.split(".")[0]))
+        if is_csky():
+            if mnemo in ("jmpi", "jsri", "nie", "nir"):
+                return True
+            return mnemo != "stop" and not mnemo.startswith("fsto") and mnemo.startswith(
+                ("ld", "st", "lrw", "lrs", "srs", "push", "pop", "ipush", "ipop", "fld", "fst", "vld", "vst"))
+        return "[" in operand
 
     def is_target_insn(self, insn):
         return "[" in str(insn)
@@ -1071,3 +1214,134 @@ class CallTraceCommand(ExecUntilCommand):
             self.output_fd.close()
             info("Saved to {!r}".format(fname))
         return
+
+
+@register_command
+class StringsContinueCommand(GenericCommand):
+    """Single-step and print ASCII strings referenced by general-purpose registers."""
+
+    _cmdline_ = "strings-continue"
+    _category_ = "01-d. Debugging Support - Execution"
+
+    parser = argparse.ArgumentParser(prog=_cmdline_)
+    parser.add_argument("-m", "--max-length", type=AddressUtil.parse_address, default=0x100,
+                        help="maximum C-string length to inspect. (default: %(default)s)")
+    parser.add_argument("-n", "--min-length", type=AddressUtil.parse_address, default=4,
+                        help="minimum C-string length to display. (default: %(default)s)")
+    _syntax_ = parser.format_help()
+
+    _note_ = [
+        "Context output is hidden while stepping.",
+        "Only registers whose values change are inspected after the initial stop.",
+        "Stops on a user breakpoint, a signal, inferior exit, or Ctrl+C.",
+        "Duplicate strings are suppressed for each invocation.",
+    ]
+    _note_ = "\n".join(_note_)
+
+    def dump_new_strings(self, seen, previous_registers, min_length, max_length):
+        string_color = Config.get("theme.dereference_string")
+        changed = []
+        for regname in DereferenceCommand.get_target_registers():
+            if regname in ("$pc", "$eip", "$rip", "$pswa"):
+                continue
+            try:
+                addr = get_register(regname)
+            except (gdb.error, ValueError):
+                continue
+            if previous_registers.get(regname) == addr:
+                continue
+            previous_registers[regname] = addr
+            if not addr:
+                continue
+            changed.append((regname, addr))
+
+        if not changed:
+            return
+
+        MemoryCache.reset()
+        strings = {}
+        for regname, addr in changed:
+            if addr not in strings:
+                strings[addr] = read_cstring_from_memory(addr, max_length=max_length, safe=True)
+            string = strings[addr]
+
+            if not string or len(string) < min_length:
+                continue
+            duplicate = False
+            for seen_addr, seen_string in seen:
+                offset = addr - seen_addr
+                if 0 <= offset < len(seen_string) and string == seen_string[offset:]:
+                    duplicate = True
+                    break
+            if duplicate:
+                continue
+
+            seen.append((addr, string))
+            gef_print("{:s} = {:#x} -> {:s}".format(Color.greenify(regname), addr, Color.colorify(repr(string), string_color)))
+        return
+
+    @parse_args
+    @only_if_gdb_running
+    @require_arch_set
+    def do_invoke(self, args):
+        if args.min_length <= 0:
+            err("--min-length must be greater than zero")
+            return
+        if args.max_length <= 0:
+            err("--max-length must be greater than zero")
+            return
+        if args.min_length > args.max_length:
+            err("--min-length must not exceed --max-length")
+            return
+
+        seen = []
+        previous_registers = {}
+        stop_event = None
+
+        def remember_stop(event):
+            nonlocal stop_event
+            stop_event = event
+            return
+
+        info("Single-stepping for register strings. Stop with a breakpoint or Ctrl+C.")
+
+        stopped = False
+        inferior_exited = False
+        execution_error = None
+        try:
+            with ContextManager.suspend_stop_handler(), \
+                    ContextManager.gdb_parameter("suppress-cli-notifications", "on", ignore_error=True):
+                with EventHooking.temporary("stop", remember_stop):
+                    self.dump_new_strings(seen, previous_registers, args.min_length, args.max_length)
+                    while is_alive():
+                        stop_event = None
+                        if ExecUntilCommand.requires_continue(get_insn()):
+                            gdb.execute("xuntil", to_string=True)
+                        else:
+                            gdb.execute("stepi", to_string=True)
+                        if not is_alive():
+                            inferior_exited = True
+                            break
+
+                        self.dump_new_strings(seen, previous_registers, args.min_length, args.max_length)
+                        if ExecUntilCommand.is_user_stop(stop_event):
+                            stopped = True
+                            break
+        except KeyboardInterrupt:
+            stopped = True
+        except gdb.error as e:
+            if is_alive():
+                execution_error = e
+            else:
+                inferior_exited = True
+        finally:
+            Cache.reset_gef_caches()
+
+        if inferior_exited:
+            info("Inferior exited")
+        elif execution_error is not None:
+            err(execution_error)
+        elif stopped and is_alive():
+            gdb.execute("context")
+        return
+

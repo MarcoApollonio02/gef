@@ -3,6 +3,7 @@
 import abc
 import ctypes
 import enum
+import re
 import struct
 
 import gdb
@@ -87,6 +88,17 @@ class X86(Architecture):
     trap_insn = b"\xcc" # int3
     ret_insn = b"\xc3" # ret
     syscall_insn = b"\xcd\x80" # int 0x80
+
+    RE_PREFIX = re.compile(r"(?:lock|rep(?:e|ne|z|nz)?|bnd|notrack|addr(?:16|32|64)|data(?:16|32)|rex(?:\.[WRXB]+)?)$")
+
+    @staticmethod
+    def get_mnemonic_operands(insn, operands=None):
+        if operands is None:
+            operands = insn.operands
+        parts = (insn.mnemonic + " " + ",".join(operands)).split(None, 1)
+        while len(parts) == 2 and X86.RE_PREFIX.fullmatch(parts[0]):
+            parts = parts[1].split(None, 1)
+        return parts[0], parts[1] if len(parts) == 2 else ""
 
     def flag_register_to_human(self, val=None):
         if val is None:

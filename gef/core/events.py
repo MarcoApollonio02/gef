@@ -10,6 +10,8 @@ Reads of the mutable global `current_arch` go through `runtime.current_arch`.
 References to `gef.commands.*` (e.g. BreakRelativeVirtualAddressCommand) are
 late-imported inside the referencing method.
 """
+import contextlib
+
 import gdb
 
 from gef.core import runtime
@@ -151,6 +153,32 @@ class EventHandler:
 
 class EventHooking:
     """A collection of utility functions that hook up specified events."""
+
+    @staticmethod
+    @contextlib.contextmanager
+    def temporary(event_name, callback, once=False):
+        registry = getattr(gdb.events, event_name, None)
+        if registry is None:
+            warn("GDB events cannot be set: {:s}".format(event_name))
+            yield
+            return
+
+        connected = True
+
+        def dispatch(event):
+            nonlocal connected
+            if once:
+                registry.disconnect(dispatch)
+                connected = False
+            callback(event)
+
+        registry.connect(dispatch)
+        try:
+            yield
+        finally:
+            if connected:
+                registry.disconnect(dispatch)
+        return
 
     @staticmethod
     @only_if_events_supported("cont")

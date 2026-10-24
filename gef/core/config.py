@@ -24,6 +24,12 @@ class Config:
         return setting[0]
 
     @staticmethod
+    @Cache.cache_until_next
+    def get(name):
+        """Read global gef settings. Return None if not found."""
+        return Config.get_gef_setting(name)
+
+    @staticmethod
     def set_gef_setting(name, value, _type=None, _desc=None):
         """Set global gef settings.
         Raise ValueError if `name` doesn't exist and `type` and `desc` are not provided."""

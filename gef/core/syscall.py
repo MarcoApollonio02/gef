@@ -9441,7 +9441,7 @@ class Syscall:
         return syscall_table
 
     @classmethod
-    def get_syscall_table(cls, arch=None, mode=None):
+    def get_syscall_table(cls, arch=None, mode=None, current_insn=False):
 
         if arch is None and mode is None :
             # Late imports: gef.core.process imports gdb at top level.
@@ -9449,7 +9449,7 @@ class Syscall:
                 is_in_secure, is_x86_32, is_x86_64
 
             if is_x86_64():
-                arch, mode = "X86", "64"
+                arch, mode = "X86", "Emulated-32" if current_insn and cls.is_x86_int80() else "64"
             elif is_x86_32():
                 if is_emulated32():
                     arch, mode = "X86", "Emulated-32"
@@ -9481,6 +9481,24 @@ class Syscall:
             mode = "Native-32"
 
         return cls.make_syscall_table(arch, mode)
+
+    @staticmethod
+    def is_x86_int80():
+        # Late imports: this module stays importable outside gdb, and gef.arch
+        # sits above gef.core in the layering.
+        import gdb
+
+        from gef.arch.x86 import X86
+        from gef.core.instruction import get_insn
+        from gef.core.process import is_x86_64
+
+        if not is_x86_64():
+            return False
+        try:
+            insn = get_insn()
+        except gdb.error:
+            return False
+        return insn is not None and X86.get_mnemonic_operands(insn)[0] == "int" and runtime.current_arch.is_syscall(insn)
 
 
 class SyscallX86_64(Syscall):

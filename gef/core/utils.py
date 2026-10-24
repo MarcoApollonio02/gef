@@ -355,6 +355,63 @@ class GefUtil:
     namedtuple_classes = {}
 
     @staticmethod
+    def get_stop_reason(use_saved=True):
+        """Parse saved or current `info program`, which describes the last stop in all-stop mode, or return None on error.
+        "reason" names the stop of the selected thread (e.g. "BREAKPOINT"). "breakpoints" has None for a deleted breakpoint.
+        Set use_saved=False to read GDB's current stop.
+        """
+        # Function-local: gef.core.exec pulls in the arch modules, which import this one.
+        from gef.core.exec import ExecAsm
+        from gef.core.registers import get_register
+        try:
+            if gdb.parameter("non-stop"):
+                context = gdb.selected_thread()
+            else:
+                context = gdb.selected_inferior()
+            if use_saved:
+                saved = ExecAsm.stop_reasons.get(context)
+            else:
+                saved = None
+            if saved is not None:
+                res = saved["info"]
+            else:
+                res = gdb.execute("info program", to_string=True)
+        except gdb.error:
+            return None
+        thread = re.search(r"^(?:Last stopped for|Selected) thread (?:(\d+)\.)?(\d+) ", res, re.M)
+        if thread: # gdb 14.1~
+            selected = gdb.selected_thread()
+            is_selected = (int(thread.group(1) or 1), int(thread.group(2))) == (selected.inferior.num, selected.num)
+        else:
+            pc = re.search(r"^Program stopped at (0x[0-9a-f]+)\.", res, re.M)
+            is_selected = bool(pc) and int(pc.group(1), 16) == get_register("$pc")
+        breakpoints = re.findall(r"^It stopped at (?:breakpoint (\d+)|a breakpoint that has since been deleted)\.", res, re.M)
+        signal = re.search(r"^It stopped with signal (\w+),", res, re.M)
+        stepped = "It stopped after being stepped." in res
+        if "The program being debugged is not being run." in res:
+            reason = "NOT RUNNING"
+        elif not is_selected:
+            reason = "STOPPED"
+        elif signal:
+            reason = signal.group(1)
+        elif breakpoints:
+            if breakpoints[0]:
+                reason = "BREAKPOINT"
+            else:
+                reason = "TEMPORARY BREAKPOINT"
+        elif stepped:
+            reason = "SINGLE STEP"
+        else:
+            reason = "STOPPED"
+        return {
+            "reason": reason,
+            "selected_thread": is_selected,
+            "stepped": stepped,
+            "breakpoints": [int(num) if num else None for num in breakpoints],
+            "signal": signal.group(1) if signal else None,
+        }
+
+    @staticmethod
     @Cache.cache_until_next
     def cached_lookup_type(_type):
         """Look up a GDB type by name and strip typedefs, returning None on failure."""

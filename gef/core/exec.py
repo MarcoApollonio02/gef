@@ -22,6 +22,9 @@ class ExecAsm:
     """Execute embedded asm. e.g., ExecAsm(asm_op_list).exec_code().
     WARNING: Disable `-enable-kvm` option for qemu-system; If set, this code will crash the guest OS."""
 
+    # `info program` only describes the last stop in all-stop mode.
+    stop_reasons = {}
+
     def __init__(self, target_codes, regs=None, step=None, use_bp=False, debug=False):
         self.regs = regs
         self.step = step or 1
