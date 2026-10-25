@@ -7,10 +7,12 @@ Auto-discovered by gef.bootstrap via pkgutil.walk_packages.
 
 import argparse
 import collections
+import hashlib
 import os
 import re
 import struct
 import sys
+import tempfile
 
 import gdb
 
@@ -42,6 +44,7 @@ from gef.core.memory import (
 from gef.core.process import (
     Path,
     ProcessMap,
+    is_alive,
     get_pagesize,
     get_pagesize_mask_high,
     get_pagesize_mask_low,
@@ -1502,25 +1505,96 @@ class V8Command(GenericCommand):
                        help="load gdbinit for v8 from internet.")
     group.add_argument("-L", "--list-command", action="store_true",
                        help="show newly added commands from v8 gdbinit.")
+    parser.add_argument("--revision", default="main", help="V8 revision or tag for the external gdbinit.")
     _syntax_ = parser.format_help()
 
-    def get_gdbinit(self):
-        gdbinit_filename = os.path.join(GEF_TEMP_DIR, "gdbinit-v8")
+    loaded_gdbinit = set()
+
+    def load_gdbinit(self, revision):
+        filename = self.get_gdbinit(revision)
+        if filename in self.loaded_gdbinit:
+            return filename
+        lines = []
+        for line in open(filename).read().splitlines():
+            if line.startswith("alias "):
+                name = line.split()[1]
+                try:
+                    gdb.execute("help " + name, to_string=True)
+                except gdb.error:
+                    pass
+                else:
+                    continue
+            lines.append(line)
+        with tempfile.NamedTemporaryFile(mode="w", prefix="v8-gdbinit-", dir=GEF_TEMP_DIR) as output:
+            output.write("\n".join(lines) + "\n")
+            output.flush()
+            gdb.execute("source " + output.name, to_string=True)
+        self.loaded_gdbinit.add(filename)
+        return filename
+
+    def get_gdbinit(self, revision):
+        if not re.fullmatch(r"[A-Za-z0-9_./-]+", revision) or ".." in revision:
+            raise gdb.error("Invalid V8 revision")
+        cache_key = hashlib.sha256(revision.encode()).hexdigest()[:16]
+        gdbinit_filename = os.path.join(GEF_TEMP_DIR, "gdbinit-v8-" + cache_key)
         if not os.path.exists(gdbinit_filename):
-            # https://chromium.googlesource.com/v8/v8/+/refs/heads/main/tools/gdbinit
-            url = "https://chromium.googlesource.com/v8/v8/+/refs/heads/main/tools/gdbinit?format=TEXT"
+            url = "https://chromium.googlesource.com/v8/v8/+/{:s}/tools/gdbinit?format=TEXT".format(revision)
             gdbinit_data = http_get(url)
+            if gdbinit_data is None:
+                raise gdb.error("Could not download V8 gdbinit for revision {:s}".format(revision))
             import base64
             gdbinit_data = base64.b64decode(gdbinit_data)
             open(gdbinit_filename, "wb").write(gdbinit_data)
             info("Download gdbinit from internet")
         else:
             info("Reuse gdbinit cached previously")
+        info("V8 gdbinit revision: {:s}; target compatibility is not verified".format(revision))
         return gdbinit_filename
 
     @staticmethod
-    @Cache.cache_this_session
+    @Cache.cache_this_session(per_inferior=True, until_new_objfile=True)
+    def get_cache():
+        return {"maps": {}, "instance_types": {}}
+
+    @staticmethod
+    def get_object_start(start):
+        if read_int32_from_memory(start) & 1:
+            return start
+        if read_int_from_memory(start + 8) == start:
+            area_start = read_int_from_memory(start + 0x20)
+            area_end = read_int_from_memory(start + 0x28)
+            if start < area_start < area_end <= start + 0x40000:
+                return area_start
+        if read_int32_from_memory(start + 12) == 0xbeadbeef:
+            area_start = read_int_from_memory(start + 0x58)
+            area_end = read_int_from_memory(start + 0x48)
+            if start < area_start < area_end <= start + 0x40000:
+                return area_start
+        return start + 0x10
+
+    @staticmethod
+    def capture_object(address, output_path):
+        stdout_oldfd = None
+        try:
+            stdout_oldfd = V8ListMapsCommand.redirect_stdout(output_path)
+            V8Command.print_object(address)
+        finally:
+            V8ListMapsCommand.revert_stdout(stdout_oldfd)
+        return open(output_path).read()
+
+    @staticmethod
+    def print_object(address):
+        gdb.execute("call (void) _v8_internal_Print_Object((void*)({:#x}))".format(address), to_string=True)
+        if V8Command.is_chromium():
+            gdb.execute("call (void) putchar(0x0a)", to_string=True)
+        gdb.execute("call (void) fflush(0)", to_string=True)
+        return
+
+    @staticmethod
+    @Cache.cache_this_session(cache_None=False, per_inferior=True, until_new_objfile=True)
     def is_chromium():
+        if not is_alive():
+            return None
         maps = ProcessMap.get_process_maps()
         for m in maps:
             if m.path.startswith("[anon:partition_alloc]"):
@@ -1532,17 +1606,19 @@ class V8Command(GenericCommand):
     @exclude_specific_gdb_mode(mode=("qemu-system", "kgdb", "vmware", "wine"))
     def do_invoke(self, args):
         if args.load_v8_gdbinit:
-            gdbinit_filename = self.get_gdbinit()
             try:
-                gdb.execute("source {:s}".format(gdbinit_filename))
+                self.load_gdbinit(args.revision)
                 info("Successfully loaded")
-            except gdb.error:
-                err("Failed to load")
+            except (gdb.error, OSError) as e:
+                err("Failed to load V8 gdbinit: {!s}".format(e))
             return
 
         if args.list_command:
-            gdb.execute("v8 -l", to_string=True)
-            gdbinit_filename = self.get_gdbinit()
+            try:
+                gdbinit_filename = self.load_gdbinit(args.revision)
+            except (gdb.error, OSError) as e:
+                err("Failed to load V8 gdbinit: {!s}".format(e))
+                return
             data = open(gdbinit_filename).read()
             for line in data.splitlines():
                 line = line.strip()
@@ -1556,21 +1632,13 @@ class V8Command(GenericCommand):
                     gdb.execute("help {:s}".format(comm))
             return
 
-        if args.address:
+        if args.address is not None:
             try:
-                # Since this command is used so often, it can be implemented without loading from internet.
-                cmd = "call (void) _v8_internal_Print_Object((void*)({:#x}))".format(args.address)
-                gdb.execute(cmd)
-                # When attached to chromium and run, the newline is not generated,
-                # so it is not displayed immediately due to buffering. As a workaround, run putchar('\n') and fflush(0).
-                if V8Command.is_chromium():
-                    cmd = "call (void) putchar(0x0a)"
-                    gdb.execute(cmd)
-                    cmd = "call (void) fflush(0)"
-                    gdb.execute(cmd)
-            except gdb.error:
-                pass
+                self.print_object(args.address)
+            except gdb.error as e:
+                err("V8 object print failed: {!s}".format(e))
         return
+
 
 
 @register_command
@@ -2659,5 +2727,3 @@ class PartitionAllocDumpCommand(GenericCommand, BufferingOutput):
 
         self.print_output()
         return
-
-

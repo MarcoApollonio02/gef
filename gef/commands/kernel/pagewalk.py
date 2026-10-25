@@ -28,9 +28,10 @@ from gef.core.address import AddressUtil, Permission
 from gef.core.cache import Cache
 from gef.core.color import Color, err, gef_print, titlify
 from gef.core.config import Config
-from gef.core.kernel import Kernel
+from gef.core.display import ProgressBar
+from gef.core.kernel import AddrMap, Kernel, Ksym
 from gef.core.memory import MemoryCache, is_valid_addr, read_int_from_memory, read_memory
-from gef.core.pagewalk import KernelAddressHeuristicFinder, PageMap
+from gef.core.pagewalk import KernelAddressHeuristicFinder, PageMap, PageTableX64
 from gef.core.process import (
     get_pagesize,
     get_pagesize_mask_high,
@@ -49,7 +50,7 @@ from gef.core.process import (
     is_x86_32,
     is_x86_64,
 )
-from gef.core.qemu import SystemManagementMemory, read_physmem
+from gef.core.qemu import QemuMonitor, SystemManagementMemory, read_physmem
 from gef.core.registers import get_register
 from gef.core.strings import String
 from gef.core.symbols import Symbol
@@ -1042,7 +1043,7 @@ class PagewalkRiscvCommand(PagewalkCommand):
 
 @register_command
 class PagewalkX64Command(PagewalkCommand):
-    """Dump pagetable for x64/x86."""
+    """Dump page tables for x86/64."""
 
     _cmdline_ = "pagewalk x64"
     _category_ = "06-a. Qemu-system/KGDB Cooperation - Memory Map"
@@ -1064,8 +1065,8 @@ class PagewalkX64Command(PagewalkCommand):
                         help="filter by map included specified physical address.")
     parser.add_argument("-t", "--trace", metavar="VADDR", action="append", type=AddressUtil.parse_address, default=[],
                         help="show all level pagetables only associated specified address.")
-    parser.add_argument("-i", "--include-esp-fixup-stacks", action="store_true",
-                        help="include `%%esp fixup stacks` area (sometimes heavy memory use; x64 only).")
+    parser.add_argument("-i", "--include-aliased-pages", action="store_true",
+                        help="include aliased pages such as espfix stacks and KASAN shadow (heavy memory use; x64 only).")
     parser.add_argument("-U", "--user-pt", action="store_true",
                         help="print userland pagetables (for KPTI, x64 only, in kernel context).")
     parser.add_argument("--cr3", dest="user_specified_cr3", type=AddressUtil.parse_address,
@@ -1073,664 +1074,36 @@ class PagewalkX64Command(PagewalkCommand):
     parser.add_argument("--cr4", dest="user_specified_cr4", type=AddressUtil.parse_address,
                         help="use specified value as cr4.")
     parser.add_argument("--ept", action="store_true", help="parse cr3 as EPT (Extended Page Table).")
+    parser.add_argument("--ept-levels", type=int, choices=(4, 5), default=4,
+                        help="EPT walk length, independent of CR4.LA57 (default: 4).")
     parser.add_argument("-D", "--disable-color", action="store_true", help="disable RWX colored output")
     parser.add_argument("-c", "--use-cache", action="store_true", help="use previous result.")
     parser.add_argument("-n", "--no-pager", action="store_true", help="do not use the pager.")
     parser.add_argument("-q", "--quiet", action="store_true", help="show result only.")
     _syntax_ = parser.format_help()
 
-    def __init__(self):
-        super().__init__(prefix=False)
-        self.mappings = None
-        return
-
-    def format_flags(self, flag_info):
-        flag_info_key = tuple(flag_info)
-        x = self.flags_strings_cache.get(flag_info_key, None)
-        if x is not None:
-            return x
-
-        flags = []
-        if self.args.ept:
-            perm = ""
-            perm += ["R", "-"]["NO_R" in flag_info]
-            perm += ["W", "-"]["NO_W" in flag_info]
-            perm += ["X", "-"]["NO_X" in flag_info]
-            flags += [perm]
-        else:
-            if "NO_RW" in flag_info:
-                if "XD" in flag_info:
-                    flags += ["R--"]
-                else:
-                    flags += ["R-X"]
-            else:
-                if "XD" in flag_info:
-                    flags += ["RW-"]
-                else:
-                    flags += ["RWX"]
-            if "NO_US" in flag_info:
-                flags += ["KERN"]
-            else:
-                flags += ["USER"]
-
-        if not self.args.simple:
-            if "A" in flag_info:
-                flags += ["ACCESSED"]
-            if "D" in flag_info:
-                flags += ["DIRTY"]
-            if "G" in flag_info:
-                flags += ["GLOBAL"]
-
-        flag_string = " ".join(flags)
-        self.flags_strings_cache[flag_info_key] = flag_string
-        return flag_string
-
-    def pagewalk_PML5T(self):
-        self.quiet_add_out(titlify("PML5E: Page Map Level 5 Entry"))
-        PML5E = []
-        COUNT = 0
-        bit_shift = sum([
-            self.bits["PML4T_BITS"],
-            self.bits["PDPT_BITS"],
-            self.bits["PDT_BITS"],
-            self.bits["PT_BITS"],
-            self.bits["OFFSET"],
-        ])
-        tqdm = GefUtil.get_tqdm(not self.args.quiet)
-        for va_base, table_base, parent_flags in tqdm(self.TABLES, leave=False, desc="PML5E"):
-            entries = self.read_physmem_cache(table_base, 2 ** self.bits["PML5T_BITS"] * self.bits["ENTRY_SIZE"])
-            entries = slice_unpack(entries, self.bits["ENTRY_SIZE"])
-            COUNT += len(entries)
-            for i, entry in enumerate(entries):
-                # present flag
-                if (entry & 1) == 0:
-                    continue
-
-                # calc virtual address
-                sign_ext = 0xfe00_0000_0000_0000 if ((i >> (self.bits["PML5T_BITS"] - 1)) & 1) else 0
-                new_va = va_base + (sign_ext | (i << bit_shift))
-                new_va_end = new_va + (1 << bit_shift)
-
-                # calc flags
-                flags = parent_flags.copy()
-                if self.args.ept:
-                    if ((entry >> 0) & 1) == 0:
-                        flags.append("NO_R")
-                    if ((entry >> 1) & 1) == 0:
-                        flags.append("NO_W")
-                    if ((entry >> 2) & 1) == 0:
-                        flags.append("NO_X")
-                    if ((entry >> 8) & 1) == 1:
-                        flags.append("A")
-                else:
-                    if ((entry >> 1) & 1) == 0:
-                        flags.append("NO_RW")
-                    if ((entry >> 2) & 1) == 0:
-                        flags.append("NO_US")
-                    if ((entry >> 5) & 1) == 1:
-                        flags.append("A")
-                    if ((entry >> 63) & 1) == 1:
-                        flags.append("XD")
-
-                # calc next table (drop the flag bits)
-                next_level_table = entry & 0x000f_ffff_ffff_f000
-
-                # make entry
-                PML5E.append([new_va, next_level_table, flags])
-                entry_type = "TABLE"
-
-                # dump
-                if self.args.print_each_level:
-                    if self.is_not_trace_target(new_va, new_va_end):
-                        continue
-                    addr = table_base + i * self.bits["ENTRY_SIZE"]
-                    line = "{:#018x}: {:#018x} (virt:{:#018x}-{:#018x},type:{:s}) {:s}".format(
-                        addr, entry, new_va, new_va_end, entry_type, " ".join(flags),
-                    )
-                    if self.is_not_filter_target(line):
-                        continue
-                    self.out.append(line)
-
-        if self.args.print_each_level:
-            self.out.append(titlify(""))
-
-        self.quiet_info_add_out("Number of entries: {:d}".format(COUNT))
-        self.quiet_info_add_out("PML5 Entry: {:d}".format(len(PML5E)))
-        self.quiet_info_add_out("Invalid entries: {:d}".format(COUNT - len(PML5E)))
-        self.TABLES = PML5E
-        return
-
-    def pagewalk_PML4T(self):
-        self.quiet_add_out(titlify("PML4E: Page Map Level 4 Entry"))
-        PML4E = []
-        COUNT = 0
-        bit_shift = sum([
-            self.bits["PDPT_BITS"],
-            self.bits["PDT_BITS"],
-            self.bits["PT_BITS"],
-            self.bits["OFFSET"],
-        ])
-        tqdm = GefUtil.get_tqdm(not self.args.quiet)
-        for va_base, table_base, parent_flags in tqdm(self.TABLES, leave=False, desc="PML4E"):
-            entries = self.read_physmem_cache(table_base, 2 ** self.bits["PML4T_BITS"] * self.bits["ENTRY_SIZE"])
-            entries = slice_unpack(entries, self.bits["ENTRY_SIZE"])
-            COUNT += len(entries)
-            for i, entry in enumerate(entries):
-                # present flag
-                if (entry & 1) == 0:
-                    continue
-
-                # calc virtual address
-                if "PML5T_BITS" in self.bits:
-                    new_va = va_base + (i << bit_shift)
-                    new_va_end = new_va + (1 << bit_shift)
-                else:
-                    sign_ext = 0xffff_0000_0000_0000 if ((i >> (self.bits["PML4T_BITS"] - 1)) & 1) else 0
-                    new_va = va_base + (sign_ext | (i << bit_shift))
-                    new_va_end = new_va + (1 << bit_shift)
-
-                # calc flags
-                flags = parent_flags.copy()
-                if self.args.ept:
-                    if ((entry >> 0) & 1) == 0:
-                        flags.append("NO_R")
-                    if ((entry >> 1) & 1) == 0:
-                        flags.append("NO_W")
-                    if ((entry >> 2) & 1) == 0:
-                        flags.append("NO_X")
-                    if ((entry >> 8) & 1) == 1:
-                        flags.append("A")
-                else:
-                    if ((entry >> 1) & 1) == 0:
-                        flags.append("NO_RW")
-                    if ((entry >> 2) & 1) == 0:
-                        flags.append("NO_US")
-                    if ((entry >> 5) & 1) == 1:
-                        flags.append("A")
-                    if ((entry >> 63) & 1) == 1:
-                        flags.append("XD")
-
-                # calc next table (drop the flag bits)
-                next_level_table = entry & 0x000f_ffff_ffff_f000
-
-                # make entry
-                PML4E.append([new_va, next_level_table, flags])
-                entry_type = "TABLE"
-
-                # dump
-                if self.args.print_each_level:
-                    if self.is_not_trace_target(new_va, new_va_end):
-                        continue
-                    addr = table_base + i * self.bits["ENTRY_SIZE"]
-                    line = "{:#018x}: {:#018x} (virt:{:#018x}-{:#018x},type:{:s}) {:s}".format(
-                        addr, entry, new_va, new_va_end, entry_type, " ".join(flags),
-                    )
-                    if self.is_not_filter_target(line):
-                        continue
-                    self.out.append(line)
-
-        if self.args.print_each_level:
-            self.out.append(titlify(""))
-
-        self.quiet_info_add_out("Number of entries: {:d}".format(COUNT))
-        self.quiet_info_add_out("PML4 Entry: {:d}".format(len(PML4E)))
-        self.quiet_info_add_out("Invalid entries: {:d}".format(COUNT - len(PML4E)))
-        self.TABLES = PML4E
-        return
-
-    def pagewalk_PDPT(self):
-        self.quiet_add_out(titlify("PDPE: Page Directory Pointer Entry"))
-
-        def is_set_PS(entry):
-            return ((entry >> 7) & 1) == 1
-
-        PDPTE = []
-        PTE = []
-        COUNT = 0
-        bit_shift = sum([
-            self.bits["PDT_BITS"],
-            self.bits["PT_BITS"],
-            self.bits["OFFSET"],
-        ])
-        tqdm = GefUtil.get_tqdm(not self.args.quiet)
-        for va_base, table_base, parent_flags in tqdm(self.TABLES, leave=False, desc="PDPE"):
-            entries = self.read_physmem_cache(table_base, 2 ** self.bits["PDPT_BITS"] * self.bits["ENTRY_SIZE"])
-            entries = slice_unpack(entries, self.bits["ENTRY_SIZE"])
-            COUNT += len(entries)
-            for i, entry in enumerate(entries):
-                # present flag
-                if (entry & 1) == 0:
-                    continue
-
-                # calc virtual address
-                new_va = va_base + (i << bit_shift)
-                new_va_end = new_va + (1 << bit_shift)
-
-                # calc flags
-                flags = parent_flags.copy()
-                if is_x86_64():
-                    if self.args.ept:
-                        if ((entry >> 0) & 1) == 0:
-                            flags.append("NO_R")
-                        if ((entry >> 1) & 1) == 0:
-                            flags.append("NO_W")
-                        if ((entry >> 2) & 1) == 0:
-                            flags.append("NO_X")
-                        if ((entry >> 8) & 1) == 1:
-                            flags.append("A")
-                        if is_set_PS(entry) and ((entry >> 9) & 1) == 1:
-                            flags.append("D")
-                    else:
-                        if ((entry >> 1) & 1) == 0:
-                            flags.append("NO_RW")
-                        if ((entry >> 2) & 1) == 0:
-                            flags.append("NO_US")
-                        if ((entry >> 5) & 1) == 1:
-                            flags.append("A")
-                        if is_set_PS(entry) and ((entry >> 6) & 1) == 1:
-                            flags.append("D")
-                        if is_set_PS(entry) and ((entry >> 8) & 1) == 1:
-                            flags.append("G")
-                        if ((entry >> 63) & 1) == 1:
-                            flags.append("XD")
-                else: # x86_32 and PAE
-                    pass
-
-                # calc next table (drop the flag bits)
-                if is_x86_64() and is_set_PS(entry):
-                    next_level_table = entry & 0x000f_ffff_ffff_e000
-                else:
-                    next_level_table = entry & 0x000f_ffff_ffff_f000
-
-                # make entry
-                if is_set_PS(entry):
-                    virt_addr = new_va
-                    phys_addr = next_level_table
-                    page_size = 1 * 1024 * 1024 * 1024
-                    page_count = 1
-                    PTE.append([virt_addr, phys_addr, page_size, page_count, self.format_flags(flags)])
-                    entry_type = "1GB-PAGE"
-                else:
-                    PDPTE.append([new_va, next_level_table, flags])
-                    entry_type = "TABLE"
-
-                # dump
-                if self.args.print_each_level:
-                    if self.is_not_trace_target(new_va, new_va_end):
-                        continue
-                    addr = table_base + i * self.bits["ENTRY_SIZE"]
-                    line = "{:#018x}: {:#018x} (virt:{:#018x}-{:#018x},type:{:s}) {:s}".format(
-                        addr, entry, new_va, new_va_end, entry_type, " ".join(flags),
-                    )
-                    if self.is_not_filter_target(line):
-                        continue
-                    self.out.append(line)
-
-        if self.args.print_each_level:
-            self.out.append(titlify(""))
-
-        self.quiet_info_add_out("Number of entries: {:d}".format(COUNT))
-        self.quiet_info_add_out("PDPT Entry: {:d}".format(len(PDPTE)))
-        self.quiet_info_add_out("PT Entry (1GB): {:d}".format(len(PTE)))
-        self.quiet_info_add_out("Invalid entries: {:d}".format(COUNT - len(PDPTE) - len(PTE)))
-        self.TABLES = PDPTE
-        self.PTE += PTE
-        return
-
-    def pagewalk_PDT(self):
-        self.quiet_add_out(titlify("PDE: Page Directory Entry"))
-
-        def is_set_PS(entry):
-            return ((entry >> 7) & 1) == 1
-
-        PDE = []
-        PTE = []
-        COUNT = 0
-        bit_shift = sum([
-            self.bits["PT_BITS"],
-            self.bits["OFFSET"],
-        ])
-        tqdm = GefUtil.get_tqdm(not self.args.quiet)
-        for va_base, table_base, parent_flags in tqdm(self.TABLES, leave=False, desc="PDE"):
-            entries = self.read_physmem_cache(table_base, 2 ** self.bits["PDT_BITS"] * self.bits["ENTRY_SIZE"])
-            entries = slice_unpack(entries, self.bits["ENTRY_SIZE"])
-            COUNT += len(entries)
-
-            if not self.args.include_esp_fixup_stacks:
-                if len({e & ~0b111 for e in entries}) == 1:
-                    continue
-
-            for i, entry in enumerate(entries):
-                # present flag
-                if (entry & 1) == 0:
-                    continue
-
-                # calc virtual address
-                new_va = va_base + (i << bit_shift)
-                new_va_end = new_va + (1 << bit_shift)
-
-                # calc flags
-                flags = parent_flags.copy()
-                if self.args.ept:
-                    if ((entry >> 0) & 1) == 0:
-                        flags.append("NO_R")
-                    if ((entry >> 1) & 1) == 0:
-                        flags.append("NO_W")
-                    if ((entry >> 2) & 1) == 0:
-                        flags.append("NO_X")
-                    if ((entry >> 8) & 1) == 1:
-                        flags.append("A")
-                    if is_set_PS(entry) and ((entry >> 9) & 1) == 1:
-                        flags.append("D")
-                else:
-                    if ((entry >> 1) & 1) == 0:
-                        flags.append("NO_RW")
-                    if ((entry >> 2) & 1) == 0:
-                        flags.append("NO_US")
-                    if ((entry >> 5) & 1) == 1:
-                        flags.append("A")
-                    if is_set_PS(entry) and ((entry >> 6) & 1) == 1:
-                        flags.append("D")
-                    if is_set_PS(entry) and ((entry >> 8) & 1) == 1:
-                        flags.append("G")
-                    if self.PAE and ((entry >> 63) & 1) == 1:
-                        flags.append("XD")
-
-                # calc next table (drop the flag bits)
-                if is_x86_64() and is_set_PS(entry):
-                    next_level_table = entry & 0x000f_ffff_ffff_e000
-                elif is_x86_32() and is_set_PS(entry):
-                    high = (entry >> 13) & 0xf
-                    low = (entry >> 22) & 0x3ff
-                    next_level_table = ((high << 10) | low) << 22
-                else:
-                    next_level_table = entry & 0x000f_ffff_ffff_f000
-
-                # make entry
-                if is_set_PS(entry):
-                    virt_addr = new_va
-                    phys_addr = next_level_table
-                    if self.PAE:
-                        page_size = 2 * 1024 * 1024
-                        entry_type = "2MB-PAGE"
-                    else:
-                        page_size = 4 * 1024 * 1024
-                        entry_type = "4MB-PAGE"
-                    page_count = 1
-                    PTE.append([virt_addr, phys_addr, page_size, page_count, self.format_flags(flags)])
-                else:
-                    PDE.append([new_va, next_level_table, flags])
-                    entry_type = "TABLE"
-
-                # dump
-                if self.args.print_each_level:
-                    if self.is_not_trace_target(new_va, new_va_end):
-                        continue
-                    addr = table_base + i * self.bits["ENTRY_SIZE"]
-                    line = "{:#018x}: {:#018x} (virt:{:#018x}-{:#018x},type:{:s}) {:s}".format(
-                        addr, entry, new_va, new_va_end, entry_type, " ".join(flags),
-                    )
-                    if self.is_not_filter_target(line):
-                        continue
-                    self.out.append(line)
-
-        if self.args.print_each_level:
-            self.out.append(titlify(""))
-
-        self.quiet_info_add_out("Number of entries: {:d}".format(COUNT))
-        self.quiet_info_add_out("PD Entry: {:d}".format(len(PDE)))
-        self.quiet_info_add_out("PT Entry ({:d}MB): {:d}".format(2 if self.PAE else 4, len(PTE)))
-        self.quiet_info_add_out("Invalid entries: {:d}".format(COUNT - len(PDE) - len(PTE)))
-        self.TABLES = PDE
-        self.PTE += PTE
-        return
-
-    def pagewalk_PT(self):
-        self.quiet_add_out(titlify("PTE: Page Table Entry"))
-        PTE = []
-        COUNT = 0
-        bit_shift = self.bits["OFFSET"]
-        flag_cache = {}
-
-        tqdm = GefUtil.get_tqdm(not self.args.quiet)
-        for va_base, table_base, parent_flags in tqdm(self.TABLES, leave=False, desc="PTE"):
-            entries = self.read_physmem_cache(table_base, 2 ** self.bits["PT_BITS"] * self.bits["ENTRY_SIZE"])
-            entries = slice_unpack(entries, self.bits["ENTRY_SIZE"])
-            COUNT += len(entries)
-
-            if not self.args.include_esp_fixup_stacks:
-                if len({e & ~0b111 for e in entries}) == 1:
-                    continue
-
-            for i, entry in enumerate(entries):
-                # present flag
-                if (entry & 1) == 0:
-                    continue
-
-                # calc virtual address
-                virt_addr = va_base + (i << bit_shift)
-                virt_addr_end = virt_addr + (1 << bit_shift)
-
-                # calc flags
-                flags = parent_flags.copy()
-                if self.args.ept:
-                    if ((entry >> 0) & 1) == 0:
-                        flags.append("NO_R")
-                    if ((entry >> 1) & 1) == 0:
-                        flags.append("NO_W")
-                    if ((entry >> 2) & 1) == 0:
-                        flags.append("NO_X")
-                    if ((entry >> 8) & 1) == 1:
-                        flags.append("A")
-                    if ((entry >> 9) & 1) == 1:
-                        flags.append("D")
-                else:
-                    # This route passes many times, so make a memo
-                    entry_flags_key = entry & 0x8000_0000_0000_0166
-                    x = flag_cache.get(entry_flags_key, None)
-                    if x is not None:
-                        flags.extend(x)
-                    else:
-                        flags_tmp = []
-                        if ((entry >> 1) & 1) == 0:
-                            flags_tmp.append("NO_RW")
-                        if ((entry >> 2) & 1) == 0:
-                            flags_tmp.append("NO_US")
-                        if ((entry >> 5) & 1) == 1:
-                            flags_tmp.append("A")
-                        if ((entry >> 6) & 1) == 1:
-                            flags_tmp.append("D")
-                        if ((entry >> 8) & 1) == 1:
-                            flags_tmp.append("G")
-                        if self.PAE and ((entry >> 63) & 1) == 1:
-                            flags_tmp.append("XD")
-                        flag_cache[entry_flags_key] = flags_tmp
-                        flags.extend(flags_tmp)
-
-                # calc physical addr (drop the flag bits)
-                phys_addr = entry & 0x000f_ffff_ffff_f000
-
-                # make entry
-                page_size = 4 * 1024
-                page_count = 1
-                PTE.append([virt_addr, phys_addr, page_size, page_count, self.format_flags(flags)])
-                entry_type = "4KB-PAGE"
-
-                # dump
-                if self.args.print_each_level:
-                    if self.is_not_trace_target(virt_addr, virt_addr_end):
-                        continue
-                    addr = table_base + i * self.bits["ENTRY_SIZE"]
-                    line = "{:#018x}: {:#018x} (virt:{:#018x}-{:#018x},type:{:s}) {:s}".format(
-                        addr, entry, virt_addr, virt_addr_end, entry_type, " ".join(flags),
-                    )
-                    if self.is_not_filter_target(line):
-                        continue
-                    self.out.append(line)
-
-        if self.args.print_each_level:
-            self.out.append(titlify(""))
-
-        self.quiet_info_add_out("Number of entries: {:d}".format(COUNT))
-        self.quiet_info_add_out("PT Entry (4KB): {:d}".format(len(PTE)))
-        self.quiet_info_add_out("Invalid entries: {:d}".format(COUNT - len(PTE)))
-        self.PTE += PTE
-
-        self.quiet_add_out(titlify("Total"))
-        self.quiet_info_add_out("PT Entry (Total): {:d}".format(len(self.PTE)))
-        self.mappings = self.PTE
-        return
-
-    def pagewalk(self):
-        # `info tlb` on qemu-monitor returns pagetable without intermediate pagetable information.
-        # for printing it, we will pagewalk manually.
-        if self.args.user_specified_cr3 is not None:
-            cr3 = self.args.user_specified_cr3
-        else:
-            cr3 = get_register("cr3", use_monitor=True, use_mbed_exec=True)
-        if cr3 is None:
-            self.quiet_err("Failed to resolve cr3")
-            return
-
-        if self.args.user_specified_cr4 is not None:
-            cr4 = self.args.user_specified_cr4
-        else:
-            cr4 = get_register("cr4", use_monitor=True, use_mbed_exec=True)
-        if cr4 is None:
-            self.quiet_err("Failed to resolve cr4")
-            return
-
-        if is_x86_64() and self.args.user_pt:
-            cr3 += get_pagesize()
-        self.quiet_info_add_out("cr3: {:#018x}".format(cr3))
-        self.quiet_info_add_out("cr4: {:#018x}".format(cr4))
-
-        # virtual address base
-        va_base = 0
-
-        # pagewalk base is from CR3 register
-        if self.args.user_specified_cr3 is not None:
-            pagewalk_base = cr3 # without mask
-        else:
-            if is_x86_64(): # 64bit
-                pagewalk_base = cr3 & ~0xfff
-            elif ((cr4 >> 5) & 1) == 1: # 32bit PAE
-                pagewalk_base = cr3 & ~0x1f
-            else: # 32bit non-PAE
-                pagewalk_base = cr3 & ~0xfff
-
-        # we ignore PWT and PCD flags.
-        flags = []
-
-        # do pagewalk
-        self.PTE = []
-        self.TABLES = [(va_base, pagewalk_base, flags)]
-        self.flags_strings_cache = {}
-        if is_x86_64():
-            if (cr4 >> 12) & 1: # PML5T check
-                # 64bit 5-level(4KB): 9,9,9,9,9,12
-                # 64bit 5-level(2MB): 9,9,9,9,0,21
-                # 64bit 5-level(1GB): 9,9,9,0,0,30
-                self.quiet_info_add_out("64-bit 5 level page table")
-                self.bits = {
-                    "ENTRY_SIZE": 8,
-                    "PML5T_BITS": 9, "PML4T_BITS": 9, "PDPT_BITS": 9, "PDT_BITS": 9, "PT_BITS": 9, "OFFSET": 12,
-                }
-                self.PAE = True
-                if not self.args.use_cache or not self.mappings:
-                    self.mappings = None
-                    self.pagewalk_PML5T()
-                    self.pagewalk_PML4T()
-                    self.pagewalk_PDPT()
-                    self.pagewalk_PDT()
-                    self.pagewalk_PT()
-                    self.merging()
-            else:
-                # 64bit 4-level(4KB): 9,9,9,9,12
-                # 64bit 4-level(2MB): 9,9,9,0,21
-                # 64bit 4-level(1GB): 9,9,0,0,30
-                self.quiet_info_add_out("64-bit 4 level page table")
-                self.bits = {
-                    "ENTRY_SIZE": 8,
-                    "PML4T_BITS": 9, "PDPT_BITS": 9, "PDT_BITS": 9, "PT_BITS": 9, "OFFSET": 12,
-                }
-                self.PAE = True
-                if not self.args.use_cache or not self.mappings:
-                    self.mappings = None
-                    self.pagewalk_PML4T()
-                    self.pagewalk_PDPT()
-                    self.pagewalk_PDT()
-                    self.pagewalk_PT()
-                    self.merging()
-        elif is_x86_32() or is_x86_16():
-            if (cr4 >> 5) & 1: # PAE check
-                # 32bit PAE(4KB): 2,9,9,12 (PTE Size: 64bit)
-                # 32bit PAE(2MB): 2,9,0,21 (PTE Size: 64bit)
-                self.quiet_info_add_out("32-bit {:s} page table".format(Color.boldify("PAE")))
-                self.bits = {
-                    "ENTRY_SIZE": 8,
-                    "PDPT_BITS": 2, "PDT_BITS": 9, "PT_BITS": 9, "OFFSET": 12,
-                }
-                self.PAE = True
-                if not self.args.use_cache or not self.mappings:
-                    self.mappings = None
-                    self.pagewalk_PDPT()
-                    self.pagewalk_PDT()
-                    self.pagewalk_PT()
-                    self.merging()
-            else:
-                # 32bit(4KB): 10,10,12
-                # 32bit(4MB): 10,0,22
-                self.quiet_info_add_out("32-bit Non-PAE page table")
-                self.bits = {
-                    "ENTRY_SIZE": 4,
-                    "PDT_BITS": 10, "PT_BITS": 10, "OFFSET": 12,
-                }
-                self.PAE = False
-                if not self.args.use_cache or not self.mappings:
-                    self.mappings = None
-                    self.pagewalk_PDT()
-                    self.pagewalk_PT()
-                    self.merging()
-        else:
-            self.err_add_out("Unsupported CPU")
-            return
-
-        self.flags_strings_cache = None
-        self.make_out(self.mappings)
-        return
-
     @parse_args
     @only_if_gdb_running
     @only_if_specific_gdb_mode(mode=("qemu-system", "vmware", "kgdb"))
     @only_if_specific_arch(arch=("x86_32", "x86_64", "x86_16"))
     def do_invoke(self, args):
-        if self.args.include_esp_fixup_stacks and not is_x86_64():
-            err("Unsupported --include-esp-fixup-stacks option in this arch")
+        self.page_table = PageTableX64()
+        if args.include_aliased_pages and not is_x86_64():
+            err("Unsupported --include-aliased-pages option in this arch")
             return
 
-        if self.args.trace:
-            # You should not modify the self.args.vrange directly.
-            self.vrange = self.args.vrange + self.args.trace # merge vrange and trace
-            self.args.print_each_level = True # overwrite
-            self.args.use_cache = False # overwrite
-        else:
-            self.vrange = self.args.vrange
-
         if not is_x86_64() or not is_in_kernel():
-            self.args.user_pt = False # support x64 only
+            args.user_pt = False
+        if args.ept and args.user_specified_cr3 is None:
+            err("Unsupported --ept option without --cr3 option")
+            return
 
-        if args.ept:
-            if not self.args.user_specified_cr3:
-                err("Unsupported --ept option without --cr3 option")
-                return
-
-        self.out = []
-        self.cache = {}
-        self.pagewalk()
-        self.cache = {} # The cache is huge, so it will be released as soon as possible.
+        with self.page_table:  # context manager for temporary physical-memory mode
+            self.page_table.pagewalk(args)
+        self.out = self.page_table.out
         self.print_output()
         return
+
 
 
 @register_command
@@ -4821,8 +4194,8 @@ class KernelVMMapCommand(GenericCommand, BufferingOutput):
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("-U", "--exclude-user", action="store_true", help="exclude userland memory.")
-    parser.add_argument("-i", "--include-esp-fixup-stacks", action="store_true",
-                        help="include `%%esp fixup stacks` area (sometimes heavy memory use; x64 only).")
+    parser.add_argument("-i", "--include-aliased-pages", action="store_true",
+                        help="include aliased pages such as espfix stacks and KASAN shadow (heavy memory use; x64 only).")
     parser.add_argument("-v", "--verbose", action="count", default=0,
                         help="increase output verbosity. (-v, -vv, -vvv)")
     parser.add_argument("address_filter", metavar="ADDRESS", nargs="*", type=AddressUtil.parse_address,
@@ -4869,15 +4242,15 @@ class KernelVMMapCommand(GenericCommand, BufferingOutput):
 
             # coloring
             if self.perm == "r--":
-                line_color = Config.get_gef_setting("theme.address_readonly")
+                line_color = Config.get("theme.address_readonly")
             elif self.perm == "rw-":
-                line_color = Config.get_gef_setting("theme.address_writable")
+                line_color = Config.get("theme.address_writable")
             elif self.perm.endswith("x"):
-                line_color = Config.get_gef_setting("theme.address_code")
+                line_color = Config.get("theme.address_code")
             else:
                 line_color = ""
             if self.perm == "rwx":
-                line_color += " " + Config.get_gef_setting("theme.address_rwx")
+                line_color += " " + Config.get("theme.address_rwx")
             return Color.colorify(line, line_color)
 
     def page_start_align(self, x):
@@ -5034,82 +4407,58 @@ class KernelVMMapCommand(GenericCommand, BufferingOutput):
         self.regions = new_regions
         return
 
-    def get_maps(self):
+    def get_regions(self):
         option = ""
-        if self.args.include_esp_fixup_stacks:
-            option = " --include-esp-fixup-stacks"
-        res = PageMap.get_page_maps_by_pagewalk("pagewalk --quiet --no-pager --disable-color" + option)
-        res = sorted(set(res.splitlines()))
-        res = list(filter(lambda line: line.endswith("]"), res))
-        res = list(filter(lambda line: "[+]" not in line, res))
-
-        def is_userland(line, addr_start):
-            if is_x86():
-                return "USER" in line
-            elif is_arm32():
-                if "[PL0/---" not in line and addr_start != 0xffff_0000:
-                    return True
-            elif is_arm64():
-                return not AddressUtil.is_msb_on(addr_start)
-            return False
+        if self.args.include_aliased_pages:
+            option = " --include-aliased-pages"
+        maps = AddrMap.get_maps(command="pagewalk --quiet --no-pager --disable-color" + option)
 
         regions = {} # {addr_start: Region(), ...}
-        for line in res:
-            line = line.split()
-
-            # parse address
-            addr_start_str, addr_end_str = line[0].split("-")
-            # Note that for espfix it looks like `0xffffff5b****e000-0xffffff5b****f000`
-            addr_start = int(addr_start_str.replace("*", "0"), 16)
-            addr_end = int(addr_end_str.replace("*", "f"), 16)
-
+        for entry in maps:
             # userland filter
-            if self.args.exclude_user:
-                if is_userland(line, addr_start):
-                    continue
-
-            # parse permission
-            if is_x86():
-                perm = Permission.from_process_maps(line[5][1:4].lower())
-            elif is_arm64() or is_arm32():
-                perm = Permission.from_process_maps(line[6][4:7].lower())
+            if self.args.exclude_user and entry.is_userland():
+                continue
 
             # add region
-            if "*" in addr_start_str:
-                regions[addr_start] = self.Region(
-                    addr_start, addr_end, str(perm), merge=False,
-                    description="esp_fixup (=0x1000*N)",
-                    addr_start_str=addr_start_str, addr_end_str=addr_end_str, size_str="0x0000000000001000",
+            if entry.has_wildcard:
+                vstart = int(entry.vstart_text.replace("*", "0"), 16)
+                if vstart in regions:
+                    continue
+                regions[vstart] = self.Region(
+                    vstart, vstart + entry.vsize, str(entry.permission), merge=False,
+                    description="aliased pages (={:#x}*N)".format(entry.vsize),
+                    addr_start_str=entry.vstart_text, addr_end_str=entry.vend_text,
+                    size_str="{:#018x}".format(entry.vsize),
                 )
-            elif is_userland(line, addr_start):
-                regions[addr_start] = self.Region(
-                    addr_start, addr_end, str(perm), description="userland",
+            elif entry.is_userland():
+                regions[entry.vstart] = self.Region(
+                    entry.vstart, entry.vend, str(entry.permission), description="userland",
                 )
             else:
-                regions[addr_start] = self.Region(
-                    addr_start, addr_end, str(perm),
+                regions[entry.vstart] = self.Region(
+                    entry.vstart, entry.vend, str(entry.permission),
                 )
         return regions
 
     def resolve_kbase(self):
         self.quiet_info("Resolving kbase")
 
-        kinfo = Kernel.get_kernel_layout()
+        klayout = Kernel.layout()
 
         # .text
-        stext = Symbol.get_ksymaddr("_stext")
-        etext = Symbol.get_ksymaddr("_etext")
+        stext = Ksym.get_addr("_stext")
+        etext = Ksym.get_addr("_etext")
         if stext and etext:
             stext = self.page_start_align(stext)
             etext = self.page_end_align(etext)
             self.insert_region(stext, etext - stext, "kernel .text")
         else:
-            if kinfo.text_base in self.regions:
-                self.regions[kinfo.text_base].add_description("maybe kernel .text")
+            if klayout.text_base in self.regions:
+                self.regions[klayout.text_base].add_description("maybe kernel .text")
 
         # .rodata
-        start_rodata = Symbol.get_ksymaddr("__start_rodata")
-        end_rodata = Symbol.get_ksymaddr("__end_rodata")
+        start_rodata = Ksym.get_addr("__start_rodata")
+        end_rodata = Ksym.get_addr("__end_rodata")
         if start_rodata and end_rodata:
             start_rodata = self.page_start_align(start_rodata)
             end_rodata = self.page_end_align(end_rodata)
@@ -5117,12 +4466,12 @@ class KernelVMMapCommand(GenericCommand, BufferingOutput):
         else:
             # In a 32-bit environment, the range of rodata may not be measured correctly, so it is not used.
             if is_64bit():
-                if kinfo.ro_base in self.regions:
-                    self.regions[kinfo.ro_base].add_description("maybe kernel .rodata")
+                if klayout.ro_base in self.regions:
+                    self.regions[klayout.ro_base].add_description("maybe kernel .rodata")
 
         # .data
-        sdata = Symbol.get_ksymaddr("_sdata")
-        edata = Symbol.get_ksymaddr("_edata")
+        sdata = Ksym.get_addr("_sdata")
+        edata = Ksym.get_addr("_edata")
         if sdata and edata:
             sdata = self.page_start_align(sdata)
             edata = self.page_end_align(edata)
@@ -5130,8 +4479,8 @@ class KernelVMMapCommand(GenericCommand, BufferingOutput):
         else:
             # In a 32-bit environment, the range of rodata may not be measured correctly, so it is not used.
             if is_64bit():
-                if kinfo.rw_base in self.regions:
-                    self.regions[kinfo.rw_base].add_description("maybe kernel .data")
+                if klayout.rw_base in self.regions:
+                    self.regions[klayout.rw_base].add_description("maybe kernel .data")
         return
 
     def resolve_direct_map(self):
@@ -5148,7 +4497,7 @@ class KernelVMMapCommand(GenericCommand, BufferingOutput):
 
         VMALLOC_START = KernelAddressHeuristicFinder.get_VMALLOC_START()
         VMALLOC_END = KernelAddressHeuristicFinder.get_VMALLOC_END()
-        if VMALLOC_END and VMALLOC_END:
+        if VMALLOC_START and VMALLOC_END:
             self.insert_region_range(VMALLOC_START, VMALLOC_END, "vmalloc")
         return
 
@@ -5181,22 +4530,24 @@ class KernelVMMapCommand(GenericCommand, BufferingOutput):
                 mem_section = KernelAddressHeuristicFinder.consts().mem_section
                 NR_MEM_SECTIONS = KernelAddressHeuristicFinder.consts().NR_MEM_SECTIONS
                 sizeof_mem_section = KernelAddressHeuristicFinder.consts().sizeof_mem_section
+                SECTION_HAS_MEM_MAP = KernelAddressHeuristicFinder.consts().SECTION_HAS_MEM_MAP
+                SECTION_MAP_MASK = KernelAddressHeuristicFinder.consts().SECTION_MAP_MASK
+                PFN_SECTION_SHIFT = KernelAddressHeuristicFinder.consts().PFN_SECTION_SHIFT
+                sizeof_struct_page = KernelAddressHeuristicFinder.consts().sizeof_struct_page
+                if sizeof_struct_page is None:
+                    self.quiet_warn("Could not find sizeof(struct page)")
+                    return
+                section_map_size = sizeof_struct_page << PFN_SECTION_SHIFT
                 # parse mem_section
                 for i in range(NR_MEM_SECTIONS):
-                    section_mem_map = read_int_from_memory(mem_section + sizeof_mem_section * i)
-                    section_mem_map &= get_pagesize_mask_high()
-                    if not is_valid_addr(section_mem_map):
+                    section_mem_map = read_int_from_memory(mem_section + sizeof_mem_section * i, safe=True)
+                    if section_mem_map is None or not section_mem_map & SECTION_HAS_MEM_MAP:
                         continue
-                    # already there
-                    if section_mem_map in self.regions:
-                        self.regions[section_mem_map].add_description("section_mem_map(=page[])")
+                    # section_mem_map is biased by the first pfn of the section
+                    page_array = AddressUtil.normalize_address((section_mem_map & SECTION_MAP_MASK) + section_map_size * i)
+                    if not is_valid_addr(page_array):
                         continue
-                    # require division
-                    for _key, r in sorted(self.regions.items()):
-                        if r.addr_start <= section_mem_map < r.addr_end:
-                            size = r.addr_end - section_mem_map
-                            self.insert_region(section_mem_map, size, "section_mem_map(=page[])")
-                            break
+                    self.insert_region(page_array, section_map_size, "section_mem_map(=page[])")
         return
 
     def resolve_ldt(self):
@@ -5273,6 +4624,8 @@ class KernelVMMapCommand(GenericCommand, BufferingOutput):
         FIXADDR_TOP = KernelAddressHeuristicFinder.consts().FIXADDR_TOP
         if FIXADDR_START and FIXADDR_TOP:
             self.insert_region_range(FIXADDR_START, FIXADDR_TOP, "fixmap")
+        elif is_x86_64():
+            self.quiet_warn("Could not determine the permanent fixmap boundary; load matching kernel debug information")
         return
 
     def resolve_vsyscall(self):
@@ -5351,40 +4704,51 @@ class KernelVMMapCommand(GenericCommand, BufferingOutput):
         kstacks = []
         for line in res.splitlines():
             line = line.split()
-            if len(line) >= 2:
+            if len(line) < 2 or line[-2] == "-":
+                continue
+            try:
                 kstack = int(line[-2], 16)
-                kstacks.append(kstack & 0xffff)
+            except ValueError:
+                continue
+            kstacks.append(kstack & 0xffff)
 
         # calc kstack size
-        kstacks = sorted(set(kstacks))
-        diffs = []
-        for i in range(len(kstacks) - 1):
-            diff = kstacks[i + 1] - kstacks[i]
-            diffs.append(diff)
-        if len(diffs) == 0:
-            kstack_size = get_pagesize() *2
-        else:
-            kstack_size = min(diffs)
+        kstack_size = Kernel.task().get_kstack_size()
+        if kstack_size is None:
+            kstacks = sorted(set(kstacks))
+            diffs = []
+            for i in range(len(kstacks) - 1):
+                diff = kstacks[i + 1] - kstacks[i]
+                diffs.append(diff)
+            if len(diffs) == 0:
+                kstack_size = get_pagesize() *2
+            else:
+                kstack_size = min(diffs)
 
         # kstack
         for line in res.splitlines():
             elems = line.split()
-            pid, kstack = int(elems[3]), int(elems[-2], 16)
-            process_name = line.split(maxsplit=4)[4][:16].strip()
+            if len(elems) < 4 or elems[-2] == "-":
+                continue
+            try:
+                pid, kstack = int(elems[3]), int(elems[-2], 16)
+                process_name = line.split(maxsplit=4)[4][:16].strip()
+            except (ValueError, IndexError):
+                continue
             description = "kstack PID:{:d} ({:s})".format(pid, process_name)
             self.insert_region(kstack, kstack_size, description)
         return
 
     def resolve_userland(self):
+        from gef.commands.kernel.basic import KernelCurrentCommand
         self.quiet_info("Resolving userland")
 
         # If current is a kernel thread, the userland memory map details will not be displayed.
         # Even if you are in a kernel thread, you may be able to see the userland memory map,
         # but it takes time to identify which process it belongs to.
         try:
-            th_num = gdb.selected_thread().num
             res = gdb.execute("kcurrent --quiet", to_string=True)
-            r = re.search(r"current \(cpu{:d}\): (0x\S+) .*".format(th_num - 1), res)
+            r = KernelCurrentCommand.search_selected_thread(res)
             if not r:
                 return
             curr_task = int(r.group(1), 16)
@@ -5427,8 +4791,7 @@ class KernelVMMapCommand(GenericCommand, BufferingOutput):
         self.quiet_info("Resolving full slub (skip if target region size >= 0x200000)")
 
         old_regions = list(self.regions.items())[::]
-        tqdm = GefUtil.get_tqdm()
-        for _region_addr, region in tqdm(old_regions, leave=False):
+        for _region_addr, region in ProgressBar(old_regions):
             if "slab cache" in region.description:
                 continue
             if region.perm != "rw-":
@@ -5442,28 +4805,28 @@ class KernelVMMapCommand(GenericCommand, BufferingOutput):
                 except gdb.error:
                     break
                 if not res:
-                    current += get_pagesize()
+                    current += KernelAddressHeuristicFinder.consts().PAGE_SIZE
                     continue
 
                 r = re.search(r"name: (\S+)  .+  num_pages: (\S+)", res)
                 if not r:
-                    current += get_pagesize()
+                    current += KernelAddressHeuristicFinder.consts().PAGE_SIZE
                     continue
 
                 name = r.group(1)
                 # something is wrong
                 if name and not all(x in String.STRING_PRINTABLE for x in name):
-                    current += get_pagesize()
+                    current += KernelAddressHeuristicFinder.consts().PAGE_SIZE
                     continue
 
                 num_pages = int(r.group(2), 16)
                 # something is wrong
                 if num_pages == 0:
-                    current += get_pagesize()
+                    current += KernelAddressHeuristicFinder.consts().PAGE_SIZE
                     continue
 
                 description = "slab cache ({:s}; full)".format(name)
-                total_page_size = get_pagesize() * num_pages
+                total_page_size = KernelAddressHeuristicFinder.consts().PAGE_SIZE * num_pages
 
                 self.insert_region(current, total_page_size, description, merge=False)
                 current += total_page_size
@@ -5482,18 +4845,19 @@ class KernelVMMapCommand(GenericCommand, BufferingOutput):
 
         name, address, size = None, None, None
         for line in res.splitlines():
+            line = Color.remove_color(line)
             r = re.search(r"name: (.+)", line)
             if r:
                 name = Color.remove_color(r.group(1))
                 continue
-            r = re.search(r"virtual address: (.+0x.+)", line)
+            r = re.search(r"virtual address: (0x[0-9a-fA-F]+)", line)
             if r:
                 address = Color.remove_color(r.group(1))
                 address = int(address, 16)
                 continue
             r = re.search(r"num pages: (\d+)", line)
             if r:
-                size = int(r.group(1)) * get_pagesize()
+                size = int(r.group(1)) * KernelAddressHeuristicFinder.consts().PAGE_SIZE
                 description = "slab cache ({:s})".format(name)
                 if address:
                     self.insert_region(address, size, description, merge=False)
@@ -5516,18 +4880,19 @@ class KernelVMMapCommand(GenericCommand, BufferingOutput):
 
         name, address, size = None, None, None
         for line in res.splitlines():
+            line = Color.remove_color(line)
             r = re.search(r"name: (.+)", line)
             if r:
                 name = Color.remove_color(r.group(1))
                 continue
-            r = re.search(r"virtual address \(s_mem & ~0xfff\): (.+0x.+)", line)
+            r = re.search(r"virtual address \(s_mem & ~0x[0-9a-f]+\): (0x[0-9a-fA-F]+)", line)
             if r:
                 address = Color.remove_color(r.group(1))
                 address = int(address, 16)
                 continue
             r = re.search(r"num pages: (\d+)", line)
             if r:
-                size = int(r.group(1)) * get_pagesize()
+                size = int(r.group(1)) * KernelAddressHeuristicFinder.consts().PAGE_SIZE
                 description = "slab cache ({:s})".format(name)
                 if address:
                     self.insert_region(address, size, description, merge=False)
@@ -5548,14 +4913,15 @@ class KernelVMMapCommand(GenericCommand, BufferingOutput):
 
         address, size = None, None
         for line in res.splitlines():
-            r = re.search(r"virtual address: (.+0x.+)", line)
+            line = Color.remove_color(line)
+            r = re.search(r"virtual address: (0x[0-9a-fA-F]+)", line)
             if r:
                 address = Color.remove_color(r.group(1))
                 address = int(address, 16)
                 continue
             r = re.search(r"num pages: (\d+)", line)
             if r:
-                size = int(r.group(1)) * get_pagesize()
+                size = int(r.group(1)) * KernelAddressHeuristicFinder.consts().PAGE_SIZE
                 description = "slab cache"
                 if address:
                     self.insert_region(address, size, description, merge=False)
@@ -5576,18 +4942,19 @@ class KernelVMMapCommand(GenericCommand, BufferingOutput):
 
         name, address, size = None, None, None
         for line in res.splitlines():
+            line = Color.remove_color(line)
             r = re.search(r"name: (.+)", line)
             if r:
                 name = Color.remove_color(r.group(1))
                 continue
-            r = re.search(r"virtual address: (.+0x.+)", line)
+            r = re.search(r"virtual address: (0x[0-9a-fA-F]+)", line)
             if r:
                 address = Color.remove_color(r.group(1))
                 address = int(address, 16)
                 continue
             r = re.search(r"num pages: (\d+)", line)
             if r:
-                size = int(r.group(1)) * get_pagesize()
+                size = int(r.group(1)) * KernelAddressHeuristicFinder.consts().PAGE_SIZE
                 description = "slab cache ({:s})".format(name)
                 if address:
                     self.insert_region(address, size, description, merge=False)
@@ -5610,20 +4977,13 @@ class KernelVMMapCommand(GenericCommand, BufferingOutput):
     def resolve_each_module(self):
         self.quiet_info("Resolving each module")
 
-        try:
-            res = gdb.execute("kmod --quiet --no-pager", to_string=True)
-        except gdb.error:
-            return
-
-        for line in res.splitlines():
-            if not line:
-                continue
-            line = line.split()
-            module_name = line[1]
-            module_base = int(line[2], 16)
-            module_size = align_to_pagesize(int(line[3], 16))
-            description = "kernel module ({:s})".format(module_name)
-            self.insert_region(module_base, module_size, description)
+        for _module, module_name, regions in Kernel.modules().get_loaded() or []:
+            for region_name, module_base, module_size in regions:
+                if region_name == "core":
+                    description = "kernel module ({:s})".format(module_name)
+                else:
+                    description = "kernel module ({:s} {:s})".format(module_name, region_name)
+                self.insert_region(module_base, align_to_pagesize(module_size), description)
         return
 
     def resolve_vdso(self):
@@ -5672,42 +5032,34 @@ class KernelVMMapCommand(GenericCommand, BufferingOutput):
             return
         self.quiet_info("Resolving device physmem")
 
-        try:
-            res = gdb.execute("monitor info mtree -f", to_string=True)
-        except gdb.error:
+        regions = QemuMonitor.get_mtree_regions("memory")
+        if not regions:
             return
 
-        maps = PageMap.get_page_maps(None)
-        if maps is None:
+        maps = AddrMap.get_maps()
+        if not maps:
             return
 
-        for line in res.splitlines():
-            if not line.startswith("  "):
+        for paddr, pend, _, name in regions:
+            if pend <= paddr:
                 continue
 
-            m = re.search(r"  ([0-9a-f]+)-([0-9a-f]+) \(.+?\): (.+)", line)
-            if not m:
-                continue
+            device_name = "device ({:s})".format(name)
 
-            paddr = int(m.group(1), 16)
-            if paddr % 0x1000:
-                continue
-
-            pend = int(m.group(2), 16)
-            if (pend & 0xfff) == 0xfff:
-                pend += 1
-            if pend % 0x1000:
-                continue
-
-            size = pend - paddr
-            if size % 0x1000 or size == 0:
-                continue
-
-            device_name = "device ({:s})".format(m.group(3))
-
-            vaddrs = PageMap.p2v_from_map(paddr, maps)
-            for vaddr in vaddrs:
-                self.insert_region(vaddr, size, device_name)
+            # each mapping may cover only a part of the device
+            entries = [e for e in maps if not e.walk_disabled and e.pstart is not None and e.pstart < pend and paddr < e.pend]
+            ranges = []
+            for entry in sorted(entries, key=lambda e: e.vstart):
+                start = max(paddr, entry.pstart)
+                end = min(pend, entry.pend)
+                vstart = entry.p2v(start)
+                vend = vstart + end - start
+                if ranges and ranges[-1][1] == vstart:
+                    ranges[-1] = (ranges[-1][0], vend)
+                else:
+                    ranges.append((vstart, vend))
+            for start, end in ranges:
+                self.insert_region_range(start, end, device_name)
         return
 
     def detect_zero_page(self):
@@ -5730,17 +5082,15 @@ class KernelVMMapCommand(GenericCommand, BufferingOutput):
             if r.size >= page_size * 0x10:
                 continue
             for addr in range(r.addr_start, r.addr_end, page_size):
-                try:
-                    x = read_memory(addr, 0x10)
-                except gdb.MemoryError:
+                x = read_memory(addr, 0x10, safe=True)
+                if x is None:
                     self.insert_region(addr, page_size, "can not access")
                     continue
 
                 if x not in [z10, ff10, cc10]:
                     continue
-                try:
-                    x = read_memory(addr, page_size)
-                except gdb.MemoryError:
+                x = read_memory(addr, page_size, safe=True)
+                if x is None:
                     continue
                 if x == z1000:
                     self.insert_region(addr, page_size, "0x00-filled")
@@ -5763,16 +5113,16 @@ class KernelVMMapCommand(GenericCommand, BufferingOutput):
     @only_if_specific_arch(arch=("x86_64", "x86_32", "ARM64", "ARM32"))
     @only_if_in_kernel_or_kpti_disabled
     def do_invoke(self, args):
-        if self.args.include_esp_fixup_stacks and not is_x86_64():
-            err("Unsupported --include-esp-fixup-stacks option in this arch")
+        if self.args.include_aliased_pages and not is_x86_64():
+            err("Unsupported --include-aliased-pages option in this arch")
             return
 
-        if Kernel.kernel_version() is None:
+        if Kernel.version() is None:
             err("Could not find Linux kernel")
             return
 
         # initial regions
-        self.regions = self.get_maps()
+        self.regions = self.get_regions()
 
         # add info
         self.out = []
@@ -5809,5 +5159,3 @@ class KernelVMMapCommand(GenericCommand, BufferingOutput):
             self.out.append(str(r))
         self.print_output()
         return
-
-

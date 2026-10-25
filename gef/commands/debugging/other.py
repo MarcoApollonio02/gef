@@ -63,11 +63,52 @@ from gef.core.symbols import ModuleLoader
 from gef.core.utils import GEF_TEMP_DIR, GefUtil
 
 
+class QemuUserStepBreakpointGroup:
+    def __init__(self):
+        self.breakpoints = []
+        return
+
+    def add(self, bp):
+        self.breakpoints.append(bp)
+        return
+
+    def delete(self):
+        for bp in self.breakpoints:
+            try:
+                if bp.is_valid():
+                    bp.delete()
+            except gdb.error as e:
+                err("Failed to remove internal breakpoint: {}".format(e))
+        self.breakpoints.clear()
+        return
+
+
 class SimpleInternalTemporaryBreakpoint(gdb.Breakpoint):
     """A simple wrapper that takes into account the bug where temporary breakpoints isn't deleted after it is hit."""
 
-    def __init__(self, loc):
+    @staticmethod
+    def get_qemu_user_step_instruction(is_next=False):
+        if is_next:
+            instruction_name = "next"
+        else:
+            instruction_name = "current"
+        try:
+            if is_next:
+                insn = get_insn_next()
+            else:
+                insn = get_insn()
+        except gdb.error as e:
+            err("Unable to decode the {} instruction: {}".format(instruction_name, e))
+            return None
+        if insn is None:
+            err("Unable to decode the {} instruction.".format(instruction_name))
+            return None
+        return insn
+
+    def __init__(self, loc, group=None):
         super().__init__("*{:#x}".format(loc), gdb.BP_BREAKPOINT, internal=True, temporary=True)
+        if group is not None:
+            group.add(self)
         return
 
     def stop(self):
@@ -76,14 +117,18 @@ class SimpleInternalTemporaryBreakpoint(gdb.Breakpoint):
 
         Cache.reset_gef_caches()
         return True
+
 
 
 class SecondBreakpoint(gdb.Breakpoint):
     """Breakpoint which sets a 2nd breakpoint, when hit."""
 
-    def __init__(self, loc, second_loc):
+    def __init__(self, loc, second_loc, group=None):
         self.second_loc = second_loc
+        self.group = group
         super().__init__("*{:#x}".format(loc), gdb.BP_BREAKPOINT, internal=True, temporary=True)
+        if group is not None:
+            group.add(self)
         return
 
     def stop(self):
@@ -91,25 +136,27 @@ class SecondBreakpoint(gdb.Breakpoint):
         self.enabled = False
 
         Cache.reset_gef_caches()
-        SimpleInternalTemporaryBreakpoint(loc=self.second_loc)
+        SimpleInternalTemporaryBreakpoint(loc=self.second_loc, group=self.group)
         return True
+
 
 
 @register_command
 class NextiForQemuUserCommand(GenericCommand):
-    """`ni` wrapper for some specific architectures (OpenRISC 1000 and CRIS)."""
+    """`ni` wrapper for specific architectures; COUNT is unsupported."""
 
     _cmdline_ = "nexti-for-qemu-user"
     _category_ = "01-c. Debugging Support - Basic Command Extension"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
-    parser.add_argument("args", metavar="ARGS", nargs="*",
-                        help="An array of arguments to pass as is to the nexti command. (default: %(default)s)")
+    parser.add_argument("count", metavar="COUNT", nargs="?",
+                        help="Unsupported. Run this command without COUNT to step once.")
     _syntax_ = parser.format_help()
 
     _note_ = [
         "Only when qemu-user with specific architecture, the `ni` command is redirected to `nexti-for-qemu-user`.",
         "This setting is done only once, when `hook_stop_handler` is called for the first time.",
+        "COUNT arguments are not supported.",
         "",
         "Target architecture:",
         "  OpenRISC 1000: branch operations don't work well, so GEF uses breakpoints to simulate.",
@@ -117,7 +164,7 @@ class NextiForQemuUserCommand(GenericCommand):
     ]
     _note_ = "\n".join(_note_)
 
-    def ni_set_bp_for_branch(self):
+    def ni_set_bp_for_branch(self, group):
         target = None
         delay_slot = False
 
@@ -127,8 +174,19 @@ class NextiForQemuUserCommand(GenericCommand):
             # gdb.selected_frame() may error for unknown reasons (often during kernel startup).
             frame = None
 
-        insn = get_insn()
-        insn_next = get_insn_next()
+        insn = SimpleInternalTemporaryBreakpoint.get_qemu_user_step_instruction()
+        if insn is None:
+            return False
+
+        # native `nexti` falls through the delay slot even if the pending branch is taken
+        if is_or1k():
+            pending = runtime.current_arch.get_pending_branch()
+            if pending is not None:
+                if not runtime.current_arch.is_call(pending):
+                    target = ContextCodeCommand.get_branch_addr(pending)
+                    if target is not None:
+                        SimpleInternalTemporaryBreakpoint(loc=target, group=group)
+                return True
 
         if insn and runtime.current_arch.is_jump(insn):
             target = ContextCodeCommand.get_branch_addr(insn)
@@ -138,67 +196,89 @@ class NextiForQemuUserCommand(GenericCommand):
             delay_slot = runtime.current_arch.has_ret_delay_slot
 
         if target is None:
-            return
+            return True
 
         # something wrong if infinity loop on CRIS architecture
         if is_cris() and target == insn.address:
-            SecondBreakpoint(loc=insn_next.address, second_loc=target)
-            return
+            insn_next = SimpleInternalTemporaryBreakpoint.get_qemu_user_step_instruction(is_next=True)
+            if insn_next is None:
+                return False
+            SecondBreakpoint(loc=insn_next.address, second_loc=target, group=group)
+            return True
 
-        SimpleInternalTemporaryBreakpoint(loc=target)
         if delay_slot:
-            SimpleInternalTemporaryBreakpoint(loc=insn_next.address)
-        return
+            insn_next = SimpleInternalTemporaryBreakpoint.get_qemu_user_step_instruction(is_next=True)
+            if insn_next is None:
+                return False
 
-    def ni_set_bp_next(self):
-        insn_next = get_insn_next()
-        SimpleInternalTemporaryBreakpoint(loc=insn_next.address)
-        return
+        SimpleInternalTemporaryBreakpoint(loc=target, group=group)
+        if delay_slot:
+            SimpleInternalTemporaryBreakpoint(loc=insn_next.address, group=group)
+        return True
+
+    def ni_set_bp_next(self, group):
+        insn_next = SimpleInternalTemporaryBreakpoint.get_qemu_user_step_instruction(is_next=True)
+        if insn_next is None:
+            return False
+        SimpleInternalTemporaryBreakpoint(loc=insn_next.address, group=group)
+        return True
 
     @parse_args
     @only_if_gdb_running
     @only_if_specific_gdb_mode(mode=("qemu-user",))
     @only_if_specific_arch(arch=("OR1K", "CRIS"))
     def do_invoke(self, args):
-        if is_cris():
-            self.ni_set_bp_for_branch()
-            self.ni_set_bp_next()
-            gdb.execute("c") # use c wrapper
+        if args.count is not None:
+            err("COUNT is not supported by `nexti-for-qemu-user`.")
             return
 
-        if is_or1k():
-            self.ni_set_bp_for_branch()
-
-        cmd = "nexti " + " ".join(args.args)
+        group = QemuUserStepBreakpointGroup()
         try:
-            gdb.execute(cmd.rstrip())
-        except gdb.error:
-            exc_type, exc_value, exc_traceback = sys.exc_info()
-            if str(exc_value).startswith("Cannot access memory at address"):
-                if is_valid_addr(runtime.current_arch.pc):
-                    gdb.execute("xuntil --from-wrapper")
+            if is_cris():
+                if not self.ni_set_bp_for_branch(group) or not self.ni_set_bp_next(group):
+                    return
+                gdb.execute("c") # use c wrapper
+                return
+
+            if is_or1k():
+                if not self.ni_set_bp_for_branch(group):
+                    return
+
+            try:
+                gdb.execute("nexti")
+            except gdb.error:
+                exc_type, exc_value, exc_traceback = sys.exc_info()
+                if str(exc_value).startswith("Cannot access memory at address"):
+                    if is_valid_addr(runtime.current_arch.pc):
+                        gdb.execute("xuntil --from-wrapper")
+                    else:
+                        err(exc_value)
                 else:
                     err(exc_value)
-            else:
-                err(exc_value)
+        except gdb.error as e:
+            err(e)
+        finally:
+            group.delete()
         return
+
 
 
 @register_command
 class StepiForQemuUserCommand(GenericCommand):
-    """`si` wrapper for some specific architectures (OpenRISC 1000 and CRIS)."""
+    """`si` wrapper for specific architectures; COUNT is unsupported."""
 
     _cmdline_ = "stepi-for-qemu-user"
     _category_ = "01-c. Debugging Support - Basic Command Extension"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
-    parser.add_argument("args", metavar="ARGS", nargs="*",
-                        help="An array of arguments to pass as is to the stepi command. (default: %(default)s)")
+    parser.add_argument("count", metavar="COUNT", nargs="?",
+                        help="Unsupported. Run this command without COUNT to step once.")
     _syntax_ = parser.format_help()
 
     _note_ = [
         "Only when qemu-user with specific architecture, the `si` command is redirected to `stepi-for-qemu-user`.",
         "This setting is done only once, when `hook_stop_handler` is called for the first time.",
+        "COUNT arguments are not supported.",
         "",
         "Target architecture:",
         "  OpenRISC 1000: branch operations don't work well, so GEF uses breakpoints to simulate.",
@@ -206,7 +286,7 @@ class StepiForQemuUserCommand(GenericCommand):
     ]
     _note_ = "\n".join(_note_)
 
-    def si_set_bp_for_branch(self):
+    def si_set_bp_for_branch(self, group):
         target = None
         delay_slot = False
 
@@ -216,8 +296,18 @@ class StepiForQemuUserCommand(GenericCommand):
             # gdb.selected_frame() may error for unknown reasons (often during kernel startup).
             frame = None
 
-        insn = get_insn()
-        insn_next = get_insn_next()
+        insn = SimpleInternalTemporaryBreakpoint.get_qemu_user_step_instruction()
+        if insn is None:
+            return False
+
+        # native `stepi` falls through the delay slot even if the pending branch is taken
+        if is_or1k():
+            pending = runtime.current_arch.get_pending_branch()
+            if pending is not None:
+                target = ContextCodeCommand.get_branch_addr(pending)
+                if target is not None:
+                    SimpleInternalTemporaryBreakpoint(loc=target, group=group)
+                return True
 
         if insn and (runtime.current_arch.is_jump(insn) or runtime.current_arch.is_call(insn)): # si also stops at `call` target
             target = ContextCodeCommand.get_branch_addr(insn)
@@ -227,50 +317,71 @@ class StepiForQemuUserCommand(GenericCommand):
             delay_slot = runtime.current_arch.has_ret_delay_slot
 
         if target is None:
-            return
+            return True
 
         # something wrong if infinity loop on CRIS architecture
         if is_cris() and target == insn.address:
-            SecondBreakpoint(loc=insn_next.address, second_loc=target)
-            return
+            insn_next = SimpleInternalTemporaryBreakpoint.get_qemu_user_step_instruction(is_next=True)
+            if insn_next is None:
+                return False
+            SecondBreakpoint(loc=insn_next.address, second_loc=target, group=group)
+            return True
 
-        SimpleInternalTemporaryBreakpoint(loc=target)
         if delay_slot:
-            SimpleInternalTemporaryBreakpoint(loc=insn_next.address)
-        return
+            insn_next = SimpleInternalTemporaryBreakpoint.get_qemu_user_step_instruction(is_next=True)
+            if insn_next is None:
+                return False
 
-    def si_set_bp_next(self):
-        insn_next = get_insn_next()
-        SimpleInternalTemporaryBreakpoint(loc=insn_next.address)
-        return
+        SimpleInternalTemporaryBreakpoint(loc=target, group=group)
+        if delay_slot:
+            SimpleInternalTemporaryBreakpoint(loc=insn_next.address, group=group)
+        return True
+
+    def si_set_bp_next(self, group):
+        insn_next = SimpleInternalTemporaryBreakpoint.get_qemu_user_step_instruction(is_next=True)
+        if insn_next is None:
+            return False
+        SimpleInternalTemporaryBreakpoint(loc=insn_next.address, group=group)
+        return True
 
     @parse_args
     @only_if_gdb_running
     @only_if_specific_gdb_mode(mode=("qemu-user",))
     @only_if_specific_arch(arch=("OR1K", "CRIS"))
     def do_invoke(self, args):
-        if is_cris():
-            self.si_set_bp_for_branch()
-            self.si_set_bp_next()
-            gdb.execute("c") # use c wrapper
+        if args.count is not None:
+            err("COUNT is not supported by `stepi-for-qemu-user`.")
             return
 
-        if is_or1k():
-            self.si_set_bp_for_branch()
-
-        cmd = "stepi " + " ".join(args.args)
+        group = QemuUserStepBreakpointGroup()
         try:
-            gdb.execute(cmd.rstrip())
-        except gdb.error:
-            exc_type, exc_value, exc_traceback = sys.exc_info()
-            if str(exc_value).startswith("Cannot access memory at address"):
-                if is_valid_addr(runtime.current_arch.pc):
-                    gdb.execute("xuntil --from-wrapper")
+            if is_cris():
+                if not self.si_set_bp_for_branch(group) or not self.si_set_bp_next(group):
+                    return
+                gdb.execute("c") # use c wrapper
+                return
+
+            if is_or1k():
+                if not self.si_set_bp_for_branch(group):
+                    return
+
+            try:
+                gdb.execute("stepi")
+            except gdb.error:
+                exc_type, exc_value, exc_traceback = sys.exc_info()
+                if str(exc_value).startswith("Cannot access memory at address"):
+                    if is_valid_addr(runtime.current_arch.pc):
+                        gdb.execute("xuntil --from-wrapper")
+                    else:
+                        err(exc_value)
                 else:
                     err(exc_value)
-            else:
-                err(exc_value)
+        except gdb.error as e:
+            err(e)
+        finally:
+            group.delete()
         return
+
 
 
 @register_command
@@ -881,7 +992,7 @@ class MemoryWatchCommand(GenericCommand):
     parser.add_argument("address", metavar="ADDRESS", type=AddressUtil.parse_address,
                         help="the memory address to register for display in `context memory`.")
     parser.add_argument("count", metavar="COUNT", nargs="?", type=AddressUtil.parse_address, default=0x10,
-                        help="the count of displayed units. (default: %(default)s)")
+                        help="the number of pointers, or bytes for byte/word/dword/qword. (default: %(default)s)")
     parser.add_argument("unit", nargs="?", default="pointers",
                         choices=["byte", "word", "dword", "qword", "pointers"],
                         help="the size of unit. (default: %(default)s)")
@@ -906,6 +1017,7 @@ class MemoryWatchCommand(GenericCommand):
         MemoryWatchCommand.mem_watches[args.address] = (args.count, args.unit)
         ok("Adding memwatch to {:#x}".format(args.address))
         return
+
 
 
 @register_command
@@ -2142,4 +2254,3 @@ class AddSymbolTemporaryCommand(GenericCommand):
             err(e)
         os.unlink(sym_elf)
         return
-

@@ -30,6 +30,7 @@ from gef.commands.base import (
 from gef.core import runtime
 from gef.core.address import AddressUtil
 from gef.core.cache import Cache
+from gef.core.kernel import AddrMap, SecureMemory
 from gef.core.color import Color, err, gef_print, info, titlify, warn
 from gef.core.config import Config
 from gef.core.elf import Elf
@@ -57,7 +58,7 @@ from gef.core.process import (
 )
 from gef.core.qemu import QemuMonitor, read_physmem, write_physmem
 from gef.core.registers import get_register
-from gef.core.utils import GefUtil, slice_unpack
+from gef.core.utils import GefUtil, align, slice_unpack
 
 
 @register_command
@@ -580,6 +581,9 @@ class OpteeBreakTaAddrCommand(GenericCommand):
     group.add_argument("ta_offset", metavar="TA_OFFSET", nargs="?", type=AddressUtil.parse_address,
                         help="The breakpoint target offset of OPTEE-TA.")
     group.add_argument("-f", "--ta-file", help="parse the TA file (or ELF file) and stop at the entry point.")
+    parser.add_argument("--ta-base", type=AddressUtil.parse_address,
+                        help="select the executable user mapping starting at this address.")
+    parser.add_argument("--persistent", action="store_true", help="arm a new temporary breakpoint on every TA entry.")
     parser.add_argument("-v", "--verbose", action="store_true", help="show memory map if stopped at __thread_enter_user_mode.")
     _syntax_ = parser.format_help()
 
@@ -601,6 +605,11 @@ class OpteeBreakTaAddrCommand(GenericCommand):
         "This __thread_enter_user_mode in TEE OS is written directly in assembly.",
         "Because of this, it is immune to compiler optimizations. By searching memory for the fixed byte sequence",
         "of this assembly routine, we can reliably locate its offset and set your breakpoint there.",
+        "",
+        "By default, exactly two executable user mappings are required; the higher one is selected as the TA.",
+        "Use --ta-base when ldelf is absent or shared libraries add mappings. Offsets are relative to this mapping.",
+        "After two unsuccessful selections, execution stops and the internal breakpoint is disabled.",
+        "The internal breakpoint is deleted after arming the target once; --persistent keeps tracking TA entries.",
     ]
     _note_ = "\n".join(_note_)
 
@@ -608,37 +617,21 @@ class OpteeBreakTaAddrCommand(GenericCommand):
         super().__init__(complete=gdb.COMPLETE_FILENAME)
         return
 
-    def get_secure_memory_maps(self):
-        maps = PageMap.get_page_maps_by_pagewalk("pagewalk --optee --quiet --no-pager --disable-color").splitlines()
-        if not maps:
+    def get_secure_memory_map(self):
+        entry = next((entry for entry in AddrMap.get_maps(scope="optee") if "TEE-OS .text" in entry.hint), None)
+        if entry is None:
             err("Could not find memory maps")
-            return None
-
-        for m in maps:
-            s = m.split(None, 3)
-            if len(s) != 4:
-                continue
-            virt_range, phys_range, size, hint = s
-            if "TEE-OS .text" not in hint:
-                continue
-            virt_start = int(virt_range.split("-")[0], 16)
-            phys_start = int(phys_range.split("-")[0], 16)
-            size = int(size, 16)
-            break
-        else:
-            err("Could not find memory maps")
-            return None
-        return virt_start, phys_start, size
+        return entry
 
     def search_thread_enter_user_mode(self):
-        ret = self.get_secure_memory_maps()
-        if ret is None:
+        entry = self.get_secure_memory_map()
+        if entry is None:
             return
-        virt_start, phys_start, size = ret
+        virt_start, phys_start, size = entry.vstart, entry.pstart, entry.psize
 
-        data = read_physmem(phys_start, size)
+        data = SecureMemory.read_phys(phys_start, size)
         if not data:
-            err("Memory read error")
+            err("Memory read error ({:s})".format(SecureMemory.PRIVILEGE_HINT))
             return None
 
         if is_arm32():
@@ -729,7 +722,11 @@ class OpteeBreakTaAddrCommand(GenericCommand):
                 err("Could not find ELF header")
                 return
 
-            elf = Elf(self.args.ta_file, elf_header_off)
+            try:
+                elf = Elf(self.args.ta_file, elf_header_off)
+            except Exception:
+                err("Invalid TA/ELF")
+                return
             if elf is None:
                 err("Invalid ELF")
                 return
@@ -737,13 +734,19 @@ class OpteeBreakTaAddrCommand(GenericCommand):
 
         if ta_offset is None:
             return
+        if ta_offset < 0:
+            err("TA offset must be non-negative")
+            return
 
         info("__thread_enter_user_mode @ OPTEE-OS: {:#x}".format(thread_enter_user_mode_virt))
         info("Breakpoint target offset of TA: {:#x}".format(ta_offset))
 
-        OpteeThreadEnterUserModeBreakpoint(thread_enter_user_mode_virt, ta_offset, args.verbose)
-        info("Temporarily breakpoint at {:#x}".format(thread_enter_user_mode_virt))
+        OpteeThreadEnterUserModeBreakpoint(
+            thread_enter_user_mode_virt, ta_offset, args.verbose, args.ta_base, args.persistent,
+        )
+        info("Internal breakpoint at {:#x}".format(thread_enter_user_mode_virt))
         return
+
 
 
 @register_command
@@ -1513,23 +1516,28 @@ class OpteeShmListCommand(GenericCommand, BufferingOutput):
     _category_ = "06-j. Qemu-system/KGDB Cooperation - TrustZone"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
+    parser.add_argument("--phys-bits", type=int, choices=(32, 64),
+                        help="paddr_t width (default: debug type, otherwise core pointer width).")
     parser.add_argument("-n", "--no-pager", action="store_true", help="do not use the pager.")
     _syntax_ = parser.format_help()
 
-    def find_reg_shm_list(self, data, virt_start):
+    def find_reg_shm_list(self, data, virt_start, phys_size=None):
+
+        if phys_size is None:
+            phys_size = GefUtil.type_size("paddr_t") or runtime.current_arch.ptrsize
 
         def is_valid_rw_addr(addr):
             return virt_start <= addr < virt_start + len(data)
 
-        def read_int_from_memory(addr):
-            if not is_valid_rw_addr(addr):
+        def read_int_from_memory(addr, size=runtime.current_arch.ptrsize):
+            index = addr - virt_start
+            if index < 0 or index + size > len(data):
                 return None
-            index = (addr - virt_start) // runtime.current_arch.ptrsize
-            return data_list[index]
+            return GefUtil.get_unpack(size)(data[index:index + size])
 
         def is_slist_head(addr, head_next, offset):
             current = head_next
-            seen = [current]
+            seen = {current}
             while True:
                 current_next = read_int_from_memory(current + offset)
                 if current_next is None:
@@ -1540,7 +1548,7 @@ class OpteeShmListCommand(GenericCommand, BufferingOutput):
 
                 if current_next in seen:
                     return False
-                seen.append(current)
+                seen.add(current_next)
 
                 current = current_next
             return False
@@ -1576,10 +1584,10 @@ class OpteeShmListCommand(GenericCommand, BufferingOutput):
         offsetof_size = offsetof_ops + runtime.current_arch.ptrsize
         offsetof_refc = offsetof_size + runtime.current_arch.ptrsize * 2
         offsetof_next = offsetof_refc + runtime.current_arch.ptrsize
-        offsetof_cookie = offsetof_next + 8 # with pad
+        offsetof_cookie = align(offsetof_next + runtime.current_arch.ptrsize, 8)
         offsetof_mm = offsetof_cookie + 8
-        offsetof_page_offset = offsetof_mm + runtime.current_arch.ptrsize
-        offsetof_pages = offsetof_page_offset + runtime.current_arch.ptrsize + 4 + 4 # 4, 4 = map_count, bool*3
+        offsetof_page_offset = align(offsetof_mm + runtime.current_arch.ptrsize, phys_size)
+        offsetof_pages = align(offsetof_page_offset + phys_size + 4 + 3, phys_size)
 
         candidate_head = []
         data_list = slice_unpack(data, runtime.current_arch.ptrsize)
@@ -1591,7 +1599,7 @@ class OpteeShmListCommand(GenericCommand, BufferingOutput):
                 continue
 
             current = next_value
-            seen = []
+            seen = set()
             entries = []
             found = True
             while current:
@@ -1603,12 +1611,15 @@ class OpteeShmListCommand(GenericCommand, BufferingOutput):
                     break
                 ops = read_int_from_memory(current + offsetof_ops)
                 size = read_int_from_memory(current + offsetof_size)
-                refc = read_int_from_memory(current + offsetof_refc)
+                refc = read_int_from_memory(current + offsetof_refc, 4)
                 next_ = read_int_from_memory(current + offsetof_next)
-                cookie = read_int_from_memory(current + offsetof_cookie)
+                cookie = read_int_from_memory(current + offsetof_cookie, 8)
                 mm = read_int_from_memory(current + offsetof_mm)
-                page_offset = read_int_from_memory(current + offsetof_page_offset)
-                seen.append(current)
+                page_offset = read_int_from_memory(current + offsetof_page_offset, phys_size)
+                seen.add(current)
+                if None in (ops, size, refc, next_, cookie, mm, page_offset):
+                    found = False
+                    break
 
                 # check ops
                 if is_valid_rw_addr(ops): # r-x
@@ -1619,7 +1630,7 @@ class OpteeShmListCommand(GenericCommand, BufferingOutput):
                     found = False
                     break
                 # check size + page_offset
-                if (size + page_offset) % get_pagesize():
+                if not size or page_offset >= 0x1000 or (size + page_offset) % 0x1000:
                     found = False
                     break
                 # check refc
@@ -1629,20 +1640,19 @@ class OpteeShmListCommand(GenericCommand, BufferingOutput):
                 if refc == 0 or refc >= 0x100:
                     found = False
                     break
-                # check cookie
-                if is_64bit():
-                    if cookie & 0xffff_0000_0000_0000 != 0xffff_0000_0000_0000:
-                        found = False
-                        break
                 # check mm
                 if mm and not is_valid_rw_addr(mm): # mm == 0 is ok
                     found = False
                     break
                 # check pages
                 pages = []
-                for j in range((size + page_offset) // get_pagesize()):
-                    p = read_int_from_memory(current + offsetof_pages + runtime.current_arch.ptrsize * j)
-                    if p & get_pagesize_mask_low():
+                num_pages = (size + page_offset) // 0x1000
+                if current + offsetof_pages + phys_size * num_pages > virt_start + len(data):
+                    found = False
+                    break
+                for j in range(num_pages):
+                    p = read_int_from_memory(current + offsetof_pages + phys_size * j, phys_size)
+                    if p is None or p & 0xfff:
                         found = False
                         break
                     pages.append(p)
@@ -1667,9 +1677,9 @@ class OpteeShmListCommand(GenericCommand, BufferingOutput):
                 candidate_head.append([head_addr, entries])
 
         if len(candidate_head) == 0:
-            err("Could not find &tee_ctxes")
+            err("Could not find &reg_shm_list")
         elif len(candidate_head) > 1:
-            warn("Found multiple canddiate for &reg_shm_list")
+            warn("Found multiple candidate for &reg_shm_list")
         return candidate_head
 
     def dump_list(self, list_heads):
@@ -1683,13 +1693,13 @@ class OpteeShmListCommand(GenericCommand, BufferingOutput):
                 pages_str = []
                 if pages:
                     start = end = pages[0]
-                    for addr in pages[1:]:
-                        if addr == end + get_pagesize():
-                            end = addr
+                    for page in pages[1:]:
+                        if page == end + 0x1000:
+                            end = page
                         else:
-                            pages_str.append("{:#x}-{:#x}".format(start, end + get_pagesize()))
-                            start = end = addr
-                    pages_str.append("{:#x}-{:#x}".format(start, end + get_pagesize()))
+                            pages_str.append("{:#x}-{:#x}".format(start, end + 0x1000))
+                            start = end = page
+                    pages_str.append("{:#x}-{:#x}".format(start, end + 0x1000))
 
                 self.out.append(
                     "{:#010x}    {:#010x}  {:#010x}  {:#010x}  {:#018x}  {:#010x}  {:#010x}   {:s}".format(
@@ -1702,28 +1712,24 @@ class OpteeShmListCommand(GenericCommand, BufferingOutput):
     @only_if_specific_gdb_mode(mode=("qemu-system",))
     @only_if_specific_arch(arch=("ARM32", "ARM64"))
     def do_invoke(self, args):
-        maps = PageMap.get_page_maps_by_pagewalk("pagewalk --optee --quiet --no-pager --disable-color").splitlines()
-        if not maps:
+        entry = next((
+            entry for entry in AddrMap.get_maps(scope="optee")
+            if "TEE-OS .data / stack" in entry.hint
+        ), None)
+        if entry is None:
             err("Could not find memory maps")
             return
 
-        for m in maps:
-            s = m.split(None, 3)
-            if len(s) != 4:
-                continue
-            virt_range, phys_range, size, hint = s
-            if "TEE-OS .data / stack" not in hint:
-                continue
-            virt_start = int(virt_range.split("-")[0], 16)
-            phys_start = int(phys_range.split("-")[0], 16)
-            size = int(size, 16)
-            break
+        data = SecureMemory.read_phys(entry.pstart, entry.psize)
+        if not data:
+            err("Memory read error ({:s})".format(SecureMemory.PRIVILEGE_HINT))
+            return
+
+        if args.phys_bits:
+            phys_size = args.phys_bits // 8
         else:
-            err("Could not find memory maps")
-            return
-
-        data = read_physmem(phys_start, size)
-        parsed_list_heads = self.find_reg_shm_list(data, virt_start)
+            phys_size = None
+        parsed_list_heads = self.find_reg_shm_list(data, entry.vstart, phys_size)
         if not parsed_list_heads:
             err("Could not find reg_shm_list")
             return
@@ -1732,6 +1738,7 @@ class OpteeShmListCommand(GenericCommand, BufferingOutput):
         self.dump_list(parsed_list_heads)
         self.print_output(check_terminal_size=True)
         return
+
 
 
 @register_command
@@ -1745,6 +1752,10 @@ class OpteeBgetDumpCommand(GenericCommand, BufferingOutput):
     parser.add_argument("-hh", "--help-simple", action="store_true", help="show help without ASCII diagram.")
     parser.add_argument("-m", "--malloc_ctx", metavar="OFFSET_malloc_ctx", type=AddressUtil.parse_address,
                         help="The offset of `malloc_ctx` at OPTEE-TA.")
+    parser.add_argument("--ta-bits", type=int, choices=(32, 64),
+                        help="TA ABI width (required when the TA ABI cannot be read from user execution state).")
+    parser.add_argument("--ta-base", type=AddressUtil.parse_address,
+                        help="select the executable user mapping starting at this address.")
     parser.add_argument("-n", "--no-pager", action="store_true", help="do not use the pager.")
     parser.add_argument("-v", "--verbose", action="store_true", help="verbose output.")
     _syntax_ = parser.format_help()
@@ -1755,6 +1766,10 @@ class OpteeBgetDumpCommand(GenericCommand, BufferingOutput):
     _example_ = "\n".join(_example_).format(_cmdline_)
 
     _note_ = [
+        "TA ABI is independent of the TEE core ABI. Use --ta-bits 32 for an AArch32 TA on an AArch64 core.",
+        "Without --ta-bits, the ABI is taken from the current user execution state; core stops require it explicitly.",
+        "Use --ta-base to select a mapping when ldelf is absent or more than two executable mappings are present.",
+        "",
         "Simplified heap structure:",
         "",
         "+-malloc_ctx-------------------+         +-freed chunk------------+",
@@ -1782,45 +1797,36 @@ class OpteeBgetDumpCommand(GenericCommand, BufferingOutput):
     ]
     _note_ = "\n".join(_note_)
 
+    def read_word(self, addr):
+        return GefUtil.get_unpack(self.ptrsize)(read_memory(addr, self.ptrsize))
+
     def is_readable_virt_memory(self, addr):
         if is_arm32():
-            res = PageMap.get_page_maps_by_pagewalk("pagewalk -S --quiet --no-pager --disable-color")
-            res = sorted(set(res.splitlines()))
-            res = list(filter(lambda line: "PL0/RW-" in line, res))
+            command = "pagewalk -S --quiet --no-pager --disable-color"
+            user_write = "PL0/RW-"
         elif is_arm64():
-            res = PageMap.get_page_maps_by_pagewalk("pagewalk 1 --quiet --no-pager --disable-color")
-            res = sorted(set(res.splitlines()))
-            res = list(filter(lambda line: "EL0/RW-" in line, res))
-        for line in res:
-            vrange, prange, *_ = line.split()
-            vstart, vend = [int(x, 16) for x in vrange.split("-")]
-            pstart, pend = [int(x, 16) for x in prange.split("-")]
-            if vstart <= addr < vend:
+            command = "pagewalk 1 --quiet --no-pager --disable-color"
+            user_write = "EL0/RW-"
+        for entry in AddrMap.get_maps(command=command):
+            if user_write in entry.flags and entry.contains_virtual(addr):
                 return True
         return False
 
     def get_ta_rw_address(self, ta_loaded_rx_end):
         if is_arm32():
-            res = PageMap.get_page_maps_by_pagewalk("pagewalk -S --quiet --no-pager --disable-color")
-            res = sorted(set(res.splitlines()))
+            command = "pagewalk -S --quiet --no-pager --disable-color"
         elif is_arm64():
-            res = PageMap.get_page_maps_by_pagewalk("pagewalk 1 --quiet --no-pager --disable-color")
-            res = sorted(set(res.splitlines()))
-        for line in res:
-            if not re.search("[PE]L1/RW", line):
-                continue
-            vrange, prange, *_ = line.split()
-            vstart, vend = [int(x, 16) for x in vrange.split("-")]
-            pstart, pend = [int(x, 16) for x in prange.split("-")]
-            if vstart == ta_loaded_rx_end:
-                return (vstart, vend, pstart, pend)
+            command = "pagewalk 1 --quiet --no-pager --disable-color"
+        for entry in AddrMap.get_maps(command=command):
+            if re.search(r"(?:PL0|EL0)/RW[-X]", entry.flags) and entry.vstart == ta_loaded_rx_end:
+                return entry
         return None
 
     def get_malloc_ctx(self, ta_rw_address_map):
-        vstart = ta_rw_address_map[0]
-        vend = ta_rw_address_map[1]
+        vstart = ta_rw_address_map.vstart
+        vend = ta_rw_address_map.vend
         data = read_memory(vstart, vend - vstart)
-        data = slice_unpack(data, runtime.current_arch.ptrsize)
+        data = slice_unpack(data, self.ptrsize)
 
         candidate = []
         for i in range(len(data) - 3):
@@ -1829,28 +1835,28 @@ class OpteeBgetDumpCommand(GenericCommand, BufferingOutput):
             if not is_valid_addr(data[i + 2]) or not is_valid_addr(data[i + 3]): # should be flink, blink
                 continue
 
-            addr = vstart + runtime.current_arch.ptrsize * i
+            addr = vstart + self.ptrsize * i
 
-            flink_blink = read_int_from_memory(data[i + 2] + runtime.current_arch.ptrsize * 3)
-            blink_flink = read_int_from_memory(data[i + 3] + runtime.current_arch.ptrsize * 2)
+            flink_blink = self.read_word(data[i + 2] + self.ptrsize * 3)
+            blink_flink = self.read_word(data[i + 3] + self.ptrsize * 2)
             if flink_blink != addr or blink_flink != addr:
                 continue
 
             link_list_count = 1
             flink_cur = data[i + 2]
             blink_cur = data[i + 3]
-            flink_seen = []
-            blink_seen = []
+            flink_seen = set()
+            blink_seen = set()
             while True:
                 if flink_cur in flink_seen:
                     break
                 if blink_cur in blink_seen:
                     break
-                flink_seen.append(flink_cur)
-                blink_seen.append(blink_cur)
+                flink_seen.add(flink_cur)
+                blink_seen.add(blink_cur)
                 try:
-                    flink_cur = read_int_from_memory(flink_cur + runtime.current_arch.ptrsize * 2)
-                    blink_cur = read_int_from_memory(blink_cur + runtime.current_arch.ptrsize * 3)
+                    flink_cur = self.read_word(flink_cur + self.ptrsize * 2)
+                    blink_cur = self.read_word(blink_cur + self.ptrsize * 3)
                 except gdb.MemoryError:
                     link_list_count = -1
                     break
@@ -1865,66 +1871,64 @@ class OpteeBgetDumpCommand(GenericCommand, BufferingOutput):
     def parse_flink(self, head):
         current = head
         flinks = []
-        seen = [current]
+        seen = {current}
         while True:
+            seen.add(current)
             try:
-                prevfree = read_int_from_memory(current + runtime.current_arch.ptrsize * 0)
-                bsize = read_int_from_memory(current + runtime.current_arch.ptrsize * 1)
-                flink = read_int_from_memory(current + runtime.current_arch.ptrsize * 2)
-                blink = read_int_from_memory(current + runtime.current_arch.ptrsize * 3)
-                next_prevfree = read_int_from_memory(current + bsize)
-                next_bsize = read_int_from_memory(current + bsize + runtime.current_arch.ptrsize)
+                prevfree = self.read_word(current + self.ptrsize * 0)
+                bsize = self.read_word(current + self.ptrsize * 1)
+                flink = self.read_word(current + self.ptrsize * 2)
+                blink = self.read_word(current + self.ptrsize * 3)
+                next_prevfree = self.read_word(current + bsize)
+                next_bsize = self.read_word(current + bsize + self.ptrsize)
             except gdb.MemoryError:
                 flinks.append("memory corrupted")
                 break
-            if flink % 8 or blink % 8 or bsize % 8 or next_prevfree % 8 or next_bsize % 8:
+            if any(value % (2 * self.ptrsize) for value in (flink, blink, bsize, next_prevfree, next_bsize)):
                 flinks.append("unaligned corrupted")
                 break
             chunk = {
                 "addr": current, "prevfree": prevfree, "bsize": bsize, "flink": flink, "blink": blink,
                 "next_prevfree": next_prevfree, "next_bsize": next_bsize,
             }
-            Chunk = collections.namedtuple("Chunk", chunk.keys())
-            flinks.append(Chunk(*chunk.values()))
+            flinks.append(GefUtil.dict_to_namedtuple("Chunk", chunk))
             if flink == head:
                 break
-            if flink in seen[1:]:
+            if flink in seen:
                 flinks.append("loop detected")
                 break
-            seen.append(current)
             current = flink
         return flinks
 
     def parse_blink(self, head):
         current = head
         blinks = []
-        seen = [current]
+        seen = {current}
         while True:
+            seen.add(current)
             try:
-                prevfree = read_int_from_memory(current + runtime.current_arch.ptrsize * 0)
-                bsize = read_int_from_memory(current + runtime.current_arch.ptrsize * 1)
-                flink = read_int_from_memory(current + runtime.current_arch.ptrsize * 2)
-                blink = read_int_from_memory(current + runtime.current_arch.ptrsize * 3)
-                next_prevfree = read_int_from_memory(current + bsize)
-                next_bsize = read_int_from_memory(current + bsize + runtime.current_arch.ptrsize)
+                prevfree = self.read_word(current + self.ptrsize * 0)
+                bsize = self.read_word(current + self.ptrsize * 1)
+                flink = self.read_word(current + self.ptrsize * 2)
+                blink = self.read_word(current + self.ptrsize * 3)
+                next_prevfree = self.read_word(current + bsize)
+                next_bsize = self.read_word(current + bsize + self.ptrsize)
             except gdb.MemoryError:
                 blinks.append("memory corrupted")
                 break
-            if flink % 8 or blink % 8 or bsize % 8 or next_prevfree % 8 or next_bsize % 8:
+            if any(value % (2 * self.ptrsize) for value in (flink, blink, bsize, next_prevfree, next_bsize)):
                 blinks.append("unaligned corrupted")
                 break
             chunk = {
                 "addr": current, "prevfree": prevfree, "bsize": bsize, "flink": flink, "blink": blink,
                 "next_prevfree": next_prevfree, "next_bsize": next_bsize,
             }
-            Chunk = collections.namedtuple("Chunk", chunk.keys())
-            blinks.append(Chunk(*chunk.values()))
+            blinks.append(GefUtil.dict_to_namedtuple("Chunk", chunk))
             if blink == head:
                 break
-            if blink in seen[1:]:
+            if blink in seen:
                 blinks.append("loop detected")
                 break
-            seen.append(current)
             current = blink
         return blinks
 
@@ -1932,21 +1936,21 @@ class OpteeBgetDumpCommand(GenericCommand, BufferingOutput):
         malloc_ctx = {}
         malloc_ctx["addr"] = current = malloc_ctx_addr
 
-        malloc_ctx["prevfree"] = read_int_from_memory(current)
-        current += runtime.current_arch.ptrsize
-        malloc_ctx["bsize"] = read_int_from_memory(current)
-        current += runtime.current_arch.ptrsize
-        malloc_ctx["flink"] = read_int_from_memory(current)
+        malloc_ctx["prevfree"] = self.read_word(current)
+        current += self.ptrsize
+        malloc_ctx["bsize"] = self.read_word(current)
+        current += self.ptrsize
+        malloc_ctx["flink"] = self.read_word(current)
         malloc_ctx["flink_list"] = self.parse_flink(malloc_ctx["flink"])
-        current += runtime.current_arch.ptrsize
-        malloc_ctx["blink"] = read_int_from_memory(current)
+        current += self.ptrsize
+        malloc_ctx["blink"] = self.read_word(current)
         malloc_ctx["blink_list"] = self.parse_blink(malloc_ctx["blink"])
-        current += runtime.current_arch.ptrsize
+        current += self.ptrsize
 
         # search for pool
         for _ in range(14):
-            pool_candidate = read_int_from_memory(current)
-            current += runtime.current_arch.ptrsize
+            pool_candidate = self.read_word(current)
+            current += self.ptrsize
             if self.is_readable_virt_memory(pool_candidate):
                 malloc_ctx["pool"] = pool_candidate
                 break
@@ -1954,24 +1958,22 @@ class OpteeBgetDumpCommand(GenericCommand, BufferingOutput):
             err("Could not find malloc_ctx->pool")
             return None
 
-        malloc_ctx["pool_len"] = read_int_from_memory(current)
-        current += runtime.current_arch.ptrsize
+        malloc_ctx["pool_len"] = self.read_word(current)
+        current += self.ptrsize
 
         malloc_ctx["pool_list"] = []
         for i in range(malloc_ctx["pool_len"]):
-            buf = read_int_from_memory(malloc_ctx["pool"] + (i * 2) * runtime.current_arch.ptrsize)
-            size = read_int_from_memory(malloc_ctx["pool"] + (i * 2 + 1) * runtime.current_arch.ptrsize)
+            buf = self.read_word(malloc_ctx["pool"] + (i * 2) * self.ptrsize)
+            size = self.read_word(malloc_ctx["pool"] + (i * 2 + 1) * self.ptrsize)
             pool = {"buf": buf, "len": size}
-            Pool = collections.namedtuple("Pool", pool.keys())
-            malloc_ctx["pool_list"].append(Pool(*pool.values()))
+            malloc_ctx["pool_list"].append(GefUtil.dict_to_namedtuple("Pool", pool))
 
-        MallocCtx = collections.namedtuple("MallocCtx", malloc_ctx.keys())
-        return MallocCtx(*malloc_ctx.values())
+        return GefUtil.dict_to_namedtuple("MallocCtx", malloc_ctx)
 
     def dump_malloc_ctx(self, malloc_ctx):
-        freed_address_color = Config.get_gef_setting("theme.heap_chunk_address_freed")
-        corrupted_msg_color = Config.get_gef_setting("theme.heap_corrupted_msg")
-        chunk_size_color = Config.get_gef_setting("theme.heap_chunk_size")
+        freed_address_color = Config.get("theme.heap_chunk_address_freed")
+        corrupted_msg_color = Config.get("theme.heap_corrupted_msg")
+        chunk_size_color = Config.get("theme.heap_chunk_size")
 
         self.out.append(titlify("malloc_ctx @ {:#x}".format(malloc_ctx.addr)))
         self.out.append("prevfree: {:#x}".format(malloc_ctx.prevfree))
@@ -1990,7 +1992,7 @@ class OpteeBgetDumpCommand(GenericCommand, BufferingOutput):
                     chunk.flink, chunk.blink,
                     chunk.next_prevfree,
                     chunk.next_bsize,
-                    (-chunk.next_bsize) & 0xffff_ffff,
+                    (-chunk.next_bsize) & ((1 << (self.ptrsize * 8)) - 1),
                 ))
         self.out.append("blink:    {:#x}".format(malloc_ctx.blink))
         for chunk in malloc_ctx.blink_list:
@@ -2007,7 +2009,7 @@ class OpteeBgetDumpCommand(GenericCommand, BufferingOutput):
                     chunk.blink,
                     chunk.next_prevfree,
                     chunk.next_bsize,
-                    (-chunk.next_bsize) & 0xffff_ffff,
+                    (-chunk.next_bsize) & ((1 << (self.ptrsize * 8)) - 1),
                 ))
         self.out.append("pool:     {:#x}".format(malloc_ctx.pool))
         self.out.append("pool_len: {:#x}".format(malloc_ctx.pool_len))
@@ -2018,12 +2020,15 @@ class OpteeBgetDumpCommand(GenericCommand, BufferingOutput):
         return
 
     def dump_chunk_list(self, malloc_ctx):
-        freed_address_color = Config.get_gef_setting("theme.heap_chunk_address_freed")
-        used_address_color = Config.get_gef_setting("theme.heap_chunk_address_used")
-        corrupted_msg_color = Config.get_gef_setting("theme.heap_corrupted_msg")
-        chunk_size_color = Config.get_gef_setting("theme.heap_chunk_size")
-        chunk_used_color = Config.get_gef_setting("theme.heap_chunk_used")
-        chunk_freed_color = Config.get_gef_setting("theme.heap_chunk_freed")
+        freed_address_color = Config.get("theme.heap_chunk_address_freed")
+        used_address_color = Config.get("theme.heap_chunk_address_used")
+        corrupted_msg_color = Config.get("theme.heap_corrupted_msg")
+        chunk_size_color = Config.get("theme.heap_chunk_size")
+        chunk_used_color = Config.get("theme.heap_chunk_used")
+        chunk_freed_color = Config.get("theme.heap_chunk_freed")
+
+        sign_bit = 1 << (self.ptrsize * 8 - 1)
+        size_mask = (sign_bit << 1) - 1
 
         for i in range(malloc_ctx.pool_len):
             pool = malloc_ctx.pool_list[i]
@@ -2032,22 +2037,33 @@ class OpteeBgetDumpCommand(GenericCommand, BufferingOutput):
             self.out.append(titlify("pool[{:d}] @ {:#x} - {:#x}".format(i, pool_start, pool_end)))
 
             chunk = pool_start
-            seen = []
+            seen = set()
             while chunk < pool_end:
                 if chunk in seen:
                     self.out.append(Color.colorify("loop detected", corrupted_msg_color))
                     break
-                seen.append(chunk)
+                seen.add(chunk)
                 try:
-                    prevfree = read_int_from_memory(chunk + runtime.current_arch.ptrsize * 0)
-                    bsize = read_int_from_memory(chunk + runtime.current_arch.ptrsize * 1)
-                    flink = read_int_from_memory(chunk + runtime.current_arch.ptrsize * 2)
-                    blink = read_int_from_memory(chunk + runtime.current_arch.ptrsize * 3)
+                    prevfree = self.read_word(chunk + self.ptrsize * 0)
+                    bsize = self.read_word(chunk + self.ptrsize * 1)
+                    if bsize == sign_bit:
+                        break
+                    if bsize & sign_bit:
+                        chunk_size = (-bsize) & size_mask
+                    else:
+                        chunk_size = bsize
+                    if chunk_size < self.ptrsize * 2 or chunk_size % (self.ptrsize * 2) or \
+                       chunk + chunk_size > pool_end - self.ptrsize * 2:
+                        self.out.append(Color.colorify("invalid chunk size", corrupted_msg_color))
+                        break
+                    if not bsize & sign_bit:
+                        flink = self.read_word(chunk + self.ptrsize * 2)
+                        blink = self.read_word(chunk + self.ptrsize * 3)
                 except gdb.MemoryError:
-                    self.out.append(Color.colorify("unaligned orrupted", corrupted_msg_color))
+                    self.out.append(Color.colorify("memory corrupted", corrupted_msg_color))
                     break
-                bsize_inv = (-bsize) & 0xffff_ffff
-                if bsize_inv < 0x8000_0000: # used
+                bsize_inv = (-bsize) & size_mask
+                if bsize & sign_bit: # used
                     self.out.append("{:s} {:s}: prevfree:{:#010x} bsize:{:#010x} ({:s})".format(
                         Color.colorify("used", chunk_used_color),
                         Color.colorify("{:#010x}".format(chunk), used_address_color),
@@ -2067,10 +2083,10 @@ class OpteeBgetDumpCommand(GenericCommand, BufferingOutput):
                         ),
                     )
                     chunk += bsize
-                if chunk % 8:
-                    self.out.append(Color.colorify("unaligned orrupted", corrupted_msg_color))
+                if chunk % (self.ptrsize * 2):
+                    self.out.append(Color.colorify("unaligned corrupted", corrupted_msg_color))
                     break
-            return
+        return
 
     @parse_args
     @only_if_gdb_running
@@ -2078,21 +2094,45 @@ class OpteeBgetDumpCommand(GenericCommand, BufferingOutput):
     @only_if_specific_arch(arch=("ARM32", "ARM64"))
     def do_invoke(self, args):
         self.out = []
+        cpsr = get_register("$cpsr")
+        user_bits = None
+        if cpsr is not None:
+            if is_arm32() and cpsr & 0x1f == 0x10:
+                user_bits = 32
+            elif is_arm64():
+                if cpsr & 0x1f == 0x10:
+                    user_bits = 32
+                elif cpsr & 0x1f == 0:
+                    user_bits = 64
+        if args.ta_bits is None and user_bits is None:
+            err("TA ABI is unknown at this stop; specify --ta-bits 32 or --ta-bits 64")
+            return
+        if args.ta_bits and user_bits and args.ta_bits != user_bits:
+            err("--ta-bits does not match the current TA execution state")
+            return
+        self.ptrsize = (args.ta_bits or user_bits) // 8
+        if is_arm32() and self.ptrsize != 4:
+            err("An ARM32 core cannot execute a 64-bit TA")
+            return
 
-        ta_address_map = OpteeThreadEnterUserModeBreakpoint.get_ta_loaded_address()
+        ta_address_map = OpteeThreadEnterUserModeBreakpoint.get_ta_loaded_address(ta_base=args.ta_base)
         if ta_address_map is None:
             err("Could not find TA address")
             return
 
-        ta_address = ta_address_map[0]
-        self.verbose_info("TA loaded address (RX): {:#x} - {:#x}".format(ta_address_map[0], ta_address_map[1]))
+        ta_address = ta_address_map.vstart
+        self.verbose_info("TA loaded address (RX): {:#x} - {:#x}".format(
+            ta_address_map.vstart, ta_address_map.vend,
+        ))
 
         if args.malloc_ctx is None:
-            ta_rw_address_map = self.get_ta_rw_address(ta_address_map[1])
+            ta_rw_address_map = self.get_ta_rw_address(ta_address_map.vend)
             if ta_rw_address_map is None:
                 err("Could not find TA rw address")
                 return
-            self.verbose_info("TA loaded address (RW): {:#x} - {:#x}".format(ta_rw_address_map[0], ta_rw_address_map[1]))
+            self.verbose_info("TA loaded address (RW): {:#x} - {:#x}".format(
+                ta_rw_address_map.vstart, ta_rw_address_map.vend,
+            ))
             malloc_ctx_addr = self.get_malloc_ctx(ta_rw_address_map)
             if malloc_ctx_addr is None:
                 err("Could not find malloc_ctx")

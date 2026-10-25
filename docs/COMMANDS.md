@@ -620,16 +620,16 @@ multi-line x/4xg $rax; ---t TAG; x/4xg $rbx  # `---t TAG`: bold white line (`=`)
 
 ## nexti-for-qemu-user
 
-`ni` wrapper for some specific architectures (OpenRISC 1000 and CRIS).
+`ni` wrapper for specific architectures; COUNT is unsupported.
 
 
 ### Syntax
 
 ```text
-usage: nexti-for-qemu-user [-h] [ARGS ...]
+usage: nexti-for-qemu-user [-h] [COUNT]
 
 positional arguments:
-  ARGS        An array of arguments to pass as is to the nexti command. (default: None)
+  COUNT       Unsupported. Run this command without COUNT to step once.
 
 options:
   -h, --help  show this help message and exit
@@ -640,6 +640,7 @@ options:
 ```text
 Only when qemu-user with specific architecture, the `ni` command is redirected to `nexti-for-qemu-user`.
 This setting is done only once, when `hook_stop_handler` is called for the first time.
+COUNT arguments are not supported.
 
 Target architecture:
   OpenRISC 1000: branch operations don't work well, so GEF uses breakpoints to simulate.
@@ -670,16 +671,16 @@ unless the stepped instruction intentionally modified DAIF.I.
 
 ## stepi-for-qemu-user
 
-`si` wrapper for some specific architectures (OpenRISC 1000 and CRIS).
+`si` wrapper for specific architectures; COUNT is unsupported.
 
 
 ### Syntax
 
 ```text
-usage: stepi-for-qemu-user [-h] [ARGS ...]
+usage: stepi-for-qemu-user [-h] [COUNT]
 
 positional arguments:
-  ARGS        An array of arguments to pass as is to the stepi command. (default: None)
+  COUNT       Unsupported. Run this command without COUNT to step once.
 
 options:
   -h, --help  show this help message and exit
@@ -690,6 +691,7 @@ options:
 ```text
 Only when qemu-user with specific architecture, the `si` command is redirected to `stepi-for-qemu-user`.
 This setting is done only once, when `hook_stop_handler` is called for the first time.
+COUNT arguments are not supported.
 
 Target architecture:
   OpenRISC 1000: branch operations don't work well, so GEF uses breakpoints to simulate.
@@ -1715,7 +1717,7 @@ usage: memory watch [-h] ADDRESS [COUNT] [{byte,word,dword,qword,pointers}]
 
 positional arguments:
   ADDRESS               the memory address to register for display in `context memory`.
-  COUNT                 the count of displayed units. (default: 16)
+  COUNT                 the number of pointers, or bytes for byte/word/dword/qword. (default: 16)
   {byte,word,dword,qword,pointers}
                         the size of unit. (default: pointers)
 
@@ -1778,19 +1780,15 @@ Redirect the file descriptor during execution.
 ### Syntax
 
 ```text
-usage: hijack-fd [-h] [--fd-adjust-connect FD_ADJUST_CONNECT] [--fd-adjust-dup3 FD_ADJUST_DUP3] [-q] OLD_FD NEW_OUTPUT
+usage: hijack-fd [-h] [-q] OLD_FD NEW_OUTPUT
 
 positional arguments:
-  OLD_FD                file descriptor number to redirect.
-  NEW_OUTPUT            the location redirected data is stored.
+  OLD_FD       file descriptor number to redirect.
+  NEW_OUTPUT   the location redirected data is stored.
 
 options:
-  -h, --help            show this help message and exit
-  --fd-adjust-connect FD_ADJUST_CONNECT
-                        slide value when `connect` syscall result and the actual opened FD differ (for old qemu-user).
-  --fd-adjust-dup3 FD_ADJUST_DUP3
-                        slide value when `dup3` syscall result and the actual opened FD differ (for old qemu-user).
-  -q, --quiet           quiet execution.
+  -h, --help   show this help message and exit
+  -q, --quiet  quiet execution.
 ```
 
 ### Examples
@@ -1798,6 +1796,12 @@ options:
 ```gdb
 hijack-fd 2 /tmp/gef/stderr.txt
 hijack-fd 2 localhost:8000  # determined as the socket by the presence of `:`.
+```
+
+### Notes
+
+```text
+`socketcall` is not supported; on i386 with Linux < 4.3 (or old qemu-user), the socket redirection fails with ENOSYS.
 ```
 
 ## kill-threads
@@ -1839,7 +1843,7 @@ usage: mmap [-h] [LOCATION] [SIZE] [PERMISSION]
 
 positional arguments:
   LOCATION    the address to allocate. (default: None)
-  SIZE        the size to allocate. (default: 4096)
+  SIZE        the size to allocate. (default: one target page)
   PERMISSION  the permission to allocate. `_` is interpreted as `-`. (default: rwx)
 
 options:
@@ -3118,17 +3122,39 @@ options:
 
 ## iouring-dump
 
-Dump the iouring area (x64 only).
+Dump the userland io_uring rings.
 
 
 ### Syntax
 
 ```text
-usage: iouring-dump [-h] [-n]
+usage: iouring-dump [-h] [-r RINGS] [-s SQES] [--no-scan] [-n]
 
 options:
-  -h, --help      show this help message and exit
-  -n, --no-pager  do not use the pager.
+  -h, --help         show this help message and exit
+  -r, --rings RINGS  the address of the rings set up with IORING_SETUP_NO_MMAP (p->cq_off.user_addr).
+  -s, --sqes SQES    the address of the SQEs set up with IORING_SETUP_NO_MMAP (p->sq_off.user_addr).
+  --no-scan          do not search writable memory for the rings set up with IORING_SETUP_NO_MMAP.
+  -n, --no-pager     do not use the pager.
+```
+
+### Examples
+
+```gdb
+iouring-dump                                      # dump mmapped rings and search IORING_SETUP_NO_MMAP rings
+iouring-dump -r 0x7ffff7fb2000 -s 0x7ffff7fb1000  # dump IORING_SETUP_NO_MMAP rings at the specified address
+```
+
+### Notes
+
+```text
+The layout of the rings is recognized from their metadata, not from the kernel version.
+  Linux v5.1-v5.3: IORING_OFF_SQ_RING and IORING_OFF_CQ_RING map struct io_sq_ring and struct io_cq_ring.
+  Linux v5.4-    : both offsets map the same struct io_rings (IORING_FEAT_SINGLE_MMAP).
+Linux v5.1-v6.9 (except some later v6.1.y/v6.6.y) maps the rings with remap_pfn_range(), so gdb cannot read them.
+Then, on x86/ARM/AArch64, they are copied to a temporary mapping in the inferior if the mapping is readable.
+The rings set up with IORING_SETUP_NO_MMAP (Linux v6.5-) are in user memory, not in an io_uring mapping.
+They are searched in writable memory. Their SQEs are guessed from the liburing layout, or specify --sqes.
 ```
 
 ## link-map
@@ -3331,14 +3357,16 @@ Demangle a mangled value by PTR_MANGLE.
 ### Syntax
 
 ```text
-usage: ptr-demangle [-h] (--source | VALUE)
+usage: ptr-demangle [-h] [-f] (--source | VALUE)
 
 positional arguments:
-  VALUE       the value to demangle.
+  VALUE                 the value to demangle.
 
 options:
-  -h, --help  show this help message and exit
-  --source    shows the source instead of displaying demangled value.
+  -h, --help            show this help message and exit
+  --source              shows the source instead of displaying demangled value.
+  -f, --force-heuristic
+                        do not use symbols to detect PTR_MANGLE
 ```
 
 ## ptr-mangle
@@ -3349,14 +3377,16 @@ Mangle a pointer value by PTR_MANGLE.
 ### Syntax
 
 ```text
-usage: ptr-mangle [-h] (--source | VALUE)
+usage: ptr-mangle [-h] [-f] (--source | VALUE)
 
 positional arguments:
-  VALUE       the value to mangle.
+  VALUE                 the value to mangle.
 
 options:
-  -h, --help  show this help message and exit
-  --source    shows the source instead of displaying mangled value.
+  -h, --help            show this help message and exit
+  --source              shows the source instead of displaying mangled value.
+  -f, --force-heuristic
+                        do not use symbols to detect PTR_MANGLE
 ```
 
 ## search-mangled-ptr
@@ -3368,11 +3398,13 @@ Search for mangled values in RW memory.
 ### Syntax
 
 ```text
-usage: search-mangled-ptr [-h] [-v]
+usage: search-mangled-ptr [-h] [-f] [-v]
 
 options:
-  -h, --help     show this help message and exit
-  -v, --verbose  shows the section currently being searched.
+  -h, --help            show this help message and exit
+  -f, --force-heuristic
+                        do not use symbols to detect PTR_MANGLE
+  -v, --verbose         shows the section currently being searched.
 ```
 
 ## sighands
@@ -5818,7 +5850,7 @@ options:
   -Ab, --auto-inclement-begin-width AUTO_INCLEMENT_BEGIN_WIDTH
                         auto inclement begin width. (default: 16)
   -Ae, --auto-inclement-end-width AUTO_INCLEMENT_END_WIDTH
-                        auto inclement end width. (default: min(len(data) // begin_width, 512)
+                        auto inclement end width. (default: max(begin_width, min(len(data) // begin_width, 512)))
   -As, --auto-inclement-step-width AUTO_INCLEMENT_STEP_WIDTH
                         auto inclement step width. (default: 2)
 ```
@@ -6986,7 +7018,7 @@ Print v8 tagged object, or load more commands from internet.
 ### Syntax
 
 ```text
-usage: v8 [-h] (-l | -L | ADDRESS)
+usage: v8 [-h] [--revision REVISION] (-l | -L | ADDRESS)
 
 positional arguments:
   ADDRESS               target map address.
@@ -6996,6 +7028,7 @@ options:
   -l, --load-v8-gdbinit
                         load gdbinit for v8 from internet.
   -L, --list-command    show newly added commands from v8 gdbinit.
+  --revision REVISION   V8 revision or tag for the external gdbinit.
 ```
 
 ## v8-dump-space
@@ -7393,20 +7426,22 @@ Simplified mimalloc structure:
 
 ## musl-heap-dump
 
-musl v1.2.6 (src/malloc/mallocng) heap reusable chunks viewer (x64/x86 only).
+musl mallocng heap reusable chunks viewer.
 
 
 ### Syntax
 
 ```text
-usage: musl-heap-dump [-h] [-i ACTIVE_IDX] [-n] [-v] [{ctx,unused}]
+usage: musl-heap-dump [-h] [--malloc-context MALLOC_CONTEXT] [-i {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47}] [-n] [-v] [{ctx,unused}]
 
 positional arguments:
   {ctx,unused}          dump mode (default: unused).
 
 options:
   -h, --help            show this help message and exit
-  -i, --active-idx ACTIVE_IDX
+  --malloc-context MALLOC_CONTEXT
+                        use a specific mallocng context address.
+  -i, --active-idx {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47}
                         the active index of dump target.
   -n, --no-pager        do not use the pager.
   -v, --verbose         also dump an empty active index.
@@ -7415,6 +7450,10 @@ options:
 ### Notes
 
 ```text
+Supports musl mallocng (1.2.1 and later), not the legacy malloc implementation.
+Without the __malloc_context symbol, specify --malloc-context; x86 also has heuristic detection.
+Only groups on active[48] are listed; individually mapped large allocations are not enumerated.
+
 Simplified musl mallocng structure:
 
 +-malloc_context------+
@@ -7575,7 +7614,7 @@ SSMalloc heap free-list viewer (x64 only).
 ### Syntax
 
 ```text
-usage: ssmalloc-heap-dump [-h] [-hh] [--local_heap LOCAL_HEAP] [--global_pool GLOBAL_POOL] [-a] [-g] [-n] [-v]
+usage: ssmalloc-heap-dump [-h] [-hh] [--local_heap LOCAL_HEAP] [--global_pool GLOBAL_POOL] [-a] [-g] [--global-only] [-n] [-v]
 
 options:
   -h, --help            show this help message and exit
@@ -7586,6 +7625,7 @@ options:
                         use specific address for global_pool.
   -a, --all             dump all local_heap.
   -g, --global          dump global_pool queues.
+  --global-only         dump only global_pool queues without inspecting TLS.
   -n, --no-pager        do not use the pager.
   -v, --verbose         display also empty freelists.
 ```
@@ -7749,7 +7789,7 @@ uclibc-ng (libc/stdlib/malloc-standard) heap reusable chunks viewer (x64/x86 onl
 ### Syntax
 
 ```text
-usage: uclibc-ng-heap-dump [-h] [--malloc_state MALLOC_STATE] [-n] [-v]
+usage: uclibc-ng-heap-dump [-h] [--malloc_state MALLOC_STATE] [-n] [-v] [-s]
 
 options:
   -h, --help            show this help message and exit
@@ -7757,6 +7797,8 @@ options:
                         use specific address for malloc_context.
   -n, --no-pager        do not use the pager.
   -v, --verbose         also dump an empty active index.
+  -s, --safe-linking-decode
+                        decode Safe-Linking fastbin links during traversal and display (default: plain links).
 ```
 
 ### Notes
@@ -7766,7 +7808,8 @@ The main structural differences between uclibc-ng (malloc-standard) and glibc ar
 - No tcache. There are fastbins, an unsorted bin, small bins, and large bins.
 - No thread arena. Therefore, chunks do not have the NON_MAIN_ARENA flag.
 The structure of malloc-standard has remained largely unchanged from version 1.0 to the latest.
-As a result, it should be usable with any version.
+Only libc/stdlib/malloc-standard is supported, not malloc or malloc-simple.
+Links are plain by default. Use -s for builds with Safe-Linking, including uClibc-ng 1.0.54 and 1.0.58.
 Since the final version of uclibc (not uclibc-ng) uses the same structure,
 this command should also be usable with uclibc.
 ```
@@ -7792,7 +7835,7 @@ options:
   -f, --full            display the same line without omitting.
   -d, --dark-color      use the dark color if chunk is allocated.
   -s, --safe-linking-decode
-                        decode safe-linking encoded pointer if tcache or fastbins.
+                        decode Safe-Linking fastbin links during traversal and display (default: plain links).
   -n, --no-pager        do not use the pager.
 ```
 
@@ -7803,7 +7846,8 @@ The main structural differences between uclibc-ng (malloc-standard) and glibc ar
 - No tcache. There are fastbins, an unsorted bin, small bins, and large bins.
 - No thread arena. Therefore, chunks do not have the NON_MAIN_ARENA flag.
 The structure of malloc-standard has remained largely unchanged from version 1.0 to the latest.
-As a result, it should be usable with any version.
+Only libc/stdlib/malloc-standard is supported, not malloc or malloc-simple.
+Links are plain by default. Use -s for builds with Safe-Linking, including uClibc-ng 1.0.54 and 1.0.58.
 Since the final version of uclibc (not uclibc-ng) uses the same structure,
 this command should also be usable with uclibc.
 ```
@@ -7826,8 +7870,8 @@ positional arguments:
 options:
   -h, --help            show this help message and exit
   -U, --exclude-user    exclude userland memory.
-  -i, --include-esp-fixup-stacks
-                        include `%esp fixup stacks` area (sometimes heavy memory use; x64 only).
+  -i, --include-aliased-pages
+                        include aliased pages such as espfix stacks and KASAN shadow (heavy memory use; x64 only).
   -v, --verbose         increase output verbosity. (-v, -vv, -vvv)
   -n, --no-pager        do not use the pager.
   -q, --quiet           quiet execution.
@@ -7946,14 +7990,14 @@ options:
 
 ## pagewalk x64
 
-Dump pagetable for x64/x86.
+Dump page tables for x86/64.
 
 - Alias: `pagewalk x86`
 
 ### Syntax
 
 ```text
-usage: pagewalk x64 [-h] [-L] [-N] [-P] [-Q] [-f REGEX] [-v VADDR] [-p PADDR] [-t VADDR] [-i] [-U] [--cr3 USER_SPECIFIED_CR3] [--cr4 USER_SPECIFIED_CR4] [--ept] [-D] [-c] [-n] [-q]
+usage: pagewalk x64 [-h] [-L] [-N] [-P] [-Q] [-f REGEX] [-v VADDR] [-p PADDR] [-t VADDR] [-i] [-U] [--cr3 USER_SPECIFIED_CR3] [--cr4 USER_SPECIFIED_CR4] [--ept] [--ept-levels {4,5}] [-D] [-c] [-n] [-q]
 
 options:
   -h, --help            show this help message and exit
@@ -7966,14 +8010,15 @@ options:
   -v, --vrange VADDR    filter by map included specified virtual address.
   -p, --prange PADDR    filter by map included specified physical address.
   -t, --trace VADDR     show all level pagetables only associated specified address.
-  -i, --include-esp-fixup-stacks
-                        include `%esp fixup stacks` area (sometimes heavy memory use; x64 only).
+  -i, --include-aliased-pages
+                        include aliased pages such as espfix stacks and KASAN shadow (heavy memory use; x64 only).
   -U, --user-pt         print userland pagetables (for KPTI, x64 only, in kernel context).
   --cr3 USER_SPECIFIED_CR3
                         use specified value as cr3.
   --cr4 USER_SPECIFIED_CR4
                         use specified value as cr4.
   --ept                 parse cr3 as EPT (Extended Page Table).
+  --ept-levels {4,5}    EPT walk length, independent of CR4.LA57 (default: 4).
   -D, --disable-color   disable RWX colored output
   -c, --use-cache       use previous result.
   -n, --no-pager        do not use the pager.
@@ -8003,15 +8048,16 @@ Print GDT/LDT entries. If user-land, show sample entries.
 ### Syntax
 
 ```text
-usage: gdtinfo [-h] [--only-gdt] [--only-ldt] [-q] [-v] [-n]
+usage: gdtinfo [-h] [--only-gdt] [--only-ldt] [--ldt-base ADDRESS] [-q] [-v] [-n]
 
 options:
-  -h, --help      show this help message and exit
-  --only-gdt      show only GDT entries (qemu-system only).
-  --only-ldt      show only LDT entries (qemu-system only).
-  -q, --quiet     enable quiet mode.
-  -v, --verbose   also display bit information of gdt entries.
-  -n, --no-pager  do not use the pager.
+  -h, --help          show this help message and exit
+  --only-gdt          show only GDT entries (qemu-system only).
+  --only-ldt          show only LDT entries (qemu-system only).
+  --ldt-base ADDRESS  supply a known full cached LDT base instead of inferring it from the GDT.
+  -q, --quiet         enable quiet mode.
+  -v, --verbose       also display bit information of gdt entries.
+  -n, --no-pager      do not use the pager.
 ```
 
 ### Notes
@@ -8021,6 +8067,9 @@ This command is intended to dump the GDTR and LDTR when working with qemu-system
 When you're debugging a normal userland app you can't read the GDTR or LDTR,
 so this is just to show you an example of what information is stored there.
 However, the segment registers show the correct (real) values.
+In long-mode compatibility code, QEMU may print only the low 32 bits of the cached LDT base.
+The full LDT base is inferred from a matching GDT descriptor; it may differ from the CPU's cached value.
+Use --ldt-base with a known full address to override this inference.
 ```
 
 ## idtinfo
@@ -8822,7 +8871,7 @@ Resolve kernel symbols from kallsyms table.
 ### Syntax
 
 ```text
-usage: ksymaddr-remote [-h] [-t TYPE] [-e] [-r] [-s] [--vmlinux-file VMLINUX_FILE] [-I] [--print-saved-config] [-n] [-v] [-q] [KEYWORD ...]
+usage: ksymaddr-remote [-h] [-t TYPE] [-e] [-r] [-s] [-V FILE | -M FILE] [-I] [-C] [-n] [-v] [-q] [KEYWORD ...]
 
 positional arguments:
   KEYWORD               filter by specific symbol name.
@@ -8833,11 +8882,14 @@ options:
   -e, --exact           use exact match.
   -r, --rescan          do not use cache.
   -s, --smart           filter __pfx_*, __ksymtab_*, etc.
-  --vmlinux-file VMLINUX_FILE
+  -V, --vmlinux-file FILE
                         force use your vmlinux file which includes symbols.
+  -M, --system-map FILE
+                        read and relocate symbols from a System.map file.
   -I, --ignore-loaded-vmlinux
                         force skip parsing loaded vmlinux.
-  --print-saved-config  print saved (cached) config contents.
+  -C, --print-saved-config
+                        print saved (cached) config contents.
   -n, --no-pager        do not use the pager.
   -v, --verbose         enable verbose mode.
   -q, --quiet           enable quiet mode.
@@ -8847,16 +8899,20 @@ options:
 
 ```gdb
 ksymaddr-remote commit_creds prepare_kernel_cred  # OR search
+ksymaddr-remote --system-map /boot/System.map commit_creds
 ```
 
 ### Notes
 
 ```text
 GEF caches offset information for parsing kallsyms to speed up this command.
-Each cache is used based on kernel version strings.
-In other words, in cases where the kernel version is exactly the same and
-the CONFIG is slightly different, the offset will be applied incorrectly.
-In this case, rescan with `ks -rv` or clear the cache with `gef reset-cache --hard`.
+Each cache is used based on kernel version strings, so kernels of the same version
+share one cache even if the CONFIG is different. GEF checks the cached offsets
+against the running kernel and parses again when they do not match.
+To drop a cache by hand, rescan with `ks -rv` or use `gef reset-cache --hard`.
+`--system-map` and `--vmlinux-file` check the KASLR offset against the exception entry and linux_banner.
+With only one anchor, it warns that the kernel build could not be verified.
+Absolute symbols and symbols linked outside the kernel image are not relocated.
 ```
 
 ## ksymaddr-remote-apply
@@ -8934,7 +8990,7 @@ usage: vmlinux-to-elf-apply [-h] [-r]
 
 options:
   -h, --help    show this help message and exit
-  -r, --rescan  force applying again. (default: reuse vmlinux-to-elf-dump-memory.elf if exists)
+  -r, --rescan  regenerate the ELF instead of reusing a matching symbol cache.
 ```
 
 # 06-f. Qemu-system/KGDB Cooperation - Linux Task
@@ -12049,7 +12105,7 @@ Call predefined system-calls and print kmalloc-N chunks allocated and freed (x64
 ### Syntax
 
 ```text
-usage: kmalloc-allocated-by [-h] [-f FILTER] [-N] [-t] [-d] [-v]
+usage: kmalloc-allocated-by [-h] [-f FILTER] [-N] [-t] [-d] [--meta]
 
 options:
   -h, --help           show this help message and exit
@@ -12057,7 +12113,7 @@ options:
   -N, --print-null     display free(NULL).
   -t, --backtrace      display backtrace.
   -d, --dump-chunk     dump the first 0x40 bytes of each chunk.
-  -v, --verbose        print meta information.
+  --meta               display offset information.
 ```
 
 ### Examples
@@ -12084,7 +12140,7 @@ Collect and display information when kmalloc/kfree.
 ### Syntax
 
 ```text
-usage: kmalloc-tracer [-h] [-f FILTER] [-T TASK_NAME] [-N] [-t] [-d] [-p] [-v]
+usage: kmalloc-tracer [-h] [-f FILTER] [-T TASK_NAME] [-N] [-t] [-d] [-p] [--meta]
 
 options:
   -h, --help            show this help message and exit
@@ -12096,7 +12152,7 @@ options:
   -d, --dump-chunk      dump the first 0x40 bytes of each chunk.
   -p, --enable-page-allocator-trace
                         in addition to kmalloc and kfree, it also monitors __alloc_pages and __free_pages.
-  -v, --verbose         print meta information.
+  --meta                display offset information.
 ```
 
 ### Examples
@@ -12160,32 +12216,35 @@ This command requires CONFIG_RANDSTRUCT=n.
 
 ## ktrace
 
-Trace kernel functions and arguments.
+Trace arguments and returns of the specified kernel functions.
 
 
 ### Syntax
 
 ```text
-usage: ktrace [-h] [--task-name TASK_NAME] [--task-addr TASK_ADDR] [-f FILTER] [-e EXCLUDE] [-c] [-q]
+usage: ktrace [-h] [--asmlinkage] FUNCTION [FUNCTION ...]
+
+positional arguments:
+  FUNCTION      exact kernel function names.
 
 options:
-  -h, --help            show this help message and exit
-  --task-name TASK_NAME
-                        task name (from `ktask`) for filtering.
-  --task-addr TASK_ADDR
-                        task address for filtering.
-  -f, --filter FILTER   function include filter (REGEXP).
-  -e, --exclude EXCLUDE
-                        function exclude filter (REGEXP).
-  -c, --commit          actually perform ktrace.
-  -q, --quiet           skip tqdm and displaying function name.
+  -h, --help    show this help message and exit
+  --asmlinkage  use the i386 stack ABI for selected functions.
+```
+
+### Examples
+
+```gdb
+ktrace commit_creds prepare_kernel_cred
 ```
 
 ### Notes
 
 ```text
-If you set breakpoints in some commonly called functions, it became too slow to be useful.
-Use filtering options to reduce the number of functions targeted by breakpoints as much as possible.
+All definitions of each exact function name are included; duplicate addresses are skipped.
+Arguments are six guessed machine words; function prototypes and pt_regs syscall arguments are not decoded.
+Tracing continues until interrupted or stopped by another breakpoint; tracing breakpoints are then removed.
+Tail calls and non-local exits may have no observed return.
 ```
 
 ## kuaf-watch
@@ -12288,13 +12347,15 @@ Dump bget allocator of OPTEE-Trusted-App.
 ### Syntax
 
 ```text
-usage: optee-bget-dump [-h] [-hh] [-m OFFSET_malloc_ctx] [-n] [-v]
+usage: optee-bget-dump [-h] [-hh] [-m OFFSET_malloc_ctx] [--ta-bits {32,64}] [--ta-base TA_BASE] [-n] [-v]
 
 options:
   -h, --help            show this help message and exit
   -hh, --help-simple    show help without ASCII diagram.
   -m, --malloc_ctx OFFSET_malloc_ctx
                         The offset of `malloc_ctx` at OPTEE-TA.
+  --ta-bits {32,64}     TA ABI width (required when the TA ABI cannot be read from user execution state).
+  --ta-base TA_BASE     select the executable user mapping starting at this address.
   -n, --no-pager        do not use the pager.
   -v, --verbose         verbose output.
 ```
@@ -12308,6 +12369,10 @@ optee-bget-dump 0x2a408
 ### Notes
 
 ```text
+TA ABI is independent of the TEE core ABI. Use --ta-bits 32 for an AArch32 TA on an AArch64 core.
+Without --ta-bits, the ABI is taken from the current user execution state; core stops require it explicitly.
+Use --ta-base to select a mapping when ldelf is absent or more than two executable mappings are present.
+
 Simplified heap structure:
 
 +-malloc_ctx-------------------+         +-freed chunk------------+
@@ -12342,7 +12407,7 @@ Set a breakpoint to OPTEE-TA.
 ### Syntax
 
 ```text
-usage: optee-break-ta [-h] [-v] (-f TA_FILE | TA_OFFSET)
+usage: optee-break-ta [-h] [--ta-base TA_BASE] [--persistent] [-v] (-f TA_FILE | TA_OFFSET)
 
 positional arguments:
   TA_OFFSET             The breakpoint target offset of OPTEE-TA.
@@ -12351,6 +12416,8 @@ options:
   -h, --help            show this help message and exit
   -f, --ta-file TA_FILE
                         parse the TA file (or ELF file) and stop at the entry point.
+  --ta-base TA_BASE     select the executable user mapping starting at this address.
+  --persistent          arm a new temporary breakpoint on every TA entry.
   -v, --verbose         show memory map if stopped at __thread_enter_user_mode.
 ```
 
@@ -12375,6 +12442,11 @@ Now, thread_enter_user_mode calls __thread_enter_user_mode.
 This __thread_enter_user_mode in TEE OS is written directly in assembly.
 Because of this, it is immune to compiler optimizations. By searching memory for the fixed byte sequence
 of this assembly routine, we can reliably locate its offset and set your breakpoint there.
+
+By default, exactly two executable user mappings are required; the higher one is selected as the TA.
+Use --ta-base when ldelf is absent or shared libraries add mappings. Offsets are relative to this mapping.
+After two unsuccessful selections, execution stops and the internal breakpoint is disabled.
+The internal breakpoint is deleted after arming the target once; --persistent keeps tracking TA entries.
 ```
 
 ## optee-shm-list
@@ -12385,11 +12457,12 @@ List dynamic shared-memory buffers currently registered in OP-TEE (for OP-TEE v4
 ### Syntax
 
 ```text
-usage: optee-shm-list [-h] [-n]
+usage: optee-shm-list [-h] [--phys-bits {32,64}] [-n]
 
 options:
-  -h, --help      show this help message and exit
-  -n, --no-pager  do not use the pager.
+  -h, --help           show this help message and exit
+  --phys-bits {32,64}  paddr_t width (default: debug type, otherwise core pointer width).
+  -n, --no-pager       do not use the pager.
 ```
 
 ## optee-smc-service-dump
@@ -12592,7 +12665,7 @@ Search the code pointer in kernel data area.
 ### Syntax
 
 ```text
-usage: ksearch-code-ptr [-h] [-d DEPTH] [-r MAX_RANGE] [-n]
+usage: ksearch-code-ptr [-h] [-d DEPTH] [-r MAX_RANGE] [-n] [-q]
 
 options:
   -h, --help            show this help message and exit
@@ -12600,6 +12673,7 @@ options:
   -r, --max-range MAX_RANGE
                         allowable offset range for each reference. (default: 0)
   -n, --no-pager        do not use the pager.
+  -q, --quiet           enable quiet mode.
 ```
 
 ## qemu-device-info
@@ -12610,25 +12684,35 @@ Dump device information for qemu-escape.
 ### Syntax
 
 ```text
-usage: qemu-device-info [-h] [-d DEVICE] [-n]
+usage: qemu-device-info [-h] [-d DEVICE | -l] [--qemu-binary QEMU_BINARY] [-N | -A] [-n]
 
 options:
-  -h, --help           show this help message and exit
-  -d, --device DEVICE  device name.
-  -n, --no-pager       do not use the pager.
+  -h, --help            show this help message and exit
+  -d, --device DEVICE   exact device name, id, or QOM path.
+  -l, --list            list active devices and owner-linked memory entries.
+  --qemu-binary QEMU_BINARY
+                        path to the qemu-system binary.
+  -N, --no-nm           do not show QEMU symbols from nm.
+  -A, --all-nm          show all symbols from nm.
+  -n, --no-pager        do not use the pager.
 ```
 
 ### Examples
 
 ```gdb
-qemu-device-info -d cydf-vga  # Specify a device name
-qemu-device-info -d cydf      # Specify a characteristic part of the device name
+qemu-device-info -l                           # List devices and owner-linked entry counts
+qemu-device-info -d cydf-vga                  # Select exact device name
+qemu-device-info -d net0                      # Select exact device id
+qemu-device-info -d /machine/peripheral/net0  # Select exact QOM path
+qemu-device-info -d net0 -N                   # Skip nm symbols
+qemu-device-info -d net0 -A                   # Show all nm symbols
 ```
 
 ### Notes
 
 ```text
 qemu-system must be running on the local host.
+Use `qemu-system-memory-region-dump` for more detailed physical memory-region information.
 ```
 
 ## uefi-ovmf-info
@@ -12639,10 +12723,14 @@ Print UEFI OVMF info.
 ### Syntax
 
 ```text
-usage: uefi-ovmf-info [-h]
+usage: uefi-ovmf-info [-h] [--start START] [--end END] [--pei-bits {32,64}] [--dxe-bits {32,64}]
 
 options:
-  -h, --help  show this help message and exit
+  -h, --help          show this help message and exit
+  --start START       physical search range start (inclusive).
+  --end END           physical search range end (exclusive).
+  --pei-bits {32,64}  override PEI table pointer width.
+  --dxe-bits {32,64}  override DXE table pointer width.
 ```
 
 # 06-l. Qemu-system/KGDB Cooperation - SMM

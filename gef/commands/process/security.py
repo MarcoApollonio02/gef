@@ -496,6 +496,7 @@ class PtrDemangleCommand(GenericCommand):
                        help="the value to demangle.")
     group.add_argument("--source", action="store_true",
                        help="shows the source instead of displaying demangled value.")
+    parser.add_argument("-f", "--force-heuristic", action="store_true", help="do not use symbols to detect PTR_MANGLE")
     _syntax_ = parser.format_help()
 
     @staticmethod
@@ -729,30 +730,35 @@ class PtrDemangleCommand(GenericCommand):
         return None
 
     @parse_args
-    @only_if_gdb_running
     @exclude_specific_gdb_mode(mode=("qemu-system", "kgdb", "vmware"))
-    @exclude_specific_arch(arch=("SPARC32", "XTENSA", "CRIS"))
+    @exclude_specific_arch(arch=("XTENSA", "CRIS"))
     @require_arch_set
     def do_invoke(self, args):
         if args.source:
             s = GefUtil.get_source(runtime.current_arch.decode_cookie)
             gef_print(s)
+            gef_print()
+            s = GefUtil.get_source(runtime.current_arch.decode_cookie_legacy)
+            gef_print(s)
             return
 
-        cookie = self.get_cookie()
+        if not is_alive():
+            warn("No debugging session active")
+            return
+
+        cookie = PtrDemangleCommand.get_cookie(force_heuristic=args.force_heuristic)
         if cookie is None:
             return
         info("Cookie is {:s}".format(Color.colorify_hex(cookie, "bold")))
 
         decoded = runtime.current_arch.decode_cookie(args.value, cookie)
-        decoded = ProcessMap.lookup_address(decoded)
-        decoded_sym = Symbol.get_symbol_string(decoded.value)
-        if is_valid_addr(decoded.value):
+        if is_valid_addr(decoded):
             valid_msg = Color.colorify("valid", "bold green")
         else:
             valid_msg = Color.colorify("invalid", "bold red")
-        info("Decoded value is {!s}{:s} [{:s}]".format(decoded, decoded_sym, valid_msg))
+        info("Decoded value is {:s} [{:s}]".format(Symbol.format(decoded, show_address=True), valid_msg))
         return
+
 
 
 @register_command
@@ -768,20 +774,27 @@ class PtrMangleCommand(GenericCommand):
                        help="the value to mangle.")
     group.add_argument("--source", action="store_true",
                        help="shows the source instead of displaying mangled value.")
+    parser.add_argument("-f", "--force-heuristic", action="store_true", help="do not use symbols to detect PTR_MANGLE")
     _syntax_ = parser.format_help()
 
     @parse_args
-    @only_if_gdb_running
     @exclude_specific_gdb_mode(mode=("qemu-system", "kgdb", "vmware"))
-    @exclude_specific_arch(arch=("SPARC32", "XTENSA", "CRIS"))
+    @exclude_specific_arch(arch=("XTENSA", "CRIS"))
     @require_arch_set
     def do_invoke(self, args):
         if args.source:
             s = GefUtil.get_source(runtime.current_arch.encode_cookie)
             gef_print(s)
+            gef_print()
+            s = GefUtil.get_source(runtime.current_arch.encode_cookie_legacy)
+            gef_print(s)
             return
 
-        cookie = PtrDemangleCommand.get_cookie()
+        if not is_alive():
+            warn("No debugging session active")
+            return
+
+        cookie = PtrDemangleCommand.get_cookie(force_heuristic=args.force_heuristic)
         if cookie is None:
             return
         info("Cookie is {:s}".format(Color.colorify_hex(cookie, "bold")))
@@ -789,6 +802,7 @@ class PtrMangleCommand(GenericCommand):
         encoded = runtime.current_arch.encode_cookie(args.value, cookie)
         info("Encoded value is {:#x}".format(encoded))
         return
+
 
 
 @register_command
@@ -800,6 +814,7 @@ class SearchMangledPtrCommand(GenericCommand):
     _aliases_ = ["cookie"]
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
+    parser.add_argument("-f", "--force-heuristic", action="store_true", help="do not use symbols to detect PTR_MANGLE")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="shows the section currently being searched.")
     _syntax_ = parser.format_help()
@@ -820,20 +835,24 @@ class SearchMangledPtrCommand(GenericCommand):
         return
 
     def print_loc(self, addr, value, decoded):
-        addr_sym = Symbol.get_symbol_string(addr)
-        decoded = ProcessMap.lookup_address(decoded)
-        decoded_sym = Symbol.get_symbol_string(decoded.value)
+        addr_sym = Symbol.format(addr)
+        if addr_sym:
+            addr_sym = " " + addr_sym
+        else:
+            addr_sym = ""
 
-        if is_valid_addr(decoded.value):
+        if is_valid_addr(decoded):
             valid_msg = Color.colorify("valid", "bold green")
         else:
             valid_msg = Color.colorify("invalid", "bold red")
 
-        base_address_color = Config.get_gef_setting("theme.dereference_base_address")
+        base_address_color = Config.get("theme.dereference_base_address")
         width = AddressUtil.get_format_address_width()
         addr = Color.colorify("{:#0{:d}x}".format(addr, width), base_address_color)
 
-        gef_print("  {:s}{:s}: {:#x} (={!s}{:s}) [{:s}]".format(addr, addr_sym, value, decoded, decoded_sym, valid_msg))
+        gef_print("  {:s}{:s}: {:#x} (={:s}) [{:s}]".format(
+            addr, addr_sym, value, Symbol.format(decoded, show_address=True), valid_msg,
+        ))
         return
 
     def search_mangled_ptr(self, start_address, end_address, cookie):
@@ -850,29 +869,35 @@ class SearchMangledPtrCommand(GenericCommand):
             else:
                 chunk_size = step
 
-            try:
-                mem = read_memory(chunk_addr, chunk_size)
-            except gdb.MemoryError:
-                # cannot access memory this range. It doesn't make sense to try any more
-                break
+            mem = read_memory(chunk_addr, chunk_size, safe=True)
+            if mem is not None:
+                mems = [(chunk_addr, mem)]
+            else:
+                # part of the range may have been unmapped after the maps were read, so retry per page
+                mems = []
+                for page in range(chunk_addr, chunk_addr + chunk_size, get_pagesize()):
+                    mem = read_memory(page, min(get_pagesize(), chunk_addr + chunk_size - page), safe=True)
+                    if mem is not None:
+                        mems.append((page, mem))
 
-            for i, value in enumerate(slice_unpack(mem, runtime.current_arch.ptrsize)):
-                decoded = runtime.current_arch.decode_cookie(value, cookie)
-                if not is_valid_addr(decoded):
-                    continue
-                addr = chunk_addr + i * runtime.current_arch.ptrsize
-                locations.append((addr, value, decoded))
-            del mem
+            for mem_addr, mem in mems:
+                for i, value in enumerate(slice_unpack(mem, runtime.current_arch.ptrsize)):
+                    decoded = runtime.current_arch.decode_cookie(value, cookie)
+                    if not is_valid_addr(decoded):
+                        continue
+                    addr = mem_addr + i * runtime.current_arch.ptrsize
+                    locations.append((addr, value, decoded))
+            del mems
         return locations
 
     @parse_args
     @only_if_gdb_running
     @exclude_specific_gdb_mode(mode=("qemu-system", "kgdb", "vmware", "wine"))
-    @exclude_specific_arch(arch=("SPARC32", "XTENSA", "CRIS"))
+    @exclude_specific_arch(arch=("XTENSA", "CRIS"))
     @require_arch_set
     def do_invoke(self, args):
         # init
-        cookie = PtrDemangleCommand.get_cookie()
+        cookie = PtrDemangleCommand.get_cookie(force_heuristic=args.force_heuristic)
         if cookie is None:
             return
         info("Cookie is {:s}".format(Color.colorify_hex(cookie, "bold")))
@@ -907,6 +932,7 @@ class SearchMangledPtrCommand(GenericCommand):
                 err("The process is dead")
                 break
         return
+
 
 
 @register_command

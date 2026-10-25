@@ -9,12 +9,14 @@ import argparse
 import math
 import os
 import re
+import shlex
 import struct
 
 import gdb
 
 from gef.commands.base import (
     BufferingOutput,
+    ContextManager,
     GenericCommand,
     exclude_specific_gdb_mode,
     only_if_gdb_running,
@@ -630,7 +632,8 @@ class VisualDumpCommand(GenericCommand):
     parser.add_argument("-Ab", "--auto-inclement-begin-width", type=AddressUtil.parse_address, default=16,
                         help="auto inclement begin width. (default: %(default)s)")
     parser.add_argument("-Ae", "--auto-inclement-end-width", type=AddressUtil.parse_address,
-                        help="auto inclement end width. (default: min(len(data) // begin_width, 512)")
+                        help="auto inclement end width. "
+                             "(default: max(begin_width, min(len(data) // begin_width, 512)))")
     parser.add_argument("-As", "--auto-inclement-step-width", type=AddressUtil.parse_address, default=2,
                         help="auto inclement step width. (default: %(default)s)")
     _syntax_ = parser.format_help()
@@ -683,10 +686,10 @@ class VisualDumpCommand(GenericCommand):
         if self.args.negate:
             command_options.append("-negate")
 
-        cmd = "{!r} {:s} GRAY:{!r} sixel:-".format(
-            GefUtil.which("convert"),
+        cmd = "{:s} {:s} {:s} sixel:-".format(
+            shlex.quote(GefUtil.which("convert")),
             " ".join(command_options),
-            tmp_path,
+            shlex.quote("GRAY:" + tmp_path),
         )
         return cmd
 
@@ -700,7 +703,7 @@ class VisualDumpCommand(GenericCommand):
             return
 
         if args.size is None:
-            loc = ProcessMap.lookup_address(args.location)
+            loc = ProcessMap.lookup(args.location)
             if loc.valid:
                 size = loc.section.page_end - args.location
             else:
@@ -709,9 +712,25 @@ class VisualDumpCommand(GenericCommand):
         else:
             size = args.size
 
-        try:
-            data = read_memory(args.location, size)
-        except (gdb.MemoryError, MemoryError, TypeError):
+        if size <= 0:
+            err("SIZE must be positive")
+            return
+        if args.width is not None and args.width <= 0:
+            err("--width must be positive")
+            return
+        if args.auto_width_inclement:
+            if args.auto_inclement_begin_width <= 0:
+                err("--auto-inclement-begin-width must be positive")
+                return
+            if args.auto_inclement_end_width is not None and args.auto_inclement_end_width <= 0:
+                err("--auto-inclement-end-width must be positive")
+                return
+            if args.auto_inclement_step_width <= 0:
+                err("--auto-inclement-step-width must be positive")
+                return
+
+        data = read_memory(args.location, size, safe=True)
+        if data is None:
             err("Memory read error")
             return
 
@@ -719,12 +738,6 @@ class VisualDumpCommand(GenericCommand):
             img_width = args.width
         else:
             img_width = int(math.sqrt(len(data)))
-        while len(data) % img_width:
-            data += b"\0"
-        img_height = len(data) // img_width
-
-        tmp_fd, tmp_path = GefUtil.mkstemp(prefix="vhexdump", suffix=".raw")
-        os.fdopen(tmp_fd, "wb").write(data)
 
         if args.auto_width_inclement:
             # if the width is too large, processing will be slow
@@ -732,25 +745,30 @@ class VisualDumpCommand(GenericCommand):
             if args.auto_inclement_end_width is not None:
                 max_width = args.auto_inclement_end_width
             else:
-                max_width = min(len(data) // min_width, 512)
+                max_width = max(min_width, min(len(data) // min_width, 512))
             step = args.auto_inclement_step_width
-            # processing while changing the width
-            for img_width in range(min_width, max_width + 1, step):
-                img_height = len(data) // img_width
-                cmd = self.make_command_line(img_width, img_height, tmp_path)
-                info(cmd)
-                # Ctrl+C is consumed by os.system, so it cannot escape from the python loop.
-                # Therefore, it is judged by the execution result.
-                e = os.system(cmd)
-                if e != 0:
-                    break
+            widths = range(min_width, max_width + 1, step)
         else:
-            cmd = self.make_command_line(img_width, img_height, tmp_path)
-            info(cmd)
-            os.system(cmd)
+            widths = (img_width,)
 
-        os.unlink(tmp_path)
+        with ContextManager.temporary_file(data, prefix="vhexdump", suffix=".raw") as tmp_path:
+            with open(tmp_path, "r+b") as fdw:
+                for img_width in widths:
+                    padding = -len(data) % img_width
+                    img_height = (len(data) + padding) // img_width
+                    fdw.seek(len(data))
+                    fdw.truncate()
+                    fdw.write(b"\0" * padding)
+                    fdw.flush()
+                    cmd = self.make_command_line(img_width, img_height, tmp_path)
+                    info(cmd)
+                    # Ctrl+C is consumed by os.system, so it cannot escape from the python loop.
+                    # Therefore, it is judged by the execution result.
+                    e = GefUtil.os_system(cmd)
+                    if e != 0:
+                        break
         return
+
 
 
 @register_command

@@ -5,6 +5,7 @@ Syscall commands (depends on gef.core.syscall from Phase 2.0).
 Auto-discovered by gef.bootstrap via pkgutil.walk_packages.
 """
 import argparse
+import contextlib
 import os
 import re
 import struct
@@ -25,11 +26,12 @@ from gef.commands.base import (
 )
 from gef.core import runtime
 from gef.core.address import AddressUtil, Permission
+from gef.core.auxv import Auxv
 from gef.core.cache import Cache
 from gef.core.color import Color, err, gef_print, info, ok, titlify, warn
 from gef.core.events import EventHandler, EventHooking
 from gef.core.exec import ExecSyscall
-from gef.core.memory import hexdump, p16, read_int_from_memory, read_memory, write_memory
+from gef.core.memory import hexdump, p16, p64, read_int_from_memory, read_memory, write_memory
 from gef.core.process import (
     ProcessMap,
     get_pagesize,
@@ -43,6 +45,7 @@ from gef.core.process import (
     is_sparc32,
     is_sparc32plus,
     is_sparc64,
+    is_s390x,
     is_x86_32,
     is_x86_64,
 )
@@ -62,10 +65,6 @@ class HijackFdCommand(GenericCommand):
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("old_fd", metavar="OLD_FD", type=int, help="file descriptor number to redirect.")
     parser.add_argument("new_output", metavar="NEW_OUTPUT", type=str, help="the location redirected data is stored.")
-    parser.add_argument("--fd-adjust-connect", type=int, default=0,
-                        help="slide value when `connect` syscall result and the actual opened FD differ (for old qemu-user).")
-    parser.add_argument("--fd-adjust-dup3", type=int, default=0,
-                        help="slide value when `dup3` syscall result and the actual opened FD differ (for old qemu-user).")
     parser.add_argument("-q", "--quiet", action="store_true", help="quiet execution.")
     _syntax_ = parser.format_help()
 
@@ -74,6 +73,11 @@ class HijackFdCommand(GenericCommand):
         "{0:s} 2 localhost:8000  # determined as the socket by the presence of `:`.",
     ]
     _example_ = "\n".join(_example_).format(_cmdline_)
+
+    _note_ = [
+        "`socketcall` is not supported; on i386 with Linux < 4.3 (or old qemu-user), the socket redirection fails with ENOSYS.",
+    ]
+    _note_ = "\n".join(_note_)
 
     def call_syscall(self, syscall_name, args):
         args = " ".join([hex(x) if x >= 0 else str(x) for x in args])
@@ -84,6 +88,7 @@ class HijackFdCommand(GenericCommand):
         self.quiet_info(output_line)
         return int(output_line.split()[2], 0)
 
+    @contextlib.contextmanager
     def write_stack(self, data):
         data = String.str2bytes(data)
 
@@ -92,83 +97,110 @@ class HijackFdCommand(GenericCommand):
         stack_addrs = [entry.page_start for entry in vmmap if entry.path == "[stack]"]
         if len(stack_addrs) == 0:
             err("Could not find the stack")
-            return None, None
+            yield None
+            return
         stack_addr = stack_addrs[0]
 
-        # read original contents
-        try:
-            original_contents = read_memory(stack_addr, len(data))
-        except gdb.MemoryError:
-            err("Failed to read stack")
-            return None, None
+        with ContextManager.temporary_memory(stack_addr, length=len(data), safe=True) as original_contents:
+            if original_contents is None:
+                err("Failed to read stack")
+                yield None
+                return
 
-        self.quiet_info("Original contents: {!s} @ {:#x}".format(original_contents, stack_addr))
-        self.quiet_info("Overwrite data: {!s}".format(data))
+            self.quiet_info("Original contents: {!s} @ {:#x}".format(original_contents, stack_addr))
+            self.quiet_info("Overwrite data: {!s}".format(data))
 
-        # overwrite it
-        try:
-            write_memory(stack_addr, data)
-        except Exception:
-            err("Failed to write stack")
-            return None, None
+            # overwrite it
+            try:
+                write_memory(stack_addr, data)
+            except Exception:
+                err("Failed to write stack")
+                yield None
+                return
 
-        # read again and check
-        if read_memory(stack_addr, len(data)) != data:
-            err("Failed to write stack")
-            return None, None
+            # read again and check
+            if read_memory(stack_addr, len(data)) != data:
+                err("Failed to write stack")
+                yield None
+                return
+            yield stack_addr
+        return
 
-        return stack_addr, original_contents
+    def close_fd(self, fd):
+        close_result = self.call_syscall("close", [fd])
+        if AddressUtil.is_msb_on(close_result):
+            err("Failed to close fd #{:d}".format(fd))
+            return False
+        self.quiet_info("Closed extra fd #{:d}".format(fd))
+        return True
 
     def get_fd_from_file_open(self):
-        # call open
-        stack_addr, original_contents = self.write_stack(self.args.new_output + "\0")
-        if stack_addr is None:
-            return None
+        open_fd = None
+        success = False
+        try:
+            # call open
+            with self.write_stack(self.args.new_output + "\0") as stack_addr:
+                if stack_addr is None:
+                    return None
+                self.quiet_info("Trying to open {:s}".format(Color.boldify(self.args.new_output)))
 
-        self.quiet_info("Trying to open {:s}".format(Color.boldify(self.args.new_output)))
+                AT_FDCWD = -100
+                flags = self.O_APPEND | self.O_CREAT | self.O_RDWR
+                mode = 0o666
+                # open does not exist in aarch64. So use openat instead of open.
+                open_fd = self.call_syscall("openat", [AT_FDCWD, stack_addr, flags, mode])
 
-        AT_FDCWD = -100
-        flags = self.O_APPEND | self.O_CREAT | self.O_RDWR
-        mode = 0o666
-        # open does not exist in aarch64. So use openat instead of open.
-        open_fd = self.call_syscall("openat", [AT_FDCWD, stack_addr, flags, mode])
-        write_memory(stack_addr, original_contents) # revert
+            if AddressUtil.is_msb_on(open_fd):
+                err("Failed to open {:s}".format(self.args.new_output))
+                return None
 
-        if AddressUtil.is_msb_on(open_fd):
-            err("Failed to open {:s}".format(self.args.new_output))
-            return None
-
-        self.quiet_info("Opened {:s} with 0o666 as fd #{:d}".format(Color.boldify(self.args.new_output), open_fd))
-        return open_fd
+            self.quiet_info("Opened {:s} with 0o666 as fd #{:d}".format(Color.boldify(self.args.new_output), open_fd))
+            success = True
+            return open_fd
+        finally:
+            if not success and open_fd is not None and not AddressUtil.is_msb_on(open_fd):
+                self.close_fd(open_fd)
 
     def get_fd_from_connect_server(self):
         import socket
-        address = socket.gethostbyname(self.args.new_output.split(":")[0])
-        port = int(self.args.new_output.split(":")[1])
+        host, port_text = self.args.new_output.rsplit(":", 1)
+        try:
+            port = int(port_text)
+        except ValueError:
+            err("Invalid port: {:s}".format(port_text))
+            return None
+        if not 1 <= port <= 65535:
+            err("Invalid port: {:s}".format(port_text))
+            return None
+        address = socket.gethostbyname(host)
 
         # call socket
         sock_fd = self.call_syscall("socket", [self.AF_INET, self.SOCK_STREAM, 0])
         if AddressUtil.is_msb_on(sock_fd):
             err("Failed to create socket")
             return None
-        self.quiet_info("Created socket fd #{:d}".format(sock_fd))
+        success = False
+        try:
+            self.quiet_info("Created socket fd #{:d}".format(sock_fd))
 
-        # call connect (Also supports big endian)
-        sockaddr_in = p16(self.AF_INET) + struct.pack("<H", socket.htons(port)) + socket.inet_aton(address)
-        stack_addr, original_contents = self.write_stack(sockaddr_in)
-        if stack_addr is None:
-            return None
+            # call connect (Also supports big endian)
+            sockaddr_in = p16(self.AF_INET) + struct.pack("<H", socket.htons(port)) + socket.inet_aton(address)
+            with self.write_stack(sockaddr_in) as stack_addr:
+                if stack_addr is None:
+                    return None
+                self.quiet_info("Trying to connect to {:s}".format(Color.boldify(self.args.new_output)))
+                connect_result = self.call_syscall("connect", [sock_fd, stack_addr, 16])
 
-        self.quiet_info("Trying to connect to {:s}".format(Color.boldify(self.args.new_output)))
-        connect_result = self.call_syscall("connect", [sock_fd - self.args.fd_adjust_connect, stack_addr, 16])
-        write_memory(stack_addr, original_contents) # revert
+            if AddressUtil.is_msb_on(connect_result):
+                err("Failed to connect to {:s}:{:d}".format(address, port))
+                return None
 
-        if AddressUtil.is_msb_on(connect_result):
-            err("Failed to connect to {:s}:{:d}".format(address, port))
-            return
-
-        self.quiet_info("Connected to {:s} as fd #{:d}".format(Color.boldify(self.args.new_output), sock_fd))
-        return sock_fd
+            self.quiet_info("Connected to {:s} as fd #{:d}".format(Color.boldify(self.args.new_output), sock_fd))
+            success = True
+            return sock_fd
+        finally:
+            if not success:
+                self.close_fd(sock_fd)
 
     def hijack_fd(self):
         if ":" in self.args.new_output:
@@ -178,20 +210,25 @@ class HijackFdCommand(GenericCommand):
         if new_fd is None:
             return
 
-        # call dup3
-        # dup2 does not exist in aarch64. So use dup3 instead of dup2.
-        dup3_result = self.call_syscall("dup3", [new_fd - self.args.fd_adjust_dup3, self.args.old_fd, 0])
-        if dup3_result - self.args.fd_adjust_dup3 != self.args.old_fd:
-            err("Failed to dup3 (result {:d} != fd #{:d})".format(dup3_result, self.args.old_fd))
+        # OLD_FD was closed and got reused; dup3 rejects the same fds with EINVAL
+        if new_fd == self.args.old_fd:
+            self.quiet_info("Already opened as fd #{:d}".format(self.args.old_fd))
+            ok("Success")
             return
-        self.quiet_info("Duplicated fd #{:d} -> #{:d}".format(new_fd, self.args.old_fd))
 
-        # call close
-        close_result = self.call_syscall("close", [new_fd])
-        if AddressUtil.is_msb_on(close_result):
-            err("Failed to close fd #{:d}".format(new_fd))
+        try:
+            # call dup3
+            # dup2 does not exist in aarch64. So use dup3 instead of dup2.
+            dup3_result = self.call_syscall("dup3", [new_fd, self.args.old_fd, 0])
+            if dup3_result != self.args.old_fd:
+                err("Failed to dup3 (result {:d} != fd #{:d})".format(dup3_result, self.args.old_fd))
+                return
+            self.quiet_info("Duplicated fd #{:d} -> #{:d}".format(new_fd, self.args.old_fd))
+        finally:
+            closed = self.close_fd(new_fd)
+
+        if not closed:
             return
-        self.quiet_info("Closed extra fd #{:d}".format(new_fd))
 
         ok("Success")
         return
@@ -202,12 +239,6 @@ class HijackFdCommand(GenericCommand):
     @exclude_specific_arch(arch=("CRIS",))
     @require_arch_set
     def do_invoke(self, args):
-        # In old version of qemu, the file descriptor was sometimes shifted by a
-        # constant value on i386 (fd returned by the syscall == actual opened fd + 80).
-        # This had been hard-coded as a workaround, but the issue appears to be fixed,
-        # so it should now be specified via a command argument.
-        # Currently supported: dup3, connect
-
         self.AF_INET = 2
         self.SOCK_STREAM = 1
         self.O_APPEND = 0o2000
@@ -238,6 +269,7 @@ class HijackFdCommand(GenericCommand):
 
         self.hijack_fd()
         return
+
 
 
 @register_command
@@ -832,8 +864,8 @@ class MmapMemoryCommand(GenericCommand):
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("location", metavar="LOCATION", nargs="?", type=AddressUtil.parse_address, default=None,
                         help="the address to allocate. (default: %(default)s)")
-    parser.add_argument("size", metavar="SIZE", nargs="?", type=AddressUtil.parse_address, default=get_pagesize(),
-                        help="the size to allocate. (default: %(default)s)")
+    parser.add_argument("size", metavar="SIZE", nargs="?", type=AddressUtil.parse_address, default=None,
+                        help="the size to allocate. (default: one target page)")
     parser.add_argument("permission", metavar="PERMISSION", nargs="?", default="rwx",
                         help="the permission to allocate. `_` is interpreted as `-`. (default: %(default)s)")
     _syntax_ = parser.format_help()
@@ -871,21 +903,32 @@ class MmapMemoryCommand(GenericCommand):
                 continue
             mmap_syscall_name = entry.name
             break
+        if mmap_syscall_name is None and is_s390x():
+            mmap_syscall_name = "mmap" # takes a pointer to the six arguments
         if mmap_syscall_name is None:
             err("Could not find the mmap syscall")
             return
 
         # location
-        if args.location and args.location % get_pagesize():
-            err("Address is not a multiple of {:#x}".format(get_pagesize()))
+        page_size = get_pagesize()
+        if args.location is not None:
+            auxval = Auxv.get_auxiliary_values()
+            if not auxval or "AT_PAGESZ" not in auxval:
+                err("Could not get the page size from auxv; omit LOCATION to let the kernel choose the address")
+                return
+            page_size = auxval["AT_PAGESZ"]
+        if args.location and args.location % page_size:
+            err("Address is not a multiple of {:#x}".format(page_size))
             return
 
         # size
-        if args.size < 0 or AddressUtil.get_vmem_end() <= args.size:
+        if args.size is None:
+            args.size = page_size
+        if args.size <= 0 or AddressUtil.get_vmem_end() <= args.size:
             err("Invalid size")
             return
-        if args.size % get_pagesize():
-            err("Size is not a multiple of {:#x}".format(get_pagesize()))
+        if args.size % page_size:
+            err("Size is not a multiple of {:#x}".format(page_size))
             return
 
         # permission
@@ -906,18 +949,35 @@ class MmapMemoryCommand(GenericCommand):
 
         # flags
         flags = 0x22 # MAP_ANONYMOUS | MAP_PRIVATE
+        map_fixed = 0x10
+        if is_alpha():
+            flags = 0x12
+            map_fixed = 0x100
+        elif is_hppa32() or is_hppa64():
+            flags = 0x12
+            map_fixed = 0x04
         if args.location is not None:
-            flags |= 0x10 # MAP_FIXED
+            flags |= map_fixed
         if is_mips32() or is_mips64() or is_mipsn32():
             flags |= 0x800 # MAP_DENYWRITE (why?)
 
         # doit
-        cmd = "call-syscall {:s} {:#x} {:#x} {:#x} {:#x} -1 0".format(
-            mmap_syscall_name, args.location or 0, args.size, perm, flags,
-        )
-        gdb.execute(cmd)
+        if is_s390x():
+            mmap_args = b"".join(p64(x) for x in [args.location or 0, args.size, perm, flags, 0xffff_ffff_ffff_ffff, 0])
+            address = runtime.current_arch.sp
+            with ContextManager.temporary_memory(address, mmap_args, safe=True) as backup:
+                if backup is None:
+                    err("Could not reserve scratch space on the inferior stack")
+                    return
+                gdb.execute("call-syscall {:s} {:#x}".format(mmap_syscall_name, address))
+        else:
+            cmd = "call-syscall {:s} {:#x} {:#x} {:#x} {:#x} -1 0".format(
+                mmap_syscall_name, args.location or 0, args.size, perm, flags,
+            )
+            gdb.execute(cmd)
         Cache.reset_gef_caches()
         return
+
 
 
 @register_command
@@ -1247,4 +1307,3 @@ class SyscallSearchCommand(GenericCommand, BufferingOutput):
         self.make_output(syscall_table, syscall_num, syscall_name_pattern, skip_x32)
         self.print_output(check_terminal_size=True)
         return
-

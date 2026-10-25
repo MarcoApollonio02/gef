@@ -77,6 +77,8 @@ from gef.core.utils import switch_to_intel_syntax, timeout  # noqa: F401
 from gef.core.events import only_if_events_supported  # noqa: F401
 
 
+from gef.core.display import BufferingOutput  # noqa: F401  (re-export)
+
 def parse_args(f):
     """Decorator wrapper to parse args for command."""
 
@@ -592,71 +594,6 @@ class GenericCommand(gdb.Command):
         if hasattr(self.args, "verbose") and self.args.verbose:
             err(msg)
         return
-
-class BufferingOutput:
-    """A collection of utility functions that append a messages to self.out."""
-
-    def info_add_out(self, msg):
-        msg = "{} {}".format(Color.colorify("[+]", "bold blue"), msg)
-        self.out.append(msg)
-        return
-
-    def warn_add_out(self, msg):
-        msg = "{} {}".format(Color.colorify("[*]", "bold yellow"), msg)
-        self.out.append(msg)
-        return
-
-    def err_add_out(self, msg):
-        msg = "{} {}".format(Color.colorify("[!]", "bold red"), msg)
-        self.out.append(msg)
-        return
-
-    def quiet_info_add_out(self, msg):
-        if not hasattr(self.args, "quiet") or not self.args.quiet:
-            msg = "{} {}".format(Color.colorify("[+]", "bold blue"), msg)
-            self.out.append(msg)
-        return
-
-    def quiet_add_out(self, msg):
-        if not hasattr(self.args, "quiet") or not self.args.quiet:
-            self.out.append(msg)
-        return
-
-    def verbose_add_out(self, msg):
-        if hasattr(self.args, "verbose") and self.args.verbose:
-            self.out.append(msg)
-        return
-
-    def print_output(self, check_terminal_size=False, skip_color=False):
-        if not hasattr(self, "out"):
-            return
-        if not self.out:
-            return
-
-        def do_check_term_size(lines):
-            # rough check
-            t_height, t_width = GefUtil.get_terminal_size()
-            if len(lines) > t_height:
-                return not self.args.no_pager
-
-            # detailed check
-            h = 0
-            for element in lines:
-                for line in element.splitlines():
-                    line = Color.remove_color(line)
-                    h += (len(line) // t_width) + 1
-                    if h > t_height:
-                        return not self.args.no_pager
-            return False
-
-        if not check_terminal_size:
-            less = not self.args.no_pager
-        else:
-            less = do_check_term_size(self.out)
-
-        gef_print("\n".join(self.out), less=less, skip_color=skip_color)
-        return
-
 
 class GefAlias(gdb.Command):
     """Simple aliasing wrapper because GDB doesn't do what it should."""

@@ -44,7 +44,7 @@ from gef.core.process import (
     is_x86,
     is_x86_64,
 )
-from gef.core.qemu import read_physmem
+from gef.core.qemu import QemuMonitor, read_physmem
 from gef.core.registers import get_register
 from gef.core.symbols import Symbol
 from gef.core.unicorn import UnicornKeystoneCapstone
@@ -1023,6 +1023,8 @@ class GdtInfoCommand(GenericCommand, BufferingOutput):
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("--only-gdt", action="store_true", help="show only GDT entries (qemu-system only).")
     parser.add_argument("--only-ldt", action="store_true", help="show only LDT entries (qemu-system only).")
+    parser.add_argument("--ldt-base", type=AddressUtil.parse_address, metavar="ADDRESS",
+                        help="supply a known full cached LDT base instead of inferring it from the GDT.")
     parser.add_argument("-q", "--quiet", action="store_true", help="enable quiet mode.")
     parser.add_argument("-v", "--verbose", action="store_true", help="also display bit information of gdt entries.")
     parser.add_argument("-n", "--no-pager", action="store_true", help="do not use the pager.")
@@ -1033,6 +1035,9 @@ class GdtInfoCommand(GenericCommand, BufferingOutput):
         "When you're debugging a normal userland app you can't read the GDTR or LDTR,",
         "so this is just to show you an example of what information is stored there.",
         "However, the segment registers show the correct (real) values.",
+        "In long-mode compatibility code, QEMU may print only the low 32 bits of the cached LDT base.",
+        "The full LDT base is inferred from a matching GDT descriptor; it may differ from the CPU's cached value.",
+        "Use --ldt-base with a known full address to override this inference.",
     ]
     _note_ = "\n".join(_note_)
 
@@ -1147,13 +1152,16 @@ class GdtInfoCommand(GenericCommand, BufferingOutput):
                 0b1101: ["Reserved", "Reserved"],
                 0b1110: ["32bit interrupt gate", "64bit interrupt gate"],
                 0b1111: ["32bit trap gate", "64bit trap gate"],
-            }[entry["type_bytes"]][is_x86_64()])
+            }[entry["type_bytes"]][GefUtil.get_x86_descriptor_mode() == "long"])
 
-        if entry["s"] == 0 and entry["type_bytes"] == 0b1100:
+        if entry["s"] == 0 and entry["type_bytes"] in (0b0100, 0b1100):
             # SYSTEM segment (call gate)
             entry["offseg0"] = val & 0xffff
             entry["segsel"] = (val >> 16) & 0xffff
-            entry["offseg1"] = (val >> 48) & 0xffff
+            if entry["type_bytes"] == 0b1100:
+                entry["offseg1"] = (val >> 48) & 0xffff
+            else:
+                entry["offseg1"] = 0
             entry["offseg"] = (entry["offseg1"] << 16) | entry["offseg0"]
 
             if isinstance(vals, list):
@@ -1164,7 +1172,7 @@ class GdtInfoCommand(GenericCommand, BufferingOutput):
 
         else:
             # CODE/DATA segment or SYSTEM segment (not call gate)
-            entry["g"] = (val >> 54) & 0x01
+            entry["g"] = (val >> 55) & 0x01
             grsize = {0: 1, 1: 4096}[entry["g"]]
 
             entry["limit0"] = val & 0xffff
@@ -1173,7 +1181,7 @@ class GdtInfoCommand(GenericCommand, BufferingOutput):
             entry["limit1"] = (val >> 48) & 0x0f
             entry["base2"] = (val >> 56) & 0xff
 
-            entry["limit"] = ((entry["limit1"] << 16) | entry["limit0"]) * grsize
+            entry["limit"] = (((entry["limit1"] << 16) | entry["limit0"]) + 1) * grsize - 1
             entry["base"] = (entry["base2"] << 24) | (entry["base1"] << 16) | entry["base0"]
 
             if isinstance(vals, list):
@@ -1184,13 +1192,13 @@ class GdtInfoCommand(GenericCommand, BufferingOutput):
 
             if entry["s"] == 1:
                 # CODE/DATA segment
-                entry["db"] = (val >> 53) & 0x01
-                entry["l"] = (val >> 52) & 0x01
+                entry["db"] = (val >> 54) & 0x01
+                entry["l"] = (val >> 53) & 0x01
                 dbl = (entry["db"] << 1) | entry["l"]
                 entry["dbl"] = "{:d}".format(dbl)
                 entry["dbl_s"] = ["16bit", "64bit", "32bit", "(N/A)"][dbl]
 
-                entry["avl"] = (val >> 51) & 0x01
+                entry["avl"] = (val >> 52) & 0x01
 
                 entry["e"] = (val >> 43) & 0x01
                 entry["dc"] = (val >> 42) & 0x01
@@ -1208,8 +1216,7 @@ class GdtInfoCommand(GenericCommand, BufferingOutput):
                     entry["dc_s"] = ["NON-CONFORMING", "CONFORMING"][entry["dc"]]
                 entry["ac_s"] = ["NotAccessed", "Accessed"][entry["ac"]]
 
-        Entry = collections.namedtuple("Entry", entry.keys())
-        return Entry(*entry.values())
+        return GefUtil.dict_to_namedtuple("Entry", entry)
 
     def entry2str(self, value, value_only=False):
         if value_only:
@@ -1221,7 +1228,7 @@ class GdtInfoCommand(GenericCommand, BufferingOutput):
         entry = self.entry_unpack(value)
         out = ""
         out += "{:#018x} ".format(entry.value)
-        if entry.s == 0 and entry.type_bytes == 0b1100: # SYSTEM - call gate
+        if entry.s == 0 and entry.type_bytes in (0b0100, 0b1100): # SYSTEM - call gate
             out += "{:#018x} ".format(entry.segsel)
             out += "{:#010x} ".format(entry.offseg)
             out += "{:15s}".format("")
@@ -1259,19 +1266,20 @@ class GdtInfoCommand(GenericCommand, BufferingOutput):
                 out += "{:#06b}({:s})".format(entry.type_bytes, type_bytes_s)
         return out
 
-    def get_segreg_list(self):
+    def get_segreg_list(self, ldt=False):
         regs = {}
         if is_alive():
             for k in ["cs", "ds", "es", "fs", "gs", "ss"]:
                 v = get_register(k)
                 ti = (v >> 2) & 0b1
                 index = int(v >> 3)
-                if v != 0 and ti == 0:
+                if v & ~0b11 != 0 and ti == ldt:
                     regs[index] = regs.get(index, []) + [k]
         return regs
 
-    def print_entries(self, entries, segm_desc=None, skip_null=False):
-        regs = self.get_segreg_list()
+    def print_entries(self, entries, segm_desc=None, skip_null=False, ldt=False):
+        regs = self.get_segreg_list(ldt=ldt)
+        long_mode = GefUtil.get_x86_descriptor_mode() == "long"
 
         # print legend
         fmt = "{:2s} {:20s} {:18s} {:18s} {:10s} {:1s} {:8s} {:3s} {:1s} {:3s} {:12s} {:s}"
@@ -1304,7 +1312,7 @@ class GdtInfoCommand(GenericCommand, BufferingOutput):
                 if not segname.endswith("-part2"):
                     segname += "-part2"
 
-            elif entry.s == 0 and entry.type_bytes != 0 and (is_x86_64() or is_emulated32()):
+            elif entry.s == 0 and entry.type_bytes in (2, 9, 11, 12) and long_mode and i + 1 < len(entries):
                 # upper half of 64bit SYSTEM entries
                 estr = self.entry2str(entries[i], value_only=True)
                 concat_prev = True
@@ -1322,20 +1330,20 @@ class GdtInfoCommand(GenericCommand, BufferingOutput):
             if reglist:
                 regstr = Color.colorify(
                     " <- {:s}".format(" ,".join(reglist)),
-                    Config.get_gef_setting("theme.dereference_register_value"),
+                    Config.get("theme.dereference_register_value"),
                 )
             else:
                 regstr = ""
 
             # print
-            self.out.append("{:<2d} {:20s} {:s} {:s}".format(i, segname, estr, regstr))
+            self.out.append("{:<2d} {:20s} {:s} {:s}".format(i, segname, estr, regstr).rstrip())
 
             i += 1
         return
 
     def print_gdt_example(self):
         # print title
-        if is_x86_64() or is_emulated32():
+        if GefUtil.get_x86_descriptor_mode() == "long":
             self.out.append(titlify("GDT Entry (x64 sample)"))
             segm_desc = self.SEGMENT_DESCRIPTION_64
         else:
@@ -1346,7 +1354,7 @@ class GdtInfoCommand(GenericCommand, BufferingOutput):
         self.info_add_out("*** This is an {:s} ***".format(Color.boldify("EXAMPLE")))
 
         # print entry
-        if is_x86_64() or is_emulated32():
+        if GefUtil.get_x86_descriptor_mode() == "long":
             entries = [
                 0x0000_0000_0000_0000,
                 0x00cf_9b00_0000_ffff,
@@ -1401,83 +1409,108 @@ class GdtInfoCommand(GenericCommand, BufferingOutput):
                 0xc400_8970_6000_206b,
             ]
 
-        if is_x86_64():
-            segm_desc = self.SEGMENT_DESCRIPTION_64
-        else:
-            segm_desc = self.SEGMENT_DESCRIPTION_32
         self.print_entries(entries, segm_desc)
         return
 
     def print_gdt_real(self):
         # parse real value
-        if is_qemu_system():
-            res = gdb.execute("monitor info registers", to_string=True)
-            r = re.search(r"GDT\s*=\s*(\S+) (\S+)", res)
-        elif is_vmware():
-            res = gdb.execute("monitor r gdtr", to_string=True)
-            r = re.search(r"gdtr base=(\S+) limit=(\S+)", res)
-
-        if not r:
+        base, limit = GefUtil.get_x86_descriptor_table_register("gdtr")
+        if base is None:
             self.err_add_out("Could not find GDTR")
             return
-
-        base = int(r.group(1), 16)
-        limit = int(r.group(2), 16)
 
         # print title
         self.out.append(titlify("GDT Entry: base:{:#x} / limit:{:#x}".format(base, limit)))
 
-        # check initialized or not
+        # Reset GDTR values can also name a live table; keep this guard to avoid dumping up to 8192 unset entries.
         if (base == 0x0 and limit == 0xffff) or limit == 0x0:
             self.err_add_out("GDT is uninitialized")
             return
 
+        size = limit + 1
+        if size % 8:
+            self.warn_add_out("Ignoring {:d} trailing GDT byte(s)".format(size % 8))
         try:
-            gdt_data = read_memory(base, limit + 1)
+            gdt_data = GefUtil.read_x86_descriptor_table(base, size - size % 8)
         except gdb.MemoryError:
             self.err_add_out("Memory read error")
             return
         entries = slice_unpack(gdt_data, 8)
 
-        if is_x86_64():
+        if GefUtil.get_x86_descriptor_mode() == "long":
             segm_desc = self.SEGMENT_DESCRIPTION_64
         else:
             segm_desc = self.SEGMENT_DESCRIPTION_32
         self.print_entries(entries, segm_desc)
         return
 
-    def print_ldt_real(self):
+    def print_ldt_real(self, base_override=None):
         # parse real value
+        selector = None
+        truncated = False
         if is_qemu_system():
             res = gdb.execute("monitor info registers", to_string=True)
-            r = re.search(r"LDT=\S+ (\S+) (\S+)", res)
+            ldtr = QemuMonitor.parse_x86_system_segment(res, "LDT")
+            if not ldtr:
+                self.err_add_out("Could not find LDTR")
+                return
+            selector, base, limit = [ldtr[name] for name in ("selector", "base", "limit")]
+            truncated = ldtr["base_truncated"]
         elif is_vmware():
             res = gdb.execute("monitor r ldtr", to_string=True)
             r = re.search(r"ldtr base=(\S+) limit=(\S+)", res)
+            if not r:
+                self.err_add_out("Could not find LDTR")
+                return
+            try:
+                base, limit = [int(r.group(i), 16) for i in range(1, 3)]
+            except ValueError:
+                self.err_add_out("Could not find LDTR")
+                return
 
-        if not r:
-            self.err_add_out("Could not find LDTR")
+        if truncated:
+            if base_override is None:
+                inferred_base = QemuMonitor.infer_x86_ldt_base(res, ldtr)
+                if inferred_base is None:
+                    self.out.append(titlify("LDT Entry: base:unknown (low32:{:#x}) / limit:{:#x}".format(base, limit)))
+                    self.err_add_out("GDT LDT descriptor unavailable or mismatched; use --ldt-base with its full address")
+                    return
+                base = inferred_base
+                self.warn_add_out("LDT base inferred from the current GDT descriptor; cached upper 32 bits may differ")
+            else:
+                if not 0 <= base_override < (1 << 64) or base_override & 0xffffffff != base:
+                    self.err_add_out("--ldt-base must be a 64-bit address matching the reported low 32 bits")
+                    return
+                base = base_override
+                self.info_add_out("LDT base supplied by --ldt-base; only its low 32 bits could be verified")
+        elif base_override is not None and base_override != base:
+            self.err_add_out("--ldt-base does not match the cached LDT base")
             return
-
-        base = int(r.group(1), 16)
-        limit = int(r.group(2), 16)
 
         # print title
         self.out.append(titlify("LDT Entry: base:{:#x} / limit:{:#x}".format(base, limit)))
 
-        # check initialized or not
-        if (base == 0x0 and limit == 0xffff_ffff) or limit == 0x0:
-            self.err_add_out("LDT is uninitialized")
+        if (selector is not None and (selector & ~0b11) == 0) or (
+            selector is None and base == 0 and limit in (0, 0xffff, 0xffff_ffff)
+        ):
+            self.info_add_out("LDT is not active")
             return
 
+        if not 7 <= limit <= 0xffff:
+            self.err_add_out("Invalid LDT limit: {:#x}".format(limit))
+            return
+
+        size = limit + 1
+        if size % 8:
+            self.warn_add_out("Ignoring {:d} trailing LDT byte(s)".format(size % 8))
         try:
-            ldt_data = read_memory(base, limit + 1)
+            ldt_data = GefUtil.read_x86_descriptor_table(base, size - size % 8)
         except gdb.MemoryError:
             self.err_add_out("Memory read error")
             return
         entries = slice_unpack(ldt_data, 8)
 
-        self.print_entries(entries, skip_null=True)
+        self.print_entries(entries, skip_null=True, ldt=True)
         return
 
     def print_gdt_entry_legend(self):
@@ -1492,12 +1525,14 @@ class GdtInfoCommand(GenericCommand, BufferingOutput):
         self.out.append("-------------------------------------------------------------------------- 4byte")
         self.out.append("|            BASE0 15:0            |             LIMIT0 15:0             |")
         self.out.append("-------------------------------------------------------------------------- 0byte")
+        self.out.append(" * Bit positions above are relative to each 32bit word")
         self.out.append(" * BASE                 : Start address")
-        self.out.append(" * LIMIT                : Segment size (4KB unit if G=1)")
+        self.out.append(" * LIMIT                : Encoded segment limit (byte units if G=0, 4KB units if G=1)")
+        self.out.append(" * Displayed LIMIT      : (encoded LIMIT + 1) * (G ? 4096 : 1) - 1")
         self.out.append(" * Flag bytes")
         self.out.append("   * G                  : Granularity flag (0:SegLimitAsByte, 1:SegLimitAs4KB)")
         self.out.append("   * D/B                : Segment flag (0:16bitSeg, 1:32bitSeg)")
-        self.out.append("   * L (if code seg)    : 64-bit code segment flag (0:32bitSeg, 1:64bitSeg)")
+        self.out.append("   * L (if code seg)    : 64-bit code segment flag (0:16/32bitSeg, 1:64bitSeg with D=0)")
         self.out.append("   * L (if data seg)    : Reserved (0)")
         self.out.append("   * AVL                : Used by system software")
         self.out.append(" * Access bytes")
@@ -1511,17 +1546,17 @@ class GdtInfoCommand(GenericCommand, BufferingOutput):
         self.out.append("     * RW (if code seg) : Read/Exec bit (0:ExecOnly, 1:Read/Exec)")
         self.out.append("     * RW (if data seg) : Read/Write bit (0:ReadOnly, 1:Read/Write)")
         self.out.append("     * AC               : Access bit (0:NotAccessed, 1:Accessed)")
-        self.out.append(titlify("legend (GDT/LDT entry for S=0, not call gate)"))
+        self.out.append(titlify("legend (GDT/LDT entry for S=0, TSS/LDT)"))
         self.out.append("                                          <---Type bytes--->")
-        self.out.append(" 31            23 22       19       15 14  12   11          7            0bit")
+        self.out.append(" 31            23 22 21 20 19       15 14  12   11          7            0bit")
         self.out.append("-------------------------------------------------------------------------- 16byte")
         self.out.append("|                             ZERO1 (x64 only)                           |")
         self.out.append("-------------------------------------------------------------------------- 12byte")
-        self.out.append("|                          BASE3 47:32 (x64 only)                        |")
+        self.out.append("|                          BASE3 63:32 (x64 only)                        |")
         self.out.append("-------------------------------------------------------------------------- 8byte")
-        self.out.append("|             |  |        |        |  |   |    |           |             |")
-        self.out.append("| BASE2 31:24 |G | ZERO0  | LIMIT1 |P |DPL|S(0)|   type    | BASE1 23:16 |")
-        self.out.append("|             |  |        | 19:16  |  |   |    |           |             |")
+        self.out.append("|             |  |  |  |A |        |  |   |    |           |             |")
+        self.out.append("| BASE2 31:24 |G |0 |0 |V | LIMIT1 |P |DPL|S(0)|   type    | BASE1 23:16 |")
+        self.out.append("|             |  |  |  |L | 19:16  |  |   |    |           |             |")
         self.out.append("-------------------------------------------------------------------------- 4byte")
         self.out.append("|            BASE0 15:0            |             LIMIT0 15:0             |")
         self.out.append("-------------------------------------------------------------------------- 0byte")
@@ -1545,7 +1580,7 @@ class GdtInfoCommand(GenericCommand, BufferingOutput):
         self.out.append("     * 1101             : Reserved             / Reserved")
         self.out.append("     * 1110             : 32bit interrupt gate / 64bit interrupt gate")
         self.out.append("     * 1111             : 32bit trap gate      / 64bit trap gate")
-        self.out.append(titlify("legend (GDT/LDT entry for S=0, call gate)"))
+        self.out.append(titlify("legend (GDT/LDT entry for S=0, 32/64bit call gate)"))
         self.out.append("                                          <---Type bytes--->")
         self.out.append(" 31                        19       15 14  12   11          7      4     0bit")
         self.out.append("-------------------------------------------------------------------------- 16byte")
@@ -1559,6 +1594,7 @@ class GdtInfoCommand(GenericCommand, BufferingOutput):
         self.out.append("-------------------------------------------------------------------------- 4byte")
         self.out.append("|       SegmentSelector 15:0       |        OffsetInSegment0 15:0        |")
         self.out.append("-------------------------------------------------------------------------- 0byte")
+        self.out.append(" * ParamCount           : Number of copied 32bit stack parameters; reserved (0) in 64bit call gates")
         return
 
     @parse_args
@@ -1574,7 +1610,7 @@ class GdtInfoCommand(GenericCommand, BufferingOutput):
             if not args.only_ldt:
                 self.print_gdt_real()
             if not args.only_gdt:
-                self.print_ldt_real()
+                self.print_ldt_real(args.ldt_base)
         else:
             self.print_gdt_example()
 
@@ -1585,6 +1621,7 @@ class GdtInfoCommand(GenericCommand, BufferingOutput):
 
         self.print_output(check_terminal_size=True)
         return
+
 
 
 @register_command
@@ -2724,4 +2761,3 @@ class SwitchELCommand(GenericCommand):
     def do_invoke(self, args):
         self.switch_el(args.target_el)
         return
-

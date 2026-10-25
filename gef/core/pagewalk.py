@@ -12,6 +12,7 @@ References to not-yet-extracted modules (gef.core.kernel `Kernel*` constants,
 gef.commands `TlsCommand` / `XSecureMemAddrCommand`) are late-imported inside
 the referencing method.
 """
+import bisect
 import collections
 import functools
 import gdb
@@ -22,14 +23,17 @@ import sys
 from gef.core import runtime
 from gef.core.address import AddressUtil
 from gef.core.cache import Cache
-from gef.core.color import Color, err, gef_print, info, warn
-from gef.core.memory import (is_ascii_string, is_valid_addr, is_valid_addr_addr, p32, p64,
+from gef.core.color import Color, err, gef_print, info, titlify, warn
+from gef.core.config import Config
+from gef.core.display import BufferingOutput, ProgressBar
+from gef.core.memory import (MemoryCache, is_ascii_string, is_valid_addr, is_valid_addr_addr, p32, p64,
                              read_cstring_from_memory, read_int32_from_memory, read_int64_from_memory,
                              read_int8_from_memory, read_int_from_memory, read_memory, u32)
-from gef.core.process import (get_pagesize, is_32bit, is_64bit, is_arm32, is_arm64, is_in_kernel, is_kgdb,
-                              is_qemu_system, is_riscv32, is_riscv64, is_vmware, is_x86, is_x86_32, is_x86_64)
+from gef.core.process import (get_pagesize, is_32bit, is_64bit, is_arm32, is_arm64, is_in_kernel, is_in_smm,
+                              is_kgdb, is_qemu_system, is_riscv32, is_riscv64, is_vmware, is_x86, is_x86_16,
+                              is_x86_32, is_x86_64)
 from gef.core.registers import get_register
-from gef.core.qemu import QemuMonitor
+from gef.core.qemu import QemuMonitor, SystemManagementMemory, read_physmem
 from gef.core.registers import to_unsigned_long
 from gef.core.symbols import Symbol
 from gef.core.utils import (GefUtil, align, align_to_ptrsize, is_double_link_list, is_single_link_list,
@@ -7940,3 +7944,1152 @@ class KernelAddressHeuristicFinder:
 
 KF = KernelAddressHeuristicFinder # for convenience using from python-interactive # noqa: F841
 KFU = KernelAddressHeuristicFinderUtil # for convenience using from python-interactive # noqa: F841
+
+
+class PageTable(BufferingOutput):
+    """Architecture-specific walker state, separate from the GDB command."""
+
+    class Entry:
+        """One page-table mapping."""
+
+        def __init__(self, vaddr, paddr, page_size, page_count, flags, vaddr_pattern=None, alias_starts=None,
+                     merged_entries=None):
+            """Initialize one virtual-to-physical mapping."""
+            self.vaddr = vaddr
+            self.paddr = paddr
+            self.page_size = page_size
+            self.page_count = page_count
+            self.flags = flags
+            self.vaddr_pattern = vaddr_pattern
+            self.alias_starts = alias_starts
+            self.merged_entries = merged_entries
+            return
+
+        def __lt__(self, other):
+            """Order entries by virtual address and then by mapping details."""
+            if not isinstance(other, type(self)):
+                return NotImplemented
+            this = self.vaddr, self.paddr, self.page_size, self.page_count, self.flags
+            that = other.vaddr, other.paddr, other.page_size, other.page_count, other.flags
+            return this < that
+
+        @property
+        def total_size(self):
+            """Return the total byte length represented by this entry."""
+            return self.page_size * self.page_count
+
+        @property
+        def has_wildcard(self):
+            """Return whether the displayed virtual address contains a wildcard."""
+            return self.vaddr_pattern is not None and "*" in self.vaddr_pattern
+
+        @property
+        def physical_mapping_key(self):
+            """Return fields that must match when compressing virtual aliases."""
+            return self.paddr, self.page_size, self.page_count, self.flags
+
+        def contains_virtual(self, address):
+            """Return whether an address belongs to one of this entry's virtual ranges."""
+            if not self.has_wildcard:
+                return self.vaddr <= address < self.vaddr + self.total_size
+            if not self.vaddr <= address < (1 << 64):
+                return False
+            index = bisect.bisect_right(self.alias_starts, address) - 1
+            return address < self.alias_starts[index] + self.total_size
+
+        @classmethod
+        def merge_aliases(cls, entries):
+            """[VA 0xffffffff11107000, ..., VA 0xffffffff111f7000] -> [VA 0xffffffff111*7000]."""
+
+            def merge_patterns(patterns, position=0):
+                if position == 16:
+                    return {"": [int(patterns[0], 16)]}
+
+                groups = {}
+                for pattern in patterns:
+                    groups.setdefault(pattern[position], []).append(pattern)
+
+                suffixes = {digit: merge_patterns(group, position + 1) for digit, group in groups.items()}
+                digits = "0123456789abcdef"
+                if set(groups) == set(digits):
+                    first = suffixes[digits[0]]
+                    if all(suffixes[digit].keys() == first.keys() for digit in digits[1:]):
+                        return {"*" + suffix: [start for digit in digits for start in suffixes[digit][suffix]]
+                                for suffix in first}
+
+                return {digit + suffix: starts for digit in sorted(suffixes)
+                        for suffix, starts in suffixes[digit].items()}
+
+            first = entries[0]
+            patterns = ["{:016x}".format(entry.vaddr) for entry in entries]
+            merged = []
+            for pattern, starts in merge_patterns(patterns).items():
+                merged.append(cls(
+                    int(pattern.replace("*", "0"), 16),
+                    first.paddr,
+                    first.page_size,
+                    first.page_count,
+                    first.flags,
+                    vaddr_pattern=pattern,
+                    alias_starts=starts if "*" in pattern else None,
+                ))
+            return merged
+
+        def can_merge(self, other, simple=False):
+            """VA 0x1000 -> PA 0x3000, VA 0x2000 -> PA 0x4000 -> True."""
+            if not isinstance(other, type(self)):
+                return False
+            if self.has_wildcard or other.has_wildcard:
+                return False
+            if self.vaddr + self.total_size != other.vaddr:
+                return False
+            if self.flags != other.flags:
+                return False
+            if simple:
+                return True
+            return self.paddr + self.total_size == other.paddr and self.page_size == other.page_size
+
+        def merged_with(self, other, simple=False):
+            """Entry(VA=0x1000, count=1) + Entry(VA=0x2000, count=1) -> Entry(VA=0x1000, count=2)."""
+            if not self.can_merge(other, simple=simple):
+                return None
+            if simple:
+                merged = type(self)(self.vaddr, self.paddr, self.total_size + other.total_size, 1, self.flags)
+                if self.merged_entries or other.merged_entries or self.paddr + self.total_size != other.paddr:
+                    merged.merged_entries = (self, other)
+                return merged
+            return type(self)(self.vaddr, self.paddr, self.page_size, self.page_count + other.page_count, self.flags)
+
+        def contains_physical(self, address):
+            pending = [self]
+            while pending:
+                entry = pending.pop()
+                if entry.merged_entries:
+                    pending.extend(entry.merged_entries)
+                elif entry.paddr <= address < entry.paddr + entry.total_size:
+                    return True
+            return False
+
+        def __add__(self, other):
+            """Entry(VA=0x1000) + Entry(VA=0x2000) -> Entry(VA=0x1000, count=2)."""
+            if not isinstance(other, type(self)):
+                return NotImplemented
+            merged = self.merged_with(other)
+            if merged is None:
+                raise ValueError("Page-table entries are not mergeable")
+            return merged
+
+        def format(self, simple=False):
+            """Entry(VA=0x1000, PA=0x2000, size=0x1000) -> "0x...1000-0x...2000  0x...2000-0x...3000 ..."."""
+            va = self.vaddr
+            vend = va + self.total_size
+            if self.has_wildcard:
+                va_text = self.vaddr_pattern
+                vend_text = "{:016x}".format(vend)
+                for match in re.finditer(r"\*", va_text):
+                    start, end = match.span()
+                    vend_text = vend_text[:start] + "*" + vend_text[end:]
+                if simple:
+                    return "0x{:16s}-0x{:16s}  {:37s}  {:<#12x} {:<11s} {:<6s} [{:s}]".format(
+                        va_text, vend_text, "-", self.page_size, "-", "-", self.flags,
+                    )
+                return "0x{:16s}-0x{:16s}  {:#018x}-{:#018x}  {:<#12x} {:<#11x} {:<6d} [{:s}]".format(
+                    va_text, vend_text, self.paddr, self.paddr + self.total_size,
+                    self.total_size, self.page_size, self.page_count, self.flags,
+                )
+
+            if simple:
+                return "{:#018x}-{:#018x}  {:37s}  {:<#12x} {:<11s} {:<6s} [{:s}]".format(
+                    va, vend, "-", self.page_size, "-", "-", self.flags,
+                )
+            return "{:#018x}-{:#018x}  {:#018x}-{:#018x}  {:<#12x} {:<#11x} {:<6d} [{:s}]".format(
+                va, vend, self.paddr, self.paddr + self.total_size,
+                self.total_size, self.page_size, self.page_count, self.flags,
+            )
+
+        def __str__(self):
+            """Return the full page-table mapping representation."""
+            return self.format()
+
+        def colorize(self, text):
+            """Apply the address theme selected by this entry's permissions."""
+            color = None
+            if is_x86():
+                if self.flags.startswith("R-- "):
+                    color = Config.get("theme.address_readonly")
+                elif re.search(r"^..X ", self.flags):
+                    color = Config.get("theme.address_code")
+                elif self.flags.startswith("RW- "):
+                    color = Config.get("theme.address_writable")
+                if self.flags.startswith("RWX "):
+                    color = Config.get("theme.address_rwx")
+            elif is_riscv32() or is_riscv64():
+                match = re.search(r"KERN/([RWX-]{3})", self.flags)
+                if match:
+                    perm = match.group(1)
+                    if perm == "R--":
+                        color = Config.get("theme.address_readonly")
+                    elif perm[2] == "X":
+                        color = Config.get("theme.address_code")
+                    elif perm == "RW-":
+                        color = Config.get("theme.address_writable")
+                    if perm == "RWX":
+                        color = Config.get("theme.address_rwx")
+            elif is_arm32():
+                if re.search(r"PL[01]/R--", self.flags):
+                    color = Config.get("theme.address_readonly")
+                elif re.search(r"PL1/..X", self.flags):
+                    color = Config.get("theme.address_code")
+                elif "PL1/RW-" in self.flags:
+                    color = Config.get("theme.address_writable")
+                if "PL1/RWX" in self.flags:
+                    color = Config.get("theme.address_rwx")
+            elif is_arm64():
+                if re.search(r"EL[1-3]/R--", self.flags):
+                    color = Config.get("theme.address_readonly")
+                elif re.search(r"EL[1-3]/..X", self.flags):
+                    color = Config.get("theme.address_code")
+                elif re.search(r"EL[1-3]/RW-", self.flags):
+                    color = Config.get("theme.address_writable")
+                if re.search(r"EL[1-3]/RWX", self.flags):
+                    color = Config.get("theme.address_rwx")
+            if color is not None:
+                return Color.colorify(text, color)
+            return text
+
+    # Each architecture declares the mapping-list attributes preserved for `pagewalk --use-cache`. A new PageTable object is
+    # made for every command, so the values themselves live in this class-level, per-subclass cache.
+    mapping_cache = {}
+    mapping_cache_fields = ()
+
+    def __init__(self):
+        self.args = None
+        self.out = []
+        # __enter__ and __exit__ must operate on the same context manager object.
+        self.physical_mode_context = None
+        self.physical = False
+        cached = PageTable.mapping_cache.get(type(self), {})
+        self.mapping_sources = cached.get("sources", {}).copy()
+        for field in self.mapping_cache_fields:
+            setattr(self, field, cached.get(field))
+        return
+
+    def save_mapping_cache(self):
+        PageTable.mapping_cache[type(self)] = {field: getattr(self, field) for field in self.mapping_cache_fields}
+        PageTable.mapping_cache[type(self)]["sources"] = self.mapping_sources.copy()
+        return
+
+    def use_cached_mapping(self, field, **registers):
+        inferior = gdb.selected_inferior()
+        options = {
+            name: getattr(self.args, name) for name in (
+                "simple", "no_merge", "include_aliased_pages", "user_pt", "ept", "ept_levels", "force_prefix_s",
+            ) if hasattr(self.args, name)
+        }
+        source = "inferior={:d}, pid={:d}, connection={}, CPU(thread)={}, {}, options={!r}".format(
+            inferior.num, inferior.pid, getattr(inferior, "connection_num", None), Cache.cpu_context(),
+            ", ".join("{}={:#x}".format(name, value) if isinstance(value, int) else "{}={}".format(name, value)
+                      for name, value in registers.items()), options,
+        )
+        if not self.args.use_cache or not getattr(self, field):
+            self.mapping_sources[field] = source
+            return False
+        cached_source = self.mapping_sources.get(field)
+        self.info_add_out("Cached {:s}: {:s}".format(field, cached_source or "Unknown source"))
+        if source != cached_source:
+            self.warn_add_out("Cached mappings differ from the current context: {:s}".format(source))
+        return True
+
+    def prepare_pagewalk(self, args):
+        self.args = args
+        if args.trace:
+            self.vrange = args.vrange + args.trace
+            args.print_each_level = True
+            args.use_cache = False
+        else:
+            self.vrange = args.vrange
+        return
+
+    def __enter__(self):
+        if is_qemu_system() or is_vmware():
+            self.physical_mode_context = QemuMonitor.use_mmu_mode("phys")
+            self.physical = self.physical_mode_context.__enter__() is True
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        if self.physical_mode_context is not None:
+            self.physical_mode_context.__exit__(exc_type, exc, traceback)
+        self.physical_mode_context = None
+        self.physical = False
+        return False
+
+    def read_memory(self, paddr, size):
+        """Read physical memory while the page-table walk keeps physical mode active."""
+        from gef.core.kernel import SecureMemory
+        if size == 0:
+            return b""
+
+        # Secure RAM is not visible through the normal CPU physical address
+        # space. Keep the qemu process-memory path for it.
+        if is_qemu_system() and (is_arm32() or is_arm64()):
+            secure = SecureMemory.get_area()
+        else:
+            secure = None
+        if secure is not None and secure.sm_base <= paddr and paddr + size <= secure.sm_base + secure.sm_size:
+            out = SecureMemory.read(paddr - secure.sm_base, size)
+            if out is not None and len(out) == size:
+                return out
+
+        # In SMM, QEMU can expose SMRAM through the current CPU address space.
+        in_smm = is_x86() and is_in_smm()
+        if in_smm:
+            smram = SystemManagementMemory.get_smram_map()
+        else:
+            smram = None
+        if smram is not None and smram[0] <= paddr and paddr + size <= smram[0] + smram[1]:
+            out = SystemManagementMemory.read_smram(paddr, size, in_smm=True)
+            if out is not None and len(out) == size:
+                return out
+
+        if in_smm:
+            namespace = "pagewalk-smm"
+        else:
+            namespace = "physical"
+        return MemoryCache.read(paddr, size, reader=self.read_memory_uncached, namespace=namespace)
+
+    def read_memory_uncached(self, paddr, size):
+        """Fetch physical bytes for ``MemoryCache.read``; callers normally use ``read_memory``."""
+        if self.physical:
+            try:
+                return MemoryCache.read_raw(paddr, size)
+            except gdb.MemoryError:
+                pass
+
+        # Retain the /proc/qemu-PID/mem and monitor-xp fallbacks for addresses
+        # that the gdbstub cannot expose directly.
+        out = read_physmem(paddr, size, already_physmode=self.physical)
+        if out is None or len(out) != size:
+            raise gdb.MemoryError("Cannot access physical memory at address {:#x}".format(paddr))
+        return out
+
+    def merge_virtual_aliases(self, mappings):
+        """[VA 0xffffffff11107000, ..., VA 0xffffffff111f7000] -> [VA 0xffffffff111*7000]."""
+        groups = {}
+        for entry in mappings:
+            # Only virtual addresses may differ within one alias group.
+            groups.setdefault(entry.physical_mapping_key, []).append(entry)
+
+        merged_mappings = []
+        for entries in groups.values():
+            merged_mappings.extend(PageTable.Entry.merge_aliases(entries))
+        return sorted(merged_mappings)
+
+    def merge_consecutive_mappings(self, mappings):
+        """[VA 0x1000 -> PA 0x3000, VA 0x2000 -> PA 0x4000] -> [VA 0x1000, page_count=2]."""
+        merged_mappings = []
+        previous = None
+        for current in mappings:
+            if previous is None:
+                previous = current
+                continue
+
+            merged = previous.merged_with(current, simple=self.args.simple)
+            if merged is not None:
+                # Normal mode preserves page size and increments page count.
+                # Simple mode treats page size as the total virtual span and
+                # intentionally ignores discontinuities in physical memory.
+                previous = merged
+                continue
+
+            merged_mappings.append(previous)
+            previous = current
+
+        if previous is not None:
+            merged_mappings.append(previous)
+
+        return merged_mappings
+
+    def merge_mappings(self):
+        """self.mappings = [page 0, page 1] -> self.mappings = [2-page range]."""
+        self.mappings = sorted(self.mappings)
+
+        if not self.args.no_merge:
+            if is_x86_64():
+                self.mappings = self.merge_virtual_aliases(self.mappings)
+                if not self.args.include_aliased_pages:
+                    self.mappings = [entry for entry in self.mappings if not entry.has_wildcard]
+                self.quiet_info_add_out("PT Entry (merged similar pages that refer the same physpage): {:d}".format(
+                    len(self.mappings),
+                ))
+            self.mappings = self.merge_consecutive_mappings(self.mappings)
+            self.quiet_info_add_out("PT Entry (merged consecutive pages): {:d}".format(
+                len(self.mappings),
+            ))
+        return
+
+    def vrange_filter(self, mappings):
+        filtered_mappings = []
+        for mapping in mappings:
+            for addr in self.vrange:
+                if mapping.contains_virtual(addr):
+                    filtered_mappings.append(mapping)
+                    break
+        return sorted(filtered_mappings)
+
+    def prange_filter(self, mappings):
+        filtered_mappings = []
+        for mapping in mappings:
+            for addr in self.args.prange:
+                if mapping.contains_physical(addr):
+                    filtered_mappings.append(mapping)
+                    break
+        return sorted(filtered_mappings)
+
+    def make_out(self, mappings, walk_disabled=False):
+        if walk_disabled:
+            self.warn_add_out("EPD=1: new translation table walks are disabled; raw tables shown, TLB state unknown")
+        if mappings is None or len(mappings) == 0:
+            self.warn_add_out("No virtual mappings found")
+            return
+
+        filtered_mappings = mappings.copy()
+        if walk_disabled:
+            filtered_mappings = [PageTable.Entry(
+                entry.vaddr, entry.paddr, entry.page_size, entry.page_count, entry.flags + " WALK-DISABLED",
+                vaddr_pattern=entry.vaddr_pattern, alias_starts=entry.alias_starts, merged_entries=entry.merged_entries,
+            ) for entry in filtered_mappings]
+
+        # filter by virtual address range
+        if self.vrange != []:
+            filtered_mappings = self.vrange_filter(filtered_mappings)
+            self.quiet_info_add_out("PT Entry (filtered by virtual address range): {:d}".format(
+                len(filtered_mappings),
+            ))
+
+        # filter by physical address range
+        if self.args.prange != []:
+            filtered_mappings = self.prange_filter(filtered_mappings)
+            self.quiet_info_add_out("PT Entry (filtered by physical address range): {:d}".format(
+                len(filtered_mappings),
+            ))
+
+        formatted = [(entry, entry.format(simple=True) if self.args.simple else str(entry)) for entry in filtered_mappings]
+
+        # filter by keyword
+        if self.args.filter != []:
+            filtered = []
+            for entry, line in formatted:
+                for re_pattern in self.args.filter:
+                    if re_pattern.search(line):
+                        filtered.append((entry, line))
+                        break
+            formatted = filtered
+            self.quiet_info_add_out("PT Entry (filtered by keyword): {:d}".format(len(formatted)))
+
+        # sort by phys
+        if self.args.sort_by_phys:
+            formatted.sort(key=lambda item: item[0].paddr)
+
+        # check how many result
+        if formatted == []:
+            self.warn_add_out("Nothing to display")
+            return
+
+        # add legend
+        self.out.append(titlify("Memory map"))
+        fmt = "{:37s}  {:37s}  {:12s} {:11s} {:6s} {:s}"
+        legend = ["Virtual address start-end", "Physical address start-end", "Total size", "Page size", "Count", "Flags"]
+        self.out.append(GefUtil.make_legend(fmt.format(*legend)))
+
+        lines = [line for _, line in formatted]
+        if not self.args.disable_color:
+            lines = [entry.colorize(line) for entry, line in formatted]
+        self.out.extend(lines)
+        return
+
+    def is_not_trace_target(self, va_start, va_end):
+        if self.args.trace == []:
+            return False
+        for tr in self.args.trace:
+            if va_start <= tr and tr < va_end:
+                return False
+        return True
+
+    def is_not_filter_target(self, line):
+        if self.args.filter == []:
+            return False
+        for re_pattern in self.args.filter:
+            if re_pattern.search(line):
+                return False
+        return True
+
+
+
+class PageTableX64(PageTable):
+    """Dump pagetable for x64/x86."""
+
+    mapping_cache_fields = ("mappings",)
+
+    def format_flags(self, flag_info):
+        flag_info_key = tuple(flag_info)
+        x = self.flags_strings_cache.get(flag_info_key, None)
+        if x is not None:
+            return x
+
+        flags = []
+        if self.args.ept:
+            perm = ""
+            perm += ["R", "-"]["NO_R" in flag_info]
+            perm += ["W", "-"]["NO_W" in flag_info]
+            perm += ["X", "-"]["NO_X" in flag_info]
+            flags += [perm]
+        else:
+            if "NO_RW" in flag_info:
+                if "XD" in flag_info:
+                    flags += ["R--"]
+                else:
+                    flags += ["R-X"]
+            else:
+                if "XD" in flag_info:
+                    flags += ["RW-"]
+                else:
+                    flags += ["RWX"]
+            if "NO_US" in flag_info:
+                flags += ["KERN"]
+            else:
+                flags += ["USER"]
+
+        if not self.args.simple:
+            if "A" in flag_info:
+                flags += ["ACCESSED"]
+            if "D" in flag_info:
+                flags += ["DIRTY"]
+            if "G" in flag_info:
+                flags += ["GLOBAL"]
+
+        flag_string = " ".join(flags)
+        self.flags_strings_cache[flag_info_key] = flag_string
+        return flag_string
+
+    def is_present_entry(self, entry):
+        if self.args.ept:
+            return (entry & 0b111) != 0 and (entry & 0b11) != 0b10
+        return (entry & 1) != 0
+
+    def is_aliased_table(self, va_base, entries, bit_shift):
+        if self.args.include_aliased_pages or self.args.ept or not is_x86_64():
+            return False
+        if len({entry & 0x000f_ffff_ffff_f001 for entry in entries}) != 1 or not entries[0] & 1:
+            return False
+        va_end = va_base + (len(entries) << bit_shift)
+        return not any(va_base <= address < va_end for address in self.args.trace)
+
+    def is_user_pgd(self, pgd):
+        user_pgd = pgd + get_pagesize()
+        if pgd & get_pagesize():
+            return False
+        kernel = slice_unpack(self.read_memory(pgd, get_pagesize()), 8)
+        user = slice_unpack(self.read_memory(user_pgd, get_pagesize()), 8)
+        if any(entry & 1 and entry & 0x000f_ffff_ffff_f000 == user_pgd for entry in kernel):
+            return False
+        if any((k ^ u) & ~0x8000_0000_0000_0020 for k, u in zip(kernel[:256], user[:256])):
+            return False
+        return any(entry & 1 for entry in user[256:])
+
+    def pagewalk_PML5T(self):
+        self.quiet_add_out(titlify("PML5E: Page Map Level 5 Entry"))
+        PML5E = []
+        COUNT = 0
+        bit_shift = sum([
+            self.bits["PML4T_BITS"],
+            self.bits["PDPT_BITS"],
+            self.bits["PDT_BITS"],
+            self.bits["PT_BITS"],
+            self.bits["OFFSET"],
+        ])
+        for va_base, table_base, parent_flags in ProgressBar(self.TABLES, desc="PML5E", disable=self.args.quiet):
+            entries = self.read_memory(table_base, 2 ** self.bits["PML5T_BITS"] * self.bits["ENTRY_SIZE"])
+            entries = slice_unpack(entries, self.bits["ENTRY_SIZE"])
+            COUNT += len(entries)
+            for i, entry in enumerate(entries):
+                # present flag
+                if not self.is_present_entry(entry):
+                    continue
+
+                # calc virtual address
+                if not self.args.ept and (i >> 8) & 1:
+                    sign_ext = 0xfe00_0000_0000_0000
+                else:
+                    sign_ext = 0
+                new_va = va_base + (sign_ext | (i << bit_shift))
+                new_va_end = new_va + (1 << bit_shift)
+
+                # calc flags
+                flags = parent_flags.copy()
+                if self.args.ept:
+                    if ((entry >> 0) & 1) == 0:
+                        flags.append("NO_R")
+                    if ((entry >> 1) & 1) == 0:
+                        flags.append("NO_W")
+                    if ((entry >> 2) & 1) == 0:
+                        flags.append("NO_X")
+                    if ((entry >> 8) & 1) == 1:
+                        flags.append("A")
+                else:
+                    if ((entry >> 1) & 1) == 0:
+                        flags.append("NO_RW")
+                    if ((entry >> 2) & 1) == 0:
+                        flags.append("NO_US")
+                    if ((entry >> 5) & 1) == 1:
+                        flags.append("A")
+                    if ((entry >> 63) & 1) == 1:
+                        flags.append("XD")
+
+                # calc next table (drop the flag bits)
+                next_level_table = entry & 0x000f_ffff_ffff_f000
+
+                # make entry
+                PML5E.append([new_va, next_level_table, flags])
+                entry_type = "TABLE"
+
+                # dump
+                if self.args.print_each_level:
+                    if self.is_not_trace_target(new_va, new_va_end):
+                        continue
+                    addr = table_base + i * self.bits["ENTRY_SIZE"]
+                    line = "{:#018x}: {:#018x} (virt:{:#018x}-{:#018x},type:{:s}) {:s}".format(
+                        addr, entry, new_va, new_va_end, entry_type, " ".join(flags),
+                    )
+                    if self.is_not_filter_target(line):
+                        continue
+                    self.out.append(line)
+
+        if self.args.print_each_level:
+            self.out.append(titlify(""))
+
+        self.quiet_info_add_out("Number of entries: {:d}".format(COUNT))
+        self.quiet_info_add_out("PML5 Entry: {:d}".format(len(PML5E)))
+        self.quiet_info_add_out("Invalid entries: {:d}".format(COUNT - len(PML5E)))
+        self.TABLES = PML5E
+        return
+
+    def pagewalk_PML4T(self):
+        self.quiet_add_out(titlify("PML4E: Page Map Level 4 Entry"))
+        PML4E = []
+        COUNT = 0
+        SKIPPED = 0
+        bit_shift = sum([
+            self.bits["PDPT_BITS"],
+            self.bits["PDT_BITS"],
+            self.bits["PT_BITS"],
+            self.bits["OFFSET"],
+        ])
+        for va_base, table_base, parent_flags in ProgressBar(self.TABLES, desc="PML4E", disable=self.args.quiet):
+            entries = self.read_memory(table_base, 2 ** self.bits["PML4T_BITS"] * self.bits["ENTRY_SIZE"])
+            entries = slice_unpack(entries, self.bits["ENTRY_SIZE"])
+            if self.is_aliased_table(va_base, entries, bit_shift):
+                SKIPPED += 1
+                continue
+            COUNT += len(entries)
+            for i, entry in enumerate(entries):
+                # present flag
+                if not self.is_present_entry(entry):
+                    continue
+
+                # calc virtual address
+                if "PML5T_BITS" in self.bits:
+                    new_va = va_base + (i << bit_shift)
+                    new_va_end = new_va + (1 << bit_shift)
+                else:
+                    if not self.args.ept and (i >> 8) & 1:
+                        sign_ext = 0xffff_0000_0000_0000
+                    else:
+                        sign_ext = 0
+                    new_va = va_base + (sign_ext | (i << bit_shift))
+                    new_va_end = new_va + (1 << bit_shift)
+
+                # calc flags
+                flags = parent_flags.copy()
+                if self.args.ept:
+                    if ((entry >> 0) & 1) == 0:
+                        flags.append("NO_R")
+                    if ((entry >> 1) & 1) == 0:
+                        flags.append("NO_W")
+                    if ((entry >> 2) & 1) == 0:
+                        flags.append("NO_X")
+                    if ((entry >> 8) & 1) == 1:
+                        flags.append("A")
+                else:
+                    if ((entry >> 1) & 1) == 0:
+                        flags.append("NO_RW")
+                    if ((entry >> 2) & 1) == 0:
+                        flags.append("NO_US")
+                    if ((entry >> 5) & 1) == 1:
+                        flags.append("A")
+                    if ((entry >> 63) & 1) == 1:
+                        flags.append("XD")
+
+                # calc next table (drop the flag bits)
+                next_level_table = entry & 0x000f_ffff_ffff_f000
+
+                # make entry
+                PML4E.append([new_va, next_level_table, flags])
+                entry_type = "TABLE"
+
+                # dump
+                if self.args.print_each_level:
+                    if self.is_not_trace_target(new_va, new_va_end):
+                        continue
+                    addr = table_base + i * self.bits["ENTRY_SIZE"]
+                    line = "{:#018x}: {:#018x} (virt:{:#018x}-{:#018x},type:{:s}) {:s}".format(
+                        addr, entry, new_va, new_va_end, entry_type, " ".join(flags),
+                    )
+                    if self.is_not_filter_target(line):
+                        continue
+                    self.out.append(line)
+
+        if self.args.print_each_level:
+            self.out.append(titlify(""))
+
+        self.quiet_info_add_out("Number of entries: {:d}".format(COUNT))
+        self.quiet_info_add_out("PML4 Entry: {:d}".format(len(PML4E)))
+        self.quiet_info_add_out("Aliased tables (skipped): {:d}".format(SKIPPED))
+        self.quiet_info_add_out("Invalid entries: {:d}".format(COUNT - len(PML4E)))
+        self.TABLES = PML4E
+        return
+
+    def pagewalk_PDPT(self):
+        self.quiet_add_out(titlify("PDPE: Page Directory Pointer Entry"))
+
+        def is_set_PS(entry):
+            return ((entry >> 7) & 1) == 1
+
+        PDPTE = []
+        PTE = []
+        COUNT = 0
+        SKIPPED = 0
+        bit_shift = sum([
+            self.bits["PDT_BITS"],
+            self.bits["PT_BITS"],
+            self.bits["OFFSET"],
+        ])
+        for va_base, table_base, parent_flags in ProgressBar(self.TABLES, desc="PDPE", disable=self.args.quiet):
+            entries = self.read_memory(table_base, 2 ** self.bits["PDPT_BITS"] * self.bits["ENTRY_SIZE"])
+            entries = slice_unpack(entries, self.bits["ENTRY_SIZE"])
+            if self.is_aliased_table(va_base, entries, bit_shift):
+                SKIPPED += 1
+                continue
+            COUNT += len(entries)
+            for i, entry in enumerate(entries):
+                # present flag
+                if not self.is_present_entry(entry):
+                    continue
+
+                # calc virtual address
+                new_va = va_base + (i << bit_shift)
+                new_va_end = new_va + (1 << bit_shift)
+
+                # calc flags
+                flags = parent_flags.copy()
+                if self.args.ept or is_x86_64():
+                    if self.args.ept:
+                        if ((entry >> 0) & 1) == 0:
+                            flags.append("NO_R")
+                        if ((entry >> 1) & 1) == 0:
+                            flags.append("NO_W")
+                        if ((entry >> 2) & 1) == 0:
+                            flags.append("NO_X")
+                        if ((entry >> 8) & 1) == 1:
+                            flags.append("A")
+                        if is_set_PS(entry) and ((entry >> 9) & 1) == 1:
+                            flags.append("D")
+                    else:
+                        if ((entry >> 1) & 1) == 0:
+                            flags.append("NO_RW")
+                        if ((entry >> 2) & 1) == 0:
+                            flags.append("NO_US")
+                        if ((entry >> 5) & 1) == 1:
+                            flags.append("A")
+                        if is_set_PS(entry) and ((entry >> 6) & 1) == 1:
+                            flags.append("D")
+                        if is_set_PS(entry) and ((entry >> 8) & 1) == 1:
+                            flags.append("G")
+                        if ((entry >> 63) & 1) == 1:
+                            flags.append("XD")
+                else: # x86_32 and PAE
+                    pass
+
+                # calc next table (drop the flag bits)
+                if (self.args.ept or is_x86_64()) and is_set_PS(entry):
+                    next_level_table = entry & 0x000f_ffff_ffff_e000
+                else:
+                    next_level_table = entry & 0x000f_ffff_ffff_f000
+
+                # make entry
+                if is_set_PS(entry):
+                    virt_addr = new_va
+                    phys_addr = next_level_table
+                    page_size = 1 * 1024 * 1024 * 1024
+                    page_count = 1
+                    PTE.append(PageTable.Entry(virt_addr, phys_addr, page_size, page_count, self.format_flags(flags)))
+                    entry_type = "1GB-PAGE"
+                else:
+                    PDPTE.append([new_va, next_level_table, flags])
+                    entry_type = "TABLE"
+
+                # dump
+                if self.args.print_each_level:
+                    if self.is_not_trace_target(new_va, new_va_end):
+                        continue
+                    addr = table_base + i * self.bits["ENTRY_SIZE"]
+                    line = "{:#018x}: {:#018x} (virt:{:#018x}-{:#018x},type:{:s}) {:s}".format(
+                        addr, entry, new_va, new_va_end, entry_type, " ".join(flags),
+                    )
+                    if self.is_not_filter_target(line):
+                        continue
+                    self.out.append(line)
+
+        if self.args.print_each_level:
+            self.out.append(titlify(""))
+
+        self.quiet_info_add_out("Number of entries: {:d}".format(COUNT))
+        self.quiet_info_add_out("PDPT Entry: {:d}".format(len(PDPTE)))
+        self.quiet_info_add_out("PT Entry (1GB): {:d}".format(len(PTE)))
+        self.quiet_info_add_out("Aliased tables (skipped): {:d}".format(SKIPPED))
+        self.quiet_info_add_out("Invalid entries: {:d}".format(COUNT - len(PDPTE) - len(PTE)))
+        self.TABLES = PDPTE
+        self.PTE += PTE
+        return
+
+    def pagewalk_PDT(self):
+        self.quiet_add_out(titlify("PDE: Page Directory Entry"))
+
+        def is_set_PS(entry):
+            return ((entry >> 7) & 1) == 1
+
+        PDE = []
+        PTE = []
+        COUNT = 0
+        SKIPPED = 0
+        bit_shift = sum([
+            self.bits["PT_BITS"],
+            self.bits["OFFSET"],
+        ])
+        for va_base, table_base, parent_flags in ProgressBar(self.TABLES, desc="PDE", disable=self.args.quiet):
+            entries = self.read_memory(table_base, 2 ** self.bits["PDT_BITS"] * self.bits["ENTRY_SIZE"])
+            entries = slice_unpack(entries, self.bits["ENTRY_SIZE"])
+            if self.is_aliased_table(va_base, entries, bit_shift):
+                SKIPPED += 1
+                continue
+            COUNT += len(entries)
+
+            for i, entry in enumerate(entries):
+                # present flag
+                if not self.is_present_entry(entry):
+                    continue
+
+                # calc virtual address
+                new_va = va_base + (i << bit_shift)
+                new_va_end = new_va + (1 << bit_shift)
+
+                # calc flags
+                flags = parent_flags.copy()
+                if self.args.ept:
+                    if ((entry >> 0) & 1) == 0:
+                        flags.append("NO_R")
+                    if ((entry >> 1) & 1) == 0:
+                        flags.append("NO_W")
+                    if ((entry >> 2) & 1) == 0:
+                        flags.append("NO_X")
+                    if ((entry >> 8) & 1) == 1:
+                        flags.append("A")
+                    if is_set_PS(entry) and ((entry >> 9) & 1) == 1:
+                        flags.append("D")
+                else:
+                    if ((entry >> 1) & 1) == 0:
+                        flags.append("NO_RW")
+                    if ((entry >> 2) & 1) == 0:
+                        flags.append("NO_US")
+                    if ((entry >> 5) & 1) == 1:
+                        flags.append("A")
+                    if is_set_PS(entry) and ((entry >> 6) & 1) == 1:
+                        flags.append("D")
+                    if is_set_PS(entry) and ((entry >> 8) & 1) == 1:
+                        flags.append("G")
+                    if self.PAE and ((entry >> 63) & 1) == 1:
+                        flags.append("XD")
+
+                # calc next table (drop the flag bits)
+                if self.PAE and is_set_PS(entry):
+                    next_level_table = entry & 0x000f_ffff_ffff_e000
+                elif is_x86_32() and is_set_PS(entry):
+                    high = (entry >> 13) & 0xf
+                    low = (entry >> 22) & 0x3ff
+                    next_level_table = ((high << 10) | low) << 22
+                else:
+                    next_level_table = entry & 0x000f_ffff_ffff_f000
+
+                # make entry
+                if is_set_PS(entry):
+                    virt_addr = new_va
+                    phys_addr = next_level_table
+                    if self.PAE:
+                        page_size = 2 * 1024 * 1024
+                        entry_type = "2MB-PAGE"
+                    else:
+                        page_size = 4 * 1024 * 1024
+                        entry_type = "4MB-PAGE"
+                    page_count = 1
+                    PTE.append(PageTable.Entry(virt_addr, phys_addr, page_size, page_count, self.format_flags(flags)))
+                else:
+                    PDE.append([new_va, next_level_table, flags])
+                    entry_type = "TABLE"
+
+                # dump
+                if self.args.print_each_level:
+                    if self.is_not_trace_target(new_va, new_va_end):
+                        continue
+                    addr = table_base + i * self.bits["ENTRY_SIZE"]
+                    line = "{:#018x}: {:#018x} (virt:{:#018x}-{:#018x},type:{:s}) {:s}".format(
+                        addr, entry, new_va, new_va_end, entry_type, " ".join(flags),
+                    )
+                    if self.is_not_filter_target(line):
+                        continue
+                    self.out.append(line)
+
+        if self.args.print_each_level:
+            self.out.append(titlify(""))
+
+        self.quiet_info_add_out("Number of entries: {:d}".format(COUNT))
+        self.quiet_info_add_out("PD Entry: {:d}".format(len(PDE)))
+        self.quiet_info_add_out("PT Entry ({:d}MB): {:d}".format(2 if self.PAE else 4, len(PTE)))
+        self.quiet_info_add_out("Aliased tables (skipped): {:d}".format(SKIPPED))
+        self.quiet_info_add_out("Invalid entries: {:d}".format(COUNT - len(PDE) - len(PTE)))
+        self.TABLES = PDE
+        self.PTE += PTE
+        return
+
+    def pagewalk_PT(self):
+        self.quiet_add_out(titlify("PTE: Page Table Entry"))
+        PTE = []
+        COUNT = 0
+        SKIPPED = 0
+        bit_shift = self.bits["OFFSET"]
+        flag_cache = {}
+
+        for va_base, table_base, parent_flags in ProgressBar(self.TABLES, desc="PTE", disable=self.args.quiet):
+            entries = self.read_memory(table_base, 2 ** self.bits["PT_BITS"] * self.bits["ENTRY_SIZE"])
+            entries = slice_unpack(entries, self.bits["ENTRY_SIZE"])
+            if self.is_aliased_table(va_base, entries, bit_shift):
+                SKIPPED += 1
+                continue
+            COUNT += len(entries)
+
+            for i, entry in enumerate(entries):
+                # present flag
+                if not self.is_present_entry(entry):
+                    continue
+
+                # calc virtual address
+                virt_addr = va_base + (i << bit_shift)
+                virt_addr_end = virt_addr + (1 << bit_shift)
+
+                # calc flags
+                flags = parent_flags.copy()
+                if self.args.ept:
+                    if ((entry >> 0) & 1) == 0:
+                        flags.append("NO_R")
+                    if ((entry >> 1) & 1) == 0:
+                        flags.append("NO_W")
+                    if ((entry >> 2) & 1) == 0:
+                        flags.append("NO_X")
+                    if ((entry >> 8) & 1) == 1:
+                        flags.append("A")
+                    if ((entry >> 9) & 1) == 1:
+                        flags.append("D")
+                else:
+                    # This route passes many times, so make a memo
+                    entry_flags_key = entry & 0x8000_0000_0000_0166
+                    x = flag_cache.get(entry_flags_key, None)
+                    if x is not None:
+                        flags.extend(x)
+                    else:
+                        flags_tmp = []
+                        if ((entry >> 1) & 1) == 0:
+                            flags_tmp.append("NO_RW")
+                        if ((entry >> 2) & 1) == 0:
+                            flags_tmp.append("NO_US")
+                        if ((entry >> 5) & 1) == 1:
+                            flags_tmp.append("A")
+                        if ((entry >> 6) & 1) == 1:
+                            flags_tmp.append("D")
+                        if ((entry >> 8) & 1) == 1:
+                            flags_tmp.append("G")
+                        if self.PAE and ((entry >> 63) & 1) == 1:
+                            flags_tmp.append("XD")
+                        flag_cache[entry_flags_key] = flags_tmp
+                        flags.extend(flags_tmp)
+
+                # calc physical addr (drop the flag bits)
+                phys_addr = entry & 0x000f_ffff_ffff_f000
+
+                # make entry
+                page_size = 4 * 1024
+                page_count = 1
+                PTE.append(PageTable.Entry(virt_addr, phys_addr, page_size, page_count, self.format_flags(flags)))
+                entry_type = "4KB-PAGE"
+
+                # dump
+                if self.args.print_each_level:
+                    if self.is_not_trace_target(virt_addr, virt_addr_end):
+                        continue
+                    addr = table_base + i * self.bits["ENTRY_SIZE"]
+                    line = "{:#018x}: {:#018x} (virt:{:#018x}-{:#018x},type:{:s}) {:s}".format(
+                        addr, entry, virt_addr, virt_addr_end, entry_type, " ".join(flags),
+                    )
+                    if self.is_not_filter_target(line):
+                        continue
+                    self.out.append(line)
+
+        if self.args.print_each_level:
+            self.out.append(titlify(""))
+
+        self.quiet_info_add_out("Number of entries: {:d}".format(COUNT))
+        self.quiet_info_add_out("PT Entry (4KB): {:d}".format(len(PTE)))
+        self.quiet_info_add_out("Aliased tables (skipped): {:d}".format(SKIPPED))
+        self.quiet_info_add_out("Invalid entries: {:d}".format(COUNT - len(PTE)))
+        self.PTE += PTE
+
+        self.quiet_add_out(titlify("Total"))
+        self.quiet_info_add_out("PT Entry (Total): {:d}".format(len(self.PTE)))
+        self.mappings = self.PTE
+        return
+
+    def pagewalk(self, args):
+        self.prepare_pagewalk(args)
+        # `info tlb` on qemu-monitor returns pagetable without intermediate pagetable information.
+        # for printing it, we will pagewalk manually.
+        if self.args.user_specified_cr3 is not None:
+            cr3 = self.args.user_specified_cr3
+        else:
+            cr3 = get_register("cr3", use_monitor=True, use_mbed_exec=True)
+        if cr3 is None:
+            if not self.args.quiet:
+                self.err_add_out("Failed to resolve cr3")
+            return
+
+        if self.args.ept:
+            cr4 = 0
+        elif self.args.user_specified_cr4 is not None:
+            cr4 = self.args.user_specified_cr4
+        else:
+            cr4 = get_register("cr4", use_monitor=True, use_mbed_exec=True)
+        if cr4 is None:
+            if not self.args.quiet:
+                self.err_add_out("Failed to resolve cr4")
+            return
+
+        if is_x86_64() and self.args.user_pt and not self.args.ept:
+            if not self.is_user_pgd(cr3 & 0x000f_ffff_ffff_f000):
+                if not self.args.quiet:
+                    self.err_add_out("Could not find the KPTI user page table next to cr3")
+                return
+            cr3 += get_pagesize()
+        self.quiet_info_add_out("cr3: {:#018x}".format(cr3))
+        if self.args.ept:
+            self.quiet_info_add_out("EPT walk length: {:d}".format(self.args.ept_levels))
+        else:
+            self.quiet_info_add_out("cr4: {:#018x}".format(cr4))
+
+        # virtual address base
+        va_base = 0
+
+        # pagewalk base is from CR3 register
+        if is_x86_64(): # 64bit
+            pagewalk_base = cr3 & 0x000f_ffff_ffff_f000
+        elif ((cr4 >> 5) & 1) == 1: # 32bit PAE
+            pagewalk_base = cr3 & ~0x1f
+        else: # 32bit non-PAE
+            pagewalk_base = cr3 & ~0xfff
+
+        # we ignore PWT and PCD flags.
+        flags = []
+
+        # do pagewalk
+        self.PTE = []
+        self.TABLES = [(va_base, pagewalk_base, flags)]
+        self.flags_strings_cache = {}
+        if self.args.ept or is_x86_64():
+            if (self.args.ept and self.args.ept_levels == 5) or (not self.args.ept and (cr4 >> 12) & 1): # PML5T check
+                # 64bit 5-level(4KB): 9,9,9,9,9,12
+                # 64bit 5-level(2MB): 9,9,9,9,0,21
+                # 64bit 5-level(1GB): 9,9,9,0,0,30
+                self.quiet_info_add_out("64-bit 5 level page table")
+                self.bits = {
+                    "ENTRY_SIZE": 8,
+                    "PML5T_BITS": 9, "PML4T_BITS": 9, "PDPT_BITS": 9, "PDT_BITS": 9, "PT_BITS": 9, "OFFSET": 12,
+                }
+                self.PAE = True
+                if not self.use_cached_mapping("mappings", cr3=cr3, cr4=cr4):
+                    self.mappings = None
+                    self.pagewalk_PML5T()
+                    self.pagewalk_PML4T()
+                    self.pagewalk_PDPT()
+                    self.pagewalk_PDT()
+                    self.pagewalk_PT()
+                    self.merge_mappings()
+            else:
+                # 64bit 4-level(4KB): 9,9,9,9,12
+                # 64bit 4-level(2MB): 9,9,9,0,21
+                # 64bit 4-level(1GB): 9,9,0,0,30
+                self.quiet_info_add_out("64-bit 4 level page table")
+                self.bits = {
+                    "ENTRY_SIZE": 8,
+                    "PML4T_BITS": 9, "PDPT_BITS": 9, "PDT_BITS": 9, "PT_BITS": 9, "OFFSET": 12,
+                }
+                self.PAE = True
+                if not self.use_cached_mapping("mappings", cr3=cr3, cr4=cr4):
+                    self.mappings = None
+                    self.pagewalk_PML4T()
+                    self.pagewalk_PDPT()
+                    self.pagewalk_PDT()
+                    self.pagewalk_PT()
+                    self.merge_mappings()
+        elif is_x86_32() or is_x86_16():
+            if (cr4 >> 5) & 1: # PAE check
+                # 32bit PAE(4KB): 2,9,9,12 (PTE Size: 64bit)
+                # 32bit PAE(2MB): 2,9,0,21 (PTE Size: 64bit)
+                self.quiet_info_add_out("32-bit {:s} page table".format(Color.boldify("PAE")))
+                self.bits = {
+                    "ENTRY_SIZE": 8,
+                    "PDPT_BITS": 2, "PDT_BITS": 9, "PT_BITS": 9, "OFFSET": 12,
+                }
+                self.PAE = True
+                if not self.use_cached_mapping("mappings", cr3=cr3, cr4=cr4):
+                    self.mappings = None
+                    self.pagewalk_PDPT()
+                    self.pagewalk_PDT()
+                    self.pagewalk_PT()
+                    self.merge_mappings()
+            else:
+                # 32bit(4KB): 10,10,12
+                # 32bit(4MB): 10,0,22
+                self.quiet_info_add_out("32-bit Non-PAE page table")
+                self.bits = {
+                    "ENTRY_SIZE": 4,
+                    "PDT_BITS": 10, "PT_BITS": 10, "OFFSET": 12,
+                }
+                self.PAE = False
+                if not self.use_cached_mapping("mappings", cr3=cr3, cr4=cr4):
+                    self.mappings = None
+                    self.pagewalk_PDT()
+                    self.pagewalk_PT()
+                    self.merge_mappings()
+        else:
+            self.err_add_out("Unsupported CPU")
+            return
+
+        self.flags_strings_cache = None
+        self.save_mapping_cache()
+        self.make_out(self.mappings)
+        return

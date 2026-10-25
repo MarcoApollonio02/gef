@@ -30,6 +30,7 @@ from gef.core.address import AddressUtil, Endian, Permission
 from gef.core.cache import Cache
 from gef.core.color import Color, err, titlify
 from gef.core.config import Config
+from gef.core.display import ProgressBar
 from gef.core.elf import Elf
 from gef.core.heap import uClibcNgHeap
 from gef.core.memory import (
@@ -53,8 +54,11 @@ from gef.core.process import (
     ARCH_CHECKERS,
     ProcessMap,
     get_pagesize,
+    get_pagesize_mask_high,
     is_32bit,
     is_64bit,
+    is_m68k,
+    is_sh4,
     is_x86,
     is_x86_32,
     is_x86_64,
@@ -3272,6 +3276,7 @@ class SsmallocHeapDumpCommand(GenericCommand, BufferingOutput):
     parser.add_argument("-a", "--all", action="store_true", help="dump all local_heap.")
     parser.add_argument("-g", "--global", dest="global_pool_queue", action="store_true",
                         help="dump global_pool queues.")
+    parser.add_argument("--global-only", action="store_true", help="dump only global_pool queues without inspecting TLS.")
     parser.add_argument("-n", "--no-pager", action="store_true", help="do not use the pager.")
     parser.add_argument("-v", "--verbose", action="store_true", help="display also empty freelists.")
     _syntax_ = parser.format_help()
@@ -3313,86 +3318,175 @@ class SsmallocHeapDumpCommand(GenericCommand, BufferingOutput):
     ]
     _note_ = "\n".join(_note_)
 
-    def initialize(self):
-        if hasattr(self, "initialized") and self.initialized:
-            return True
+    # SSMalloc/include-x86_64/cpu.h
+    PAGE_SIZE = 0x1000
+    CHUNK_DATA_SIZE = 0x10 * PAGE_SIZE
+    DEFAULT_BLOCK_CLASS = 100
+    MAX_CORE_ID = 8
+    BLOCK_BUF_CNT = 16
+    #LARGE_CLASS = 100
+    DUMMY_CLASS = 101
+    #LARGE_OWNER = 0xdead
+    ABA_ADDR_BIT = 48
+    ABA_ADDR_MASK = (1 << ABA_ADDR_BIT) - 1
 
-        # SSMalloc/include-x86_64/cpu.h
-        self.PAGE_SIZE = 0x1000
-        self.CHUNK_DATA_SIZE = 0x10 * self.PAGE_SIZE
-        self.DEFAULT_BLOCK_CLASS = 100
-        self.MAX_CORE_ID = 8
-        self.BLOCK_BUF_CNT = 16
-        #self.LARGE_CLASS = 100
-        self.DUMMY_CLASS = 101
-        #self.LARGE_OWNER = 0xdead
-        self.ABA_ADDR_BIT = 48
-        self.ABA_ADDR_MASK = (1 << self.ABA_ADDR_BIT) - 1
+    # queue.h / double-list.h derived sizes on x86_64
+    #sizeof_linked_list_elem = 0x18
+    sizeof_linked_list = 0x10
+    #sizeof_seq_queue = 0x8
+    sizeof_queue = 0x40
+    sizeof_obj_buf = 0x20
+    sizeof_dchunk = 0x100
+    CHUNK_SIZE = CHUNK_DATA_SIZE + sizeof_dchunk
+    MAX_FREE_CHUNK = (4 * 0x100000) // CHUNK_SIZE
 
-        # queue.h / double-list.h derived sizes on x86_64
-        #self.sizeof_linked_list_elem = 0x18
-        self.sizeof_linked_list = 0x10
-        #self.sizeof_seq_queue = runtime.current_arch.ptrsize
-        self.sizeof_queue = 0x40
-        self.sizeof_obj_buf = 0x20
-        self.sizeof_dchunk = 0x100
+    # dchunk_t offsets
+    offset_dchunk_next = 0x8
+    offset_dchunk_prev = 0x10
+    offset_dchunk_numa_node = 0x18
+    offset_dchunk_owner = 0x40
+    offset_dchunk_size_cls = 0x48
+    offset_dchunk_state = 0x80
+    offset_dchunk_free_blk_cnt = 0x84
+    offset_dchunk_blk_cnt = 0x88
+    offset_dchunk_free_head = 0x90
+    offset_dchunk_block_size = 0x98
+    offset_dchunk_free_mem = 0xa0
+    offset_dchunk_remote_free_head = 0xc0
+
+    # lheap_t offsets
+    offset_lheap_numa_node = 0x18
+    offset_lheap_free_head = 0x20
+    offset_lheap_free_cnt = 0x28
+    offset_lheap_foreground = 0x30
+    offset_lheap_background = 0x350
+    offset_lheap_dummy_chunk = 0x9c0
+    offset_lheap_block_bufs = 0xac0
+    offset_lheap_need_gc = 0xcc0
+
+    # obj_buf_t offsets
+    offset_obj_buf_dc = 0x0
+    offset_obj_buf_first = 0x8
+    offset_obj_buf_free_head = 0x10
+    offset_obj_buf_count = 0x18
+
+    # gpool_t offsets, pthread_mutex_t is 0x28 bytes on Linux/x86_64 glibc
+    offset_gpool_pool_start = 0x28
+    offset_gpool_pool_end = 0x30
+    offset_gpool_free_start = 0x38
+    offset_gpool_free_dc_head = 0x40
+    offset_gpool_free_lh_head = 0x240
+    offset_gpool_released_dc_head = 0x440
+
+    state_names = {
+        0: "FOREGROUND",
+        1: "BACKGROUND",
+        2: "FULL",
+    }
+
+    def initialize(self, global_only=False):
+        for name, value in vars(type(self)).items():
+            if name.startswith(("offset_", "sizeof_")) or name in ("DEFAULT_BLOCK_CLASS", "MAX_CORE_ID", "BLOCK_BUF_CNT"):
+                setattr(self, name, value)
+
+        if global_only:
+            structures = {"gpool": "gpool_s"}
+            sizes = {"sizeof_queue": "Queue"}
+        else:
+            structures = {"dchunk": "dchunk_s", "lheap": "lheap_s", "obj_buf": "obj_buf_s"}
+            sizes = {
+                "sizeof_linked_list": "LinkedList", "sizeof_queue": "FastQueue",
+                "sizeof_obj_buf": "obj_buf_t", "sizeof_dchunk": "dchunk_t",
+            }
+        arrays = [("MAX_CORE_ID", "gpool_s", "free_dc_head", "sizeof_queue" if global_only else None)]
+        if global_only:
+            arrays += [
+                ("MAX_CORE_ID", "gpool_s", "free_lh_head", "sizeof_queue"),
+                ("MAX_CORE_ID", "gpool_s", "released_dc_head", "sizeof_queue"),
+            ]
+        else:
+            arrays += [
+                ("DEFAULT_BLOCK_CLASS", "lheap_s", "foreground", None),
+                ("DEFAULT_BLOCK_CLASS", "lheap_s", "background", "sizeof_linked_list"),
+                ("DEFAULT_BLOCK_CLASS", "lheap_s", "need_gc", "sizeof_queue"),
+                ("BLOCK_BUF_CNT", "lheap_s", "block_bufs", "sizeof_obj_buf"),
+            ]
+
+        sources = []
+        for prefix, type_name in structures.items():
+            if GefUtil.cached_lookup_type("struct " + type_name) is None:
+                sources.append(prefix + "=default")
+                continue
+            sources.append(prefix + "=DWARF")
+            for name in vars(type(self)):
+                if not name.startswith("offset_" + prefix + "_"):
+                    continue
+                member = name[len("offset_" + prefix + "_"):]
+                if prefix == "dchunk" and member in ("next", "prev"):
+                    member = "active_link." + member
+                offset = GefUtil.offsetof(type_name, member)
+                if offset is None:
+                    self.err_add_out("Unsupported SSMalloc layout: {:s}.{:s}".format(type_name, member))
+                    return False
+                setattr(self, name, offset)
+
+        for name, type_name in sizes.items():
+            size = GefUtil.type_size(type_name)
+            if size:
+                setattr(self, name, size)
+            sources.append("{:s}={:s}".format(type_name, "DWARF" if size else "default"))
+        resolved = {}
+        for name, type_name, member, stride in arrays:
+            field = GefUtil.lookup_field("struct " + type_name, member)
+            if field is None:
+                continue
+            array_type = field.type.strip_typedefs()
+            if array_type.code != gdb.TYPE_CODE_ARRAY:
+                self.err_add_out("Unsupported SSMalloc array: {:s}.{:s}".format(type_name, member))
+                return False
+            first, last = array_type.range()
+            if first != 0 or last < first:
+                self.err_add_out("Unsupported SSMalloc array bounds: {:s}.{:s}".format(type_name, member))
+                return False
+            if name in resolved and resolved[name] != last + 1:
+                self.err_add_out("Inconsistent SSMalloc array lengths: {:s}.{:s}".format(type_name, member))
+                return False
+            resolved[name] = last + 1
+            if stride:
+                resolved[stride] = array_type.target().sizeof
+        for name, value in resolved.items():
+            setattr(self, name, value)
+        for name in dict.fromkeys(array[0] for array in arrays):
+            sources.append("{:s}={:s}".format(name, "DWARF" if name in resolved else "default"))
+
         self.CHUNK_SIZE = self.CHUNK_DATA_SIZE + self.sizeof_dchunk
         self.MAX_FREE_CHUNK = (4 * 0x100000) // self.CHUNK_SIZE
-
-        # dchunk_t offsets
-        self.offset_dchunk_next = runtime.current_arch.ptrsize
-        self.offset_dchunk_prev = runtime.current_arch.ptrsize * 2
-        self.offset_dchunk_numa_node = 0x18
-        self.offset_dchunk_owner = 0x40
-        self.offset_dchunk_size_cls = 0x48
-        self.offset_dchunk_state = 0x80
-        self.offset_dchunk_free_blk_cnt = 0x84
-        self.offset_dchunk_blk_cnt = 0x88
-        self.offset_dchunk_free_head = 0x90
-        self.offset_dchunk_block_size = 0x98
-        self.offset_dchunk_free_mem = 0xa0
-        self.offset_dchunk_remote_free_head = 0xc0
-
-        # lheap_t offsets
-        self.offset_lheap_numa_node = 0x18
-        self.offset_lheap_free_head = 0x20
-        self.offset_lheap_free_cnt = 0x28
-        self.offset_lheap_foreground = 0x30
-        self.offset_lheap_background = 0x350
-        self.offset_lheap_dummy_chunk = 0x9c0
-        self.offset_lheap_block_bufs = 0xac0
-        self.offset_lheap_need_gc = 0xcc0
-
-        # obj_buf_t offsets
-        self.offset_obj_buf_dc = 0x0
-        self.offset_obj_buf_first = 0x8
-        self.offset_obj_buf_free_head = 0x10
-        self.offset_obj_buf_count = 0x18
-
-        # gpool_t offsets, pthread_mutex_t is 0x28 bytes on Linux/x86_64 glibc
-        self.offset_gpool_pool_start = 0x28
-        self.offset_gpool_pool_end = 0x30
-        self.offset_gpool_free_start = 0x38
-        self.offset_gpool_free_dc_head = 0x40
-        self.offset_gpool_free_lh_head = 0x240
-        self.offset_gpool_released_dc_head = 0x440
-
-        self.state_names = {
-            0: "FOREGROUND",
-            1: "BACKGROUND",
-            2: "FULL",
-        }
-        self.class_to_size_list = self.build_class_to_size_list()
-        self.initialized = True
+        self.out.append(titlify("SSMalloc configuration ({:s})".format("global" if global_only else "local")))
+        self.out.append("layout: " + ", ".join(sources))
+        self.out.append("MAX_CORE_ID: {:d}, queue size: {:#x}".format(self.MAX_CORE_ID, self.sizeof_queue))
+        if not global_only:
+            self.out.append("DEFAULT_BLOCK_CLASS: {:d}, BLOCK_BUF_CNT: {:d}, dchunk size: {:#x}, chunk size: {:#x}".format(
+                self.DEFAULT_BLOCK_CLASS, self.BLOCK_BUF_CNT, self.sizeof_dchunk, self.CHUNK_SIZE,
+            ))
+            self.out.append("Assumes PAGE_SIZE=0x1000, CHUNK_DATA_SIZE=0x10000, MAX_FREE_SIZE=0x400000, DUMMY_CLASS=101.")
+        self.out.append("Assumes SSMalloc x86_64 queues with ABA_ADDR_BIT=48.")
+        if any(source.endswith("=default") for source in sources):
+            self.out.append("Default layout requires the original build: 8 cores, 100 classes, 16 buffers, glibc mutex=0x28.")
+        if self.args.verbose:
+            for name in vars(type(self)):
+                if any(name.startswith("offset_" + prefix + "_") for prefix in structures):
+                    self.out.append("{:s}: {:#x}".format(name, getattr(self, name)))
         return True
 
+    @Cache.cache_this_session(per_inferior=True, until_new_objfile=True, cache_None=False)
     def build_class_to_size_list(self):
         try:
-            cls2size = AddressUtil.parse_address("&cls2size")
+            cls2size = Symbol.resolve_address("cls2size")
             class_to_size_list = []
-            for size_cls in range(self.DEFAULT_BLOCK_CLASS):
-                size = read_int32_from_memory(cls2size + (size_cls * 4))
-                class_to_size_list.append(size)
+            if cls2size is not None:
+                for size_cls in range(self.DEFAULT_BLOCK_CLASS):
+                    size = read_int32_from_memory(cls2size + (size_cls * 4))
+                    class_to_size_list.append(size)
             if any(class_to_size_list):
                 return class_to_size_list
         except gdb.error:
@@ -3417,9 +3511,10 @@ class SsmallocHeapDumpCommand(GenericCommand, BufferingOutput):
         return class_to_size_list
 
     def class_to_size(self, size_cls):
-        if size_cls < 0 or size_cls >= len(self.class_to_size_list):
+        class_to_size_list = self.build_class_to_size_list()
+        if size_cls < 0 or size_cls >= len(class_to_size_list):
             return 0
-        return self.class_to_size_list[size_cls]
+        return class_to_size_list[size_cls]
 
     def decode_aba_address(self, value):
         return value & self.ABA_ADDR_MASK
@@ -3461,11 +3556,12 @@ class SsmallocHeapDumpCommand(GenericCommand, BufferingOutput):
 
     def get_current_local_heap_heuristic(self):
         tls = runtime.current_arch.get_tls()
+        if tls is None:
+            return None
         for i in range(-0x40, 0x41):
             addr = tls + (runtime.current_arch.ptrsize * i)
-            try:
-                val = read_int_from_memory(addr)
-            except gdb.MemoryError:
+            val = read_int_from_memory(addr, safe=True)
+            if val is None:
                 continue
             if self.is_lheap_candidate(val):
                 return val
@@ -3484,20 +3580,16 @@ class SsmallocHeapDumpCommand(GenericCommand, BufferingOutput):
         return self.get_current_local_heap_heuristic()
 
     def get_local_heap_list(self, all_thread=False):
-        if self.args.local_heap:
+        if self.args.local_heap is not None:
             return [(gdb.selected_thread().num, self.args.local_heap)]
 
         if all_thread:
-            orig_thread = gdb.selected_thread()
-            orig_frame = gdb.selected_frame()
             local_heaps = []
-            for thread in gdb.selected_inferior().threads():
-                thread.switch()
-                local_heap = self.get_current_local_heap()
-                if local_heap:
-                    local_heaps.append((thread.num, local_heap))
-            orig_thread.switch()
-            orig_frame.select()
+            with ContextManager.threads() as threads:
+                for thread in threads:
+                    local_heap = self.get_current_local_heap()
+                    if local_heap:
+                        local_heaps.append((thread.num, local_heap))
             return local_heaps
 
         local_heap = self.get_current_local_heap()
@@ -3506,13 +3598,9 @@ class SsmallocHeapDumpCommand(GenericCommand, BufferingOutput):
         return None
 
     def get_global_pool(self):
-        if self.args.global_pool:
+        if self.args.global_pool is not None:
             return self.args.global_pool
-        try:
-            return AddressUtil.parse_address("&global_pool")
-        except gdb.error:
-            pass
-        return None
+        return Symbol.resolve_address("global_pool")
 
     def read_dchunk(self, addr):
         dic = {}
@@ -3531,8 +3619,7 @@ class SsmallocHeapDumpCommand(GenericCommand, BufferingOutput):
         dic["remote_head_raw"] = read_int_from_memory(addr + self.offset_dchunk_remote_free_head)
         dic["remote_head"] = self.decode_aba_address(dic["remote_head_raw"])
         dic["remote_count"] = self.decode_aba_count(dic["remote_head_raw"])
-        Dchunk = collections.namedtuple("Dchunk", dic.keys())
-        dchunk = Dchunk(*dic.values())
+        dchunk = GefUtil.dict_to_namedtuple("Dchunk", dic)
         return dchunk
 
     def read_lheap(self, addr):
@@ -3541,8 +3628,7 @@ class SsmallocHeapDumpCommand(GenericCommand, BufferingOutput):
         dic["numa_node"] = read_int32_from_memory(addr + self.offset_lheap_numa_node)
         dic["free_head"] = read_int_from_memory(addr + self.offset_lheap_free_head)
         dic["free_cnt"] = read_int32_from_memory(addr + self.offset_lheap_free_cnt)
-        Lheap = collections.namedtuple("Lheap", dic.keys())
-        lheap = Lheap(*dic.values())
+        lheap = GefUtil.dict_to_namedtuple("Lheap", dic)
         return lheap
 
     def read_obj_buf(self, addr):
@@ -3552,8 +3638,7 @@ class SsmallocHeapDumpCommand(GenericCommand, BufferingOutput):
         dic["first"] = read_int_from_memory(addr + self.offset_obj_buf_first)
         dic["free_head"] = read_int_from_memory(addr + self.offset_obj_buf_free_head)
         dic["count"] = read_int32_from_memory(addr + self.offset_obj_buf_count)
-        ObjBuf = collections.namedtuple("ObjBuf", dic.keys())
-        obj_buf = ObjBuf(*dic.values())
+        obj_buf = GefUtil.dict_to_namedtuple("ObjBuf", dic)
         return obj_buf
 
     def read_gpool(self, addr):
@@ -3562,15 +3647,18 @@ class SsmallocHeapDumpCommand(GenericCommand, BufferingOutput):
         dic["pool_start"] = read_int_from_memory(addr + self.offset_gpool_pool_start)
         dic["pool_end"] = read_int_from_memory(addr + self.offset_gpool_pool_end)
         dic["free_start"] = read_int_from_memory(addr + self.offset_gpool_free_start)
-        Gpool = collections.namedtuple("Gpool", dic.keys())
-        gpool = Gpool(*dic.values())
+        gpool = GefUtil.dict_to_namedtuple("Gpool", dic)
         return gpool
 
     def parse_single_link_list(self, head, next_offset=0, decode_head=False, dchunk=None):
-        corrupted_msg_color = Config.get_gef_setting("theme.heap_corrupted_msg")
+        corrupted_msg_color = Config.get("theme.heap_corrupted_msg")
 
-        cur = self.decode_aba_address(head) if decode_head else head
+        if decode_head:
+            cur = self.decode_aba_address(head)
+        else:
+            cur = head
         seen = []
+        seen_addresses = set()
         while True:
             if cur == 0:
                 seen.append(cur)
@@ -3578,7 +3666,7 @@ class SsmallocHeapDumpCommand(GenericCommand, BufferingOutput):
             if not is_valid_addr(cur):
                 seen.append(cur)
                 return seen, Color.colorify("(corrupted)", corrupted_msg_color)
-            if cur in seen:
+            if cur in seen_addresses:
                 seen.append(cur)
                 return seen, Color.colorify("(loop detected)", corrupted_msg_color)
             if dchunk:
@@ -3589,26 +3677,29 @@ class SsmallocHeapDumpCommand(GenericCommand, BufferingOutput):
                     seen.append(cur)
                     return seen, Color.colorify("(corrupted: not aligned)", corrupted_msg_color)
             seen.append(cur)
-            try:
-                cur = read_int_from_memory(cur + next_offset)
-            except gdb.MemoryError:
+            seen_addresses.add(cur)
+            next_cur = read_int_from_memory(cur + next_offset, safe=True)
+            if next_cur is None:
                 seen.append(0)
                 return seen, Color.colorify("(corrupted: invalid next)", corrupted_msg_color)
+            cur = next_cur
         return seen, None
 
     def parse_double_link_list(self, head):
-        corrupted_msg_color = Config.get_gef_setting("theme.heap_corrupted_msg")
+        corrupted_msg_color = Config.get("theme.heap_corrupted_msg")
 
         cur = head
         seen = []
+        seen_addresses = set()
         while cur != 0:
             if not is_valid_addr(cur):
                 seen.append(cur)
                 return seen, Color.colorify("(corrupted)", corrupted_msg_color)
-            if cur in seen:
+            if cur in seen_addresses:
                 seen.append(cur)
                 return seen, Color.colorify("(loop detected)", corrupted_msg_color)
             seen.append(cur)
+            seen_addresses.add(cur)
             cur = read_int_from_memory(cur + self.offset_dchunk_next)
 
         for i, chunk in enumerate(seen):
@@ -3621,7 +3712,7 @@ class SsmallocHeapDumpCommand(GenericCommand, BufferingOutput):
         return seen, None
 
     def append_freelist(self, title, addr, free_list, error=None, expected_count=None):
-        freed_address_color = Config.get_gef_setting("theme.heap_chunk_address_freed")
+        freed_address_color = Config.get("theme.heap_chunk_address_freed")
 
         if not self.args.verbose:
             if free_list == [0] and error is None:
@@ -3632,7 +3723,7 @@ class SsmallocHeapDumpCommand(GenericCommand, BufferingOutput):
         if addr is None:
             self.out.append("{:s}:".format(title))
         else:
-            self.out.append("{:s} @ {!s}:".format(title, ProcessMap.lookup_address(addr)))
+            self.out.append("{:s} @ {!s}:".format(title, ProcessMap.lookup(addr)))
 
         for i, obj in enumerate(free_list):
             obj_str = Color.colorify_hex(obj, freed_address_color)
@@ -3670,10 +3761,7 @@ class SsmallocHeapDumpCommand(GenericCommand, BufferingOutput):
                 self.out.append("{:s} @ {:#x}: dummy_chunk".format(title or "dchunk", dchunk_addr))
             return False
 
-        if dchunk.size_cls >= len(self.class_to_size_list):
-            size = 0
-        else:
-            size = self.class_to_size(dchunk.size_cls)
+        size = self.class_to_size(dchunk.size_cls)
 
         free_list, error = self.parse_single_link_list(dchunk.free_head, dchunk=dchunk)
         remote_list, remote_error = self.parse_single_link_list(dchunk.remote_head, dchunk=dchunk)
@@ -3685,7 +3773,7 @@ class SsmallocHeapDumpCommand(GenericCommand, BufferingOutput):
 
         self.out.append(titlify("{:s} @ {:#x}".format(title or "dchunk", dchunk.addr)))
         self.out.append("owner: {!s}, state: {:s}, numa_node: {:#x}".format(
-            ProcessMap.lookup_address(dchunk.owner),
+            ProcessMap.lookup(dchunk.owner),
             self.get_state_name(dchunk.state),
             dchunk.numa_node,
         ))
@@ -3696,7 +3784,7 @@ class SsmallocHeapDumpCommand(GenericCommand, BufferingOutput):
             dchunk.free_blk_cnt,
             dchunk.blk_cnt,
         ))
-        self.out.append("free_mem: {!s}".format(ProcessMap.lookup_address(dchunk.free_mem)))
+        self.out.append("free_mem: {!s}".format(ProcessMap.lookup(dchunk.free_mem)))
 
         local_count = self.append_freelist(
             "free_head",
@@ -3742,14 +3830,14 @@ class SsmallocHeapDumpCommand(GenericCommand, BufferingOutput):
             if dchunk_addr == lheap.addr + self.offset_lheap_dummy_chunk:
                 if self.args.verbose:
                     self.out.append("foreground[{:#x}, size={:#x}] @ {!s}: dummy_chunk".format(
-                        size_cls, size, ProcessMap.lookup_address(entry),
+                        size_cls, size, ProcessMap.lookup(entry),
                     ))
                     printed_flag = True
                 continue
             if dchunk_addr == 0:
                 if self.args.verbose:
                     self.out.append("foreground[{:#x}, size={:#x}] @ {!s}: 0x0".format(
-                        size_cls, size, ProcessMap.lookup_address(entry),
+                        size_cls, size, ProcessMap.lookup(entry),
                     ))
                     printed_flag = True
                 continue
@@ -3780,7 +3868,7 @@ class SsmallocHeapDumpCommand(GenericCommand, BufferingOutput):
                 continue
 
             self.out.append("background[{:#x}, size={:#x}] @ {!s}:".format(
-                size_cls, size, ProcessMap.lookup_address(entry),
+                size_cls, size, ProcessMap.lookup(entry),
             ))
             if error:
                 self.out.append(" {:s}".format(error))
@@ -3815,7 +3903,7 @@ class SsmallocHeapDumpCommand(GenericCommand, BufferingOutput):
                 continue
 
             self.out.append("need_gc[{:#x}, size={:#x}] @ {!s}:".format(
-                size_cls, size, ProcessMap.lookup_address(entry),
+                size_cls, size, ProcessMap.lookup(entry),
             ))
             if error:
                 self.out.append(" {:s}".format(error))
@@ -3848,9 +3936,9 @@ class SsmallocHeapDumpCommand(GenericCommand, BufferingOutput):
 
             self.out.append("block_bufs[{:#x}] @ {!s}: dc={!s}, first={!s}, count={:#x}".format(
                 index,
-                ProcessMap.lookup_address(entry),
-                ProcessMap.lookup_address(obj_buf.dc),
-                ProcessMap.lookup_address(obj_buf.first),
+                ProcessMap.lookup(entry),
+                ProcessMap.lookup(obj_buf.dc),
+                ProcessMap.lookup(obj_buf.first),
                 obj_buf.count,
             ))
 
@@ -3897,9 +3985,9 @@ class SsmallocHeapDumpCommand(GenericCommand, BufferingOutput):
     def dump_global_pool(self, global_pool):
         gpool = self.read_gpool(global_pool)
         self.out.append(titlify("global_pool @ {:#x}".format(global_pool), color="bold", msg_color="bold"))
-        self.out.append("pool_start: {!s}".format(ProcessMap.lookup_address(gpool.pool_start)))
-        self.out.append("pool_end: {!s}".format(ProcessMap.lookup_address(gpool.pool_end)))
-        self.out.append("free_start: {!s}".format(ProcessMap.lookup_address(gpool.free_start)))
+        self.out.append("pool_start: {!s}".format(ProcessMap.lookup(gpool.pool_start)))
+        self.out.append("pool_end: {!s}".format(ProcessMap.lookup(gpool.pool_end)))
+        self.out.append("free_start: {!s}".format(ProcessMap.lookup(gpool.free_start)))
 
         for index in range(self.MAX_CORE_ID):
             queue_addr = global_pool + self.offset_gpool_free_dc_head + (self.sizeof_queue * index)
@@ -3918,26 +4006,29 @@ class SsmallocHeapDumpCommand(GenericCommand, BufferingOutput):
     @only_if_specific_arch(arch=("x86_64",))
     def do_invoke(self, args):
         self.out = []
-        if self.initialize() is False:
-            return
 
-        local_heap_list = self.get_local_heap_list(args.all)
-        if not local_heap_list:
-            self.quiet_err("Could not find local_heap")
-            return
+        if not args.global_only and self.initialize():
+            try:
+                local_heap_list = self.get_local_heap_list(args.all)
+                if not local_heap_list:
+                    self.err_add_out("Could not find local_heap")
+                for thread_num, local_heap in local_heap_list or []:
+                    if not self.is_lheap_candidate(local_heap):
+                        self.err_add_out("Invalid local_heap: {:#x}".format(local_heap))
+                        continue
+                    self.dump_lheap(local_heap, thread_num)
+            except gdb.error as exception:
+                self.err_add_out("Could not read local_heap: {!s}".format(exception))
 
-        for thread_num, local_heap in local_heap_list:
-            if not self.is_lheap_candidate(local_heap):
-                self.quiet_err("Invalid local_heap: {:#x}".format(local_heap))
-                continue
-            self.dump_lheap(local_heap, thread_num)
-
-        if args.global_pool_queue:
+        if (args.global_pool_queue or args.global_only) and self.initialize(global_only=True):
             global_pool = self.get_global_pool()
             if global_pool is None:
-                self.quiet_err("Could not find global_pool")
+                self.err_add_out("Could not find global_pool")
             else:
-                self.dump_global_pool(global_pool)
+                try:
+                    self.dump_global_pool(global_pool)
+                except gdb.error as exception:
+                    self.err_add_out("Could not read global_pool: {!s}".format(exception))
 
         self.print_output()
         return
@@ -5553,7 +5644,7 @@ class JemallocHeapDumpCommand(GenericCommand, BufferingOutput):
 
 @register_command
 class MuslHeapDumpCommand(GenericCommand, BufferingOutput):
-    """musl v1.2.6 (src/malloc/mallocng) heap reusable chunks viewer (x64/x86 only)."""
+    """musl mallocng heap reusable chunks viewer."""
 
     # See https://h-noson.hatenablog.jp/entry/2021/05/03/161933#-177pts-mooosl
     _cmdline_ = "musl-heap-dump"
@@ -5563,12 +5654,18 @@ class MuslHeapDumpCommand(GenericCommand, BufferingOutput):
     modes = ["ctx", "unused"]
     parser.add_argument("command", choices=modes, nargs="?", default="unused",
                         help="dump mode (default: %(default)s).")
-    parser.add_argument("-i", "--active-idx", type=int, help="the active index of dump target.")
+    parser.add_argument("--malloc-context", type=AddressUtil.parse_address,
+                        help="use a specific mallocng context address.")
+    parser.add_argument("-i", "--active-idx", type=int, choices=range(48), help="the active index of dump target.")
     parser.add_argument("-n", "--no-pager", action="store_true", help="do not use the pager.")
     parser.add_argument("-v", "--verbose", action="store_true", help="also dump an empty active index.")
     _syntax_ = parser.format_help()
 
     _note_ = [
+        "Supports musl mallocng (1.2.1 and later), not the legacy malloc implementation.",
+        "Without the __malloc_context symbol, specify --malloc-context; x86 also has heuristic detection.",
+        "Only groups on active[48] are listed; individually mapped large allocations are not enumerated.",
+        "",
         "Simplified musl mallocng structure:",
         "",
         "+-malloc_context------+",
@@ -5611,19 +5708,13 @@ class MuslHeapDumpCommand(GenericCommand, BufferingOutput):
         super().__init__(complete="use_user_complete")
         return
 
-    def complete(self, text, word): # noqa
-        if text.strip() in self.modes:
-            # already matched
-            return []
-
-        if text == "":
-            # no prefix
-            return [s for s in self.modes if ((word is None) or (s and word in s))]
-
-        # finally, look for possible values for given prefix
-        return [s for s in self.modes if s and s.startswith(text.strip())]
+    def complete(self, text, word):
+        return GefUtil.complete_candidates(self.modes, text, word)
 
     def get_malloc_context_heuristic(self):
+        if not is_x86():
+            err("Specify --malloc-context when the __malloc_context symbol is unavailable on this architecture")
+            return None
         try:
             # search for malloc
             malloc = AddressUtil.parse_address("malloc")
@@ -5641,14 +5732,15 @@ class MuslHeapDumpCommand(GenericCommand, BufferingOutput):
             [pattern 3]
                0xf7f78bf0 <malloc>: jmp    0xf7f8bc3c
             """
+            libc_malloc_impl = malloc
             res = gdb.execute("x/10i {:#x}".format(malloc), to_string=True)
             for line in res.splitlines():
-                m = re.search(r"jmp\s*(0x\w+)", line)
+                m = re.search(r"(?:jmp|call)\s*(0x\w+)", line)
                 if not m:
                     continue
-                __libc_malloc_impl = int(m.group(1), 16)
+                libc_malloc_impl = int(m.group(1), 16)
                 break
-            self.info_add_out("__libc_malloc_impl: {:#x}".format(__libc_malloc_impl))
+            self.info_add_out("__libc_malloc_impl: {:#x}".format(libc_malloc_impl))
 
             # search for __malloc_alloc_meta
             """
@@ -5671,14 +5763,14 @@ class MuslHeapDumpCommand(GenericCommand, BufferingOutput):
                0xf7f8bca0:  call   0xf7f8b3d2
                0xf7f8bca5:  call   0xf7f8b439
             """
-            __malloc_alloc_meta_candidate = []
-            res = gdb.execute("x/100i {:#x}".format(__libc_malloc_impl), to_string=True)
+            malloc_alloc_meta_candidate = []
+            res = gdb.execute("x/256i {:#x}".format(libc_malloc_impl), to_string=True)
             for line in res.splitlines():
                 m = re.search(r"call\s*(0x\w+)", line)
                 if not m:
                     continue
                 addr = int(m.group(1), 16)
-                __malloc_alloc_meta_candidate.append(addr)
+                malloc_alloc_meta_candidate.append(addr)
 
             # search for __malloc_context
             """
@@ -5711,48 +5803,65 @@ class MuslHeapDumpCommand(GenericCommand, BufferingOutput):
                0xf7f8b448:  sub    esp,0x1c
                0xf7f8b44b:  cmp    DWORD PTR [ebx+0x708],0x0
             """
-            for cand in __malloc_alloc_meta_candidate:
+            for cand in malloc_alloc_meta_candidate:
                 self.info_add_out("alloc_meta (candidate): {:#x}".format(cand))
                 res = gdb.execute("x/10i {:#x}".format(cand), to_string=True)
+                pic_bases = {}
                 for line in res.splitlines():
+                    m = re.search(r"^\s*(0x\w+).*:\s*add\s+(e[abcd]x),(0x\w+)", line)
+                    if m:
+                        pic_bases[m.group(2)] = int(m.group(1), 16) + int(m.group(3), 16)
                     if is_x86_64():
                         m = re.search(r"DWORD PTR \[rip\+0x\w+\].*#\s*(0x\w+)", line)
                         if not m:
                             continue
-                        __malloc_context_init_done = int(m.group(1), 16)
+                        malloc_context_init_done = int(m.group(1), 16)
                     else:
-                        m = re.search(r"DWORD PTR \[e[abcd]x\+(0x\w+)\]", line)
-                        if not m:
-                            continue
-                        __malloc_context_init_done_offset = int(m.group(1), 16)
-                        maps = ProcessMap.get_process_maps()
-                        rw_maps = [p for p in maps if p.permission.value == Permission.READ | Permission.WRITE]
-                        rw_maps = [p for p in rw_maps if "libc.so" in p.path]
-                        libc_bss_base = rw_maps[0].page_start
-                        __malloc_context_init_done = libc_bss_base + __malloc_context_init_done_offset
+                        m = re.search(r"DWORD PTR \[(e[abcd]x)([+-])(0x\w+)\]", line)
+                        if m and m.group(1) in pic_bases:
+                            displacement = int(m.group(3), 16) * (1 if m.group(2) == "+" else -1)
+                            malloc_context_init_done = pic_bases[m.group(1)] + displacement
+                        else:
+                            m = re.search(r"DWORD PTR (?:ds:|\[)(0x\w+)", line)
+                            if not m:
+                                continue
+                            malloc_context_init_done = int(m.group(1), 16)
                     # check
-                    value = read_int32_from_memory(__malloc_context_init_done)
-                    if value not in [0, 1]: # init_done is 1 or 0
+                    value = read_int32_from_memory(malloc_context_init_done, safe=True)
+                    if value != 1:
                         continue
                     # found
-                    self.info_add_out("__malloc_context.init_done: {:#x}".format(__malloc_context_init_done))
-                    __malloc_context = __malloc_context_init_done - runtime.current_arch.ptrsize
-                    x = read_int_from_memory(__malloc_context)
-                    if x == get_pagesize():
-                        __malloc_context -= runtime.current_arch.ptrsize
-                    self.info_add_out("__malloc_context: {:#x}".format(__malloc_context))
-                    return __malloc_context
+                    self.info_add_out("__malloc_context.init_done: {:#x}".format(malloc_context_init_done))
+                    malloc_context = malloc_context_init_done - 8
+                    init_offset = GefUtil.member_offset("struct malloc_context", "init_done")
+                    if init_offset is not None:
+                        malloc_context = malloc_context_init_done - init_offset
+                    elif read_int_from_memory(malloc_context_init_done - runtime.current_arch.ptrsize) == get_pagesize():
+                        malloc_context -= runtime.current_arch.ptrsize
+                    area = read_int_from_memory(malloc_context_init_done + 8 + 5 * runtime.current_arch.ptrsize, safe=True)
+                    if not area or read_int64_from_memory(area, safe=True) != read_int64_from_memory(malloc_context, safe=True):
+                        continue
+                    self.info_add_out("__malloc_context: {:#x}".format(malloc_context))
+                    return malloc_context
+            err("Could not find &__malloc_context; specify --malloc-context")
             return None
         except Exception:
-            err("Could not find &__malloc_context")
+            err("Could not find &__malloc_context; specify --malloc-context")
             return None
 
     def get_malloc_context(self):
-        try:
-            return AddressUtil.parse_address("&__malloc_context")
-        except gdb.error:
-            self.info_add_out("Could not find the symbol, GEF will use heuristic search")
-            return self.get_malloc_context_heuristic()
+        if self.args.malloc_context is not None:
+            return self.args.malloc_context
+        if is_sh4():
+            symbols = ("__malloc_context", "_malloc_context")
+        else:
+            symbols = ("__malloc_context",)
+        for symbol in symbols:
+            address = Symbol.resolve_address(symbol)
+            if address is not None:
+                return address
+        self.info_add_out("Could not find the symbol, GEF will use heuristic search")
+        return self.get_malloc_context_heuristic()
 
     def class_to_size(self, cl):
         class_to_size_list = [
@@ -5768,7 +5877,8 @@ class MuslHeapDumpCommand(GenericCommand, BufferingOutput):
             2340, 2730, 3276, 4095,
             4680, 5460, 6552, 8191,
         ]
-        assert cl < len(class_to_size_list)
+        if not 0 <= cl < len(class_to_size_list):
+            raise ValueError("Invalid mallocng size class: {:d}".format(cl))
         return class_to_size_list[cl] * 0x10
 
     def read_ctx(self):
@@ -5802,13 +5912,14 @@ class MuslHeapDumpCommand(GenericCommand, BufferingOutput):
         };
         """
         ctx["secret"] = read_int64_from_memory(current)
-        current += 8
-        x = read_int_from_memory(current)
-        if x == get_pagesize():
-            ctx["pagesize"] = x
-            current += ptrsize
+        init_offset = GefUtil.member_offset("struct malloc_context", "init_done")
+        if init_offset is None:
+            init_offset = 8
+        if init_offset > 8:
+            ctx["pagesize"] = read_int_from_memory(current + 8)
         else:
             ctx["pagesize"] = None
+        current += init_offset
 
         ctx["init_done"] = read_int32_from_memory(current)
         current += 4
@@ -5843,12 +5954,15 @@ class MuslHeapDumpCommand(GenericCommand, BufferingOutput):
         ctx["bounces"] = read_memory(current, 32)
         current += 32
         ctx["seq"] = ord(read_memory(current, 1))
-        current += ptrsize # with padding
+        brk_offset = GefUtil.member_offset("struct malloc_context", "brk")
+        if brk_offset is not None:
+            current = ctx["addr"] + brk_offset
+        else:
+            current = current + (2 if is_m68k() else ptrsize)
         ctx["brk"] = read_int_from_memory(current)
         current += ptrsize
 
-        Ctx = collections.namedtuple("Ctx", ctx.keys())
-        return Ctx(*ctx.values())
+        return GefUtil.dict_to_namedtuple("Ctx", ctx)
 
     def dump_ctx(self, ctx):
         self.out.append(titlify("__malloc_context: {:#x}".format(ctx.addr)))
@@ -5857,14 +5971,14 @@ class MuslHeapDumpCommand(GenericCommand, BufferingOutput):
             self.out.append("  size_t pagesize:                    {:#x}".format(ctx.pagesize))
         self.out.append("  int init_done:                      {:#x}".format(ctx.init_done))
         self.out.append("  unsigned int mmap_counter:          {:#x}".format(ctx.mmap_counter))
-        self.out.append("  struct meta* free_meta_head:        {!s}".format(ProcessMap.lookup_address(ctx.free_meta_head)))
-        self.out.append("  struct meta* avail_meta:            {!s}".format(ProcessMap.lookup_address(ctx.avail_meta)))
+        self.out.append("  struct meta* free_meta_head:        {!s}".format(ProcessMap.lookup(ctx.free_meta_head)))
+        self.out.append("  struct meta* avail_meta:            {!s}".format(ProcessMap.lookup(ctx.avail_meta)))
         self.out.append("  size_t avail_meta_count:            {:#x}".format(ctx.avail_meta_count))
         self.out.append("  size_t avail_meta_area_count:       {:#x}".format(ctx.avail_meta_area_count))
         self.out.append("  size_t alloc_shift:                 {:#x}".format(ctx.alloc_shift))
-        self.out.append("  struct meta_area* meta_area_head:   {!s}".format(ProcessMap.lookup_address(ctx.meta_area_head)))
-        self.out.append("  struct meta_area* meta_area_tail:   {!s}".format(ProcessMap.lookup_address(ctx.meta_area_tail)))
-        self.out.append("  unsigned char* avail_meta_areas:    {!s}".format(ProcessMap.lookup_address(ctx.avail_meta_areas)))
+        self.out.append("  struct meta_area* meta_area_head:   {!s}".format(ProcessMap.lookup(ctx.meta_area_head)))
+        self.out.append("  struct meta_area* meta_area_tail:   {!s}".format(ProcessMap.lookup(ctx.meta_area_tail)))
+        self.out.append("  unsigned char* avail_meta_areas:    {!s}".format(ProcessMap.lookup(ctx.avail_meta_areas)))
         self.out.append("  struct meta* active[48]:")
         for i in range(48):
             self.out.append("     active[{:2d}] (for chunk_size={:#7x}):     {:#x}".format(i, self.class_to_size(i), ctx.active[i]))
@@ -5874,7 +5988,7 @@ class MuslHeapDumpCommand(GenericCommand, BufferingOutput):
         self.out.append("  uint8_t unmap_seq[32]:              {}".format(" ".join(["{:02x}".format(x) for x in ctx.unmap_seq])))
         self.out.append("  uint8_t bounces[32]:                {}".format(" ".join(["{:02x}".format(x) for x in ctx.bounces])))
         self.out.append("  uint8_t seq:                        {:#x}".format(ctx.seq))
-        self.out.append("  uintptr_t brk:                      {!s}".format(ProcessMap.lookup_address(ctx.brk)))
+        self.out.append("  uintptr_t brk:                      {!s}".format(ProcessMap.lookup(ctx.brk)))
         return
 
     def read_meta(self, addr):
@@ -5905,14 +6019,20 @@ class MuslHeapDumpCommand(GenericCommand, BufferingOutput):
         meta["freed_mask"] = read_int32_from_memory(current)
         current += 4
         x = read_int_from_memory(current)
-        meta["last_idx"] = x & 0b11111
-        meta["freeable"] = (x >> 5) & 0b1
-        meta["sizeclass"] = (x >> 6) & 0b111111
-        meta["maplen"] = (x >> 12)
+        if Endian.is_big_endian():
+            bits = ptrsize * 8
+            meta["last_idx"] = x >> (bits - 5)
+            meta["freeable"] = (x >> (bits - 6)) & 1
+            meta["sizeclass"] = (x >> (bits - 12)) & 63
+            meta["maplen"] = x & ((1 << (bits - 12)) - 1)
+        else:
+            meta["last_idx"] = x & 31
+            meta["freeable"] = (x >> 5) & 1
+            meta["sizeclass"] = (x >> 6) & 63
+            meta["maplen"] = x >> 12
         current += ptrsize
 
-        Meta = collections.namedtuple("Meta", meta.keys())
-        return Meta(*meta.values())
+        return GefUtil.dict_to_namedtuple("Meta", meta)
 
     def make_state(self, meta):
         avail_mask = meta.avail_mask
@@ -5930,66 +6050,53 @@ class MuslHeapDumpCommand(GenericCommand, BufferingOutput):
             freed_mask >>= 1
         return text
 
+    def get_stride(self, meta):
+        if meta.last_idx == 0 and meta.maplen:
+            return meta.maplen * 4096 - 16
+        return self.class_to_size(meta.sizeclass)
+
     def read_group(self, meta, offset):
-        ptrsize = runtime.current_arch.ptrsize
+        stride = self.get_stride(meta)
         group = {}
-        group["addr"] = current = meta.mem + offset
-        group["data"] = read_memory(group["addr"], self.class_to_size(meta.sizeclass))
-        """
-        from source code:
-        struct group {
-            struct meta *meta;
-            unsigned char active_idx:5;
-            char pad[UNIT - sizeof(struct meta *) - 1]; // UNIT = 16
-            unsigned char storage[];
-        };
-
-        however, the actual usage is as follows. (x64)
-        struct group {
-            struct meta *meta;
-            unsigned int slot_offset32;
-            unsigned char is_slot_offset32;
-            unsigned char slot_index:5;
-            unsigned char reserved:3;
-            unsigned short slot_offset16;
-        };
-        """
-        group["meta"] = read_int_from_memory(current)
-        current += ptrsize
-        x = read_int32_from_memory(current)
-        current += 4 if is_x86_64() else 8
-        y = read_int32_from_memory(current)
-        group["reserved"] = (x >> 13) & 0b111
-        group["slot_idx"] = (y >> 8) & 0b11111
-        if y & 0xff:
-            group["slot_offset"] = x
+        group["addr"] = meta.mem + 16 + offset
+        group["data"] = read_memory(group["addr"], stride)
+        group["meta"] = read_int_from_memory(meta.mem)
+        current = group["addr"]
+        if read_int8_from_memory(current - 3) >> 5 == 7:
+            current += 16 * read_int16_from_memory(current - 2)
+        if current >= group["addr"] + stride - 4:
+            raise ValueError("Slot header offset exceeds the slot")
+        header = read_int8_from_memory(current - 3)
+        group["user_addr"] = current
+        group["reserved"] = header >> 5
+        group["slot_idx"] = header & 31
+        if read_int8_from_memory(current - 4):
+            group["slot_offset"] = read_int32_from_memory(current - 8)
         else:
-            group["slot_offset"] = (y >> 16) & 0xffff
-        current += ptrsize
-
-        Group = collections.namedtuple("Group", group.keys())
-        return Group(*group.values())
+            group["slot_offset"] = read_int16_from_memory(current - 2)
+        return GefUtil.dict_to_namedtuple("Group", group)
 
     def dump_chunk(self, group, state):
-        chunk_used_color = Config.get_gef_setting("theme.heap_chunk_used")
-        chunk_freed_color = Config.get_gef_setting("theme.heap_chunk_freed")
+        chunk_used_color = Config.get("theme.heap_chunk_used")
+        chunk_freed_color = Config.get("theme.heap_chunk_freed")
 
         subinfo = "state:{:5s} meta:{:<#14x} reserved:{:#x}".format(state, group.meta, group.reserved)
         if state == "Used":
-            subinfo += " slot_idx:{:<#3x} slot_offset:{:#x}".format(group.slot_idx, group.slot_offset)
+            subinfo += " slot_idx:{:<#3x} slot_offset:{:#x} user:{:#x}".format(
+                group.slot_idx, group.slot_offset, group.user_addr,
+            )
 
         data = slicer(group.data, runtime.current_arch.ptrsize * 2)
         addr = group.addr
         group_line_threshold = 8
 
         # create dump text
-        unpack = u32 if runtime.current_arch.ptrsize == 4 else u64
+        unpack = GefUtil.get_unpack()
         width = runtime.current_arch.ptrsize * 2 + 2
-        done = False
         for blk, blks in itertools.groupby(data):
             repeat_count = len(list(blks))
             d1, d2 = unpack(blk[:runtime.current_arch.ptrsize]), unpack(blk[runtime.current_arch.ptrsize:])
-            dascii = "".join([chr(x) if 0x20 <= x < 0x7f else "." for x in blk])
+            dascii = GefUtil.bytes_to_ascii(blk)
             fmt = "{:#x}: {:#0{:d}x} {:#0{:d}x} | {:s} | {:s}"
             if repeat_count < group_line_threshold:
                 for _ in range(repeat_count):
@@ -6011,11 +6118,6 @@ class MuslHeapDumpCommand(GenericCommand, BufferingOutput):
                 addr += runtime.current_arch.ptrsize * 2 * repeat_count
                 if subinfo:
                     subinfo = ""
-            if done:
-                break
-
-        # print
-        dump = dump.rstrip()
         return
 
     def dump_meta(self, ctx):
@@ -6024,7 +6126,7 @@ class MuslHeapDumpCommand(GenericCommand, BufferingOutput):
         self.out.append("  2. Search most right 'F' and return it")
         self.out.append("  3. If nothing is found, create new meta")
 
-        management_color = Config.get_gef_setting("theme.heap_management_address")
+        management_color = Config.get("theme.heap_management_address")
 
         # iterate __malloc_context.active
         for idx in range(48):
@@ -6037,9 +6139,17 @@ class MuslHeapDumpCommand(GenericCommand, BufferingOutput):
             self.out.append(titlify("active[{:2d}] (chunk_size={:#x})".format(idx, self.class_to_size(idx))))
 
             # iterate list of meta
-            seen = []
-            while current not in seen:
-                meta = self.read_meta(current)
+            seen = set()
+            while current and current not in seen:
+                try:
+                    meta = self.read_meta(current)
+                except gdb.MemoryError:
+                    self.out.append("Unreadable meta @ {:#x}".format(current))
+                    break
+                invalid_mask = (meta.avail_mask | meta.freed_mask) >> (meta.last_idx + 1)
+                if meta.sizeclass != idx or not meta.mem or invalid_mask or meta.avail_mask & meta.freed_mask:
+                    self.out.append("Invalid meta @ {:#x}".format(current))
+                    break
                 self.out.append("meta @ {:s}".format(Color.colorify_hex(meta.addr, management_color)))
                 text = "  "
                 colored_prev = Color.colorify_hex(meta.prev, management_color)
@@ -6056,27 +6166,42 @@ class MuslHeapDumpCommand(GenericCommand, BufferingOutput):
                 self.out.append("  Unused chunks list: {}".format(repr(state)))
 
                 # dump chunks
+                # `state` has one character per slot, so "F" means the group has a single freed slot
                 if state != "F" or self.args.verbose:
                     dic = {"A": "Avail", "F": "Freed", "U": "Used"}
                     for i in range(meta.last_idx + 1):
-                        offset = self.class_to_size(idx) * i
-                        group = self.read_group(meta, offset)
+                        offset = self.get_stride(meta) * i
+                        try:
+                            group = self.read_group(meta, offset)
+                        except (gdb.MemoryError, ValueError) as error:
+                            self.out.append("Invalid slot[{:d}]: {!s}".format(i, error))
+                            break
                         self.dump_chunk(group, dic[state[-i - 1]])
                     self.out.append("")
 
-                seen.append(current)
+                seen.add(current)
                 current = meta.next
+            if not current:
+                self.out.append("Broken meta list: NULL link")
+            elif current in seen and current != ctx.active[idx]:
+                self.out.append("Meta list loop @ {:#x}".format(current))
         return
 
     @parse_args
     @only_if_gdb_running
     @exclude_specific_gdb_mode(mode=("qemu-system", "kgdb", "vmware", "wine"))
-    @only_if_specific_arch(arch=("x86_32", "x86_64"))
     def do_invoke(self, args):
         self.out = []
 
-        ctx = self.read_ctx()
+        try:
+            ctx = self.read_ctx()
+        except gdb.MemoryError:
+            err("Could not read the mallocng context")
+            return
         if ctx is None:
+            return
+        if ctx.init_done not in (0, 1):
+            err("Invalid mallocng context")
             return
         if args.command == "ctx":
             self.dump_ctx(ctx)
@@ -6085,6 +6210,7 @@ class MuslHeapDumpCommand(GenericCommand, BufferingOutput):
 
         self.print_output()
         return
+
 
 
 @register_command
@@ -6099,6 +6225,8 @@ class UclibcNgHeapDumpCommand(GenericCommand, BufferingOutput):
                         help="use specific address for malloc_context.")
     parser.add_argument("-n", "--no-pager", action="store_true", help="do not use the pager.")
     parser.add_argument("-v", "--verbose", action="store_true", help="also dump an empty active index.")
+    parser.add_argument("-s", "--safe-linking-decode", action="store_true",
+                        help="decode Safe-Linking fastbin links during traversal and display (default: plain links).")
     _syntax_ = parser.format_help()
 
     _note_ = [
@@ -6106,11 +6234,14 @@ class UclibcNgHeapDumpCommand(GenericCommand, BufferingOutput):
         "- No tcache. There are fastbins, an unsorted bin, small bins, and large bins.",
         "- No thread arena. Therefore, chunks do not have the NON_MAIN_ARENA flag.",
         "The structure of malloc-standard has remained largely unchanged from version 1.0 to the latest.",
-        "As a result, it should be usable with any version.",
+        "Only libc/stdlib/malloc-standard is supported, not malloc or malloc-simple.",
+        "Links are plain by default. Use -s for builds with Safe-Linking, including uClibc-ng 1.0.54 and 1.0.58.",
         "Since the final version of uclibc (not uclibc-ng) uses the same structure,",
         "this command should also be usable with uclibc.",
     ]
     _note_ = "\n".join(_note_)
+
+    UNSORTED_BIN = 1
 
     fast_size_table = [
         # 64bit  32bit
@@ -6229,10 +6360,9 @@ class UclibcNgHeapDumpCommand(GenericCommand, BufferingOutput):
 
     def get_malloc_state(self):
         # fast path
-        try:
-            return AddressUtil.parse_address("&__malloc_state")
-        except gdb.error:
-            pass
+        address = Symbol.resolve_address("__malloc_state")
+        if address is not None:
+            return address
 
         # slow path
         # Do not use AddressUtil.parse_address("malloc").
@@ -6241,7 +6371,9 @@ class UclibcNgHeapDumpCommand(GenericCommand, BufferingOutput):
         libc = ProcessMap.process_lookup_path("libuClibc-")
         if libc is None:
             return None
-        ret = gdb.execute("got --no-pager --quiet --file {!r} <malloc>".format(libc.path), to_string=True)
+        ret = gdb.execute("got --no-pager --quiet --file {:s} <malloc>".format(
+            GefUtil.quote_gdb_argument(libc.path),
+        ), to_string=True)
         if not ret:
             return None
         elem = Color.remove_color(ret).splitlines()[0].split()
@@ -6272,7 +6404,7 @@ class UclibcNgHeapDumpCommand(GenericCommand, BufferingOutput):
                         regname = m.group(2)
                         continue
                 else:
-                    m = re.search(r"DWORD PTR \[(\S+)\+(0x\S+)\]", line)
+                    m = re.search(r"(?:DWORD PTR |lea\s+\w+,\s*)\[(\w+)\+(0x\w+)\]", line)
                     if m and m.group(1) == regname:
                         malloc_state = base + int(m.group(2), 16)
                         if is_valid_addr(malloc_state):
@@ -6430,13 +6562,12 @@ class UclibcNgHeapDumpCommand(GenericCommand, BufferingOutput):
         except gdb.MemoryError:
             malloc_state["heap_base"] = 0
 
-        MallocState = collections.namedtuple("MallocState", malloc_state.keys())
-        return MallocState(*malloc_state.values())
+        return GefUtil.dict_to_namedtuple("MallocState", malloc_state)
 
     def dump_malloc_state(self, malloc_state):
-        chunk_size_color = Config.get_gef_setting("theme.heap_chunk_size")
+        chunk_size_color = Config.get("theme.heap_chunk_size")
 
-        self.verbose_add_out("malloc_state: {!s}".format(ProcessMap.lookup_address(malloc_state.address)))
+        self.verbose_add_out("malloc_state: {!s}".format(ProcessMap.lookup(malloc_state.address)))
         max_fast_flags = "|".join(malloc_state.max_fast_flags)
         self.verbose_add_out("max_fast:            {:#x} ({:s})".format(malloc_state.max_fast, max_fast_flags))
 
@@ -6450,20 +6581,22 @@ class UclibcNgHeapDumpCommand(GenericCommand, BufferingOutput):
                     colored_size = Color.colorify(size, chunk_size_color)
                 self.out.append("fastbins[idx={:d}, size={:s}, @{!s}]: fd={!s}".format(
                     i, colored_size,
-                    ProcessMap.lookup_address(addr),
-                    ProcessMap.lookup_address(n),
+                    ProcessMap.lookup(addr),
+                    ProcessMap.lookup(n),
                 ))
 
             if n != 0:
-                seen = []
+                seen = set()
                 while is_valid_addr(n) and n not in seen:
-                    seen.append(n)
+                    seen.add(n)
                     chunk = uClibcNgHeap.uClibcChunk(n, from_base=True)
-                    self.out.append(" -> {}".format(chunk.to_str(is_fastbin=True)))
-                    n = chunk.get_fwd_ptr(True)
+                    self.out.append(" -> {}".format(
+                        chunk.to_str(is_fastbin=True, safe_linking=self.args.safe_linking_decode),
+                    ))
+                    n = chunk.get_fwd_ptr(self.args.safe_linking_decode)
 
-        self.verbose_add_out("top:                 {!s}".format(ProcessMap.lookup_address(malloc_state.top)))
-        self.verbose_add_out("last_remainder:      {!s}".format(ProcessMap.lookup_address(malloc_state.last_remainder)))
+        self.verbose_add_out("top:                 {!s}".format(ProcessMap.lookup(malloc_state.top)))
+        self.verbose_add_out("last_remainder:      {!s}".format(ProcessMap.lookup(malloc_state.last_remainder)))
 
         self.out.append(titlify("Unsorted Bin / Small Bins"))
         for i in range(len(malloc_state.smallbins)):
@@ -6474,17 +6607,17 @@ class UclibcNgHeapDumpCommand(GenericCommand, BufferingOutput):
                 else:
                     colored_size = Color.colorify(size, chunk_size_color)
                 self.out.append("{:s}[idx={:d}, size={:s}, @{!s}]: fd={!s}, bk={!s}".format(
-                    ["small_bins", "unsorted_bin"][i == 1],
+                    ["small_bins", "unsorted_bin"][i == self.UNSORTED_BIN],
                     i, colored_size,
-                    ProcessMap.lookup_address(addr),
-                    ProcessMap.lookup_address(n),
-                    ProcessMap.lookup_address(p),
+                    ProcessMap.lookup(addr),
+                    ProcessMap.lookup(n),
+                    ProcessMap.lookup(p),
                 ))
 
             if n and addr - runtime.current_arch.ptrsize * 2 != n:
-                seen = [addr - runtime.current_arch.ptrsize * 2]
+                seen = {addr - runtime.current_arch.ptrsize * 2}
                 while is_valid_addr(n) and n not in seen:
-                    seen.append(n)
+                    seen.add(n)
                     chunk = uClibcNgHeap.uClibcChunk(n, from_base=True)
                     self.out.append(" -> {}".format(chunk.to_str()))
                     n = chunk.fwd
@@ -6499,15 +6632,15 @@ class UclibcNgHeapDumpCommand(GenericCommand, BufferingOutput):
                     colored_size = Color.colorify(size, chunk_size_color)
                 self.out.append("large_bins[idx={:d}, size={:s}, @{!s}]: fd={!s}, bk={!s}".format(
                     self.NSMALLBINS + i, colored_size,
-                    ProcessMap.lookup_address(addr),
-                    ProcessMap.lookup_address(n),
-                    ProcessMap.lookup_address(p),
+                    ProcessMap.lookup(addr),
+                    ProcessMap.lookup(n),
+                    ProcessMap.lookup(p),
                 ))
 
             if addr - runtime.current_arch.ptrsize * 2 != n:
-                seen = [addr - runtime.current_arch.ptrsize * 2]
+                seen = {addr - runtime.current_arch.ptrsize * 2}
                 while is_valid_addr(n) and n not in seen:
-                    seen.append(n)
+                    seen.add(n)
                     chunk = uClibcNgHeap.uClibcChunk(n, from_base=True)
                     self.out.append(" -> {}".format(chunk.to_str()))
                     n = chunk.fwd
@@ -6538,13 +6671,18 @@ class UclibcNgHeapDumpCommand(GenericCommand, BufferingOutput):
     def do_invoke(self, args):
         self.out = []
 
-        malloc_state = self.read_malloc_state(args.malloc_state)
+        try:
+            malloc_state = self.read_malloc_state(args.malloc_state)
+        except gdb.MemoryError:
+            err("Could not read malloc_state")
+            return
         if malloc_state is None:
             err("Could not find malloc_state")
             return
         self.dump_malloc_state(malloc_state)
         self.print_output()
         return
+
 
 
 @register_command
@@ -6566,7 +6704,7 @@ class UclibcNgVisualHeapCommand(UclibcNgHeapDumpCommand, BufferingOutput):
     parser.add_argument("-d", "--dark-color", action="store_true",
                         help="use the dark color if chunk is allocated.")
     parser.add_argument("-s", "--safe-linking-decode", action="store_true",
-                        help="decode safe-linking encoded pointer if tcache or fastbins.")
+                        help="decode Safe-Linking fastbin links during traversal and display (default: plain links).")
     parser.add_argument("-n", "--no-pager", action="store_true", help="do not use the pager.")
     _syntax_ = parser.format_help()
 
@@ -6595,11 +6733,13 @@ class UclibcNgVisualHeapCommand(UclibcNgHeapDumpCommand, BufferingOutput):
         for i in range(self.NFASTBINS):
             addr, n, size = malloc_state.fastbins[i]
             seen = []
-            while n and n not in seen:
+            seen_addresses = set()
+            while n and n not in seen_addresses:
                 seen.append(n)
+                seen_addresses.add(n)
                 try:
                     chunk = uClibcNgHeap.uClibcChunk(n, from_base=True)
-                    n = chunk.get_fwd_ptr(True)
+                    n = chunk.get_fwd_ptr(self.args.safe_linking_decode)
                 except gdb.MemoryError:
                     break
             self.bins_info["fastbins"][i] = seen
@@ -6607,8 +6747,10 @@ class UclibcNgVisualHeapCommand(UclibcNgHeapDumpCommand, BufferingOutput):
         for i in range(len(malloc_state.smallbins)):
             addr, n, p, size = malloc_state.smallbins[i]
             seen = []
-            while n and addr - runtime.current_arch.ptrsize * 2 != n and n not in seen:
+            seen_addresses = set()
+            while n and addr - runtime.current_arch.ptrsize * 2 != n and n not in seen_addresses:
                 seen.append(n)
+                seen_addresses.add(n)
                 try:
                     chunk = uClibcNgHeap.uClibcChunk(n, from_base=True)
                     n = chunk.fwd
@@ -6619,8 +6761,10 @@ class UclibcNgVisualHeapCommand(UclibcNgHeapDumpCommand, BufferingOutput):
         for i in range(len(malloc_state.largebins)):
             addr, n, p, size = malloc_state.largebins[i]
             seen = []
-            while n and addr - runtime.current_arch.ptrsize * 2 != n and n not in seen:
+            seen_addresses = set()
+            while n and addr - runtime.current_arch.ptrsize * 2 != n and n not in seen_addresses:
                 seen.append(n)
+                seen_addresses.add(n)
                 try:
                     chunk = uClibcNgHeap.uClibcChunk(n, from_base=True)
                     n = chunk.fwd
@@ -6632,15 +6776,21 @@ class UclibcNgVisualHeapCommand(UclibcNgHeapDumpCommand, BufferingOutput):
         # dict[address] = ["bins info1", "bins info2", ...]
         self.bins_dict_for_address = {}
         for fastbin_idx, fastbin_list in self.bins_info["fastbins"].items():
+            position_table = GefUtil.make_position_table(fastbin_list)
             for address in fastbin_list:
-                pos = ",".join([str(i + 1) for i, x in enumerate(fastbin_list) if x == address])
+                pos = position_table[address]
                 sz = self.fast_size_table[fastbin_idx][is_32bit()]
-                m = "fastbins[idx={:d},sz={:#x}][{:s}/{:d}]".format(fastbin_idx, sz, pos, len(fastbin_list))
+                if isinstance(sz, int):
+                    sz = "{:#x}".format(sz)
+                else:
+                    sz = str(sz)
+                m = "fastbins[idx={:d},sz={:s}][{:s}/{:d}]".format(fastbin_idx, sz, pos, len(fastbin_list))
                 self.bins_dict_for_address[address] = self.bins_dict_for_address.get(address, []) + [m]
         for smallbin_idx, smallbin_list in self.bins_info["small_bins"].items():
+            position_table = GefUtil.make_position_table(smallbin_list)
             for address in smallbin_list:
-                pos = ",".join([str(i + 1) for i, x in enumerate(smallbin_list) if x == address])
-                if smallbin_idx == 0:
+                pos = position_table[address]
+                if smallbin_idx == self.UNSORTED_BIN:
                     m = "unsortedbins[{:s}/{:d}]".format(pos, len(smallbin_list))
                 else:
                     size = self.size_table[smallbin_idx][is_32bit()]
@@ -6651,8 +6801,9 @@ class UclibcNgVisualHeapCommand(UclibcNgHeapDumpCommand, BufferingOutput):
                     m = "smallbins[idx={:d},sz={:s}][{:s}/{:d}]".format(smallbin_idx, sz, pos, len(smallbin_list))
                 self.bins_dict_for_address[address] = self.bins_dict_for_address.get(address, []) + [m]
         for largebin_idx, largebin_list in self.bins_info["large_bins"].items():
+            position_table = GefUtil.make_position_table(largebin_list)
             for address in largebin_list:
-                pos = ",".join([str(i + 1) for i, x in enumerate(largebin_list) if x == address])
+                pos = position_table[address]
                 size = self.size_table[self.NSMALLBINS + largebin_idx][is_32bit()]
                 if isinstance(size, tuple):
                     sz = "{:#x}-{:#x}".format(size[0], size[1])
@@ -6665,28 +6816,43 @@ class UclibcNgVisualHeapCommand(UclibcNgHeapDumpCommand, BufferingOutput):
         return
 
     def get_bins_info(self, malloc_state, address):
-        info = self.bins_dict_for_address.get(address, [])
+        info = list(self.bins_dict_for_address.get(address, []))
         if address == malloc_state.top:
             info.append("top")
         return info
 
     def generate_visual_chunk(self, malloc_state, chunk, idx):
-        unpack = u32 if runtime.current_arch.ptrsize == 4 else u64
-        data = slicer(chunk.data, runtime.current_arch.ptrsize * 2)
+
+        def group_key(x):
+            # The decoded fd row is kept apart from the following rows.
+            return (decode_fd and x[0] == 1, x[1])
+
+        unpack = GefUtil.get_unpack()
+        display_end = max(malloc_state.top + runtime.current_arch.ptrsize * 4 - chunk.chunk_base_address, 0)
+        data = slicer(chunk.data[:display_end], runtime.current_arch.ptrsize * 2)
         group_line_threshold = 8
 
         addr = chunk.chunk_base_address
         width = runtime.current_arch.ptrsize * 2 + 2
-        exceed_top = False
         has_bins_info = False
+
+        base_bins_info = ", ".join(self.bins_dict_for_address.get(chunk.chunk_base_address, []))
+        decode_fd = self.args.safe_linking_decode and "fastbins" in base_bins_info
 
         out_tmp = []
         # Group rows to display rows with the same value together.
-        prev_bins_info = ""
-        for blk, blks in itertools.groupby(data):
+        for (_, blk), blks in itertools.groupby(enumerate(data), key=group_key):
             repeat_count = len(list(blks))
+            dascii = GefUtil.bytes_to_ascii(blk)
+            if len(blk) < runtime.current_arch.ptrsize * 2:
+                offset1 = addr - chunk.chunk_base_address
+                offset2 = addr - malloc_state.heap_base
+                raw = " ".join("{:02x}".format(x) for x in blk)
+                out_tmp.append("{:#x}|{:+#08x}|{:+#08x}: {:s} | {:s} |".format(
+                    addr, offset1, offset2, raw, dascii,
+                ))
+                break
             d1, d2 = unpack(blk[:runtime.current_arch.ptrsize]), unpack(blk[runtime.current_arch.ptrsize:])
-            dascii = "".join([chr(x) if 0x20 <= x < 0x7f else "." for x in blk])
 
             if self.args.full or repeat_count < group_line_threshold:
                 # non-collapsed line
@@ -6698,21 +6864,16 @@ class UclibcNgVisualHeapCommand(UclibcNgHeapDumpCommand, BufferingOutput):
                     else:
                         bins_info = ""
 
-                    if self.args.safe_linking_decode:
-                        if chunk.address == addr and "fastbins" in prev_bins_info:
-                            d1 = chunk.get_fwd_ptr(True)
+                    fd = d1
+                    if decode_fd and chunk.address == addr:
+                        fd ^= addr >> 12
 
                     offset1 = addr - chunk.chunk_base_address
                     offset2 = addr - malloc_state.heap_base
                     out_tmp.append("{:#x}|{:+#08x}|{:+#08x}: {:#0{:d}x} {:#0{:d}x} | {:s} | {:s}".format(
-                        addr, offset1, offset2, d1, width, d2, width, dascii, bins_info,
+                        addr, offset1, offset2, fd, width, d2, width, dascii, bins_info,
                     ).rstrip())
                     addr += runtime.current_arch.ptrsize * 2
-                    prev_bins_info = bins_info
-
-                    if addr > malloc_state.top + runtime.current_arch.ptrsize * 4:
-                        exceed_top = True
-                        break
             else:
                 # collapsed line
                 bins_info = self.get_bins_info(malloc_state, addr)
@@ -6732,11 +6893,6 @@ class UclibcNgVisualHeapCommand(UclibcNgHeapDumpCommand, BufferingOutput):
                     repeat_count - 1, (repeat_count - 1) * runtime.current_arch.ptrsize * 2,
                 ))
 
-            prev_bins_info = bins_info
-
-            if exceed_top:
-                break
-
         # coloring
         if self.args.dark_color and not has_bins_info:
             color_func = self.dark_colors[idx % len(self.dark_colors)]
@@ -6745,7 +6901,7 @@ class UclibcNgVisualHeapCommand(UclibcNgHeapDumpCommand, BufferingOutput):
         self.out.append("\n".join(map(color_func, out_tmp)))
 
         # corrupted case
-        if exceed_top:
+        if len(chunk.data) > display_end:
             self.out.append(Color.boldify("..."))
         return
 
@@ -6759,56 +6915,60 @@ class UclibcNgVisualHeapCommand(UclibcNgHeapDumpCommand, BufferingOutput):
             # This is fast, but does not return an accurate list in some cases.
             # For example, sparc64 may not include the heap area.
             # So it detects the end of the page from malloc_state.top.
-            end = malloc_state.top + uClibcNgHeap.uClibcChunk(malloc_state.top, from_base=True).size
+            try:
+                end = malloc_state.top + uClibcNgHeap.uClibcChunk(malloc_state.top, from_base=True).size
+            except gdb.MemoryError:
+                self.out.append("Unreadable top chunk @ {:#x}".format(malloc_state.top))
+                return
 
-        try:
-            from tqdm import tqdm
-        except ImportError:
-            tqdm = None
-        if tqdm:
-            pbar = tqdm(total=end - dump_start, leave=False)
+        pbar = ProgressBar(total=end - dump_start)
 
         addr = dump_start
         i = 0
 
         while addr < end:
-            chunk = uClibcNgHeap.uClibcChunk(addr + runtime.current_arch.ptrsize * 2)
-            # corrupt check
-            if chunk.size == 0:
-                msg = "{} Corrupted (chunk.size == 0)".format(Color.colorify("[!]", "bold red"))
-                self.out.append(msg)
-                chunk.data = read_memory(addr, max(malloc_state.top - addr + 0x10, 0))
-                self.generate_visual_chunk(malloc_state, chunk, i)
-                break
-            elif addr != malloc_state.top and addr + chunk.size > malloc_state.top:
-                msg = "{} Corrupted (addr + chunk.size > malloc_state.top)".format(Color.colorify("[!]", "bold red"))
-                self.out.append(msg)
-                chunk.data = read_memory(addr, max(malloc_state.top - addr + 0x10, 0))
-                self.generate_visual_chunk(malloc_state, chunk, i)
-                break
-            elif addr + chunk.size > end:
-                msg = "{} Corrupted (addr + chunk.size > sect.page_end)".format(Color.colorify("[!]", "bold red"))
-                self.out.append(msg)
-                chunk.data = read_memory(addr, max(malloc_state.top - addr + 0x10, 0))
-                self.generate_visual_chunk(malloc_state, chunk, i)
-                break
-            # maybe not corrupted
+            chunk = uClibcNgHeap.uClibcChunk(addr, from_base=True)
+            msg = None
+            size = 0
             try:
-                chunk.data = read_memory(addr, chunk.size)
-            except gdb.MemoryError:
-                break
-            self.generate_visual_chunk(malloc_state, chunk, i)
-            addr += chunk.size
-            i += 1
+                if end - addr < runtime.current_arch.ptrsize * 2:
+                    msg = "incomplete chunk header"
+                else:
+                    size = chunk.size
+                    if size < runtime.current_arch.ptrsize * 4 or size % (runtime.current_arch.ptrsize * 2):
+                        msg = "invalid chunk size"
+                    elif addr != malloc_state.top and addr + size > malloc_state.top:
+                        msg = "addr + chunk.size > malloc_state.top"
+                    elif addr + size > end:
+                        msg = "addr + chunk.size > sect.page_end"
 
-            if tqdm:
-                pbar.update(chunk.size)
+                if msg:
+                    self.out.append("{} Corrupted ({})".format(Color.colorify("[!]", "bold red"), msg))
+                    readable_end = min(end, malloc_state.top + runtime.current_arch.ptrsize * 4)
+                    if sect is None:
+                        readable_end = min(readable_end, (addr & get_pagesize_mask_high()) + get_pagesize())
+                    chunk.data = read_memory(addr, max(readable_end - addr, 0))
+                else:
+                    if addr == malloc_state.top:
+                        read_size = min(size, runtime.current_arch.ptrsize * 4)
+                    else:
+                        read_size = size
+                    chunk.data = read_memory(addr, read_size)
+            except gdb.MemoryError:
+                self.out.append("Unreadable chunk @ {:#x}".format(addr))
+                break
+
+            self.generate_visual_chunk(malloc_state, chunk, i)
+            if msg or addr == malloc_state.top:
+                break
+            addr += size
+            i += 1
+            pbar.update(size)
 
             if max_count and max_count <= i:
                 break
 
-        if tqdm:
-            pbar.close()
+        pbar.close()
         return
 
     @parse_args
@@ -6816,10 +6976,17 @@ class UclibcNgVisualHeapCommand(UclibcNgHeapDumpCommand, BufferingOutput):
     @exclude_specific_gdb_mode(mode=("qemu-system", "kgdb", "vmware", "wine"))
     @only_if_specific_arch(arch=("x86_32", "x86_64"))
     def do_invoke(self, args):
-        malloc_state = self.read_malloc_state(args.malloc_state)
+        if args.max_count is not None and args.max_count <= 0:
+            err("Invalid maximum count")
+            return
+        try:
+            malloc_state = self.read_malloc_state(args.malloc_state)
+        except gdb.MemoryError:
+            err("Could not read malloc_state")
+            return
         if malloc_state is None:
-           err("Could not find malloc_state")
-           return
+            err("Could not find malloc_state")
+            return
 
         if malloc_state.heap_base is None or not is_valid_addr(malloc_state.heap_base):
             err("Could not find the heap base")
