@@ -15,6 +15,7 @@ import configparser
 import functools
 import hashlib
 import itertools
+import math
 import os
 import re
 import struct
@@ -75,12 +76,12 @@ class KernelConstsBase:
                 vs = [int(vs[0]), int(vs[1]), int(vs[2])]
             self.kversion = KernelVersion(0, "",  *vs)
         else:
-            self.kversion = Kernel.kernel_version()
+            self.kversion = Kernel.version()
         return
 
     def order_base_2(self, n):
         if n > 1:
-            return GefUtil.log2(n)
+            return (n - 1).bit_length()
         return 0
 
     def round_up(self, x, y):
@@ -89,22 +90,6 @@ class KernelConstsBase:
     def ALIGN(self, x, a):
         mask = a - 1
         return (x + mask) & ~mask
-
-    def test(self): # noqa
-        if is_32bit():
-            target = ["PAGE_OFFSET", "PAGE_OFFSET_END", "VMALLOC_START", "VMALLOC_END"]
-        else:
-            target = ["PAGE_OFFSET", "PAGE_OFFSET_END", "VMALLOC_START", "VMALLOC_END", "VMEMMAP_START", "VMEMMAP_END"]
-        for attr in target:
-            try:
-                v = getattr(self, attr)
-                if v:
-                    info("{:16s} = {:#x}".format(attr, v))
-                else:
-                    err("{:16s} = None".format(attr))
-            except Exception:
-                err("{:16s} = {}".format(attr, Color.colorify("ERROR", "bold red")))
-        return
 
     def resolve_phys_offset_from_maps(self):
         """Resolve PHYS_OFFSET from the kernel image and linear mappings."""
@@ -130,6 +115,23 @@ class KernelConstsBase:
             return None
         return AddressUtil.normalize_address(phys_kbase - (linear_candidates[0] - page_offset))
 
+    def test(self): # noqa: V105
+        if is_32bit():
+            target = ["PAGE_OFFSET", "PAGE_OFFSET_END", "VMALLOC_START", "VMALLOC_END"]
+        else:
+            target = ["PAGE_OFFSET", "PAGE_OFFSET_END", "VMALLOC_START", "VMALLOC_END", "VMEMMAP_START", "VMEMMAP_END"]
+        for attr in target:
+            try:
+                v = getattr(self, attr)
+                if v:
+                    info("{:16s} = {:#x}".format(attr, v))
+                else:
+                    err("{:16s} = None".format(attr))
+            except Exception:
+                err("{:16s} = {}".format(attr, Color.colorify("ERROR", "bold red")))
+        return
+
+
 
 class KernelConstsX86(KernelConstsBase):
     """A class that manages x86 constants by version."""
@@ -145,7 +147,8 @@ class KernelConstsX86(KernelConstsBase):
 
     @property
     def CONFIG_HIGHMEM(self):
-        addr = Symbol.get_ksymaddr("nr_free_highpages")
+        # v5.11~ renamed it to __nr_free_highpages
+        addr = Ksym.get_addr("nr_free_highpages") or Ksym.get_addr("__nr_free_highpages")
         return bool(addr)
 
     @property
@@ -164,25 +167,32 @@ class KernelConstsX86(KernelConstsBase):
 
     @property
     def CONFIG_INTEL_TXT(self):
-        addr = Symbol.get_ksymaddr("tboot_probe")
+        addr = Ksym.get_addr("tboot_probe")
         return bool(addr)
 
     @property
     def CONFIG_PAGE_OFFSET(self):
         if hasattr(self, "cached_PAGE_OFFSET"):
             return self.cached_PAGE_OFFSET
-        kern_min = Kernel.get_maps()[0][0]
+        maps = AddrMap.get_maps(scope="kernel")
+        if not maps:
+            return None
+        kern_min = maps[0].vstart
         if 0xc000_0000 <= kern_min:
-            self.cached_PAGE_OFFSET = 0xc000_0000 # VMSPLIT_3G
+            page_offset = 0xc000_0000 # VMSPLIT_3G
         elif 0xb000_0000 <= kern_min:
-            self.cached_PAGE_OFFSET = 0xb000_0000 # VMSPLIT_3G_OPT
+            page_offset = 0xb000_0000 # VMSPLIT_3G_OPT
         elif 0x8000_0000 <= kern_min:
-            self.cached_PAGE_OFFSET = 0x8000_0000 # VMSPLIT_2G
+            page_offset = 0x8000_0000 # VMSPLIT_2G
         elif 0x7800_0000 <= kern_min:
-            self.cached_PAGE_OFFSET = 0x7800_0000 # VMSPLIT_2G_OPT
+            page_offset = 0x7800_0000 # VMSPLIT_2G_OPT
         elif 0x4000_0000 <= kern_min:
-            self.cached_PAGE_OFFSET = 0x4000_0000 # VMSPLIT_1G
-        return self.cached_PAGE_OFFSET
+            page_offset = 0x4000_0000 # VMSPLIT_1G
+        else:
+            # Do not cache an unresolved PAGE_OFFSET; the current maps may be incomplete.
+            return None
+        self.cached_PAGE_OFFSET = page_offset
+        return page_offset
 
     @property
     def __PAGE_OFFSET(self):
@@ -193,22 +203,21 @@ class KernelConstsX86(KernelConstsBase):
         return self.__PAGE_OFFSET
 
     @property
+    def TASK_SIZE(self):
+        return self.PAGE_OFFSET
+
+    @property
     def PAGE_OFFSET_END(self):
         return self.high_memory
 
-    @property
+    @functools.cached_property
     def high_memory(self):
-        if hasattr(self, "cached_high_memory"):
-            return self.cached_high_memory
-
         max_hm = AddressUtil.normalize_address(-128 << 20)
         vmalloc_start = KernelAddressHeuristicFinder._get_VMALLOC_START()
         if vmalloc_start is None:
-            self.cached_high_memory = max_hm
-        else:
-            real_hm = vmalloc_start - self.VMALLOC_OFFSET
-            self.cached_high_memory = min(real_hm, max_hm)
-        return self.cached_high_memory
+            return max_hm
+        real_hm = vmalloc_start - self.VMALLOC_OFFSET
+        return min(real_hm, max_hm)
 
     @property
     def __FIXADDR_TOP(self):
@@ -220,6 +229,10 @@ class KernelConstsX86(KernelConstsBase):
 
     @property
     def __end_of_permanent_fixed_addresses(self):
+        # FIX_BTMAP_END may be rounded up to a page table boundary, so the subtraction below is not always exact
+        end = KernelAddressHeuristicFinder.get_end_of_permanent_fixed_addresses()
+        if end is not None:
+            return end
         end = self.__end_of_fixed_addresses
         if end is None:
             return None
@@ -244,28 +257,40 @@ class KernelConstsX86(KernelConstsBase):
     @property
     def FIXADDR_BOOT_SIZE(self):
         if "3.0" <= self.kversion < "3.19":
-            return self.__end_of_fixed_addresses << self.PAGE_SHIFT
+            end = self.__end_of_fixed_addresses
+            if end is None:
+                return None
+            return end << self.PAGE_SHIFT
         return None
 
     @property
     def FIXADDR_TOT_SIZE(self):
         if "4.14" <= self.kversion:
-            return self.__end_of_fixed_addresses << self.PAGE_SHIFT
+            end = self.__end_of_fixed_addresses
+            if end is None:
+                return None
+            return end << self.PAGE_SHIFT
         return None
 
     @property
     def FIXADDR_START(self):
+        if self.FIXADDR_SIZE is None:
+            return None
         return self.FIXADDR_TOP - self.FIXADDR_SIZE
 
     @property
     def FIXADDR_BOOT_START(self):
         if "3.0" <= self.kversion < "3.19":
+            if self.FIXADDR_BOOT_SIZE is None:
+                return None
             return self.FIXADDR_TOP - self.FIXADDR_BOOT_SIZE
         return None
 
     @property
     def FIXADDR_TOT_START(self):
         if "4.14" <= self.kversion:
+            if self.FIXADDR_TOT_SIZE is None:
+                return None
             return self.FIXADDR_TOP - self.FIXADDR_TOT_SIZE
         return None
 
@@ -387,23 +412,19 @@ class KernelConstsX86(KernelConstsBase):
     def MODULES_END(self):
         return self.VMALLOC_END
 
-    @property # noqa
+    @property # noqa: V106
     def MODULES_LEN(self):
+        # Note: the kernel itself defines it in this (reversed) order for x86_32.
+        # See arch/x86/include/asm/pgtable_32_areas.h
         return self.MODULES_VADDR - self.MODULES_END
 
-    @property
+    @functools.cached_property
     def mem_map(self):
-        if hasattr(self, "cached_mem_map"):
-            return self.cached_mem_map
-        self.cached_mem_map = KernelAddressHeuristicFinder.get_mem_map()
-        return self.cached_mem_map
+        return KernelAddressHeuristicFinder.get_mem_map()
 
-    @property
+    @functools.cached_property
     def mem_section(self):
-        if hasattr(self, "cached_mem_section"):
-            return self.cached_mem_section
-        self.cached_mem_section = KernelAddressHeuristicFinder.get_mem_section()
-        return self.cached_mem_section
+        return KernelAddressHeuristicFinder.get_mem_section()
 
     @property
     def CONFIG_FLATMEM(self):
@@ -491,7 +512,7 @@ class KernelConstsX86(KernelConstsBase):
     @property
     def CONFIG_PAGE_EXTENSION(self):
         if "3.19" <= self.kversion:
-            addr = Symbol.get_ksymaddr("page_ext_init")
+            addr = Ksym.get_addr("page_ext_init")
             return bool(addr)
         return None
 
@@ -558,9 +579,6 @@ class KernelConstsX86(KernelConstsBase):
         self.cached_sizeof_struct_page = size
         return size
 
-    @property
-    def TASK_SIZE(self):
-        return self.PAGE_OFFSET
 
 
 class KernelConstsX64(KernelConstsBase):
@@ -579,8 +597,8 @@ class KernelConstsX64(KernelConstsBase):
         if self.kaslr is not None:
             return self.kaslr
 
-        kcmdline = Kernel.kernel_cmdline()
-        ksym_ret = gdb.execute("ksymaddr-remote --quiet --no-pager kaslr_", to_string=True)
+        kcmdline = Kernel.cmdline()
+        ksym_ret = Ksym.get_addrs("kaslr_", match="in")
         if not ksym_ret:
             self.kaslr = False
         elif kcmdline and "nokaslr" in kcmdline.cmdline:
@@ -599,10 +617,16 @@ class KernelConstsX64(KernelConstsBase):
             return None
         page, vaddr = ret
         pfn = (vaddr - self.PAGE_OFFSET) >> self.PAGE_SHIFT
-        sizeof_struct_page_value = align_to_ptrsize((page - self.VMEMMAP_START) // pfn)
-        if sizeof_struct_page_value != 0:
-            self.cached_sizeof_struct_page = sizeof_struct_page_value
-        return sizeof_struct_page_value
+        if pfn == 0:
+            return None
+
+        size = align_to_ptrsize((page - self.VMEMMAP_START) // pfn)
+        if size == 0:
+            # 0 is never a valid size, and the callers only check for None
+            return None
+
+        self.cached_sizeof_struct_page = size
+        return size
 
     @property
     def CONFIG_X86_5LEVEL(self):
@@ -656,7 +680,7 @@ class KernelConstsX64(KernelConstsBase):
 
     @property
     def CONFIG_INTEL_TXT(self):
-        addr = Symbol.get_ksymaddr("tboot_probe")
+        addr = Ksym.get_addr("tboot_probe")
         return bool(addr)
 
     @property
@@ -687,30 +711,37 @@ class KernelConstsX64(KernelConstsBase):
             return 0xffff_ffff_8000_0000
         return None
 
-    @property # noqa
+    @property
     def START_KERNEL_map(self):
         return self.__START_KERNEL_map
 
     @property
     def __PAGE_OFFSET_BASE(self):
         if "4.8" <= self.kversion < "4.12":
-            return 0xffff_8800_0000_0000
+            return self.__PAGE_OFFSET_BASE_L4_OLD
         elif "4.12" <= self.kversion < "4.17":
             if self.CONFIG_X86_5LEVEL:
                 return 0xff10_0000_0000_0000
             else:
-                return 0xffff_8800_0000_0000
+                return self.__PAGE_OFFSET_BASE_L4_OLD
         return None
+
+    @property
+    def __PAGE_OFFSET_BASE_L4_OLD(self):
+        # The move for the LDT remap of PTI (v4.19) is backported to stable kernels (e.g., 4.14.336)
+        if not is_valid_addr(0xffff_8800_0000_0000) and is_valid_addr(0xffff_8880_0000_0000):
+            return 0xffff_8880_0000_0000
+        return 0xffff_8800_0000_0000
 
     @property
     def __PAGE_OFFSET_BASE_L4(self):
         if "4.17" <= self.kversion < "4.19":
-            return 0xffff_8800_0000_0000
+            return self.__PAGE_OFFSET_BASE_L4_OLD
         elif "4.19" <= self.kversion:
             return 0xffff_8880_0000_0000
         return None
 
-    @property # noqa
+    @property
     def __PAGE_OFFSET_BASE_L5(self):
         if "4.17" <= self.kversion < "4.19":
             return 0xff10_0000_0000_0000
@@ -743,7 +774,10 @@ class KernelConstsX64(KernelConstsBase):
             if self.CONFIG_DYNAMIC_MEMORY_LAYOUT:
                 return self.page_offset_base
             else:
-                return self.__PAGE_OFFSET_BASE_L4
+                if self.CONFIG_X86_5LEVEL:
+                    return self.__PAGE_OFFSET_BASE_L5
+                else:
+                    return self.__PAGE_OFFSET_BASE_L4
         elif "6.16" <= self.kversion:
                 return self.page_offset_base
         return None
@@ -836,7 +870,10 @@ class KernelConstsX64(KernelConstsBase):
                 else:
                     return self.VMALLOC_SIZE_TB_L4
             else:
-                return self.VMALLOC_SIZE_TB_L4
+                if self.CONFIG_X86_5LEVEL:
+                    return self.VMALLOC_SIZE_TB_L5
+                else:
+                    return self.VMALLOC_SIZE_TB_L4
         elif "6.16" <= self.kversion:
             if self.CONFIG_X86_5LEVEL:
                 return self.VMALLOC_SIZE_TB_L5
@@ -866,7 +903,7 @@ class KernelConstsX64(KernelConstsBase):
             return 0xffff_c900_0000_0000
         return None
 
-    @property # noqa
+    @property
     def __VMALLOC_BASE_L5(self):
         if "4.17" <= self.kversion:
             return 0xffa0_0000_0000_0000
@@ -897,7 +934,10 @@ class KernelConstsX64(KernelConstsBase):
             if self.CONFIG_DYNAMIC_MEMORY_LAYOUT:
                 return self.vmalloc_base
             else:
-                return self.__VMALLOC_BASE_L4
+                if self.CONFIG_X86_5LEVEL:
+                    return self.__VMALLOC_BASE_L5
+                else:
+                    return self.__VMALLOC_BASE_L4
         elif "6.16" <= self.kversion:
             return self.vmalloc_base
         return None
@@ -905,7 +945,11 @@ class KernelConstsX64(KernelConstsBase):
     @property
     def VMEMORY_END(self):
         if "6.1" <= self.kversion:
-            return self.VMALLOC_START + (self.VMALLOC_SIZE_TB << 40)
+            vmalloc_start = self.VMALLOC_START
+            if vmalloc_start is not None:
+                vmemory_end = vmalloc_start + (self.VMALLOC_SIZE_TB << 40)
+                if vmemory_end <= 0xffff_ffff_ffff_ffff:
+                    return vmemory_end
         return None
 
     @property
@@ -920,12 +964,20 @@ class KernelConstsX64(KernelConstsBase):
         if "3.0" <= self.kversion < "4.8":
             return 0xffff_e900_0000_0000
         elif "4.8" <= self.kversion < "6.1":
-            return self.VMALLOC_START + (self.VMALLOC_SIZE_TB << 40)
+            vmalloc_start = self.VMALLOC_START
+            if vmalloc_start is not None:
+                vmalloc_end = vmalloc_start + (self.VMALLOC_SIZE_TB << 40)
+                if vmalloc_end <= 0xffff_ffff_ffff_ffff:
+                    return vmalloc_end
         elif "6.1" <= self.kversion:
             if not self.CONFIG_KMSAN:
                 return self.VMEMORY_END
             else:
-                return self.VMALLOC_START + self.VMALLOC_QUARTER_SIZE
+                vmalloc_start = self.VMALLOC_START
+                if vmalloc_start is not None:
+                    vmalloc_end = vmalloc_start + self.VMALLOC_QUARTER_SIZE
+                    if vmalloc_end <= 0xffff_ffff_ffff_ffff:
+                        return vmalloc_end
         return None
 
     @property
@@ -945,7 +997,7 @@ class KernelConstsX64(KernelConstsBase):
             return 0xffff_ea00_0000_0000
         return None
 
-    @property # noqa
+    @property
     def __VMEMMAP_BASE_L5(self):
         if "4.17" <= self.kversion:
             return 0xffd4_0000_0000_0000
@@ -976,7 +1028,10 @@ class KernelConstsX64(KernelConstsBase):
             if self.CONFIG_DYNAMIC_MEMORY_LAYOUT:
                 return self.vmemmap_base
             else:
-                return self.__VMEMMAP_BASE_L4
+                if self.CONFIG_X86_5LEVEL:
+                    return self.__VMEMMAP_BASE_L5
+                else:
+                    return self.__VMEMMAP_BASE_L4
         elif "6.16" <= self.kversion:
             return self.vmemmap_base
         return None
@@ -984,7 +1039,9 @@ class KernelConstsX64(KernelConstsBase):
     @property
     def VMEMMAP_END(self):
         if "3.0" <= self.kversion:
-            return self.VMEMMAP_START + self.SZ_1T
+            vmemmap_start = self.VMEMMAP_START
+            if vmemmap_start is not None:
+                return vmemmap_start + self.SZ_1T
         return None
 
     @property
@@ -1031,16 +1088,7 @@ class KernelConstsX64(KernelConstsBase):
 
     @property
     def __end_of_permanent_fixed_addresses(self):
-        end = self.__end_of_fixed_addresses
-        if end is None:
-            return None
-        if "3.0" <= self.kversion < "3.10":
-            # (FIX_TBOOT_BASE), FIX_BTMAP_BEGIN ~ FIX_BTMAP_END
-            return end - int(self.CONFIG_INTEL_TXT) - 256
-        elif "3.10" <= self.kversion:
-            # (FIX_TBOOT_BASE), FIX_BTMAP_BEGIN ~ FIX_BTMAP_END
-            return end - int(self.CONFIG_INTEL_TXT) - 512
-        return None
+        return KernelAddressHeuristicFinder.get_end_of_permanent_fixed_addresses()
 
     @property
     def __end_of_fixed_addresses(self):
@@ -1075,7 +1123,7 @@ class KernelConstsX64(KernelConstsBase):
                 return 0xffff_ffff_fe00_0000
         return None
 
-    @property # noqa
+    @property # noqa: V106
     def MODULES_LEN(self):
         if "3.0" <= self.kversion:
             return self.MODULES_END - self.MODULES_VADDR
@@ -1136,7 +1184,7 @@ class KernelConstsX64(KernelConstsBase):
             return AddressUtil.normalize_address(espfix_base_addr)
         return None
 
-    @property # noqa
+    @property # noqa: V106
     def ESPFIX_END(self):
         if "3.0" <= self.kversion:
             return self.ESPFIX_BASE_ADDR + 0x0000_0080_0000_0000
@@ -1161,26 +1209,20 @@ class KernelConstsX64(KernelConstsBase):
             return self.CPU_ENTRY_AREA_BASE + 0x0000_0080_0000_0000
         return None
 
-    @property # noqa
+    @property
     def EFI_VA_START(self):
         if "3.19" <= self.kversion:
             efi_va_start = -4 * (1 << 30)
             return AddressUtil.normalize_address(efi_va_start)
         return None
 
-    @property # noqa
+    @property
     def EFI_VA_END(self):
         if "3.19" <= self.kversion:
             efi_va_end = -68 * (1 << 30)
             return AddressUtil.normalize_address(efi_va_end)
         return None
 
-    @property
-    def __PAGE_OFFSET_BASE_L4_OLD(self):
-        # The move for the LDT remap of PTI (v4.19) is backported to stable kernels (e.g., 4.14.336)
-        if not is_valid_addr(0xffff_8800_0000_0000) and is_valid_addr(0xffff_8880_0000_0000):
-            return 0xffff_8880_0000_0000
-        return 0xffff_8800_0000_0000
 
 
 class KernelConstsArm32(KernelConstsBase):
@@ -1197,22 +1239,34 @@ class KernelConstsArm32(KernelConstsBase):
     def CONFIG_PAGE_OFFSET(self):
         if hasattr(self, "cached_PAGE_OFFSET"):
             return self.cached_PAGE_OFFSET
-        kern_min = Kernel.get_maps()[0][0]
+
+        # TTBR0 may contain privileged firmware mappings below PAGE_OFFSET,
+        # especially when LPAE is enabled. Use the resolved kernel image
+        # instead of assuming that the first pagewalk mapping is lowmem.
+        klayout = Kernel.layout(use_iomem=False)
+        if klayout.text_base is None:
+            return None
+        kern_min = klayout.text_base
         if 0xc000_0000 - 0x0100_0000 <= kern_min:
             # 0xbf000000-0xc0000000 is kernel module area.
             # Even if it is VMSPLIT_3G, this is used.
-            self.cached_PAGE_OFFSET = 0xc000_0000 # VMSPLIT_3G
+            page_offset = 0xc000_0000 # VMSPLIT_3G
         elif 0xb000_0000 - 0x0100_0000 <= kern_min:
-            self.cached_PAGE_OFFSET = 0xb000_0000 # VMSPLIT_3G_OPT
+            page_offset = 0xb000_0000 # VMSPLIT_3G_OPT
         elif 0x8000_0000 - 0x0100_0000 <= kern_min:
-            self.cached_PAGE_OFFSET = 0x8000_0000 # VMSPLIT_2G
+            page_offset = 0x8000_0000 # VMSPLIT_2G
         elif 0x4000_0000 - 0x0100_0000 <= kern_min:
-            self.cached_PAGE_OFFSET = 0x4000_0000 # VMSPLIT_1G
-        return self.cached_PAGE_OFFSET
+            page_offset = 0x4000_0000 # VMSPLIT_1G
+        else:
+            # Do not cache an unresolved PAGE_OFFSET; the current maps may be incomplete.
+            return None
+        self.cached_PAGE_OFFSET = page_offset
+        return page_offset
 
     @property
     def CONFIG_HIGHMEM(self):
-        addr = Symbol.get_ksymaddr("nr_free_highpages")
+        # v5.11~ renamed it to __nr_free_highpages
+        addr = Ksym.get_addr("nr_free_highpages") or Ksym.get_addr("__nr_free_highpages")
         return bool(addr)
 
     @property
@@ -1237,6 +1291,13 @@ class KernelConstsArm32(KernelConstsBase):
         return self.CONFIG_PAGE_OFFSET
 
     @property
+    def TASK_SIZE(self):
+        # the modules are placed between TASK_SIZE and PAGE_OFFSET
+        if self.PAGE_OFFSET is None:
+            return None
+        return self.PAGE_OFFSET - self.SZ_16M
+
+    @property
     def PAGE_OFFSET_END(self):
         return self.high_memory
 
@@ -1245,36 +1306,25 @@ class KernelConstsArm32(KernelConstsBase):
         if hasattr(self, "cached_high_memory"):
             return self.cached_high_memory
 
-        res = PageMap.get_page_maps_by_pagewalk("pagewalk --quiet --no-pager --disable-color")
-        res = sorted(set(res.splitlines()))
-        res = list(filter(lambda line: line.endswith("]"), res))
-        res = list(filter(lambda line: "[+]" not in line, res))
-        res = list(filter(lambda line: "*" not in line, res))
+        page_offset = self.PAGE_OFFSET
+        if page_offset is None:
+            return None
 
-        maps = []
-        for line in res:
-            line = line.split()
-            vaddr_start = int(line[0].split("-")[0], 16)
-            if vaddr_start < self.PAGE_OFFSET:
-                continue
-            dic = {
-                "vaddr_start": vaddr_start,
-                "vaddr_end": int(line[0].split("-")[1], 16),
-                "paddr_start": int(line[1].split("-")[0], 16),
-                "paddr_end": int(line[1].split("-")[1], 16),
-            }
-            Maps = collections.namedtuple("Maps", dic.keys())
-            maps.append(Maps(*dic.values()))
+        maps = AddrMap.get_maps(command="pagewalk --quiet --no-pager --disable-color")
+        maps = [entry for entry in maps if entry.vstart >= page_offset and entry.pstart is not None]
+
+        if maps == []: # `pagewalk` failed, or stopped in user mode
+            return None
 
         physmap = maps[0]
-        for m in maps[1:]:
-            if physmap.vaddr_end != m.vaddr_start:
+        for entry in maps[1:]:
+            if physmap.vend != entry.vstart:
                 break
-            if physmap.paddr_end != m.paddr_start:
+            if physmap.pend != entry.pstart:
                 break
-            physmap = m
+            physmap = entry
 
-        self.cached_high_memory = physmap.vaddr_end
+        self.cached_high_memory = physmap.vend
         return self.cached_high_memory
 
     @property
@@ -1308,6 +1358,8 @@ class KernelConstsArm32(KernelConstsBase):
 
     @property
     def VMALLOC_START(self):
+        if self.high_memory is None:
+            return None
         return (self.high_memory + self.VMALLOC_OFFSET) & ~(self.VMALLOC_OFFSET - 1)
 
     @property
@@ -1368,35 +1420,19 @@ class KernelConstsArm32(KernelConstsBase):
             return self.cached_PHYS_OFFSET
 
         # When p2v and v2p are available, memstart_addr can be resolved without relying on symbols.
-        if self.PAGE_OFFSET is None:
+        phys_offset = self.resolve_phys_offset_from_maps()
+        if phys_offset is None:
             return None
-        kinfo = Kernel.get_kernel_layout()
-        if kinfo is None:
-            return None
-        phys_kbase = Kernel.v2p(kinfo.text_base)
-        if phys_kbase is None:
-            return None
-        cands = Kernel.p2v(phys_kbase)
-        linear_cands = [x for x in cands if self.PAGE_OFFSET <= x < self.PAGE_OFFSET_END]
-        if len(linear_cands) != 1:
-            return None
-        linear_kbase = linear_cands[0]
-        self.cached_PHYS_OFFSET = AddressUtil.normalize_address(phys_kbase - (linear_kbase - self.PAGE_OFFSET))
+        self.cached_PHYS_OFFSET = phys_offset
         return self.cached_PHYS_OFFSET
 
-    @property
+    @functools.cached_property
     def mem_map(self):
-        if hasattr(self, "cached_mem_map"):
-            return self.cached_mem_map
-        self.cached_mem_map = KernelAddressHeuristicFinder.get_mem_map()
-        return self.cached_mem_map
+        return KernelAddressHeuristicFinder.get_mem_map()
 
-    @property
+    @functools.cached_property
     def mem_section(self):
-        if hasattr(self, "cached_mem_section"):
-            return self.cached_mem_section
-        self.cached_mem_section = KernelAddressHeuristicFinder.get_mem_section()
-        return self.cached_mem_section
+        return KernelAddressHeuristicFinder.get_mem_section()
 
     @property
     def CONFIG_FLATMEM(self):
@@ -1477,12 +1513,14 @@ class KernelConstsArm32(KernelConstsBase):
 
     @property
     def PHYS_PFN_OFFSET(self):
+        if self.PHYS_OFFSET is None:
+            return None
         return self.PHYS_OFFSET >> self.PAGE_SHIFT
 
     @property
     def CONFIG_PAGE_EXTENSION(self):
         if "3.19" <= self.kversion:
-            addr = Symbol.get_ksymaddr("page_ext_init")
+            addr = Ksym.get_addr("page_ext_init")
             return bool(addr)
         return None
 
@@ -1550,12 +1588,6 @@ class KernelConstsArm32(KernelConstsBase):
         self.cached_sizeof_struct_page = size
         return size
 
-    @property
-    def TASK_SIZE(self):
-        # the modules are placed between TASK_SIZE and PAGE_OFFSET
-        if self.PAGE_OFFSET is None:
-            return None
-        return self.PAGE_OFFSET - self.SZ_16M
 
 
 class KernelConstsArm64(KernelConstsBase):
@@ -1567,11 +1599,11 @@ class KernelConstsArm64(KernelConstsBase):
         assert "3.7" <= self.kversion # arm64 support start version
         return
 
-    @Cache.cache_until_next
+    @Cache.cache_until_next(per_cpu=True)
     def TCR_EL1(self):
         return get_register("$TCR_EL1", use_mbed_exec=True)
 
-    @Cache.cache_until_next
+    @Cache.cache_this_session(per_cpu=True, per_inferior=True)
     def ID_AA64MMFR2_EL1(self):
         return get_register("$ID_AA64MMFR2_EL1", use_mbed_exec=True)
 
@@ -1606,8 +1638,7 @@ class KernelConstsArm64(KernelConstsBase):
     def CONFIG_KASAN(self):
         if self.kasan is not None:
             return bool(self.kasan)
-        res = gdb.execute("ksymaddr-remote --quiet kasan_", to_string=True)
-        self.kasan = bool(res)
+        self.kasan = bool(Ksym.get_addrs("kasan_", match="in"))
         return self.kasan
 
     @property
@@ -1631,10 +1662,12 @@ class KernelConstsArm64(KernelConstsBase):
     @property
     def CONFIG_ARM64_VA_BITS(self):
         tcr = self.TCR_EL1()
+        if tcr is None:
+            return None
         T1SZ = (tcr >> 16) & 0b111111
         region_end = 2 ** 64
         region_start = region_end - (2 ** (64 - T1SZ))
-        region_bits = GefUtil.log2(region_end - region_start)
+        region_bits = int(math.log2(region_end - region_start))
         if self.FEAT_LVA:
             return min(52, region_bits)
         return region_bits
@@ -1811,8 +1844,10 @@ class KernelConstsArm64(KernelConstsBase):
             else:
                 return self.VA_BITS_MIN
         elif "6.9" <= self.kversion:
-            if self.VA_BITS > 48:
+            if self.VA_BITS and self.VA_BITS > 48:
                 tcr = self.TCR_EL1()
+                if tcr is None:
+                    return None
                 return (64 - ((tcr >> 16) & 63))
             else:
                 return self.VA_BITS
@@ -1858,7 +1893,38 @@ class KernelConstsArm64(KernelConstsBase):
 
     @property
     def sizeof_struct_page(self):
-        return 0x40
+        if hasattr(self, "cached_sizeof_struct_page"):
+            return self.cached_sizeof_struct_page
+        size = GefUtil.sizeof("page")
+        if size:
+            self.cached_sizeof_struct_page = size
+            return size
+        layout = KernelAddressHeuristicFinder.get_arm64_sparsemem()
+        if layout:
+            self.cached_sizeof_struct_page = layout["sizeof_struct_page"]
+            return self.cached_sizeof_struct_page
+        if Kernel.get_slab_type() not in ("SLAB", "SLOB"):
+            return 0x40
+        pair = Kernel.get_page_virt_pair()
+        if not pair or self.PAGE_OFFSET is None:
+            return 0x40
+        page, virt = pair
+        index = (virt - self.PAGE_OFFSET) >> self.PAGE_SHIFT
+        candidates = []
+        try:
+            for size in range(32, 257, runtime.current_arch.ptrsize):
+                # VMEMMAP reservation itself depends on the page size (or its rounded power of two).
+                self.cached_sizeof_struct_page = size
+                base = self.VMEMMAP_START
+                if base is not None and index > 0 and page == base + index * size:
+                    candidates.append(size)
+        finally:
+            del self.cached_sizeof_struct_page
+        if len(candidates) == 1:
+            self.cached_sizeof_struct_page = candidates[0]
+        else:
+            self.cached_sizeof_struct_page = 0x40
+        return self.cached_sizeof_struct_page
 
     @property
     def STRUCT_PAGE_MAX_SHIFT(self):
@@ -1956,7 +2022,7 @@ class KernelConstsArm64(KernelConstsBase):
             return self.PAGE_OFFSET + 2 ** (self.VA_BITS - 1) # no need to align
         return None
 
-    @property # noqa
+    @property # noqa: V106
     def KIMAGE_VADDR(self):
         if "4.6" <= self.kversion:
             return self.MODULES_END
@@ -2065,7 +2131,7 @@ class KernelConstsArm64(KernelConstsBase):
             return self.PCI_IO_START + self.PCI_IO_SIZE
         return None
 
-    @property # noqa
+    @property
     def FIXADDR_TOP(self):
         if "3.15" <= self.kversion < "4.0":
             return self.MODULES_VADDR - self.SZ_2M - self.PAGE_SIZE
@@ -2137,7 +2203,7 @@ class KernelConstsArm64(KernelConstsBase):
             return None
         return self.FIXADDR_TOP - self.FIXADDR_SIZE
 
-    @property # noqa
+    @property # noqa: V106
     def EARLYCON_IOBASE(self):
         if "3.7" <= self.kversion < "3.15":
             return self.MODULES_VADDR - self.SZ_4M
@@ -2208,7 +2274,7 @@ class KernelConstsArm64(KernelConstsBase):
             return self.cached_physmap_base
 
         if self.PAGE_OFFSET is None:
-            self.cached_physmap_base = None
+            # None does not cache, because PAGE_OFFSET may be resolved later
             return None
 
         # physmap_base is used in KGDB mode when pseudo reading physical addresses without page walking.
@@ -2218,18 +2284,19 @@ class KernelConstsArm64(KernelConstsBase):
 
         # Prevent recursion:
         #   read_physmem -> kgdb_use_physmap -> get_ksymaddr -> pagewalk -> read_physmem -> ...
-        if not runtime.CommandRegistry.instances["ksymaddr-remote"].kallsyms:
+        if Ksym.peek() is None:
             # None does not cache, because kallsyms may be resolved later
             return None
 
-        memstart_addr = Symbol.get_ksymaddr("memstart_addr")
+        memstart_addr = Ksym.get_addr("memstart_addr")
         if memstart_addr is None:
-            self.cached_physmap_base = None
+            # None does not cache, because the symbol may be resolved later
             return None
 
         PHYS_OFFSET = read_int_from_memory(memstart_addr)
         if "6.12" <= self.kversion:
             PHYS_OFFSET &= self.PHYS_MASK
+        self.cached_memstart_addr = PHYS_OFFSET
         self.cached_physmap_base = AddressUtil.normalize_address(self.PAGE_OFFSET - PHYS_OFFSET)
         return self.cached_physmap_base
 
@@ -2238,27 +2305,21 @@ class KernelConstsArm64(KernelConstsBase):
         if hasattr(self, "cached_memstart_addr"):
             return self.cached_memstart_addr
 
+        if is_kgdb():
+            if self.physmap_base is None:
+                return None
+            return self.cached_memstart_addr
+
         # When p2v and v2p are available, memstart_addr can be resolved without relying on symbols.
-        if self.PAGE_OFFSET is None:
+        phys_offset = self.resolve_phys_offset_from_maps()
+        if phys_offset is None:
             return None
-        kinfo = Kernel.get_kernel_layout()
-        if kinfo is None:
-            return None
-        phys_kbase = Kernel.v2p(kinfo.text_base)
-        if phys_kbase is None:
-            return None
-        cands = Kernel.p2v(phys_kbase)
-        linear_cands = [x for x in cands if self.PAGE_OFFSET <= x < self.PAGE_OFFSET_END]
-        if len(linear_cands) != 1:
-            return None
-        linear_kbase = linear_cands[0]
-        self.cached_memstart_addr = AddressUtil.normalize_address(phys_kbase - (linear_kbase - self.PAGE_OFFSET))
+        self.cached_memstart_addr = phys_offset
         return self.cached_memstart_addr
 
     @property
     def PHYS_OFFSET(self):
         return self.memstart_addr
-
 
 
 

@@ -281,9 +281,10 @@ class Hash:
             return bytes(out)
 
         def state_bytes(self, nbytes):
+            from gef.core.utils import align
             # Serialize the first nbytes of the state (little-endian lanes)
             out = bytearray()
-            lanes = (nbytes + 7) // 8
+            lanes = align(nbytes, 8) // 8
             for i in range(lanes):
                 out.extend(struct.pack("<Q", self.state[i] & 0xffff_ffff_ffff_ffff))
             return bytes(out[:nbytes])
@@ -453,6 +454,7 @@ class Hash:
             return bytes(out[:out_len])
 
         def state_bytes(self, nbytes):
+            from gef.core.utils import align
             lane_count = self.rate_bytes // 8
             packed = self.lane_pack.pack(*[
                 self.state[i] & 0xffff_ffff_ffff_ffff
@@ -536,7 +538,7 @@ class Hash:
             self.block_size = self.chunk_size
             self.buf = bytearray()
             self.msg_len = 0  # in bytes
-            self.custom = custom
+            self.custom = bytes(custom)
             if data:
                 self.update(data)
             return
@@ -640,6 +642,7 @@ class Hash:
             return bytes(out[:out_len])
 
         def state_bytes(self, a, nbytes):
+            from gef.core.utils import align
             out = bytearray()
             lanes = (nbytes + 7) // 8
             for i in range(lanes):
@@ -849,9 +852,8 @@ class Hash:
             data = bytes(data)
             msg = bytearray(data)
             msg.append(suffix)
-            while (len(msg) % rate) != (rate - 1):
-                msg.append(0)
-            msg.append(0x80)
+            msg.extend(b"\x00" * (-len(msg) % rate))
+            msg[-1] ^= 0x80
 
             s = [0] * 25
             rate_words = rate // 8
@@ -916,11 +918,11 @@ class Hash:
 
     class KMAC128(KMACBase):
         block_size = 168  # rate for cshake_128/kmac_128
-        digest_size = 32  # 256 bits
+        digest_bits = 256
 
     class KMAC256(KMACBase):
         block_size = 136  # rate for cshake_256/kmac_256
-        digest_size = 64  # 512 bits
+        digest_bits = 512
 
     class TupleHashBase:
         rho = (
@@ -943,7 +945,11 @@ class Hash:
                 raise TypeError("custom must be bytes-like")
 
             self.suffix = 0x04  # cSHAKE domain separation suffix
-            self.output_bits = digest_bits
+            if digest_bits is not None:
+                self.output_bits = digest_bits
+            else:
+                self.output_bits = self.digest_size * 8
+            self.element_remaining = 0
 
             if digest_bits is not None:
                 self.digest_size = digest_bits // 8
@@ -964,7 +970,8 @@ class Hash:
             return
 
         def copy(self):
-            other = self.__class__(b"", self.custom)
+            other = self.__class__(b"", self.custom, self.output_bits)
+            other.element_remaining = self.element_remaining
             other.rate = self.rate
             other.suffix = self.suffix
             other.output_bits = self.output_bits
@@ -981,10 +988,29 @@ class Hash:
             data = bytes(data)
 
             # TupleHash input is a tuple of strings: update(data) == append one element
-            self.absorb(self.encode_string(data))
+            self.begin_element(len(data))
+            self.update_element(data)
+            return self
+
+        def begin_element(self, size):
+            if self.finalized or self.element_remaining:
+                raise ValueError("cannot start an element in the current state")
+            if size < 0:
+                raise ValueError("element size must be non-negative")
+            self.absorb(self.left_encode(size * 8))
+            self.element_remaining = size
+            return self
+
+        def update_element(self, data):
+            if self.finalized or len(data) > self.element_remaining:
+                raise ValueError("invalid element data length")
+            self.absorb(data)
+            self.element_remaining -= len(data)
             return self
 
         def digest(self):
+            if self.element_remaining:
+                raise ValueError("incomplete element")
             c = self.copy()
             c.finalize()
             out = c.squeeze(self.digest_size)
@@ -1759,11 +1785,11 @@ class Hash:
             if not isinstance(data, (bytes, bytearray, memoryview)):
                 raise TypeError("data must be bytes-like")
             self.count += len(data)
-            self.buf += data
-            while len(self.buf) >= 64:
-                block = self.buf[:64]
-                self.buf = self.buf[64:]
-                self.process_block(block)
+            data = self.buf + bytes(data)
+            end = len(data) - len(data) % self.block_size
+            for off in range(0, end, self.block_size):
+                self.process_block(data[off:off + self.block_size])
+            self.buf = data[end:]
             return self
 
         def rho(self, a, n, c):
@@ -2239,7 +2265,7 @@ class Hash:
                     raise ValueError("r must be non-negative")
                 self.r = int(r)
 
-            self.buffer = b""
+            self.buffer = bytearray()
             self.w = 64
             self.n = 89
             self.c = 16
@@ -2263,7 +2289,7 @@ class Hash:
         def update(self, data):
             if not isinstance(data, (bytes, bytearray, memoryview)):
                 raise TypeError("data must be bytes-like")
-            self.buffer += bytes(data)
+            self.buffer.extend(bytes(data))
             return self
 
         def digest(self):
@@ -2365,14 +2391,20 @@ class Hash:
 
             K_words = self.make_key_words()
             keylen = len(self.key)
-            z_all = 1 if j == 1 else 0
+            if j == 1:
+                z_all = 1
+            else:
+                z_all = 0
 
             out_chunks = []
             for i in range(j):
                 Bi = Mp[i * block_bytes:(i + 1) * block_bytes]
                 B_words = self.bytes_to_words_be(Bi, 64)
 
-                p = pad_bits if (i == j - 1) else 0
+                if i == j - 1:
+                    p = pad_bits
+                else:
+                    p = 0
                 V = self.pack_control(self.r, self.L, z_all, p, keylen, self.digest_bits)
                 U = self.pack_node_id(ell, i)
 
@@ -2405,8 +2437,14 @@ class Hash:
                 Bi = Mp[i * block_bytes:(i + 1) * block_bytes]
                 Bi_words = self.bytes_to_words_be(Bi, block_words)
 
-                z = 1 if (i == j - 1) else 0
-                p = pad_bits if (i == j - 1) else 0
+                if i == j - 1:
+                    z = 1
+                else:
+                    z = 0
+                if i == j - 1:
+                    p = pad_bits
+                else:
+                    p = 0
 
                 V = self.pack_control(self.r, self.L, z, p, keylen, self.digest_bits)
                 U = self.pack_node_id(ell, i)
@@ -2455,7 +2493,7 @@ class Hash:
                 if len(M_ell) == self.c * 8:
                     return self.last_bits(M_ell, self.digest_bits)
                 M_ell_minus_1 = M_ell
-            raise
+            raise AssertionError("MD6Base.hash: unreachable")
 
     class MD6_128(MD6Base):
         digest_bits = 128
@@ -2500,7 +2538,10 @@ class Hash:
                 C_prev = [0] * self.c
                 for i in range(n_blocks):
                     block = M[i * block_bytes:(i + 1) * block_bytes]
-                    p = block_bytes * 8 - len(block) * 8 if i == n_blocks - 1 else 0
+                    if i == n_blocks - 1:
+                        p = block_bytes * 8 - len(block) * 8
+                    else:
+                        p = 0
                     B_words = C_prev + self.bytes_to_words_be(block + b"\x00" * (block_bytes - len(block)), block_words)
                     C_prev = C(B_words, self.L + 1, i, 1 if i == n_blocks - 1 else 0, p)
                 return self.first_bits(self.words_to_bytes_be(C_prev), self.digest_bits)
@@ -2510,7 +2551,10 @@ class Hash:
             chunks = []
             for i in range(n_blocks):
                 block = M[i * block_bytes:(i + 1) * block_bytes]
-                p = block_bytes * 8 - len(block) * 8 if i == n_blocks - 1 else 0
+                if i == n_blocks - 1:
+                    p = block_bytes * 8 - len(block) * 8
+                else:
+                    p = 0
                 B_words = self.bytes_to_words_be(block + b"\x00" * (block_bytes - len(block)), 64)
                 chunks.append(C(B_words, 1, i, 1 if n_blocks == 1 else 0, p))
 
@@ -2635,11 +2679,11 @@ class Hash:
             if not data:
                 return self
             self.total += len(data)
-            self.buf += bytes(data)
-            while len(self.buf) >= 64:
-                block = self.buf[:64]
-                self.buf = self.buf[64:]
-                self.transform(block)
+            data = self.buf + bytes(data)
+            end = len(data) - len(data) % self.block_size
+            for off in range(0, end, self.block_size):
+                self.transform(data[off:off + self.block_size])
+            self.buf = data[end:]
             return self
 
         def pad(self):
@@ -3025,11 +3069,17 @@ class Hash:
             if len(final_data) % self.block_size != 0:
                 raise ValueError("internal padding error")
 
-            first_counter = msg_bits if (self.total % self.block_size) != 0 else 0
+            if (self.total % self.block_size) != 0:
+                first_counter = msg_bits
+            else:
+                first_counter = 0
 
             for off in range(0, len(final_data), self.block_size):
                 block = final_data[off:off + self.block_size]
-                counter_bits = first_counter if off == 0 else 0
+                if off == 0:
+                    counter_bits = first_counter
+                else:
+                    counter_bits = 0
                 self.compress(block, counter_bits)
             return
 
@@ -3175,7 +3225,10 @@ class Hash:
             other.msg_len = self.msg_len
             other.block_index = self.block_index
             other.finalized = self.finalized
-            other.final_digest = None if self.final_digest is None else bytes(self.final_digest)
+            if self.final_digest is None:
+                other.final_digest = None
+            else:
+                other.final_digest = bytes(self.final_digest)
             return other
 
         def update(self, data):
@@ -3306,7 +3359,10 @@ class Hash:
             other.msg_len = self.msg_len
             other.block_index = self.block_index
             other.finalized = self.finalized
-            other.final_digest = None if self.final_digest is None else bytes(self.final_digest)
+            if self.final_digest is None:
+                other.final_digest = None
+            else:
+                other.final_digest = bytes(self.final_digest)
             other.leaves = [h.copy() for h in self.leaves]
             return other
 
@@ -3523,7 +3579,10 @@ class Hash:
                 # This must always make progress (take > 0).
                 chunk_pos = self.chunk_state_len()
                 want = self.chunk_len - chunk_pos
-                take = want if want < (n - off) else (n - off)
+                if want < (n - off):
+                    take = want
+                else:
+                    take = n - off
                 if take <= 0:
                     raise RuntimeError("internal error: take <= 0")
 
@@ -3862,7 +3921,10 @@ class Hash:
 
             P = [0] * 256
             for i in range(256):
-                swapped_i = i ^ 1 if (i & 2) else i
+                if i & 2:
+                    swapped_i = i ^ 1
+                else:
+                    swapped_i = i
                 if swapped_i % 2 == 0:
                     k = swapped_i // 2
                     final_idx = k
@@ -4250,7 +4312,10 @@ class Hash:
 
         def shift_bytes(self, state, which):
             cols = self.block_size // 8
-            sigma = self.sigma_p if which == "P" else self.sigma_q
+            if which == "P":
+                sigma = self.sigma_p
+            else:
+                sigma = self.sigma_q
             for r in range(8):
                 sh = sigma[r] % cols
                 if sh:
@@ -4769,7 +4834,7 @@ class Hash:
 
         def __init__(self, seed=0):
             self.seed = seed & 0xffff_ffff_ffff_ffff
-            self.buf = b""
+            self.buf = bytearray()
             return
 
         def update(self, data):
@@ -4777,8 +4842,7 @@ class Hash:
                 return self
             if not isinstance(data, (bytes, bytearray, memoryview)):
                 raise TypeError("data must be bytes-like")
-            b = bytes(data)
-            self.buf += b
+            self.buf.extend(bytes(data))
             return self
 
         def hexdigest(self):
@@ -6706,7 +6770,10 @@ class Hash:
             other.h = list(self.h)
             other.buf = bytearray(self.buf)
             other.done = self.done
-            other.out = None if self.out is None else list(self.out)
+            if self.out is None:
+                other.out = None
+            else:
+                other.out = list(self.out)
             return other
 
         def update(self, data):
@@ -6868,14 +6935,14 @@ class Hash:
         def __init__(self, data=b"", seed=0):
             if not isinstance(data, (bytes, bytearray, memoryview)):
                 raise TypeError("data must be bytes-like")
-            self.data = data
+            self.data = bytes(data)
             self.seed = seed
             return
 
         def update(self, data):
             if not isinstance(data, (bytes, bytearray, memoryview)):
                 raise TypeError("data must be bytes-like")
-            self.data += data
+            self.data += bytes(data)
             return
 
         def ror32(self, x, r):
@@ -6946,17 +7013,12 @@ class Hash:
             return h & 0xffff_ffff
 
         def cityhash32_len0to4(self, data, seed):
-
-            def signed_byte(b):
-                if b >= 128:
-                    return b - 256
-                return b
-
+            from gef.core.utils import u2i
             b = seed & 0xffff_ffff
             c = 9
             n = len(data)
             for i in range(n):
-                v = signed_byte(data[i]) & 0xffff_ffff
+                v = u2i(data[i], 8) & 0xffff_ffff
                 b = (b * self.c1 + v) & 0xffff_ffff
                 c ^= b
             return self.cityhash32_fmix(
@@ -8497,7 +8559,10 @@ class Hash:
             other.v1 = list(self.v1)
             other.buf = bytearray(self.buf)
             other.finalized = self.finalized
-            other.result_words = None if self.result_words is None else list(self.result_words)
+            if self.result_words is None:
+                other.result_words = None
+            else:
+                other.result_words = list(self.result_words)
             return other
 
         def update(self, data):
@@ -9091,7 +9156,10 @@ class Hash:
                 self.sum[i] = (self.sum[i] & 0x00ff_ffff) + (block[i] & 0x00ff_ffff) + carry
                 hb = hb + ((block[i] >> 24) & 0xff) + ((self.sum[i] >> 24) & 0xff)
                 self.sum[i] = (self.sum[i] & 0x00ff_ffff) | ((hb & 0xff) << 24)
-                carry = 1 if (hb & 0x100) != 0 else 0
+                if (hb & 0x100) != 0:
+                    carry = 1
+                else:
+                    carry = 0
                 self.sum[i] &= 0xffff_ffff
             self.block_compress(block)
             return
@@ -11218,6 +11286,7 @@ class Hash:
             if not isinstance(data, (bytes, bytearray, memoryview)):
                 raise TypeError("data must be bytes-like")
             self.hash = 0xaaaa_aaaa
+            self.length = 0
             if data:
                 self.update(data)
             return
@@ -11225,12 +11294,13 @@ class Hash:
         def update(self, data):
             if not isinstance(data, (bytes, bytearray, memoryview)):
                 raise TypeError("data must be bytes-like")
-            for i, c in enumerate(bytes(data)):
+            for i, c in enumerate(bytes(data), self.length):
                 if (i & 1) == 0:
                     self.hash ^= (self.hash << 7) ^ (c * (self.hash >> 3))
                 else:
                     self.hash ^= ~((self.hash << 11) + (c ^ (self.hash >> 5)))
                 self.hash &= 0xffff_ffff
+            self.length += len(data)
             return self
 
         def digest(self):
@@ -12467,7 +12537,10 @@ class Hash:
             t0, t1, t2, t3 = [], [], [], []
             for i in range(256):
                 s = cls.sbox[i]
-                s2 = ((s << 1) ^ 0x1b) & 0xff if (s & 0x80) else (s << 1)
+                if s & 0x80:
+                    s2 = ((s << 1) ^ 0x1b) & 0xff
+                else:
+                    s2 = s << 1
                 s3 = s2 ^ s
                 t0.append((s2, s, s, s3))
                 t1.append((s3, s2, s, s))
@@ -12561,7 +12634,10 @@ class Hash:
             if len(self.buf) != block_bytes:
                 raise AssertionError("final block size mismatch")
 
-            Ci = total if (not processed_extra and L != self.total_bits) else 0
+            if not processed_extra and L != self.total_bits:
+                Ci = total
+            else:
+                Ci = 0
             self.compress(bytes(self.buf), Ci)
 
             self.buf = bytearray()
@@ -12578,7 +12654,10 @@ class Hash:
             for i in range(self.msg_words):
                 w[self.cv_words + i] = m_words[i][:]
 
-            counter = (Ci & 0xffff_ffff_ffff_ffff) if Ci else 0
+            if Ci:
+                counter = Ci & 0xffff_ffff_ffff_ffff
+            else:
+                counter = 0
 
             for _ in range(self.rounds):
                 counter = self.sub_words(w, counter)
@@ -12674,7 +12753,9 @@ class Hash:
         def mix_columns_words(self, w):
 
             def xtime8(x):
-                return ((x << 1) ^ 0x1b) & 0xff if (x & 0x80) else (x << 1)
+                if x & 0x80:
+                    return ((x << 1) ^ 0x1b) & 0xff
+                return x << 1
 
             def mix_column4(a0, a1, a2, a3):
                 t = (a0 ^ a1 ^ a2 ^ a3) & 0xff
@@ -12817,7 +12898,10 @@ class Hash:
                 if guard:
                     x = x // self.pow10(guard)
 
-                s = str(int(x)) if self.gmpy2 is not None else str(x)
+                if self.gmpy2 is not None:
+                    s = str(int(x))
+                else:
+                    s = str(x)
                 need = n_digits + 1
                 if len(s) < need:
                     s = ("0" * (need - len(s))) + s
@@ -13510,7 +13594,10 @@ class Hash:
             if not isinstance(data, (bytes, bytearray, memoryview)):
                 raise TypeError("data must be bytes-like")
 
-            mv = data if isinstance(data, memoryview) else memoryview(data)
+            if isinstance(data, memoryview):
+                mv = data
+            else:
+                mv = memoryview(data)
             blocksize = self.block_size
             total = len(mv)
             offset = 0
@@ -14009,10 +14096,8 @@ class Hash:
             return x
 
         def signed_char(self, x):
-            x &= 0xff
-            if x & 0x80:
-                return x - 0x100
-            return x
+            from gef.core.utils import u2i
+            return u2i(x, 8)
 
         def update(self, data):
             if not isinstance(data, (bytes, bytearray, memoryview)):
@@ -14544,7 +14629,10 @@ class Hash:
                 for i in range(4):
                     for j in range(4):
                         coeff = M[j][i]
-                        add = d[i] if coeff == 1 else gf_mul(d[i], coeff)
+                        if coeff == 1:
+                            add = d[i]
+                        else:
+                            add = gf_mul(d[i], coeff)
                         W[i][j] = (V[i][j] ^ add) & 0xff
                 for i in range(4):
                     n = i & 3
@@ -14558,7 +14646,10 @@ class Hash:
 
             sbox = [0] * 256
             for x in range(256):
-                inv = 0 if x == 0 else gf_pow(x, 254)
+                if x == 0:
+                    inv = 0
+                else:
+                    inv = gf_pow(x, 254)
                 y = inv & 0xff
                 sb = (y ^ rol8(y, 1) ^ rol8(y, 2) ^ rol8(y, 3) ^ rol8(y, 4) ^ 0x63)
                 sbox[x] = sb & 0xff
@@ -16050,7 +16141,10 @@ class Hash:
                 for i, v in enumerate(self.h):
                     hbuf[i] = v
                 blk = self.cffi.ffi.new("uint8_t[]", bytes(block))
-                alpha = self.cffi.alpha_f if final_round else self.cffi.alpha_n
+                if final_round:
+                    alpha = self.cffi.alpha_f
+                else:
+                    alpha = self.cffi.alpha_n
                 self.cffi.lib.compress_small(hbuf, blk, int(final_round), alpha, self.cffi.tables)
                 for i in range(len(self.h)):
                     self.h[i] = hbuf[i]
@@ -16067,8 +16161,14 @@ class Hash:
             s8, s9, s10, s11 = m[4], m[5], h[4], h[5]
             s12, s13, s14, s15 = h[6], h[7], m[6], m[7]
 
-            alpha = self.alpha_f if final_round else self.alpha_n
-            rounds = 6 if final_round else 3
+            if final_round:
+                alpha = self.alpha_f
+            else:
+                alpha = self.alpha_n
+            if final_round:
+                rounds = 6
+            else:
+                rounds = 3
 
             for rc in range(rounds):
                 s0 ^= alpha[0x00]
@@ -16114,7 +16214,10 @@ class Hash:
                 for i, v in enumerate(self.h):
                     hbuf[i] = v
                 blk = self.cffi.ffi.new("uint8_t[]", bytes(block))
-                alpha = self.cffi.alpha_f if final_round else self.cffi.alpha_n
+                if final_round:
+                    alpha = self.cffi.alpha_f
+                else:
+                    alpha = self.cffi.alpha_n
                 self.cffi.lib.compress_big(hbuf, blk, int(final_round), alpha, self.cffi.tables)
                 for i in range(len(self.h)):
                     self.h[i] = hbuf[i]
@@ -16136,8 +16239,14 @@ class Hash:
             s18, s19, s1a, s1b = h[12], h[13], m[12], m[13]
             s1c, s1d, s1e, s1f = h[14], h[15], m[14], m[15]
 
-            alpha = self.alpha_f if final_round else self.alpha_n
-            rounds = 12 if final_round else 6
+            if final_round:
+                alpha = self.alpha_f
+            else:
+                alpha = self.alpha_n
+            if final_round:
+                rounds = 12
+            else:
+                rounds = 6
 
             for rc in range(rounds):
                 s00 ^= alpha[0x00]
@@ -19060,7 +19169,10 @@ class Hash:
         def process_data(self, data, off, length):
             if self.squeezing:
                 raise ValueError("attempt to absorb while squeezing")
-            sponge = self.tree if self.curr_node == 0 else self.leaf
+            if self.curr_node == 0:
+                sponge = self.tree
+            else:
+                sponge = self.leaf
             space = self.node_block_size - self.processed
             if space >= length:
                 sponge.absorb(data, off, length)
@@ -19839,14 +19951,20 @@ class Hash:
                 state[0:mlen] = msg
                 if mlen < 16:
                     state[mlen] ^= 0x01
-                c0 = 0x01 if mlen < 16 else 0x02
+                if mlen < 16:
+                    c0 = 0x01
+                else:
+                    c0 = 0x02
                 state[31] ^= (c0 << 5)
                 out = gen_tag(state)
                 return out
 
             state[0:16] = msg[0:16]
             rem = msg[16:]
-            c0 = 0x01 if (len(rem) % 4) == 0 else 0x02
+            if (len(rem) % 4) == 0:
+                c0 = 0x01
+            else:
+                c0 = 0x02
             absorb4(state, rem, c0)
             out = gen_tag(state)
             return out
@@ -21219,9 +21337,18 @@ class Hash:
 
             if self.USE_CFFI and out_bits <= 0xffff_ffff_ffff_ffff:
                 out_len = (out_bits + 7) // 8
-                data_buf = self.cffi.ffi.NULL if len(data) == 0 else self.cffi.ffi.new("uint8_t[]", data)
-                function_name_buf = self.cffi.ffi.NULL if len(function_name) == 0 else self.cffi.ffi.new("uint8_t[]", function_name)
-                customization_buf = self.cffi.ffi.NULL if len(customization) == 0 else self.cffi.ffi.new("uint8_t[]", customization)
+                if len(data) == 0:
+                    data_buf = self.cffi.ffi.NULL
+                else:
+                    data_buf = self.cffi.ffi.new("uint8_t[]", data)
+                if len(function_name) == 0:
+                    function_name_buf = self.cffi.ffi.NULL
+                else:
+                    function_name_buf = self.cffi.ffi.new("uint8_t[]", function_name)
+                if len(customization) == 0:
+                    customization_buf = self.cffi.ffi.NULL
+                else:
+                    customization_buf = self.cffi.ffi.new("uint8_t[]", customization)
                 out_buf = self.cffi.ffi.new("uint8_t[]", max(out_len, 1))
                 rc = self.cffi.lib.cshake_run(
                     data_buf, len(data), out_bits, function_name_buf,
@@ -21261,7 +21388,10 @@ class Hash:
 
             if self.USE_CFFI and out_bits <= 0xffff_ffff_ffff_ffff:
                 out_len = (out_bits + 7) // 8
-                data_buf = self.cffi.ffi.NULL if len(data) == 0 else self.cffi.ffi.new("uint8_t[]", data)
+                if len(data) == 0:
+                    data_buf = self.cffi.ffi.NULL
+                else:
+                    data_buf = self.cffi.ffi.new("uint8_t[]", data)
                 out_buf = self.cffi.ffi.new("uint8_t[]", max(out_len, 1))
                 self.cffi.lib.keccak_xof_run(data_buf, len(data), out_bits, rate_bytes, domain_suffix, out_buf)
                 return bytes(self.cffi.ffi.buffer(out_buf, out_len))
@@ -25157,17 +25287,15 @@ class Hash:
                 curve_b = to_limbs(self.curve.b, nlimbs)
                 gx = to_limbs(self.curve.g[0], nlimbs)
                 gy = to_limbs(self.curve.g[1], nlimbs)
-                qx = ffi.new("uint64_t[]", nlimbs)
-                qy = ffi.new("uint64_t[]", nlimbs)
             except Exception:
                 self.USE_CFFI = False
                 return
 
             # add to cache
             cffi_obj = collections.namedtuple("CFFI",
-                "ffi lib nlimbs counter_limbs checksum_limbs curve_a curve_b gx gy qx qy")(
+                "ffi lib nlimbs counter_limbs checksum_limbs curve_a curve_b gx gy")(
                 ffi, lib, nlimbs, counter_limbs, checksum_limbs,
-                curve_a, curve_b, gx, gy, qx, qy,
+                curve_a, curve_b, gx, gy,
             )
             self.cffi = base_class.cffi_cache[key] = cffi_obj
             self.USE_CFFI = True
@@ -25184,6 +25312,8 @@ class Hash:
             self.curve = self.ECOHCurve(*self.curve_const)
             self.init_cffi_backend()
             if self.USE_CFFI:
+                self.cffi_qx = self.cffi.ffi.new("uint64_t[]", self.cffi.nlimbs)
+                self.cffi_qy = self.cffi.ffi.new("uint64_t[]", self.cffi.nlimbs)
                 self.cffi_qinf = self.cffi.ffi.new("int *", 1)
                 self.cffi_qinf[0] = 1
                 self.cffi_checksum = self.cffi.ffi.new("uint64_t[]", self.cffi.checksum_limbs)
@@ -25198,10 +25328,15 @@ class Hash:
             other.msg_len = self.msg_len
             other.checksum = self.checksum
             other.counter = self.counter
-            other.q = None if self.q is None else (self.q[0], self.q[1])
+            if self.q is None:
+                other.q = None
+            else:
+                other.q = (self.q[0], self.q[1])
             other.USE_CFFI = self.USE_CFFI
             if other.USE_CFFI:
                 other.cffi = self.cffi
+                other.cffi_qx = other.cffi.ffi.new("uint64_t[]", list(self.cffi_qx))
+                other.cffi_qy = other.cffi.ffi.new("uint64_t[]", list(self.cffi_qy))
                 other.cffi_qinf = other.cffi.ffi.new("int *", self.cffi_qinf[0])
                 other.cffi_checksum = other.cffi.ffi.new("uint64_t[]", list(self.cffi_checksum))
                 other.cffi_counter = other.cffi.ffi.new("uint64_t[]", list(self.cffi_counter))
@@ -25221,7 +25356,7 @@ class Hash:
                     del self.buf[:full_len]
                     block_buf = self.cffi.ffi.new("uint8_t[]", blocks)
                     self.cffi.lib.process_blocks_state(
-                        self.cffi.qx, self.cffi.qy, self.cffi_qinf, self.cffi_checksum, self.cffi_counter,
+                        self.cffi_qx, self.cffi_qy, self.cffi_qinf, self.cffi_checksum, self.cffi_counter,
                         block_buf, full_len // self.block_size, self.cffi.curve_a, self.cffi.curve_b,
                     )
                     self.counter += full_len // self.block_size
@@ -25265,7 +25400,7 @@ class Hash:
                 tail_bytes = bytes(self.buf)
                 tail = self.cffi.ffi.new("uint8_t[]", tail_bytes or b"\x00")
                 self.cffi.lib.finalize_hash_state(
-                    self.cffi.qx, self.cffi.qy, self.cffi_qinf, self.cffi_checksum, self.cffi_counter,
+                    self.cffi_qx, self.cffi_qy, self.cffi_qinf, self.cffi_checksum, self.cffi_counter,
                     tail, len(tail_bytes), msg_len_bits, self.cffi.curve_a, self.cffi.curve_b, self.cffi.gx, self.cffi.gy,
                 )
                 self.buf = bytearray()
@@ -25273,7 +25408,7 @@ class Hash:
                 if self.cffi_qinf[0]:
                     self.q = None
                 else:
-                    self.q = (limbs_to_int(self.cffi.qx, self.cffi.nlimbs), limbs_to_int(self.cffi.qy, self.cffi.nlimbs))
+                    self.q = (limbs_to_int(self.cffi_qx, self.cffi.nlimbs), limbs_to_int(self.cffi_qy, self.cffi.nlimbs))
                 return
 
             # --- pure Python ---
@@ -25652,8 +25787,8 @@ class Hash:
         word_mask = 0xffff_ffff
         q_const_a = 0xaaaa_aaaa
         q_const_b = 0x5555_5555
-        rot1 = (4, 8, 13, 17, 22, 24, 29)
-        rot2 = (5, 9, 11, 15, 20, 25, 27)
+        rot1 = (5, 11, 13, 17, 19, 29, 31)
+        rot2 = (3, 7, 11, 17, 19, 23, 29)
         word_format = "I"
         init_pipe = (
             0x0001_0203, 0x0405_0607, 0x0809_0a0b, 0x0c0d_0e0f, 0x1011_1213, 0x1415_1617, 0x1819_1a1b, 0x1c1d_1e1f,
@@ -25680,8 +25815,8 @@ class Hash:
         word_mask = 0xffff_ffff_ffff_ffff
         q_const_a = 0xaaaa_aaaa_aaaa_aaaa
         q_const_b = 0x5555_5555_5555_5555
-        rot1 = (5, 15, 22, 31, 40, 50, 59)
-        rot2 = (10, 19, 29, 36, 44, 48, 55)
+        rot1 = (5, 19, 29, 31, 41, 57, 61)
+        rot2 = (3, 17, 23, 31, 37, 45, 59)
         word_format = "Q"
         init_pipe = (
             0x0001_0203_0405_0607, 0x0809_0a0b_0c0d_0e0f, 0x1011_1213_1415_1617, 0x1819_1a1b_1c1d_1e1f,
@@ -26715,7 +26850,10 @@ class Hash:
             for i in range(num_bits):
                 src_byte = source[i // 8]
                 src_mask = 0x80 >> (i % 8)
-                bit = 1 if (src_byte & src_mask) else 0
+                if src_byte & src_mask:
+                    bit = 1
+                else:
+                    bit = 0
                 dest_index = dest_bit_offset + i
                 dest_byte_index = dest_index // 8
                 dest_mask = 0x80 >> (dest_index % 8)
@@ -28917,7 +29055,10 @@ class Hash:
                 for i in range(4):
                     w[i] = self.x128(w[i], ms[self.sandwmspick[rnd] + i])
 
-                rounds = 1 if rnd < 4 else (xrnds + 1)
+                if rnd < 4:
+                    rounds = 1
+                else:
+                    rounds = xrnds + 1
                 for _ in range(rounds):
                     for i in range(4):
                         w[i] = self.r128(
@@ -32764,7 +32905,10 @@ class Hash:
             self.digest_size = self.digest_bits // 8
             self.B = [[0, 0, 0, 0] for _ in range(4)]
             self.K = [[0, 0, 0, 0] for _ in range(12)]
-            self.r = 1 if self.digest_bits <= 256 else 2
+            if self.digest_bits <= 256:
+                self.r = 1
+            else:
+                self.r = 2
             self.buf = bytearray()
             self.msg_len = 0
             self.block_count = 0
@@ -35206,7 +35350,10 @@ class Hash:
             sbox = []
             reflect_table = []
             for i in range(256):
-                inv = 0 if i == 0 else gf_pow(i, 254)
+                if i == 0:
+                    inv = 0
+                else:
+                    inv = gf_pow(i, 254)
                 s = inv ^ rol8(inv, 1) ^ rol8(inv, 2) ^ rol8(inv, 3) ^ rol8(inv, 4) ^ 0x63
                 sbox.append(s)
                 r = 0
@@ -36352,7 +36499,10 @@ class Hash:
             val3 = (val3 ^ self.f2(self.bs & 0xff)) & 0xffff_ffff
             val4 = self.bytes_to_word([self.kk1[48], self.kk1[112], self.kk1[176], self.kk1[240]])
             val4 = (val4 + (self.bs & 0xff)) & 0xffff_ffff
-            max_count = (self.bs << 1) if (self.bs << 1) > 256 else 256
+            if (self.bs << 1) > 256:
+                max_count = self.bs << 1
+            else:
+                max_count = 256
 
             for i in range(0, max_count, 4):
                 words[pos1] = (words[pos1] ^ val1) & 0xffff_ffff
@@ -36441,7 +36591,10 @@ class Hash:
                 pos2 = (pos2 + 1) & self.bs1
             ik = self.h1((self.kk(self.f1(val1)) + val2) & 0xffff_ffff) & self.size1
             pk = self.h1(self.f1(val1) ^ self.kk(val2)) & self.size1
-            max_count = self.size if self.bs2 < self.size else self.bs2 + 1
+            if self.bs2 < self.size:
+                max_count = self.size
+            else:
+                max_count = self.bs2 + 1
             over = False
             sz = self.size - self.bs
             i = 0
@@ -36476,7 +36629,10 @@ class Hash:
             incr2 = self.h2(self.kk(val2)) & self.size1
             i = self.h1(self.f1(val1)) & self.bs1
             k = self.h2(val2) & self.size1
-            max_count = self.size if self.bs < self.size else self.bs
+            if self.bs < self.size:
+                max_count = self.size
+            else:
+                max_count = self.bs
             for _ix in range(max_count):
                 temp1 = data_words[i]
                 val1 = (val1 + self.kk(temp1)) & 0xffff_ffff
@@ -37157,7 +37313,7 @@ class Hash:
                 v = ((v >> n) | (v << (8 - n))) & 0xff
             return v
 
-        def discosum_hexdigest(self): # noqa
+        def discosum_hexdigest(self): # noqa: V105
             return "".join(f"{word:016x}" for word in struct.unpack("<4Q", self.digest()))
 
         def hash(self, data, seed=0):
@@ -38276,5 +38432,3 @@ class Hash:
 
         def hexdigest(self):
             return self.digest().hex()
-
-

@@ -10,7 +10,10 @@ runtime.py. References to modules that are not yet extracted (process, auxv,
 utils) are imported lazily inside the method that needs them.
 """
 import gdb
+
+from gef.core.color import err
 import os
+import re
 import struct
 import subprocess
 
@@ -347,21 +350,20 @@ class Elf:
         return elf
 
     def __init__(self, elf=None, file_offset=0):
-        """Instantiate an ELF object."""
         from gef.core.process import Path
-        from gef.core.utils import err
-
+        """Instantiate an ELF object."""
+        self.filename = None
+        self.addr = None
+        self.e_magic = None
         if elf is None:
             elf = Path.get_filepath()
             if elf is None:
-                self.e_magic = None
                 err("Could not find the path")
                 return
 
         if isinstance(elf, str):
             if not os.access(elf, os.R_OK):
                 err("'{:s}' not found/readable".format(elf))
-                self.e_magic = None
                 return
             self.fd = open(elf, "rb")
             self.addr = None
@@ -375,16 +377,19 @@ class Elf:
             self.pos = 0
             self.filename = None
         else:
-            raise
+            raise TypeError("Elf: unsupported source: {!r}".format(elf))
 
         # off 0x0
         self.e_magic, self.e_class, self.e_endianness, self.e_eiversion = struct.unpack(">IBBB", self.read(7))
         # adjust endianness in bin reading
-        endian = "<" if self.e_endianness == Elf.LITTLE_ENDIAN else ">"
+        if self.e_endianness == Elf.LITTLE_ENDIAN:
+            endian = "<"
+        else:
+            endian = ">"
         # off 0x7
         self.e_osabi, self.e_abiversion = struct.unpack("{}BB".format(endian), self.read(2))
         # off 0x9
-        self.e_pad = self.read(7) # noqa
+        self.e_pad = self.read(7) # noqa: V101
         # off 0x10
         self.e_type, self.e_machine, self.e_version = struct.unpack("{}HHI".format(endian), self.read(8))
         # off 0x18
@@ -394,6 +399,19 @@ class Elf:
             self.e_entry, self.e_phoff, self.e_shoff = struct.unpack("{}III".format(endian), self.read(12))
         self.e_flags, self.e_ehsize, self.e_phentsize, self.e_phnum = struct.unpack("{}IHHH".format(endian), self.read(10))
         self.e_shentsize, self.e_shnum, self.e_shstrndx = struct.unpack("{}HHH".format(endian), self.read(6))
+
+        if self.e_shoff and (self.e_shnum == 0 or self.e_shstrndx == 0xffff or self.e_phnum == 0xffff):
+            try:
+                shdr = Elf.Shdr(self, self.e_shoff, resolve_name=False)
+            except gdb.MemoryError:
+                shdr = None
+            if shdr is not None:
+                if self.e_shnum == 0:
+                    self.e_shnum = shdr.sh_size
+                if self.e_shstrndx == 0xffff:
+                    self.e_shstrndx = shdr.sh_link
+                if self.e_phnum == 0xffff:
+                    self.e_phnum = shdr.sh_info
 
         # phdr
         self.phdrs = []
@@ -427,7 +445,7 @@ class Elf:
         return
 
     def __repr__(self):
-        if not hasattr(self, "filename"):
+        if self.e_magic is None:
             msg = '<{:s}.{:s} object at {:#x}, invalid>'.format(
                 self.__module__, self.__class__.__name__, id(self),
             )
@@ -447,7 +465,7 @@ class Elf:
         elif self.addr is not None:
             v = read_memory(self.addr + self.pos, size)
         else:
-            raise
+            raise ValueError("Elf.read: neither file nor address is set")
         self.pos += size
         return v
 
@@ -457,7 +475,7 @@ class Elf:
         elif self.addr is not None:
             self.pos = off
         else:
-            raise
+            raise ValueError("Elf.seek: neither file nor address is set")
         return
 
     def is_valid(self):
@@ -468,7 +486,7 @@ class Elf:
             return 64
         if self.e_class == Elf.ELF_32_BITS:
             return 32
-        raise
+        raise ValueError("Elf.get_bits: invalid e_class: {!r}".format(self.e_class))
 
     def get_phdr(self, p_type):
         for phdr in self.phdrs:
@@ -489,7 +507,7 @@ class Elf:
 
         if self.filename:
             fd = open(self.filename, "rb")
-            fd.seek(phdr.p_offset)
+            fd.seek(self.seek_init_offset + phdr.p_offset)
             data = fd.read(phdr.p_filesz)
             fd.close()
             return data
@@ -511,7 +529,7 @@ class Elf:
 
         if self.filename:
             fd = open(self.filename, "rb")
-            fd.seek(shdr.sh_offset)
+            fd.seek(self.seek_init_offset + shdr.sh_offset)
             data = fd.read(shdr.sh_size)
             fd.close()
             return data
@@ -540,7 +558,14 @@ class Elf:
 
     def is_static(self):
         # note: static-pie has no PT_INTERP
-        return not bool(self.get_phdr(Elf.Phdr.PT_INTERP))
+        return not bool(self.get_phdr(Elf.Phdr.PT_INTERP)) and not self.is_shared_object()
+
+    def is_shared_object(self):
+        # note: executables including static-pie have DT_DEBUG, and DF_1_PIE if the linker is new
+        if self.e_type != Elf.ET_DYN or self.get_dynamic_value(0x15) is not None: # DT_DEBUG
+            return False
+        flags_1 = self.get_dynamic_value(0x6fff_fffb) or 0 # DT_FLAGS_1
+        return not flags_1 & 0x0800_0000 # DF_1_PIE
 
     def has_dynamic(self):
         # note: static-pie has PT_DYNAMIC
@@ -554,9 +579,8 @@ class Elf:
 
     def has_canary_heuristic(self):
         from gef.core.utils import GefUtil
-
         try:
-            objdump_command = GefUtil.which(Config.get_gef_setting("gef.objdump_command"))
+            objdump_command = GefUtil.which(Config.get("gef.objdump_command"))
         except FileNotFoundError:
             return None # it means unknown
 
@@ -593,17 +617,20 @@ class Elf:
 
     def is_full_relro(self):
         from gef.core.utils import slicer
-
         data = self.get_dynamic_data()
         if data is None:
             return False
 
         # check
         for tag, value in slicer(data, 2):
+            if tag == 0: # DT_NULL
+                break
             if tag == 0x18: # DT_BIND_NOW
                 return True
-            if tag == 0x1e: # DT_FLAGS
-                return bool(value & 0x08) # DF_BIND_NOW
+            if tag == 0x1e and value & 0x08: # DT_FLAGS, DF_BIND_NOW
+                return True
+            if tag == 0x6fff_fffb and value & 0x01: # DT_FLAGS_1, DF_1_NOW
+                return True
         return False
 
     def vaddr_to_offset(self, vaddr):
@@ -622,7 +649,7 @@ class Elf:
             if offset is None:
                 return None
             with open(self.filename, "rb") as fd:
-                fd.seek(offset)
+                fd.seek(self.seek_init_offset + offset)
                 data = fd.read(size)
             return self.get_string_from_data(data, 0)
 
@@ -647,18 +674,20 @@ class Elf:
         return data[offset:end].decode(errors="replace")
 
     def get_dynamic_data(self):
-        from gef.core.utils import slice_unpack
-
         data = self.read_shdr(".dynamic")
         if data is None:
             data = self.read_phdr(Elf.Phdr.PT_DYNAMIC)
         if data is None:
             return None
-        return slice_unpack(data, self.get_bits() // 8)
+        if self.e_endianness == Elf.LITTLE_ENDIAN:
+            endian = "<"
+        else:
+            endian = ">"
+        size = self.get_bits() // 8
+        return struct.unpack("{}{}{}".format(endian, len(data) // size, "Q" if size == 8 else "I"), data)
 
     def get_dynamic_value(self, tag_type):
         from gef.core.utils import slicer
-
         data = self.get_dynamic_data()
         if data is None:
             return None
@@ -688,13 +717,155 @@ class Elf:
             size = strsz - val
         return self.read_cstring_from_vaddr(strtab + val, size)
 
-    def has_rpath(self): # noqa
+    def get_gnu_properties(self):
+        from gef.core.utils import align
+        """Return the entries in a NT_GNU_PROPERTY_TYPE_0 note."""
+        data = self.read_phdr(Elf.Phdr.PT_GNU_PROPERTY)
+        if not data:
+            data = self.read_shdr(".note.gnu.property")
+        if not data:
+            return {}
+
+        if self.e_endianness == Elf.LITTLE_ENDIAN:
+            endian = "<"
+        else:
+            endian = ">"
+        if self.e_class == Elf.ELF_64_BITS:
+            property_align = 8
+        else:
+            property_align = 4
+        properties = {}
+        note_pos = 0
+
+        while note_pos + 12 <= len(data):
+            namesz, descsz, note_type = struct.unpack_from("{}III".format(endian), data, note_pos)
+            note_pos += 12
+            if note_pos + namesz > len(data):
+                break
+            name = data[note_pos:note_pos + namesz]
+            note_pos = align(note_pos + namesz, 4)
+            if note_pos + descsz > len(data):
+                break
+            desc = data[note_pos:note_pos + descsz]
+            note_pos = align(note_pos + descsz, 4)
+
+            if note_type != 5 or name.rstrip(b"\0") != b"GNU": # NT_GNU_PROPERTY_TYPE_0
+                continue
+
+            property_pos = 0
+            while property_pos + 8 <= len(desc):
+                property_type, property_size = struct.unpack_from("{}II".format(endian), desc, property_pos)
+                value_pos = property_pos + 8
+                value_end = value_pos + property_size
+                if value_end > len(desc):
+                    break
+                properties[property_type] = desc[value_pos:value_end]
+                property_pos = align(value_end, property_align)
+        return properties
+
+    def get_gnu_property_value(self, property_type):
+        data = self.get_gnu_properties().get(property_type)
+        if data is None or len(data) < 4:
+            return None
+        if self.e_endianness == Elf.LITTLE_ENDIAN:
+            endian = "<"
+        else:
+            endian = ">"
+        return struct.unpack("{}I".format(endian), data[:4])[0]
+
+    def get_imported_symbols(self):
+        """Return undefined symbols from .dynsym."""
+        dynsym = self.get_shdr(".dynsym")
+        dynstr = self.read_shdr(".dynstr")
+        data = self.read_shdr(".dynsym")
+        if dynsym is None or dynstr is None or data is None:
+            return None
+
+        entry_size = dynsym.sh_entsize
+        if not entry_size:
+            if self.e_class == Elf.ELF_64_BITS:
+                entry_size = 24
+            else:
+                entry_size = 16
+        if self.e_class == Elf.ELF_64_BITS:
+            minimum_entry_size = 24
+        else:
+            minimum_entry_size = 16
+        if entry_size < minimum_entry_size:
+            return None
+        if self.e_endianness == Elf.LITTLE_ENDIAN:
+            endian = "<"
+        else:
+            endian = ">"
+        symbols = set()
+
+        for pos in range(0, len(data) - entry_size + 1, entry_size):
+            name_offset = struct.unpack_from("{}I".format(endian), data, pos)[0]
+            if self.e_class == Elf.ELF_64_BITS:
+                section_index = struct.unpack_from("{}H".format(endian), data, pos + 6)[0]
+            else:
+                section_index = struct.unpack_from("{}H".format(endian), data, pos + 14)[0]
+            if section_index != 0 or name_offset >= len(dynstr): # SHN_UNDEF
+                continue
+            end = dynstr.find(b"\0", name_offset)
+            if end < 0:
+                continue
+            symbols.add(dynstr[name_offset:end])
+        return symbols
+
+    def get_wx_load_ranges(self):
+        from gef.core.process import get_pagesize
+        from gef.core.utils import align
+        """Return direct RWX PT_LOAD ranges and page-rounded W/X overlaps."""
+        load_segments = [
+            phdr for phdr in self.phdrs
+            if phdr.p_type == Elf.Phdr.PT_LOAD and phdr.p_memsz
+        ]
+        direct = [
+            (phdr.p_vaddr, phdr.p_vaddr + phdr.p_memsz)
+            for phdr in load_segments
+            if phdr.p_flags & Elf.Phdr.PF_W and phdr.p_flags & Elf.Phdr.PF_X
+        ]
+
+        try:
+            page_size = get_pagesize()
+        except Exception:
+            page_size = 0x1000
+
+        writable = [phdr for phdr in load_segments if phdr.p_flags & Elf.Phdr.PF_W]
+        executable = [phdr for phdr in load_segments if phdr.p_flags & Elf.Phdr.PF_X]
+        overlaps = []
+        for writable_phdr in writable:
+            writable_start = writable_phdr.p_vaddr & ~(page_size - 1)
+            writable_end = align(writable_phdr.p_vaddr + writable_phdr.p_memsz, page_size)
+            for executable_phdr in executable:
+                if writable_phdr is executable_phdr:
+                    continue
+                executable_start = executable_phdr.p_vaddr & ~(page_size - 1)
+                executable_end = align(executable_phdr.p_vaddr + executable_phdr.p_memsz, page_size)
+                start = max(writable_start, executable_start)
+                end = min(writable_end, executable_end)
+                if start < end:
+                    overlaps.append((start, end))
+
+        def merge_ranges(ranges):
+            merged = []
+            for start, end in sorted(set(ranges)):
+                if merged and start <= merged[-1][1]:
+                    merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+                else:
+                    merged.append((start, end))
+            return merged
+
+        return merge_ranges(direct), merge_ranges(overlaps)
+
+    def has_rpath(self): # noqa: V105
         return self.get_rpath() is not None
 
     def get_rpath(self):
         return self.get_dynamic_string(0xf) # DT_RPATH
 
-    def has_runpath(self): # noqa
+    def has_runpath(self): # noqa: V105
         return self.get_runpath() is not None
 
     def get_runpath(self):
@@ -702,7 +873,6 @@ class Elf:
 
     def has_pac_heuristic(self):
         from gef.core.utils import GefUtil
-
         pac_ops = [
             b"paciasp", b"pacia", b"pacibsp", b"pacib", b"pacda", b"pacdb", b"pacga",
             b"autiasp", b"autia", b"autibsp", b"autib", b"autda", b"autdb",
@@ -711,7 +881,7 @@ class Elf:
         ]
 
         try:
-            objdump_command = GefUtil.which(Config.get_gef_setting("gef.objdump_command"))
+            objdump_command = GefUtil.which(Config.get("gef.objdump_command"))
         except FileNotFoundError:
             return None # it means unknown
 
@@ -722,7 +892,8 @@ class Elf:
             line = proc.stdout.readline().strip()
             if not line:
                 continue
-            if line.split()[-1] in pac_ops:
+            insn = re.match(rb"\s*[0-9a-f]+:\s+(?:[0-9a-f]{2,8}\s+)+([a-z][a-z0-9]*)\b", line)
+            if insn and insn.group(1) in pac_ops:
                 proc.kill()
                 return True
         proc.kill()
@@ -731,37 +902,39 @@ class Elf:
     def checksec(self):
         """Check the following security properties of the ELF binary.
         Canary, NX, PIE, RELRO, Fortify, Static, Symbol, Debuginfo, CET,
-        RPATH/RUNPATH, and Clang CFI/SafeStack."""
+        AArch64 features, RPATH/RUNPATH, Clang CFI/SafeStack, W^X, and text relocations."""
 
-        def exists_sym(dynstr, strtab, keywords):
-            if dynstr:
+        def exists_sym(dynstr, strtab, keywords, prefix=False):
+            for table in [dynstr, strtab]:
+                if not table:
+                    continue
                 for kw in keywords:
-                    if kw in dynstr:
+                    if prefix:
+                        if any(sym.startswith(kw) for sym in table):
+                            return True
+                    elif kw in table:
                         return True
-            if strtab:
-                for kw in keywords:
-                    if kw in strtab:
-                        return True
+            if dynstr is None and strtab is None:
+                return None
             return False
 
-        def get_features_from_note(note):
-            note = note[0x10:] # skip header
-            while note:
-                pr_type, note = u32(note[:4]), note[4:]
-                pr_datasz, note = u32(note[:4]), note[4:]
-                pr_data, note = note[:pr_datasz], note[pr_datasz:]
-
-                if pr_type == 0xc000_0002: # GNU_PROPERTY_X86_FEATURE_1_AND
-                    if pr_datasz == 4:
-                        return u32(pr_data)
-
-                pr_padding = 0
-                while (pr_datasz + pr_padding) % runtime.current_arch.ptrsize:
-                    pr_padding += 1
-                note = note[pr_padding:]
-            return 0
-
         dynstr = self.read_shdr(".dynstr")
+        if dynstr is None:
+            strtab_addr = self.get_dynamic_value(0x5) # DT_STRTAB
+            strtab_size = self.get_dynamic_value(0xa) # DT_STRSZ
+            if strtab_addr is not None and strtab_size is not None:
+                if self.filename:
+                    offset = self.vaddr_to_offset(strtab_addr)
+                    if offset is not None:
+                        with open(self.filename, "rb") as fd:
+                            fd.seek(self.seek_init_offset + offset)
+                            dynstr = fd.read(strtab_size)
+                        if len(dynstr) != strtab_size:
+                            dynstr = None
+                elif self.addr is not None:
+                    if self.is_pie() and self.vaddr_to_offset(strtab_addr) is not None:
+                        strtab_addr += self.addr
+                    dynstr = read_memory(strtab_addr, strtab_size, safe=True)
         if dynstr:
             dynstr = dynstr.split(b"\0")
         strtab = self.read_shdr(".strtab")
@@ -780,7 +953,7 @@ class Elf:
         sec["Debuginfo"] = self.has_debuginfo()
 
         # Canary
-        if self.is_static() and self.is_stripped():
+        if self.is_static() and self.is_stripped() and dynstr is None and strtab is None:
             sec["Canary"] = self.has_canary_heuristic()
         else:
             keywords = [
@@ -796,58 +969,79 @@ class Elf:
 
         # PIE
         sec["PIE"] = self.is_pie()
+        sec["Shared object"] = self.is_shared_object()
 
         # RELRO
         sec["Partial RELRO"] = self.is_relro()
         sec["Full RELRO"] = sec["Partial RELRO"] and self.is_full_relro()
 
         # Fortify
-        if self.is_static() and self.is_stripped():
+        fortify_keywords = [
+            b"__memcpy_chk",
+            b"__memmove_chk",
+            b"__mempcpy_chk",
+            b"__memset_chk",
+            b"__printf_chk",
+            b"__fprintf_chk",
+            b"__dprintf_chk",
+            b"__sprintf_chk",
+            b"__asprintf_chk",
+            b"__snprintf_chk",
+            b"__wprintf_chk",
+            b"__fwprintf_chk",
+            b"__swprintf_chk",
+            b"__obstack_printf_chk",
+            b"__vprintf_chk",
+            b"__vfprintf_chk",
+            b"__vdprintf_chk",
+            b"__vsprintf_chk",
+            b"__vasprintf_chk",
+            b"__vsnprintf_chk",
+            b"__vwprintf_chk",
+            b"__vfwprintf_chk",
+            b"__vswprintf_chk",
+            b"__obstack_vprintf_chk",
+            b"__syslog_chk",
+            b"__vsyslog_chk",
+        ]
+        if self.is_static() and self.is_stripped() and dynstr is None and strtab is None:
             sec["Fortify"] = None # it means unknown
         else:
-            keywords = [
-                b"__memcpy_chk",
-                b"__memmove_chk",
-                b"__mempcpy_chk",
-                b"__memset_chk",
-                b"__printf_chk",
-                b"__fprintf_chk",
-                b"__dprintf_chk",
-                b"__sprintf_chk",
-                b"__asprintf_chk",
-                b"__snprintf_chk",
-                b"__wprintf_chk",
-                b"__fwprintf_chk",
-                b"__swprintf_chk",
-                b"__obstack_printf_chk",
-                b"__vprintf_chk",
-                b"__vfprintf_chk",
-                b"__vdprintf_chk",
-                b"__vsprintf_chk",
-                b"__vasprintf_chk",
-                b"__vsnprintf_chk",
-                b"__vwprintf_chk",
-                b"__vfwprintf_chk",
-                b"__vswprintf_chk",
-                b"__obstack_vprintf_chk",
-                b"__syslog_chk",
-                b"__vsyslog_chk",
-            ]
-            sec["Fortify"] = exists_sym(dynstr, strtab, keywords)
+            sec["Fortify"] = exists_sym(dynstr, strtab, fortify_keywords)
+
+        # Count only observable dynamic imports; this is not source-level coverage.
+        imported_symbols = self.get_imported_symbols()
+        if imported_symbols is None or self.is_static():
+            sec["Fortified Imports"] = None
+            sec["Unfortified Candidates"] = None
+        else:
+            fortify_pairs = {keyword: keyword[2:-4] for keyword in fortify_keywords}
+            sec["Fortified Imports"] = len(imported_symbols & set(fortify_pairs))
+            sec["Unfortified Candidates"] = len(imported_symbols & set(fortify_pairs.values()))
 
         # CET flags via Ehdr
         if self.e_machine in (Elf.EM_X86_64, Elf.EM_386):
             sec["CET IBT flag"] = False
             sec["CET SHSTK flag"] = False
-            note_gnu_property = self.read_phdr(Elf.Phdr.PT_GNU_PROPERTY)
-            if note_gnu_property:
-                features = get_features_from_note(note_gnu_property)
+            features = self.get_gnu_property_value(0xc000_0002) # GNU_PROPERTY_X86_FEATURE_1_AND
+            if features is not None:
                 sec["CET IBT flag"] = features & 1 # GNU_PROPERTY_X86_FEATURE_1_IBT
                 sec["CET SHSTK flag"] = features & 2 # GNU_PROPERTY_X86_FEATURE_1_SHSTK
 
         # PAC
         if self.e_machine == Elf.EM_AARCH64:
             sec["PAC"] = self.has_pac_heuristic()
+            features = self.get_gnu_property_value(0xc000_0000) # GNU_PROPERTY_AARCH64_FEATURE_1_AND
+            features = features or 0
+            sec["AArch64 BTI flag"] = bool(features & 1)
+            sec["AArch64 PAC flag"] = bool(features & 2)
+            sec["AArch64 GCS flag"] = bool(features & 4)
+            sec["AArch64 BTI PLT"] = self.get_dynamic_value(0x7000_0001) is not None
+            sec["AArch64 PAC PLT"] = self.get_dynamic_value(0x7000_0003) is not None
+            sec["AArch64 MTE mode"] = self.get_dynamic_value(0x7000_0009)
+            sec["AArch64 MTE heap"] = self.get_dynamic_value(0x7000_000b) is not None
+            sec["AArch64 MTE stack"] = self.get_dynamic_value(0x7000_000c) is not None
+            sec["AArch64 MTE globals"] = self.get_dynamic_value(0x7000_000d) is not None
 
         # RPATH
         sec["RPATH"] = self.get_rpath()
@@ -856,16 +1050,25 @@ class Elf:
         sec["RUNPATH"] = self.get_runpath()
 
         # Clang CFI (detected only when `-fno-sanitize-trap=all`)
-        if self.is_static() and self.is_stripped():
+        if self.is_static() and self.is_stripped() and dynstr is None and strtab is None:
             sec["Clang CFI"] = None
         else:
-            sec["Clang CFI"] = exists_sym(dynstr, strtab, ["__ubsan_handle_cfi_"])
+            sec["Clang CFI"] = exists_sym(dynstr, strtab, [b"__ubsan_handle_cfi_"], prefix=True)
 
         # Clang SafeStack
-        if self.is_static() and self.is_stripped():
+        if self.is_static() and self.is_stripped() and dynstr is None and strtab is None:
             sec["Clang SafeStack"] = None
         else:
-            sec["Clang SafeStack"] = exists_sym(dynstr, strtab, ["__safestack_init"])
+            sec["Clang SafeStack"] = exists_sym(dynstr, strtab, [b"__safestack_init"])
+
+        # Writable and executable load segments
+        sec["W^X LOAD segments"], sec["W^X page overlap"] = self.get_wx_load_ranges()
+
+        # Dynamic relocations against non-writable segments
+        dynamic_flags = self.get_dynamic_value(0x1e) # DT_FLAGS
+        sec["Text Relocations"] = self.get_dynamic_value(0x16) is not None # DT_TEXTREL
+        if dynamic_flags is not None:
+            sec["Text Relocations"] |= bool(dynamic_flags & 0x04) # DF_TEXTREL
         return sec
 
     class Phdr:
@@ -962,7 +1165,10 @@ class Elf:
             if elf is None:
                 return None
             elf.seek(off)
-            endian = "<" if elf.e_endianness == Elf.LITTLE_ENDIAN else ">"
+            if elf.e_endianness == Elf.LITTLE_ENDIAN:
+                endian = "<"
+            else:
+                endian = ">"
             if elf.e_class == Elf.ELF_64_BITS:
                 self.p_type, self.p_flags, self.p_offset = struct.unpack("{}IIQ".format(endian), elf.read(16))
                 self.p_vaddr, self.p_paddr = struct.unpack("{}QQ".format(endian), elf.read(16))
@@ -1023,7 +1229,7 @@ class Elf:
         SHT_GNU_INCREMENTAL_INPUTS         = 0x6fff_4700
         SHT_LLVM_ODRTAB                    = 0x6fff_4c00
         SHT_LLVM_LINKER_OPTIONS            = 0x6fff_4c01
-        SHT_LLVM_CALL_GRAPH_PROFILE        = 0x6fff_4c02
+        SHT_LLVM_CALL_GRAPH_PROFILE_V0     = 0x6fff_4c02 # noqa: F841
         SHT_LLVM_ADDRSIG                   = 0x6fff_4c03
         SHT_LLVM_DEPENDENT_LIBRARIES       = 0x6fff_4c04
         SHT_LLVM_SYMPART                   = 0x6fff_4c05
@@ -1182,11 +1388,14 @@ class Elf:
         sh_addralign         = None
         sh_entsize           = None
 
-        def __init__(self, elf, off):
+        def __init__(self, elf, off, resolve_name=True):
             if elf is None:
                 return None
             elf.seek(off)
-            endian = "<" if elf.e_endianness == Elf.LITTLE_ENDIAN else ">"
+            if elf.e_endianness == Elf.LITTLE_ENDIAN:
+                endian = "<"
+            else:
+                endian = ">"
             if elf.e_class == Elf.ELF_64_BITS:
                 self.sh_name, self.sh_type, self.sh_flags = struct.unpack("{}IIQ".format(endian), elf.read(16))
                 self.sh_addr, self.sh_offset = struct.unpack("{}QQ".format(endian), elf.read(16))
@@ -1197,6 +1406,12 @@ class Elf:
                 self.sh_addr, self.sh_offset = struct.unpack("{}II".format(endian), elf.read(8))
                 self.sh_size, self.sh_link, self.sh_info = struct.unpack("{}III".format(endian), elf.read(12))
                 self.sh_addralign, self.sh_entsize = struct.unpack("{}II".format(endian), elf.read(8))
+
+            if not resolve_name:
+                return
+            if self.sh_name == 0 or elf.e_shstrndx == 0:
+                self.sh_name = ""
+                return
 
             # name
             stroff = elf.e_shoff + elf.e_shentsize * elf.e_shstrndx
@@ -1221,154 +1436,6 @@ class Elf:
                 self.__module__, self.__class__.__name__, id(self), self.sh_name,
             )
 
-    def get_gnu_properties(self):
-        from gef.core.utils import align
-        """Return the entries in a NT_GNU_PROPERTY_TYPE_0 note."""
-        data = self.read_phdr(Elf.Phdr.PT_GNU_PROPERTY)
-        if not data:
-            data = self.read_shdr(".note.gnu.property")
-        if not data:
-            return {}
-
-        if self.e_endianness == Elf.LITTLE_ENDIAN:
-            endian = "<"
-        else:
-            endian = ">"
-        if self.e_class == Elf.ELF_64_BITS:
-            property_align = 8
-        else:
-            property_align = 4
-        properties = {}
-        note_pos = 0
-
-        while note_pos + 12 <= len(data):
-            namesz, descsz, note_type = struct.unpack_from("{}III".format(endian), data, note_pos)
-            note_pos += 12
-            if note_pos + namesz > len(data):
-                break
-            name = data[note_pos:note_pos + namesz]
-            note_pos = align(note_pos + namesz, 4)
-            if note_pos + descsz > len(data):
-                break
-            desc = data[note_pos:note_pos + descsz]
-            note_pos = align(note_pos + descsz, 4)
-
-            if note_type != 5 or name.rstrip(b"\0") != b"GNU": # NT_GNU_PROPERTY_TYPE_0
-                continue
-
-            property_pos = 0
-            while property_pos + 8 <= len(desc):
-                property_type, property_size = struct.unpack_from("{}II".format(endian), desc, property_pos)
-                value_pos = property_pos + 8
-                value_end = value_pos + property_size
-                if value_end > len(desc):
-                    break
-                properties[property_type] = desc[value_pos:value_end]
-                property_pos = align(value_end, property_align)
-        return properties
-
-    def get_gnu_property_value(self, property_type):
-        data = self.get_gnu_properties().get(property_type)
-        if data is None or len(data) < 4:
-            return None
-        if self.e_endianness == Elf.LITTLE_ENDIAN:
-            endian = "<"
-        else:
-            endian = ">"
-        return struct.unpack("{}I".format(endian), data[:4])[0]
-
-    def get_imported_symbols(self):
-        """Return undefined symbols from .dynsym."""
-        dynsym = self.get_shdr(".dynsym")
-        dynstr = self.read_shdr(".dynstr")
-        data = self.read_shdr(".dynsym")
-        if dynsym is None or dynstr is None or data is None:
-            return None
-
-        entry_size = dynsym.sh_entsize
-        if not entry_size:
-            if self.e_class == Elf.ELF_64_BITS:
-                entry_size = 24
-            else:
-                entry_size = 16
-        if self.e_class == Elf.ELF_64_BITS:
-            minimum_entry_size = 24
-        else:
-            minimum_entry_size = 16
-        if entry_size < minimum_entry_size:
-            return None
-        if self.e_endianness == Elf.LITTLE_ENDIAN:
-            endian = "<"
-        else:
-            endian = ">"
-        symbols = set()
-
-        for pos in range(0, len(data) - entry_size + 1, entry_size):
-            name_offset = struct.unpack_from("{}I".format(endian), data, pos)[0]
-            if self.e_class == Elf.ELF_64_BITS:
-                section_index = struct.unpack_from("{}H".format(endian), data, pos + 6)[0]
-            else:
-                section_index = struct.unpack_from("{}H".format(endian), data, pos + 14)[0]
-            if section_index != 0 or name_offset >= len(dynstr): # SHN_UNDEF
-                continue
-            end = dynstr.find(b"\0", name_offset)
-            if end < 0:
-                continue
-            symbols.add(dynstr[name_offset:end])
-        return symbols
-
-    def get_wx_load_ranges(self):
-        from gef.core.process import get_pagesize
-        from gef.core.utils import align
-        """Return direct RWX PT_LOAD ranges and page-rounded W/X overlaps."""
-        load_segments = [
-            phdr for phdr in self.phdrs
-            if phdr.p_type == Elf.Phdr.PT_LOAD and phdr.p_memsz
-        ]
-        direct = [
-            (phdr.p_vaddr, phdr.p_vaddr + phdr.p_memsz)
-            for phdr in load_segments
-            if phdr.p_flags & Elf.Phdr.PF_W and phdr.p_flags & Elf.Phdr.PF_X
-        ]
-
-        try:
-            page_size = get_pagesize()
-        except Exception:
-            page_size = 0x1000
-
-        writable = [phdr for phdr in load_segments if phdr.p_flags & Elf.Phdr.PF_W]
-        executable = [phdr for phdr in load_segments if phdr.p_flags & Elf.Phdr.PF_X]
-        overlaps = []
-        for writable_phdr in writable:
-            writable_start = writable_phdr.p_vaddr & ~(page_size - 1)
-            writable_end = align(writable_phdr.p_vaddr + writable_phdr.p_memsz, page_size)
-            for executable_phdr in executable:
-                if writable_phdr is executable_phdr:
-                    continue
-                executable_start = executable_phdr.p_vaddr & ~(page_size - 1)
-                executable_end = align(executable_phdr.p_vaddr + executable_phdr.p_memsz, page_size)
-                start = max(writable_start, executable_start)
-                end = min(writable_end, executable_end)
-                if start < end:
-                    overlaps.append((start, end))
-
-        def merge_ranges(ranges):
-            merged = []
-            for start, end in sorted(set(ranges)):
-                if merged and start <= merged[-1][1]:
-                    merged[-1] = (merged[-1][0], max(merged[-1][1], end))
-                else:
-                    merged.append((start, end))
-            return merged
-
-        return merge_ranges(direct), merge_ranges(overlaps)
-
-    def is_shared_object(self):
-        # note: executables including static-pie have DT_DEBUG, and DF_1_PIE if the linker is new
-        if self.e_type != Elf.ET_DYN or self.get_dynamic_value(0x15) is not None: # DT_DEBUG
-            return False
-        flags_1 = self.get_dynamic_value(0x6fff_fffb) or 0 # DT_FLAGS_1
-        return not flags_1 & 0x0800_0000 # DF_1_PIE
 
 
 class Checksec:
