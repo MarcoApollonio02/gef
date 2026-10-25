@@ -2417,6 +2417,138 @@ class GlibcHeap:
     A = GlibcArena # noqa
     C = GlibcChunk # noqa
 
+    @staticmethod
+    @Cache.cache_until_next
+    def search_for_thread_arena_from_tls():
+        from gef.commands.base import ContextManager
+        from gef.commands.process.base_address import TlsCommand
+        from gef.core.process import get_pagesize, is_m68k
+        """search for thread_arena from TLS, then return (tls, &thread_arena, [thread_arena, *next_arenas])."""
+
+        """
+        [x64]
+        0x7ffff7f986f8|+0x0038|007: 0x0000555555559010  ->  0x0000000000000000
+        0x7ffff7f98700|+0x0040|008: 0x0000000000000000
+        0x7ffff7f98708|+0x0048|009: 0x00007ffff7e19c80 <main_arena>  ->  0x0000000000000000
+        0x7ffff7f98710|+0x0050|010: 0x0000000000000000
+        0x7ffff7f98718|+0x0058|011: 0x0000000000000000
+        0x7ffff7f98720|+0x0060|012: 0x0000000000000000
+        0x7ffff7f98728|+0x0068|013: 0x0000000000000000
+        0x7ffff7f98730|+0x0070|014: 0x0000000000000000
+        0x7ffff7f98738|+0x0078|015: 0x0000000000000000
+        -- TLS --
+        0x7ffff7f98740|+0x0000|000: 0x00007ffff7f98740  ->  [loop detected]
+        0x7ffff7f98748|+0x0008|001: 0x00007ffff7f99160  ->  0x0000000000000001
+        0x7ffff7f98750|+0x0010|002: 0x00007ffff7f98740  ->  [loop detected]
+
+        [x86]
+        0xf7fbf4d0|+0x00d0|052: 0x5655a010  ->  0x00000000
+        0xf7fbf4d4|+0x00d4|053: 0x00000000
+        0xf7fbf4d8|+0x00d8|054: 0xf7e2a7c0 <main_arena>  ->  0x00000000
+        0xf7fbf4dc|+0x00dc|055: 0x00000000
+        0xf7fbf4e0|+0x00e0|056: 0x00000000
+        0xf7fbf4e4|+0x00e4|057: 0x00000000
+        0xf7fbf4e8|+0x00e8|058: 0x00000000
+        0xf7fbf4ec|+0x00ec|059: 0x00000000
+        0xf7fbf4f0|+0x00f0|060: 0x00000000
+        0xf7fbf4f4|+0x00f4|061: 0x00000000
+        0xf7fbf4f8|+0x00f8|062: 0x00000000
+        0xf7fbf4fc|+0x00fc|063: 0x00000000
+        -- TLS --
+        0xf7fbf500|+0x0100|064: 0xf7fbf500  ->  [loop detected]
+        0xf7fbf504|+0x0104|065: 0xf7fbfa88  ->  0x00000001
+        0xf7fbf508|+0x0108|066: 0xf7fbf500  ->  [loop detected]
+
+        [ARM]
+        -- TLS --
+        0x0007d580|+0x0000|000: 0x0007a3c8 <_dl_static_dtv+0x8>  ->  0x00000000
+        0x0007d584|+0x0004|001: 0x00000000
+        0x0007d588|+0x0008|002: 0x00079fa0 <_nl_global_locale>  ->  ...
+        0x0007d58c|+0x000c|003: 0x00079fa0 <_nl_global_locale>  ->  ...
+        0x0007d590|+0x0010|004: 0x00079fa4 <_nl_global_locale+0x4>  ->  ...
+        0x0007d594|+0x0014|005: 0x00079fb0 <_nl_global_locale+0x10>  ->  ...
+        0x0007d598|+0x0018|006: 0x00000000
+        0x0007d59c|+0x001c|007: 0x00079660 <main_arena>  ->  0x00000000
+        0x0007d5a0|+0x0020|008: 0x0007d908  ->  0x00000000
+        0x0007d5a4|+0x0024|009: 0x00000000
+        0x0007d5a8|+0x0028|010: 0x00000000
+
+        [ARM64]
+        -- TLS --
+        0x0000004997c0|+0x0000|000: 0x0000000000493078 <_dl_static_dtv+0x10>  ->  0x0000000000000000
+        0x0000004997c8|+0x0008|001: 0x0000000000000000
+        0x0000004997d0|+0x0010|002: 0x0000000000492838 <_nl_global_locale>  ->  ...
+        0x0000004997d8|+0x0018|003: 0x0000000000492840 <_nl_global_locale+0x8>  ->  ...
+        0x0000004997e0|+0x0020|004: 0x0000000000492838 <_nl_global_locale>  ->  ...
+        0x0000004997e8|+0x0028|005: 0x0000000000492858 <_nl_global_locale+0x20>  ->  ...
+        0x0000004997f0|+0x0030|006: 0x0000000000000000
+        0x0000004997f8|+0x0038|007: 0x0000000000491678 <main_arena>  ->  0x0000000000000000
+        0x000000499800|+0x0040|008: 0x0000000000499b90  ->  0x0000000000000000
+        0x000000499808|+0x0048|009: 0x0000000000000000
+        0x000000499810|+0x0050|010: 0x0000000000000000
+        0x000000499818|+0x0058|011: 0x000000000045e780 <_nl_C_LC_CTYPE_class+0x100>  ->  0x0002000200020002
+        0x000000499820|+0x0060|012: 0x000000000045de80 <_nl_C_LC_CTYPE_toupper+0x200>  ->  0x0000000100000000
+        0x000000499828|+0x0068|013: 0x000000000045d880 <_nl_C_LC_CTYPE_tolower+0x200>  ->  0x0000000100000000
+        0x000000499830|+0x0070|014: 0x0000000000000000
+        0x000000499838|+0x0078|015: 0x0000000000000000
+        """
+
+        threads = sorted(gdb.selected_inferior().threads(), key=lambda th: th.num)
+        direction = TlsCommand.get_direction()
+
+        # The main thread may have exited, so try each thread in order.
+        for thread in threads:
+            with ContextManager.selected_thread():
+                try:
+                    thread.switch()
+                except (gdb.error, RuntimeError):
+                    continue
+                tls = runtime.current_arch.get_tls()
+            if tls is None:
+                continue
+
+            for i in range(1, 500):
+                addr = tls + (runtime.current_arch.ptrsize * i) * direction
+
+                if is_m68k():
+                    addr += 2
+
+                if not is_valid_addr(addr):
+                    break
+
+                candidate_arena_addr = read_int_from_memory(addr)
+                if not is_valid_addr(candidate_arena_addr):
+                    continue
+
+                candidate_arena = GlibcHeap.MallocStateStruct(candidate_arena_addr)
+                arena_size = candidate_arena.sizeof
+                if not is_valid_addr(candidate_arena_addr + arena_size - 1):
+                    continue
+                if candidate_arena.system_mem < get_pagesize():
+                    continue
+                # Statically built binaries have an unaligned system_mem,
+                # so alignment should not be used to determine the validity of system_mem.
+
+                top = candidate_arena.top
+                if not is_valid_addr(top):
+                    continue
+
+                next_addr = to_unsigned_long(candidate_arena.next)
+                seen_arena = []
+                while True:
+                    if not is_valid_addr(next_addr) or not is_valid_addr(next_addr + arena_size - 1):
+                        break
+                    if candidate_arena_addr == next_addr:
+                        return tls, addr, [candidate_arena_addr] + seen_arena
+                    if next_addr in seen_arena:
+                        # broken `next` chain, give up this candidate
+                        break
+                    seen_arena.append(next_addr)
+                    next_addr = to_unsigned_long(GlibcHeap.MallocStateStruct(next_addr).next)
+
+        # not found
+        return None
+
 
 # for convenience
 GH = GlibcHeap # noqa

@@ -275,6 +275,12 @@ class PPC(Architecture):
     def encode_cookie(self, value, cookie):
         return value ^ cookie
 
+    def decode_cookie_legacy(self, value, cookie):
+        return value ^ cookie
+
+    def encode_cookie_legacy(self, value, cookie):
+        return value ^ cookie
+
 
 class PPC64(PPC):
     """GEF representation of PowerPC-64 architecture."""

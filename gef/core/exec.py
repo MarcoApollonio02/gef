@@ -24,6 +24,7 @@ class ExecAsm:
 
     # `info program` only describes the last stop in all-stop mode.
     stop_reasons = {}
+    queued_signals = {}
 
     def __init__(self, target_codes, regs=None, step=None, use_bp=False, debug=False):
         self.regs = regs
@@ -183,6 +184,130 @@ class ExecAsm:
         # revert
         self.revert_state(d)
         return ret
+
+    @staticmethod
+    def clear_queued_signal(event):
+        thread = getattr(event, "inferior_thread", None) or gdb.selected_thread()
+        if event is None or gdb.parameter("non-stop") or gdb.parameter("scheduler-locking") == "on":
+            ExecAsm.queued_signals.pop(thread, None)
+        else:
+            for stopped in list(ExecAsm.queued_signals):
+                if not stopped.is_valid() or stopped.inferior == gdb.selected_inferior():
+                    ExecAsm.queued_signals.pop(stopped, None)
+        return
+
+    def execute_with_bp(self):
+        bp = None
+        try:
+            bp_addr = self.get_end_pc()
+            bp = gdb.Breakpoint("*{:#x}".format(bp_addr), gdb.BP_BREAKPOINT, internal=True)
+            gdb.execute("c", to_string=True) # use c wrapper
+        except gdb.error:
+            pass
+        finally:
+            if bp:
+                bp.delete()
+        return
+
+    def get_end_pc(self):
+        pc = self.pc
+        if len(self.insn_sizes) >= self.step:
+            # the disassembler may decode the injected code in a stale mode (e.g., ARM vs Thumb)
+            return pc + sum(self.insn_sizes[:self.step])
+        for _ in range(self.step):
+            pc += get_insn(pc).size
+        return pc
+
+    @staticmethod
+    def get_stop_signal():
+        from gef.core.utils import GefUtil
+        stop = GefUtil.get_stop_reason(use_saved=False)
+        if stop is None:
+            return None
+        thread = gdb.selected_thread()
+        signal = ExecAsm.queued_signals.get(thread)
+        if signal is None and stop["selected_thread"]:
+            signal = stop["signal"]
+        if signal is None:
+            return None
+
+        # signals not passed to the program are never delivered
+        line = gdb.execute("info signals {:s}".format(signal), to_string=True).splitlines()[1]
+        if line.split()[3] != "Yes":
+            return None
+        return thread, signal
+
+    def is_complete(self):
+        gdb.newest_frame().select()
+        if not self.use_bp and self.step == 1 and runtime.current_arch.pc == self.pc and \
+                self.stops and gdb.selected_thread() == self.thread:
+            event = self.stops[-1]
+            if not isinstance(event, (gdb.SignalEvent, gdb.BreakpointEvent)) and \
+                    getattr(event, "details", {}).get("reason") in (None, "end-stepping-range"):
+                gdb.execute("stepi 1", to_string=True)
+                gdb.newest_frame().select()
+
+        # Only linear instructions have a fixed completion PC; syscall stepping may stop past the instruction.
+        expected_pc = self.get_end_pc()
+        if not self.stops or gdb.selected_thread() != self.thread or runtime.current_arch.pc != expected_pc:
+            return False
+        event = self.stops[-1]
+        stopped_thread = getattr(event, "inferior_thread", None)
+        if stopped_thread is not None and stopped_thread != self.thread:
+            return False
+        signal = getattr(event, "stop_signal", None)
+        reason = getattr(event, "details", {}).get("reason")
+        reasons = (None, "end-stepping-range", "signal-received")
+        if self.use_bp:
+            reasons += ("breakpoint-hit",)
+        if signal not in (None, "SIGTRAP") or reason not in reasons:
+            return False
+        if reason == "signal-received" and signal != "SIGTRAP":
+            return False
+        if isinstance(event, gdb.BreakpointEvent) and not self.use_bp:
+            return False
+        return True
+
+    def modify_code(self, pc):
+        from gef.core.process import is_x86_32, is_x86_64
+        write_memory(pc, self.code)
+        if self.debug:
+            gdb.execute("context")
+
+        # skip infloop
+        if self.code:
+            dst = pc + len(runtime.current_arch.infloop_insn)
+            if runtime.current_arch.has_delay_slot:
+                dst += len(runtime.current_arch.nop_insn)
+            if is_hppa32() or is_hppa64():
+                gdb.execute("set $pcoqh = {:#x}".format(dst), to_string=True)
+                dst2 = dst + len(runtime.current_arch.syscall_insn)
+                gdb.execute("set $pcoqt = {:#x}".format(dst2), to_string=True)
+            elif is_sparc32() or is_sparc32plus() or is_sparc64():
+                gdb.execute("set $pc = {:#x}".format(dst), to_string=True)
+                dst2 = dst + len(runtime.current_arch.syscall_insn)
+                gdb.execute("set $npc = {:#x}".format(dst2), to_string=True)
+            else:
+                gdb.execute("set $pc = {:#x}".format(dst), to_string=True)
+        if is_x86_32() or is_x86_64():
+            if is_x86_64():
+                reg = "$orig_rax"
+            else:
+                reg = "$orig_eax"
+            if get_register(reg) is not None:
+                gdb.execute("set {:s} = -1".format(reg), to_string=True)
+        self.pc = runtime.current_arch.pc
+        return
+
+    @staticmethod
+    def queue_signal(thread, signal):
+        current = gdb.selected_thread()
+        thread.switch()
+        try:
+            gdb.execute("queue-signal {:s}".format(signal), to_string=True)
+        finally:
+            current.switch()
+        return
 
 
 class ExecSyscall(ExecAsm):

@@ -743,6 +743,8 @@ class ExecUntilCondCommand(ExecUntilCommand):
     _repeat_ = True
     _aliases_ = ["next-cond"]
 
+    RE_QUOTED = r"\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'"
+
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("-I", "--print-insn", action="store_true", help="print each instruction during execution.")
     parser.add_argument("-n", "--use-ni", action="store_true", help="use `ni` instead of `si`.")
@@ -767,42 +769,72 @@ class ExecUntilCondCommand(ExecUntilCommand):
     def is_target_insn(self, insn):
         try:
             v = gdb.parse_and_eval(self.condition)
-        except gdb.error:
-            return False
+        except gdb.error as e:
+            self.err = "Could not evaluate condition: {}".format(e)
+            return True
         if v not in [0x0, 0x1]:
             self.err = "condition result should be True or False"
             return True
         return bool(v)
+
+    def expand_condition(self, condition):
+        quoted = self.RE_QUOTED
+        matches = re.compile(quoted + r"|\$ALL_REG\b\s*==\s*")
+        tokens = re.compile(quoted + r"|[()\[\]{}]|&&|\|\||==|!=|[&^|?:,]")
+        if hasattr(runtime.current_arch, "general_registers"):
+            regs = list(runtime.current_arch.general_registers)
+        else:
+            regs = list(runtime.current_arch.all_registers)
+        if hasattr(runtime.current_arch, "flag_register") and runtime.current_arch.flag_register in regs:
+            regs.remove(runtime.current_arch.flag_register)
+        result = ""
+        position = 0
+        for match in matches.finditer(condition):
+            if not match.group().startswith("$ALL_REG") or match.start() < position:
+                continue
+            end = len(condition)
+            depth = 0
+            for token in tokens.finditer(condition, match.end()):
+                value = token.group()
+                if value[0] in "\"'":
+                    continue
+                if value in "([{":
+                    depth += 1
+                elif value in ")]}":
+                    if depth == 0:
+                        end = token.start()
+                        break
+                    depth -= 1
+                elif depth == 0:
+                    end = token.start()
+                    break
+            value = condition[match.end():end].strip()
+            result += condition[position:match.start()]
+            result += "(" + "||".join("{:s}==({:s})".format(regname, value) for regname in regs) + ")"
+            position = end
+        return result + condition[position:]
 
     @parse_args
     @only_if_gdb_running
     @require_arch_set
     def do_invoke(self, args):
         condition = args.condition
-        if re.search(r"[^><!=]=[^=]", condition):
-            err("Should not use `=` since it will be replace register/memory value, try use `==`")
+        if re.search(r"\+\+|--|<<=|>>=|(?<![><!=])=(?!=)", re.sub(self.RE_QUOTED, "", condition)):
+            err("Do not use assignment or increment/decrement in a condition; use `==` for comparisons")
             return
 
-        match = re.search(r"\$ALL_REG==(\w+)", condition)
-        if match:
-            value = match.groups()[0]
-            replace_cond = []
-            if hasattr(runtime.current_arch, "general_registers"):
-                regs = runtime.current_arch.general_registers
-            else:
-                regs = runtime.current_arch.all_registers
-                if hasattr(runtime.current_arch, "flag_register"):
-                    if runtime.current_arch.flag_register in regs:
-                        regs.remove(runtime.current_arch.flag_register)
-            for regname in regs:
-                replace_cond.append("{:s}=={:s}".format(regname, value))
-            replace_string = "(" + "||".join(replace_cond) + ")"
-            condition = re.sub(r"\$ALL_REG==(\w+)", replace_string, condition)
+        condition = self.expand_condition(condition)
 
         info("Condition: {:s}".format(condition))
         self.condition = condition
+        self.err = None
+        self.is_target_insn(None)
+        if self.err:
+            err(self.err)
+            return
         self.exec_next()
         return
+
 
 
 @register_command

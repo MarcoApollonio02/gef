@@ -144,6 +144,29 @@ class HeapBaseCommand(GenericCommand):
             return None
 
     @staticmethod
+    def heap_base_from_noncontiguous_main_arena():
+        # If brk fails (e.g., memory tagging on ARM64, some qemu-user runs), glibc allocates the main heap
+        # with mmap and sets NONCONTIGUOUS_BIT. Then the heap is not in `[heap]`, so use the mapping of top.
+        if get_libc_version(silent=True) is None:
+            return None
+
+        try:
+            main_arena_addr = GlibcHeap.search_for_main_arena()
+        except OSError:
+            return None
+        if main_arena_addr is None:
+            return None
+
+        main_arena = GlibcHeap.MallocStateStruct(main_arena_addr)
+        if (main_arena.flags & 2) == 0: # NONCONTIGUOUS_BIT
+            return None
+
+        sect = ProcessMap.process_lookup_address(main_arena.top)
+        if sect is None or sect.path == "[heap]":
+            return None
+        return sect.page_start
+
+    @staticmethod
     def heap_base_from_info_proc_map(force_heuristic=False):
         # For non-static binaries, this is mostly sufficient.
         if force_heuristic:
@@ -182,7 +205,8 @@ class HeapBaseCommand(GenericCommand):
         # and can be used to find the starting address of the heap.
         # This path is useful for old qemu-user emulation, etc.
 
-        if get_libc_version() < (2, 26):
+        libc_version = get_libc_version(silent=True)
+        if libc_version is None or libc_version < (2, 26):
             return None
 
         # In 2.42 and later, tcache_perthread_struct is not necessarily the first chunk,
@@ -190,13 +214,16 @@ class HeapBaseCommand(GenericCommand):
         # However, glibc 2.42 is used in an Ubuntu 25.10 environment, and in this environment qemu-user is 10.1.
         # This version of qemu-user can obtain the exact heap base address via `info proc map`,
         # so the heuristic method should not be necessary.
-        if get_libc_version() >= (2, 42):
+        if libc_version >= (2, 42):
             return None
 
         if not runtime.current_arch.tls_supported:
             return None
 
-        main_arena_addr = GlibcHeap.search_for_main_arena()
+        try:
+            main_arena_addr = GlibcHeap.search_for_main_arena()
+        except OSError:
+            return None
         if main_arena_addr is None:
             return None
 
@@ -215,7 +242,13 @@ class HeapBaseCommand(GenericCommand):
     def heap_base_from_mp():
         # However, in the case of qemu-user runs static binary, the heapbase cannot be obtained even with
         # `info proc map`, and this way may be necessary.
-        main_arena_addr = GlibcHeap.search_for_main_arena()
+        if get_libc_version(silent=True) is None:
+            return None
+
+        try:
+            main_arena_addr = GlibcHeap.search_for_main_arena()
+        except OSError:
+            return None
         if main_arena_addr is None:
             return None
 
@@ -266,13 +299,17 @@ class HeapBaseCommand(GenericCommand):
         return None
 
     @staticmethod
-    @Cache.cache_this_session(cache_None=False)
+    @Cache.cache_this_session(cache_None=False, per_inferior=True, until_new_objfile=True)
     def heap_base(force_heuristic=False):
-        heap_base = getattr(HeapBaseCommand, "heap_base_user_specific", None)
+        heap_base = GefUtil.get_user_base("heapbase")
         if is_valid_addr(heap_base):
             return heap_base
 
         heap_base = HeapBaseCommand.heap_base_from_symbol(force_heuristic)
+        if is_valid_addr(heap_base):
+            return heap_base
+
+        heap_base = HeapBaseCommand.heap_base_from_noncontiguous_main_arena()
         if is_valid_addr(heap_base):
             return heap_base
 
@@ -296,12 +333,12 @@ class HeapBaseCommand(GenericCommand):
     def do_invoke(self, args):
         # user specific
         if args.set is not None:
-            HeapBaseCommand.heap_base_user_specific = args.set
+            GefUtil.set_user_base("heapbase", args.set)
             Cache.reset_gef_caches(all=True)
 
         if args.reset:
-            if hasattr(HeapBaseCommand, "heap_base_user_specific"):
-                delattr(HeapBaseCommand, "heap_base_user_specific")
+            GefUtil.set_user_base("heapbase", None)
+            Cache.reset_gef_caches(all=True)
 
         # auto estimation
         heap_base = HeapBaseCommand.heap_base()
@@ -311,9 +348,10 @@ class HeapBaseCommand(GenericCommand):
 
         # print
         self.quiet_print(titlify("Heap base"))
-        gdb.execute(f"set $heapbase = {heap_base:#x}")
+        gdb.set_convenience_variable("heapbase", heap_base)
         self.quiet_print(f"$heapbase = {heap_base:#x}")
         return
+
 
 
 @register_command

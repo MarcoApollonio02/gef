@@ -106,6 +106,30 @@ class KernelConstsBase:
                 err("{:16s} = {}".format(attr, Color.colorify("ERROR", "bold red")))
         return
 
+    def resolve_phys_offset_from_maps(self):
+        """Resolve PHYS_OFFSET from the kernel image and linear mappings."""
+        page_offset = self.PAGE_OFFSET
+        page_offset_end = self.PAGE_OFFSET_END
+        if page_offset is None or page_offset_end is None:
+            return None
+
+        klayout = Kernel.layout()
+        if klayout.text_base is None:
+            return None
+
+        maps = AddrMap.get_maps()
+        if not maps:
+            return None
+        phys_kbase = AddrMap.v2p(klayout.text_base, maps=maps)
+        if phys_kbase is None:
+            return None
+
+        candidates = AddrMap.p2v(phys_kbase, maps=maps)
+        linear_candidates = [address for address in candidates if page_offset <= address < page_offset_end]
+        if len(linear_candidates) != 1:
+            return None
+        return AddressUtil.normalize_address(phys_kbase - (linear_candidates[0] - page_offset))
+
 
 class KernelConstsX86(KernelConstsBase):
     """A class that manages x86 constants by version."""
@@ -533,6 +557,10 @@ class KernelConstsX86(KernelConstsBase):
 
         self.cached_sizeof_struct_page = size
         return size
+
+    @property
+    def TASK_SIZE(self):
+        return self.PAGE_OFFSET
 
 
 class KernelConstsX64(KernelConstsBase):
@@ -1147,6 +1175,13 @@ class KernelConstsX64(KernelConstsBase):
             return AddressUtil.normalize_address(efi_va_end)
         return None
 
+    @property
+    def __PAGE_OFFSET_BASE_L4_OLD(self):
+        # The move for the LDT remap of PTI (v4.19) is backported to stable kernels (e.g., 4.14.336)
+        if not is_valid_addr(0xffff_8800_0000_0000) and is_valid_addr(0xffff_8880_0000_0000):
+            return 0xffff_8880_0000_0000
+        return 0xffff_8800_0000_0000
+
 
 class KernelConstsArm32(KernelConstsBase):
     """A class that manages arm32 constants by version."""
@@ -1514,6 +1549,13 @@ class KernelConstsArm32(KernelConstsBase):
 
         self.cached_sizeof_struct_page = size
         return size
+
+    @property
+    def TASK_SIZE(self):
+        # the modules are placed between TASK_SIZE and PAGE_OFFSET
+        if self.PAGE_OFFSET is None:
+            return None
+        return self.PAGE_OFFSET - self.SZ_16M
 
 
 class KernelConstsArm64(KernelConstsBase):

@@ -40,8 +40,10 @@ class BreakRelativeVirtualAddressCommand(GenericCommand):
                         help="the offset from codebase to set a breakpoint.")
     _syntax_ = parser.format_help()
 
-    delayed_breakpoints = set()
-    delayed_bp_set = False
+    def __init__(self):
+        super().__init__()
+        RelativeVirtualAddressFunction()
+        return
 
     @parse_args
     @exclude_specific_gdb_mode(mode=("qemu-system", "kgdb", "vmware", "wine"))
@@ -56,17 +58,12 @@ class BreakRelativeVirtualAddressCommand(GenericCommand):
             err("Non-PIE ELF is unsupported")
             return
 
-        if is_alive():
-            codebase = ProcessMap.get_codebase()
-            if codebase is None:
-                gef_print("Could not find the codebase")
-                return
-            gdb.execute("b *{:#x}".format(codebase + args.offset))
-        else:
-            # use delayed breakpoints
-            BreakRelativeVirtualAddressCommand.delayed_breakpoints.add(args.offset)
+        gdb.execute("b *$gef_rva({:#x})".format(args.offset))
+        if not is_alive():
             info("Add delayed breakpoint to codebase+{:#x}".format(args.offset))
         return
+
+
 
 @register_command
 class MultiBreakCommand(GenericCommand):
@@ -507,3 +504,20 @@ class BreakIfNotTakenCommand(GenericCommand):
     def do_invoke(self, args):
         TakenOrNotBreakpoint(args.location, False, args.hw)
         return
+
+
+class RelativeVirtualAddressFunction(gdb.Function):
+    """Resolve an offset from the current codebase."""
+
+    def __init__(self):
+        super().__init__("gef_rva")
+        return
+
+    def invoke(self, offset): # noqa: V105
+        if is_alive():
+            codebase = ProcessMap.get_codebase()
+        else:
+            codebase = 0
+        if codebase is None:
+            raise gdb.GdbError("Could not find the codebase")
+        return codebase + int(offset)

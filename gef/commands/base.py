@@ -879,3 +879,23 @@ class ContextManager:
             error("File name could not be determined")
         yield local_filepath, remote_filepath
         return
+
+    @staticmethod
+    @contextlib.contextmanager
+    def exception_level(target_el, info=None, error=err):
+        from gef.commands.kernel.register import SwitchELCommand
+        """Temporarily switch the AArch64 exception level and restore $cpsr on exit, yielding whether it succeeded.
+        Report the switch and the restoration to info when given.
+        """
+        cpsr = get_register("$cpsr") & 0xffff_ffff
+        try:
+            switched = SwitchELCommand.switch_el(target_el, error=error)
+            if switched and info and (cpsr >> 2) & 0b11 != target_el:
+                info("Moving to EL{:d}".format(target_el))
+            yield switched
+        finally:
+            if get_register("$cpsr") & 0xffff_ffff != cpsr:
+                gdb.parse_and_eval("$cpsr = {:#x}".format(cpsr))
+                if info:
+                    info("Moving back to EL{:d}".format((cpsr >> 2) & 0b11))
+        return

@@ -6243,67 +6243,196 @@ class KernelConfigCommand(GenericCommand, BufferingOutput):
     parser.add_argument("-q", "--quiet", action="store_true", help="enable quiet mode.")
     _syntax_ = parser.format_help()
 
-    def get_config(self):
-        kinfo = Kernel.get_kernel_layout()
-        if kinfo.ro_base is None:
-            err("Not recognized .rodata")
-            return False
+    MAGIC_START = b"IKCFG_ST"
+    MAGIC_END = b"IKCFG_ED"
+    MAX_CONFIG_GZ_SIZE = 0x100000
+
+    def extract_config(self, addr, end=None):
+        # v5.1~: `kernel_config_data` points just after IKCFG_ST
+        # ~v5.0: `kernel_config_data` is a static array that begins with IKCFG_ST
+        data = read_memory(addr, len(self.MAGIC_START), safe=True)
+        if data is None:
+            return None
+        if data != self.MAGIC_START:
+            addr -= len(self.MAGIC_START)
+            if read_memory(addr, len(self.MAGIC_START), safe=True) != self.MAGIC_START:
+                return None
+
+        import zlib
+        decompressor = zlib.decompressobj(zlib.MAX_WBITS | 16)
+        pos = addr + len(self.MAGIC_START)
+        if end:
+            limit = end
+        else:
+            limit = pos + self.MAX_CONFIG_GZ_SIZE
+        configs = []
+        while not decompressor.eof:
+            if pos >= limit:
+                warn("Truncated gzip stream at {:#x}".format(addr))
+                return None
+            size = min(limit, (pos & ~0xfff) + 0x1000) - pos
+            data = read_memory(pos, size, safe=True)
+            if data is None:
+                warn("Failed to read the gzip stream at {:#x}".format(pos))
+                return None
+            try:
+                configs.append(decompressor.decompress(data))
+            except zlib.error as e:
+                warn("Gzip decompress error at {:#x}: {}".format(addr, e))
+                return None
+            pos += size
+        end_pos = pos - len(decompressor.unused_data)
+        found_end = read_memory(end_pos, len(self.MAGIC_END), safe=True) == self.MAGIC_END
+        self.markers = (addr, end_pos, found_end)
+        return String.bytes2str(b"".join(configs))
+
+    def print_markers(self):
+        start_pos, end_pos, found_end = self.markers
+        info("IKCFG_ST: {:#x}".format(start_pos))
+        if found_end:
+            info("IKCFG_ED: {:#x}".format(end_pos))
+        else:
+            warn("IKCFG_ED is not found just after the gzip stream ({:#x})".format(end_pos))
+        return
+
+    def iter_readable(self, start, end, chunk_size):
+        pagesize = get_pagesize()
+        for pos in ProgressBar(range(start, end, chunk_size), disable=self.args.quiet or not is_kgdb()):
+            size = min(chunk_size, end - pos)
+            data = read_memory(pos, size, safe=True)
+            if data is not None:
+                yield pos, data
+                continue
+            for page in range(pos, pos + size, pagesize):
+                yield page, read_memory(page, min(pagesize, pos + size - page), safe=True)
+        return
+
+    def search_config(self, start, end, chunk_size):
+        # the marker may straddle two chunks, so keep the tail of the previous one
+        keep = len(self.MAGIC_START) - 1
+        buf = b""
+        buf_addr = start
+        unreadable = 0
+        for addr, data in self.iter_readable(start, end, chunk_size):
+            if data is None:
+                buf = b""
+                unreadable += 1
+                continue
+            if not buf:
+                buf_addr = addr
+            buf += data
+            pos = buf.find(self.MAGIC_START)
+            while pos >= 0:
+                configs = self.extract_config(buf_addr + pos)
+                if configs is not None:
+                    return configs
+                pos = buf.find(self.MAGIC_START, pos + 1)
+            buf_addr += len(buf) - keep
+            buf = buf[-keep:]
+        if unreadable:
+            warn("Skipped {:d} unreadable pages in {:#x}-{:#x}".format(unreadable, start, end))
+        return None
+
+    def get_config_from_symbol(self):
+        addr = Ksym.get_addr("kernel_config_data")
+        if not addr:
+            return None
+        end = Ksym.get_addr("kernel_config_data_end") # v5.1~
+        configs = self.extract_config(addr, end)
+        if configs is None:
+            warn("kernel_config_data ({:#x}) does not have a valid config".format(addr))
+        return configs
+
+    def get_config_from_rodata(self):
+        klayout = Kernel.layout()
+        if klayout.ro_base is None:
+            warn("Not recognized .rodata")
+            return None
 
         if is_kgdb():
             info("The config is often near the top of .rodata; once found, the search stops early.")
-            ro_data = b""
-            tqdm = GefUtil.get_tqdm(not self.args.quiet)
-            for pos in tqdm(range(0, kinfo.ro_size, 0x1000), leave=False):
-                if not is_valid_addr(kinfo.ro_base + pos):
-                    err("Memory read error")
-                    return
-                ro_data += read_memory(kinfo.ro_base + pos, 0x1000)
-                if ro_data.find(b"IKCFG_ST") >= 0 and ro_data.find(b"IKCFG_ED") >= 0:
-                    break
+            chunk_size = 0x1000
         else:
-            if not is_valid_addr(kinfo.ro_base):
-                err("Memory read error")
-                return
-            ro_data = read_memory(kinfo.ro_base, kinfo.ro_size)
+            chunk_size = 0x100000
+        configs = self.search_config(klayout.ro_base, klayout.ro_base + klayout.ro_size, chunk_size)
+        if configs is None:
+            info("Could not find IKCFG_ST in .rodata")
+        return configs
 
-        start_pos = ro_data.find(b"IKCFG_ST")
-        if start_pos == -1:
-            err("Could not find IKCFG_ST, this kernel may be built as CONFIG_IKCONFIG_PROC=n")
-            return False
-        end_pos = ro_data.find(b"IKCFG_ED")
+    def get_config_from_module(self):
+        kmod = Kernel.modules()
+        if not kmod.initialize():
+            info("Could not find modules (CONFIG_MODULES may not be set)")
+            return None
+        module_addrs = kmod.get_addrs()[0]
+        module = kmod.find(module_addrs, "configs")
+        if module is None:
+            info("The configs module is not loaded")
+            return None
+        info("configs module: {:#x}".format(module))
 
-        info("IKCFG_ST: {:#x}".format(kinfo.ro_base + start_pos))
-        info("IKCFG_ED: {:#x}".format(kinfo.ro_base + end_pos))
-        configz = ro_data[start_pos + len("IKCFG_ST"):end_pos]
-
-        import gzip
+        # module->kallsyms may be unresolvable, then the module memory is searched
+        symbols = {}
         try:
-            self.configs = String.bytes2str(gzip.decompress(configz))
-        except gzip.BadGzipFile:
-            err("Gzip decompress error")
-            return False
-        return True
+            if kmod.initialize_kallsyms(module_addrs):
+                symbols = {name: addr for addr, _type, name in kmod.parse_kallsyms(module)}
+        except gdb.error:
+            pass
+        if "kernel_config_data" in symbols:
+            configs = self.extract_config(symbols["kernel_config_data"], symbols.get("kernel_config_data_end"))
+            if configs is not None:
+                return configs
+
+        if not kmod.initialize_memory(module_addrs):
+            info("Could not resolve the memory of the configs module")
+            return None
+        # since v6.4, the config is in the rodata region
+        ranges = [(base, base + size) for _type, base, size in kmod.get_regions(module)]
+        for start, end in sorted(set(ranges)):
+            configs = self.search_config(start, end, 0x1000 if is_kgdb() else 0x100000)
+            if configs is not None:
+                return configs
+        warn("Could not find IKCFG_ST in the configs module")
+        return None
+
+    @Cache.cache_this_session(cache_None=False, per_inferior=True)
+    def get_config(self):
+        for getter in (self.get_config_from_symbol, self.get_config_from_rodata, self.get_config_from_module):
+            configs = getter()
+            if configs is not None:
+                self.print_markers()
+                return configs
+        err("Could not find IKCFG_ST, this kernel may be built as CONFIG_IKCONFIG=n, "
+            "or CONFIG_IKCONFIG=m without loading the configs module")
+        return None
+
+    @Cache.cache_this_session(per_inferior=True, until_new_objfile=True)
+    def get_configs(self):
+        """Return the embedded config as a dict, or None if unavailable."""
+        result = gdb.execute("kconfig --quiet --no-pager", to_string=True)
+        configs = {}
+        for line in Color.remove_color(result).splitlines():
+            match = re.match(r"^(CONFIG_\w+)=(.*)$", line)
+            if match:
+                configs[match.group(1)] = match.group(2)
+        return configs or None
 
     @parse_args
     @only_if_gdb_running
     @only_if_specific_gdb_mode(mode=("qemu-system", "vmware", "kgdb"))
-    @only_if_specific_arch(arch=("x86_32", "x86_64", "ARM32", "ARM64"))
+    @only_if_specific_arch(arch=("x86_32", "x86_64", "ARM32", "ARM64", "RISCV32", "RISCV64"))
     @only_if_in_kernel_or_kpti_disabled
     def do_invoke(self, args):
         self.quiet_info("Wait for memory scan")
 
-        if not hasattr(self, "configs"):
-            self.configs = None
-
         if args.rescan:
-            self.configs = None
+            Cache.reset_gef_caches(all=True)
 
-        if self.configs is None:
-            ret = self.get_config()
-            if not ret:
-                return
+        configs = self.get_config()
+        if configs is None:
+            return
 
-        self.out = self.configs.splitlines()
+        self.out = configs.splitlines()
 
         if args.filter:
             out = []

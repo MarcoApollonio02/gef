@@ -367,6 +367,12 @@ class HPPA(Architecture):
     def encode_cookie(self, value, cookie):
         return value
 
+    def decode_cookie_legacy(self, value, cookie):
+        return value
+
+    def encode_cookie_legacy(self, value, cookie):
+        return value
+
 
 class HPPA64(HPPA):
     """GEF representation of HP-PA-64 architecture."""

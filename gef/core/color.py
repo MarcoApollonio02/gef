@@ -611,9 +611,24 @@ class Color:
 
     NO_COLOR = None
 
+    # `attrs` comes from the theme settings, so the number of distinct keys is small.
+    cached_escapes = {}
+
+    # `colorify` is one of the hottest paths, so the setting lookup is memoized here.
+    # It is dropped by `Cache.reset_gef_caches`, which every write to `gef.disable_color`
+    # goes through (`Config.set`, `add_setting`, `gef config`, `gef restore`).
+    cached_disabled = None
+
     @staticmethod
     def disable_color():
-        if Config.get_gef_setting("gef.disable_color") is True:
+        if Color.cached_disabled is not None:
+            return Color.cached_disabled
+        Color.cached_disabled = Color.disable_color_uncached()
+        return Color.cached_disabled
+
+    @staticmethod
+    def disable_color_uncached():
+        if Config.get("gef.disable_color") is True:
             return True
         if Color.NO_COLOR is None:
             if os.environ.get("NO_COLOR", None):
@@ -630,12 +645,15 @@ class Color:
         if Color.disable_color():
             return str(text)
 
-        colors = Color.colors
-        escapes = [colors[attr] for attr in attrs.split() if attr in colors]
-        if len(escapes) == 0:
+        escapes = Color.cached_escapes.get(attrs)
+        if escapes is None:
+            colors = Color.colors
+            escapes = "".join([colors[attr] for attr in attrs.split() if attr in colors])
+            Color.cached_escapes[attrs] = escapes
+        if not escapes:
             return str(text)
 
-        out = "".join(escapes) + str(text) + colors["normal"]
+        out = escapes + str(text) + Color.colors["normal"]
         return out
 
     @staticmethod
@@ -646,5 +664,3 @@ class Color:
     @staticmethod
     def remove_color(text):
         return re.sub(r"\x1B\[([0-9]{1,2}(;[0-9]{1,3})*)?m", "", text)
-
-

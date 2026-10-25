@@ -28,6 +28,8 @@ from gef.core.utils import GefUtil
 class ARM(Architecture):
     """GEF representation of ARM-32 architecture."""
 
+    RE_CONDITION_SUFFIX = re.compile(r"(?:eq|ne|lt|le|gt|ge|vs|vc|mi|pl|hi|ls|cs|cc|hs|lo|al)(?=(?:\.[nw])?$)")
+
     arch = "ARM"
 
     load_condition = [
@@ -458,6 +460,12 @@ class ARM(Architecture):
         return value ^ cookie
 
     def encode_cookie(self, value, cookie):
+        return value ^ cookie
+
+    def decode_cookie_legacy(self, value, cookie):
+        return value ^ cookie
+
+    def encode_cookie_legacy(self, value, cookie):
         return value ^ cookie
 
 

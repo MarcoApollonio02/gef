@@ -42,6 +42,7 @@ from gef.core.process import (
     Pid,
     ProcessMap,
     get_pagesize,
+    is_core_file,
     is_32bit,
     is_64bit,
     is_alive,
@@ -975,8 +976,7 @@ class ChecksecCommand(GenericCommand):
     _aliases_ = ["cs"]
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
-    parser.add_argument("-r", "--remote", action="store_true",
-                        help="parse remote binary if download feature is available.")
+    parser.add_argument("-r", "--remote", action="store_true", help="parse remote binary if download feature is available.")
     parser.add_argument("-f", "--file", help="the file path to parse.")
     _syntax_ = parser.format_help()
 
@@ -990,7 +990,7 @@ class ChecksecCommand(GenericCommand):
         super().__init__(complete=gdb.COMPLETE_FILENAME)
         return
 
-    def check_CET_SHSTK(self, sec):
+    def check_CET_SHSTK(self, sec, runtime=True):
         # Intel CET SHSTK flags via Ehdr
         if "CET SHSTK flag" not in sec:
             # ELF is not x86_64
@@ -1001,11 +1001,11 @@ class ChecksecCommand(GenericCommand):
             gef_print("{:<40s}: {:s}".format("CET SHSTK feature flag (via Ehdr)", Color.colorify("Not found", "bold red")))
 
         # gdb mode check
-        if not is_x86():
+        if not runtime or not is_x86():
             return
         if not is_alive():
             return
-        if is_rr():
+        if is_rr() or is_core_file():
             return
 
         # Intel CET SHSTK status via arch_prctl
@@ -1059,7 +1059,7 @@ class ChecksecCommand(GenericCommand):
                 gef_print("{:<40s}: {:s}".format("CET SHSTK Lock status (via procfs)", msg))
         return
 
-    def check_CET_IBT(self, sec):
+    def check_CET_IBT(self, sec, runtime=True):
         # Intel CET IBT flags via Ehdr
         if "CET IBT flag" not in sec:
             # ELF is not x86_64
@@ -1070,7 +1070,7 @@ class ChecksecCommand(GenericCommand):
             gef_print("{:<40s}: {:s}".format("CET IBT feature flag (via Ehdr)", Color.colorify("Not found", "bold red")))
 
         # gdb mode check
-        if not is_x86():
+        if not runtime or not is_x86():
             return
         if not is_alive():
             return
@@ -1098,7 +1098,7 @@ class ChecksecCommand(GenericCommand):
             gef_print("{:<40s}: {:s}".format("CET IBT status", msg))
         return
 
-    def check_PAC(self, sec):
+    def check_PAC(self, sec, runtime=True):
         # PAC opcode
         if "PAC" not in sec:
             # ELF is not ARM64
@@ -1111,7 +1111,7 @@ class ChecksecCommand(GenericCommand):
             gef_print("{:<40s}: {:s}".format("PAC opcode", Color.colorify("Not found", "bold red")))
 
         # gdb mode check
-        if not is_arm64():
+        if not runtime or not is_arm64():
             return
         if not is_alive():
             return
@@ -1146,9 +1146,9 @@ class ChecksecCommand(GenericCommand):
             gef_print("{:<40s}: {:s}".format("PAC", msg))
         return
 
-    def check_MTE(self, sec):
+    def check_MTE(self, sec, runtime=True):
         # gdb mode check
-        if not is_arm64():
+        if not runtime or not is_arm64():
             return
         if not is_alive():
             return
@@ -1180,10 +1180,102 @@ class ChecksecCommand(GenericCommand):
             gef_print("{:<40s}: {:s}".format("MTE", msg))
         return
 
+    def check_AARCH64_ELF(self, sec):
+        if "AArch64 BTI flag" not in sec:
+            return
+
+        properties = [
+            ("AArch64 BTI feature flag", sec["AArch64 BTI flag"]),
+            ("AArch64 PAC feature flag", sec["AArch64 PAC flag"]),
+            ("AArch64 GCS feature flag", sec["AArch64 GCS flag"]),
+            ("AArch64 BTI-PLT", sec["AArch64 BTI PLT"]),
+            ("AArch64 PAC-PLT", sec["AArch64 PAC PLT"]),
+        ]
+        for name, enabled in properties:
+            if enabled:
+                state = Color.colorify("Found", "bold green")
+            else:
+                state = Color.colorify("Not found", "bold red")
+            gef_print("{:<40s}: {:s}".format(name, state))
+
+        mte_mode = sec["AArch64 MTE mode"]
+        mte_regions = [
+            name for name, enabled in [
+                ("heap", sec["AArch64 MTE heap"]),
+                ("stack", sec["AArch64 MTE stack"]),
+                ("globals", sec["AArch64 MTE globals"]),
+            ] if enabled
+        ]
+        if mte_mode is None and not mte_regions:
+            gef_print("{:<40s}: {:s}".format("MTE ELF policy", Color.colorify("Not requested", "bold red")))
+        else:
+            modes = {0: "sync", 1: "async"}
+            mode = modes.get(mte_mode, "unspecified" if mte_mode is None else "{:#x}".format(mte_mode))
+            if mte_regions:
+                regions = ", ".join(mte_regions)
+            else:
+                regions = "none"
+            msg = Color.colorify("Requested", "bold green") + " (mode: {:s}, regions: {:s})".format(mode, regions)
+            gef_print("{:<40s}: {:s}".format("MTE ELF policy", msg))
+        return
+
+    def check_GCS(self, sec, runtime=True):
+        if "AArch64 GCS flag" not in sec:
+            return
+        if not runtime or not is_arm64():
+            return
+        if not is_alive():
+            return
+        if is_rr():
+            return
+
+        status = Checksec.get_gcs_status()
+        if status is None:
+            msg = Color.colorify("Unsupported", "bold red")
+        elif status & 1: # PR_SHADOW_STACK_ENABLE
+            features = []
+            if status & 2:
+                features.append("write")
+            if status & 4:
+                features.append("push")
+            if features:
+                additional = " ({:s})".format(", ".join(features))
+            else:
+                additional = ""
+            msg = Color.colorify("Enabled", "bold green") + additional
+        else:
+            msg = Color.colorify("Disabled", "bold red")
+        gef_print("{:<40s}: {:s}".format("GCS runtime status", msg))
+        return
+
+    def check_runtime_wx(self):
+        if not is_alive():
+            return
+
+        sections = [
+            section for section in (ProcessMap.get_process_maps() or [])
+            if section.is_writable() and section.is_executable()
+        ]
+        if not sections:
+            return
+
+        ranges = []
+        for section in sections[:4]:
+            if section.path:
+                path = " {:s}".format(section.path)
+            else:
+                path = ""
+            ranges.append("{:#x}-{:#x}{:s}".format(section.page_start, section.page_end, path))
+        if len(sections) > 4:
+            ranges.append("... +{:d} more".format(len(sections) - 4))
+        msg = Color.colorify("RWX found", "bold red") + " ({:d}: {:s})".format(len(sections), ", ".join(ranges))
+        gef_print("{:<40s}: {:s}".format("Runtime W^X (current process)", msg))
+        return
+
     def check_system_ASLR(self):
-        if is_remote_debug():
+        if is_remote_debug() or is_core_file():
             msg = Color.grayify("Unknown")
-            gef_print("{:<40s}: {:s} (remote process)".format("System-ASLR", msg))
+            gef_print("{:<40s}: {:s} (remote process or core file)".format("System-ASLR", msg))
         else:
             try:
                 system_aslr = int(open("/proc/sys/kernel/randomize_va_space").read())
@@ -1202,9 +1294,9 @@ class ChecksecCommand(GenericCommand):
         return
 
     def check_gdb_ASLR(self):
-        if is_attach() or is_remote_debug():
+        if is_attach() or is_remote_debug() or is_core_file():
             msg = Color.grayify("Ignored")
-            gef_print("{:<40s}: {:s} (attached or remote process)".format("GDB ASLR setting", msg))
+            gef_print("{:<40s}: {:s} (attached, remote process or core file)".format("GDB ASLR setting", msg))
         else:
             ret = gdb.parameter("disable-randomization")
             if ret is True:
@@ -1227,7 +1319,7 @@ class ChecksecCommand(GenericCommand):
             msg = Color.grayify("Unknown")
         return msg
 
-    def print_security_properties(self, filename):
+    def print_security_properties(self, filename, runtime=True):
         elf = Elf.get_elf(filename)
         if elf is None or not elf.is_valid():
             err("checksec is failed")
@@ -1242,7 +1334,7 @@ class ChecksecCommand(GenericCommand):
 
         # Canary
         msg = self.get_colored_msg(sec["Canary"])
-        if sec["Canary"] is True and is_alive():
+        if sec["Canary"] is True and runtime and is_alive():
             res = CanaryCommand.gef_read_canary()
             if not res:
                 msg += " (Could not get the canary value)"
@@ -1254,11 +1346,17 @@ class ChecksecCommand(GenericCommand):
         gef_print("{:<40s}: {:s}".format("NX", self.get_colored_msg(sec["NX"])))
 
         # PIE
-        if sec["PIE"]:
+        if sec["Shared object"]:
+            gef_print("{:<40s}: {:s} (shared object)".format("PIE", self.get_colored_msg(sec["PIE"])))
+        elif sec["PIE"]:
             gef_print("{:<40s}: {:s}".format("PIE", self.get_colored_msg(sec["PIE"])))
         else:
-            vaddr = min([p.p_vaddr for p in elf.phdrs if p.p_type == Elf.Phdr.PT_LOAD])
-            gef_print("{:<40s}: {:s} ({:#x})".format("PIE", self.get_colored_msg(sec["PIE"]), vaddr))
+            vaddr = min((p.p_vaddr for p in elf.phdrs if p.p_type == Elf.Phdr.PT_LOAD), default=None)
+            if vaddr is not None:
+                detail = "{:#x}".format(vaddr)
+            else:
+                detail = "N/A"
+            gef_print("{:<40s}: {:s} ({:s})".format("PIE", self.get_colored_msg(sec["PIE"]), detail))
 
         # RELRO
         if sec["Full RELRO"]:
@@ -1272,10 +1370,17 @@ class ChecksecCommand(GenericCommand):
             gef_print("{:<40s}: {:s}".format("RELRO", Color.colorify("No RELRO", "bold red")))
 
         # Fortify
-        if sec["Fortify"]:
-            gef_print("{:<40s}: {:s}".format("Fortify", Color.colorify("Found", "bold green")))
+        if sec["Fortify"] is None:
+            msg = Color.grayify("Unknown")
+        elif sec["Fortify"]:
+            msg = Color.colorify("Found", "bold green")
         else:
-            gef_print("{:<40s}: {:s}".format("Fortify", Color.colorify("Not found", "bold red")))
+            msg = Color.colorify("Not found", "bold red")
+        if sec["Fortified Imports"] is not None:
+            msg += " ({:d} fortified imports, {:d} unfortified candidates; observable imports)".format(
+                sec["Fortified Imports"], sec["Unfortified Candidates"],
+            )
+        gef_print("{:<40s}: {:s}".format("Fortify", msg))
 
         gef_print(titlify("Additional information"))
 
@@ -1301,12 +1406,14 @@ class ChecksecCommand(GenericCommand):
             gef_print("{:<40s}: {:s}".format("Debuginfo", Color.colorify("No debuginfo", "bold green")))
 
         # Intel CET
-        self.check_CET_SHSTK(sec)
-        self.check_CET_IBT(sec)
+        self.check_CET_SHSTK(sec, runtime=runtime)
+        self.check_CET_IBT(sec, runtime=runtime)
 
         # ARM64 PAC/MTE
-        self.check_PAC(sec)
-        self.check_MTE(sec)
+        self.check_AARCH64_ELF(sec)
+        self.check_PAC(sec, runtime=runtime)
+        self.check_MTE(sec, runtime=runtime)
+        self.check_GCS(sec, runtime=runtime)
 
         # RPATH
         if sec["RPATH"]:
@@ -1324,69 +1431,54 @@ class ChecksecCommand(GenericCommand):
         if sec["Clang SafeStack"]:
             gef_print("{:<40s}: {:s}".format("Clang SafeStack", self.get_colored_msg(sec["Clang SafeStack"])))
 
+        # File and runtime W^X
+        direct = sec["W^X LOAD segments"]
+        overlaps = sec["W^X page overlap"]
+        if direct:
+            ranges = ", ".join("{:#x}-{:#x}".format(start, end) for start, end in direct)
+            msg = Color.colorify("RWX found", "bold red") + " ({:s})".format(ranges)
+            gef_print("{:<40s}: {:s}".format("File W^X LOAD segments", msg))
+
+        if overlaps:
+            ranges = ", ".join("{:#x}-{:#x}".format(start, end) for start, end in overlaps)
+            msg = Color.colorify("Found", "bold red") + " ({:s})".format(ranges)
+            gef_print("{:<40s}: {:s}".format("File W/X page overlap", msg))
+
+        if sec["Text Relocations"]:
+            gef_print("{:<40s}: {:s}".format("Text relocations", Color.colorify("Found", "bold red")))
+        if runtime:
+            self.check_runtime_wx()
+
         # ASLR
         self.check_system_ASLR()
-        self.check_gdb_ASLR()
+        if runtime:
+            self.check_gdb_ASLR()
         return
 
     @parse_args
     @exclude_specific_gdb_mode(mode=("wine", "kgdb"))
-    @require_arch_set
     def do_invoke(self, args):
         if is_qemu_system() or is_vmware():
             info("Redirect to kchecksec")
             gdb.execute("kchecksec")
             return
 
-        local_filepath = None
-        remote_filepath = None
-        tmp_filepath = None
-
-        if args.remote:
-            if not is_remote_debug():
-                err("-r option is allowed only remote debug")
+        with ContextManager.local_elf(args.file, remote=args.remote,
+                                      prefix=self._cmdline_) as (local_filepath, remote_filepath):
+            if local_filepath is None:
                 return
 
+            runtime = args.file is None and not is_core_file()
             if args.file:
-                remote_filepath = args.file # if specified, assume it is remote
-            elif gdb.current_progspace().filename:
-                f = gdb.current_progspace().filename
-                if f.startswith("target:"): # gdbserver
-                    f = f[7:]
-                remote_filepath = f
-            elif Pid.get_pid(remote=True):
-                remote_filepath = "/proc/{:d}/exe".format(Pid.get_pid(remote=True))
-            else:
-                err("File name could not be determined")
-                return
-
-            data = Path.read_remote_file(remote_filepath, as_byte=True) # qemu-user is failed here, it is ok
-            if not data:
-                err("Failed to read remote filepath")
-                return
-            tmp_fd, tmp_filepath = GefUtil.mkstemp(prefix="checksec", suffix=".elf")
-            os.fdopen(tmp_fd, "wb").write(data)
-            local_filepath = tmp_filepath
-            del data
-
-        elif args.file:
-            local_filepath = args.file
-
-        elif args.file is None:
-            if is_qemu_system():
-                err("Argument-less calls are unsupported under qemu-system")
-                return
-            local_filepath = Path.get_filepath()
-
-        if local_filepath is None:
-            err("File name could not be determined")
-            return
-
-        self.print_security_properties(local_filepath)
-
-        if tmp_filepath and os.path.exists(tmp_filepath):
-            os.unlink(tmp_filepath)
+                if args.remote:
+                    runtime = remote_filepath == Path.get_remote_filepath()
+                else:
+                    current_filepath = Path.get_filepath()
+                    if current_filepath and os.path.isfile(current_filepath) and os.path.isfile(local_filepath):
+                        runtime = os.path.samefile(local_filepath, current_filepath) and not is_core_file()
+            self.print_security_properties(local_filepath, runtime=runtime)
         return
+
 
 
 @register_command

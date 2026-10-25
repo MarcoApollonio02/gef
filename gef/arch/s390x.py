@@ -408,4 +408,10 @@ class S390X(Architecture):
     def encode_cookie(self, value, cookie):
         return value ^ cookie
 
+    def decode_cookie_legacy(self, value, cookie):
+        return value ^ cookie
+
+    def encode_cookie_legacy(self, value, cookie):
+        return value ^ cookie
+
 

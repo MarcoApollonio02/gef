@@ -217,6 +217,22 @@ class SPARC(Architecture):
     def encode_cookie(self, value, cookie):
         return value ^ cookie
 
+    def decode_cookie_legacy(self, value, cookie):
+        return value ^ cookie
+
+    def encode_cookie_legacy(self, value, cookie):
+        return value ^ cookie
+
+    def is_register_window_saved(self):
+        try:
+            frame = gdb.selected_frame()
+            caller = frame.older()
+            if caller is not None:
+                return int(frame.read_register("fp")) == int(caller.read_register("sp"))
+        except (gdb.error, ValueError):
+            pass
+        return True
+
 
 class SPARC32PLUS(SPARC):
     """GEF representation of SPARC-32+ architecture."""

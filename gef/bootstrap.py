@@ -54,6 +54,8 @@ def update_gef(argv):
 class Gef:
     """A collection of utility functions that are related to GEF start up."""
 
+    missing_commands = runtime.missing_commands
+
     @staticmethod
     def list_current_commands():
         command_list = []

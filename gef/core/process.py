@@ -541,6 +541,20 @@ def is_csky():
     return runtime.current_arch and runtime.current_arch.arch == "CSKY"
 
 
+GDB_MODE_CHECKERS = {
+    "pin": is_pin,
+    "qemu-system": is_qemu_system,
+    "qemu-user": is_qemu_user,
+    "vmware": is_vmware,
+    "kgdb": is_kgdb,
+    "kdb": is_kdb,
+    "core": is_core_file,
+    "qiling": is_qiling,
+    "rr": is_rr,
+    "wine": is_wine,
+}
+
+
 ARCH_CHECKERS = {
     "x86_32": is_x86_32,
     "x86_64": is_x86_64,
@@ -836,6 +850,39 @@ class Pid:
         ptid = gdb.selected_thread().ptid
         return ptid[1] or ptid[2]
 
+    @staticmethod
+    def get_pid_from_thread_ids(tids, filepath):
+        """Return the PID of the only process that has all `tids` as its thread IDs, or None."""
+        candidate = []
+        for process in Pid.get_all_process():
+            if not process["filepath"].startswith(filepath):
+                continue
+            pid = process["pid"]
+            own_tids = set()
+            try:
+                for tid in os.listdir("/proc/{:d}/task".format(pid)):
+                    status = open("/proc/{:d}/task/{:s}/status".format(pid, tid)).read()
+                    m = re.search(r"^NSpid:\s+(.+)$", status, re.MULTILINE)
+                    own_tids.add(int(m.group(1).split()[-1]) if m else int(tid))
+            except (FileNotFoundError, ProcessLookupError, OSError):
+                continue
+            if tids <= own_tids:
+                candidate.append(pid)
+        if len(candidate) == 1:
+            return candidate[0]
+        return None
+
+    @staticmethod
+    def get_qemu_thread_ids():
+        """Return the host thread IDs that the QEMU gdbstub reports (in the PID namespace of QEMU)."""
+        if is_qemu_system():
+            try:
+                res = gdb.execute("monitor info cpus", to_string=True)
+            except gdb.error:
+                return set()
+            return {int(x) for x in re.findall(r"thread_id=(\d+)", res)}
+        return {thread.ptid[1] for thread in gdb.selected_inferior().threads() if thread.ptid[1] > 0}
+
 
 class Path:
     """A collection of utility functions that obtains a path."""
@@ -930,6 +977,25 @@ class Path:
             data = open(tmp_name, "r").read()
         os.unlink(tmp_name)
         return data
+
+    @staticmethod
+    def get_binary_map_path():
+        maps = ProcessMap.get_process_maps() or []
+        entry = (Auxv.get_auxiliary_values() or {}).get("AT_ENTRY")
+        if entry is not None:
+            for section in maps:
+                if section.page_start <= entry < section.page_end and section.path:
+                    if not section.path.startswith("[") or section.path == "[code]":
+                        return section.path
+
+        paths = [Path.get_remote_filepath(), Path.get_filepath(append_proc_root_prefix=False)]
+        if is_qemu_user():
+            paths.append("[code]")
+        for path in paths:
+            if path and any(section.path == path for section in maps):
+                return path
+        err("Could not determine the executable memory map")
+        return None
 
 
 class ProcessMap:
@@ -1639,6 +1705,25 @@ class ProcessMap:
         filepath = Path.get_filepath_from_info_proc()
         code_base = ProcessMap.get_section_base_address(filepath)
         return code_base
+
+    @staticmethod
+    @Cache.cache_until_next(per_inferior=True)
+    def get_process_map_index():
+        """Return sorted starts and sections, preserving the original order when regions overlap."""
+        maps = ProcessMap.get_process_maps()
+        ordered = sorted(maps, key=lambda section: section.page_start)
+        if any(first.page_end > second.page_start for first, second in zip(ordered, ordered[1:])):
+            return None, maps
+        return [section.page_start for section in ordered], ordered
+
+    @staticmethod
+    @Cache.cache_this_session(per_inferior=True, until_new_objfile=True)
+    def supports_info_proc_mappings():
+        try:
+            res = gdb.execute("info proc mappings", to_string=True)
+            return "warning" not in res and "Perms" in res
+        except gdb.error:
+            return False
 
 
 class LinuxSignal:

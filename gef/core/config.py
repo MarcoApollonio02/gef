@@ -24,6 +24,28 @@ class Config:
         return setting[0]
 
     @staticmethod
+    def add(name, value, description=""):
+        Config.__gef_config__[name] = [value, type(value), description]
+        Cache.reset_gef_caches()
+        return
+
+    @staticmethod
+    def info(name):
+        setting = Config.__gef_config__.get(name)
+        if setting is None:
+            return None
+        return {"value": setting[0], "type": setting[1], "description": setting[2]}
+
+    @staticmethod
+    def names(prefix=""):
+        return [name for name in Config.__gef_config__ if name.startswith(prefix)]
+
+    @staticmethod
+    def set(name, value, _type=None, _desc=None, *, reset_all=False):
+        Config.set_gef_setting(name, value, _type, _desc)
+        return
+
+    @staticmethod
     @Cache.cache_until_next
     def get(name):
         """Read global gef settings. Return None if not found."""

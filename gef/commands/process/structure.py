@@ -3520,6 +3520,10 @@ class DynamicCommand(GenericCommand, BufferingOutput):
             0x70000001: "DT_AARCH64_BTI_PLT",
             0x70000003: "DT_AARCH64_PAC_PLT",
             0x70000005: "DT_AARCH64_VARIANT_PCS",
+            0x70000009: "DT_AARCH64_MEMTAG_MODE",
+            0x7000000b: "DT_AARCH64_MEMTAG_HEAP",
+            0x7000000c: "DT_AARCH64_MEMTAG_STACK",
+            0x7000000d: "DT_AARCH64_MEMTAG_GLOBALS",
         },
         "alpha": {
             0x70000000: "DT_ALPHA_PLTRO",
@@ -3604,19 +3608,16 @@ class DynamicCommand(GenericCommand, BufferingOutput):
     }
 
     @staticmethod
-    def get_ARCH_SPECIFIC_DT_TABLE():
+    def get_DT_THISPROCNUM():
         # default value
         DT_THISPROCNUM = 0
-        ARCH_SPECIFIC_DT_TABLE = {}
 
         # Considering glibc 2.20 and later
         if is_arm64():
             if get_libc_version() >= (2, 33):
                 DT_THISPROCNUM = 6
-                ARCH_SPECIFIC_DT_TABLE = DynamicCommand.ARCH_SPECIFIC_DT_TABLE["arm64"]
         elif is_alpha():
             DT_THISPROCNUM = 1
-            ARCH_SPECIFIC_DT_TABLE = DynamicCommand.ARCH_SPECIFIC_DT_TABLE["alpha"]
         elif is_mips32() or is_mips64() or is_mipsn32():
             if get_libc_version() >= (2, 31):
                 DT_THISPROCNUM = 0x37
@@ -3624,47 +3625,74 @@ class DynamicCommand(GenericCommand, BufferingOutput):
                 DT_THISPROCNUM = 0x36
             else:
                 DT_THISPROCNUM = 0x35
-            ARCH_SPECIFIC_DT_TABLE = DynamicCommand.ARCH_SPECIFIC_DT_TABLE["mips"] # 2.20~
-        elif is_nios2():
-            # DT_THISPROCNUM is not changed
-            ARCH_SPECIFIC_DT_TABLE = DynamicCommand.ARCH_SPECIFIC_DT_TABLE["nios2"]
         elif is_ppc32():
             if get_libc_version() >= (2, 22):
                 DT_THISPROCNUM = 2
             else:
                 DT_THISPROCNUM = 1
-            ARCH_SPECIFIC_DT_TABLE = DynamicCommand.ARCH_SPECIFIC_DT_TABLE["ppc32"]
         elif is_ppc64():
             DT_THISPROCNUM = 4
-            ARCH_SPECIFIC_DT_TABLE = DynamicCommand.ARCH_SPECIFIC_DT_TABLE["ppc64"]
-        elif is_riscv32() or is_riscv64():
-            if get_libc_version() >= (2, 36):
-                # DT_THISPROCNUM is not changed
-                ARCH_SPECIFIC_DT_TABLE = DynamicCommand.ARCH_SPECIFIC_DT_TABLE["riscv"]
         elif is_sparc32() or is_sparc32plus() or is_sparc64():
             DT_THISPROCNUM = 2
-            ARCH_SPECIFIC_DT_TABLE = DynamicCommand.ARCH_SPECIFIC_DT_TABLE["sparc"]
         elif is_x86_64():
             if get_libc_version() >= (2, 39):
                 DT_THISPROCNUM = 4
-                ARCH_SPECIFIC_DT_TABLE = DynamicCommand.ARCH_SPECIFIC_DT_TABLE["x86-64"]
-        elif is_xtensa():
-            # DT_THISPROCNUM is not changed
-            ARCH_SPECIFIC_DT_TABLE = DynamicCommand.ARCH_SPECIFIC_DT_TABLE["xtensa"]
-        return DT_THISPROCNUM, ARCH_SPECIFIC_DT_TABLE
+        return DT_THISPROCNUM
 
     @staticmethod
     @Cache.cache_this_session
     def get_DT_TABLE():
-        _, ARCH_SPECIFIC_DT_TABLE = DynamicCommand.get_ARCH_SPECIFIC_DT_TABLE()
-        return DynamicCommand.DT_TABLE | ARCH_SPECIFIC_DT_TABLE
+        ARCH_SPECIFIC_DT_TABLE = {}
+        if is_arm64():
+            ARCH_SPECIFIC_DT_TABLE = DynamicCommand.ARCH_SPECIFIC_DT_TABLE["arm64"]
+        elif is_alpha():
+            ARCH_SPECIFIC_DT_TABLE = DynamicCommand.ARCH_SPECIFIC_DT_TABLE["alpha"]
+        elif is_mips32() or is_mips64() or is_mipsn32():
+            ARCH_SPECIFIC_DT_TABLE = DynamicCommand.ARCH_SPECIFIC_DT_TABLE["mips"]
+        elif is_nios2():
+            ARCH_SPECIFIC_DT_TABLE = DynamicCommand.ARCH_SPECIFIC_DT_TABLE["nios2"]
+        elif is_ppc32():
+            ARCH_SPECIFIC_DT_TABLE = DynamicCommand.ARCH_SPECIFIC_DT_TABLE["ppc32"]
+        elif is_ppc64():
+            ARCH_SPECIFIC_DT_TABLE = DynamicCommand.ARCH_SPECIFIC_DT_TABLE["ppc64"]
+        elif is_riscv32() or is_riscv64():
+            ARCH_SPECIFIC_DT_TABLE = DynamicCommand.ARCH_SPECIFIC_DT_TABLE["riscv"]
+        elif is_sparc32() or is_sparc32plus() or is_sparc64():
+            ARCH_SPECIFIC_DT_TABLE = DynamicCommand.ARCH_SPECIFIC_DT_TABLE["sparc"]
+        elif is_x86_64():
+            ARCH_SPECIFIC_DT_TABLE = DynamicCommand.ARCH_SPECIFIC_DT_TABLE["x86-64"]
+        elif is_xtensa():
+            ARCH_SPECIFIC_DT_TABLE = DynamicCommand.ARCH_SPECIFIC_DT_TABLE["xtensa"]
+        return {**DynamicCommand.DT_TABLE, **ARCH_SPECIFIC_DT_TABLE}
 
     def __init__(self):
         super().__init__(complete=gdb.COMPLETE_FILENAME)
         return
 
-    def dump_dynamic(self, dynamic, remain_size):
-        base_address_color = Config.get_gef_setting("theme.dereference_base_address")
+    @staticmethod
+    def iter_dynamic(dynamic, size=None, raw=False):
+        current = dynamic.value
+        if dynamic.section:
+            end = dynamic.section.page_end
+        else:
+            end = AddressUtil.get_vmem_end()
+        if size is not None:
+            end = min(AddressUtil.get_vmem_end(), current + size)
+        while current + runtime.current_arch.ptrsize * 2 <= end:
+            try:
+                tag = read_int_from_memory(current)
+                val = read_int_from_memory(current + runtime.current_arch.ptrsize)
+            except gdb.MemoryError:
+                err("Memory read error at {:#x}".format(current))
+                break
+            yield current, tag, val
+            if tag == 0 and not raw: # DT_NULL
+                break
+            current += runtime.current_arch.ptrsize * 2
+        return
+
+    def dump_dynamic(self, dynamic, remain_size, raw=None):
+        base_address_color = Config.get("theme.dereference_base_address")
 
         if dynamic is None:
             info("Could not find _DYNAMIC")
@@ -3678,29 +3706,16 @@ class DynamicCommand(GenericCommand, BufferingOutput):
 
         DT_TABLE = DynamicCommand.get_DT_TABLE()
 
-        current = dynamic.value
-        while True:
-            addr = current
-            tag = read_int_from_memory(current)
-            current += runtime.current_arch.ptrsize
-            val = read_int_from_memory(current)
-            current += runtime.current_arch.ptrsize
-
-            if remain_size is None:
-                if tag not in DT_TABLE:
-                    break
-            else:
-                remain_size -= runtime.current_arch.ptrsize * 2
-
-            val = ProcessMap.lookup_address(val)
+        if raw is None:
+            raw = remain_size is not None
+        for addr, tag, val in self.iter_dynamic(dynamic, remain_size, raw):
+            val = ProcessMap.lookup(val)
             tag_description = DT_TABLE.get(tag, "Unknown")
             colored_addr = Color.colorify("{:#0{:d}x}".format(addr, width), base_address_color)
             self.out.append("{:s}: {:#0{:d}x} {!s}  |  {:s}".format(
                 colored_addr, tag, width, val, tag_description,
             ))
 
-            if remain_size is not None and remain_size <= 0:
-                break
         return
 
     @staticmethod
@@ -3708,9 +3723,10 @@ class DynamicCommand(GenericCommand, BufferingOutput):
         if not filename_or_addr:
             # fast path
             try:
-                dynamic = AddressUtil.parse_address("(void*) &_DYNAMIC")
-                dynamic = ProcessMap.lookup_address(dynamic)
-                return dynamic
+                dynamic = Symbol.resolve_address("_DYNAMIC")
+                # patchelf may leave _DYNAMIC pointing to a clobbered old .dynamic section.
+                if dynamic is not None and read_memory(dynamic, 4) != b"\x5a\x5a\x5a\x5a":
+                    return ProcessMap.lookup(dynamic)
             except gdb.error:
                 pass
 
@@ -3779,9 +3795,9 @@ class DynamicCommand(GenericCommand, BufferingOutput):
             else:
                 dynamic = phdr.p_vaddr
 
-        dynamic = ProcessMap.lookup_address(dynamic)
+        dynamic = ProcessMap.lookup(dynamic)
         if not silent:
-            info("_DNYAMIC: {!s} [{!s}]".format(dynamic, dynamic.section.permission))
+            info("_DYNAMIC: {!s} [{!s}]".format(dynamic, dynamic.section.permission))
         return dynamic
 
     @parse_args
@@ -3789,8 +3805,9 @@ class DynamicCommand(GenericCommand, BufferingOutput):
     @exclude_specific_gdb_mode(mode=("qemu-system", "kgdb", "vmware", "wine"))
     @require_arch_set
     def do_invoke(self, args):
-        if args.dynamic_address:
-            dynamic = ProcessMap.lookup_address(args.dynamic_address)
+        dynamic_size = args.dynamic_size
+        if args.dynamic_address is not None:
+            dynamic = ProcessMap.lookup(args.dynamic_address)
         else:
             try:
                 dynamic = self.get_dynamic(args.elf_address or args.filename)
@@ -3798,15 +3815,23 @@ class DynamicCommand(GenericCommand, BufferingOutput):
                 err("Failed to get _DYNAMIC")
                 return
 
+            if dynamic_size is None:
+                try:
+                    elf = Elf.get_elf(args.elf_address or args.filename)
+                    dynamic_size = elf.get_phdr(Elf.Phdr.PT_DYNAMIC).p_memsz
+                except Exception:
+                    dynamic_size = None
+
         self.out = []
         try:
-            self.dump_dynamic(dynamic, args.dynamic_size)
+            self.dump_dynamic(dynamic, dynamic_size, raw=args.dynamic_size is not None)
         except Exception:
             err("Failed to parse _DYNAMIC")
             return
 
         self.print_output(check_terminal_size=True)
         return
+
 
 
 @register_command

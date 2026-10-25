@@ -10,6 +10,7 @@ Auto-discovered by gef.bootstrap via pkgutil.walk_packages.
 import argparse
 import collections
 import re
+import shlex
 
 import gdb
 
@@ -449,6 +450,23 @@ class PagewalkCommand(GenericCommand, BufferingOutput):
             gdb.execute("pagewalk arm64 {}".format(" ".join(argv)))
         elif is_riscv64() or is_riscv32():
             gdb.execute("pagewalk riscv {}".format(" ".join(argv)))
+        return
+
+    @only_if_gdb_running
+    @only_if_specific_gdb_mode(mode=("qemu-system", "vmware", "kgdb"))
+    @only_if_specific_arch(arch=("x86_32", "x86_64", "x86_16", "ARM32", "ARM64", "RISCV32", "RISCV64"))
+    def invoke_subcommand(self, argv):
+        arguments = " ".join(shlex.quote(arg) for arg in argv)
+        if is_x86_32() or is_x86_16():
+            gdb.execute("pagewalk x86 {}".format(arguments))
+        elif is_x86_64():
+            gdb.execute("pagewalk x64 {}".format(arguments))
+        elif is_arm32():
+            gdb.execute("pagewalk arm {}".format(arguments))
+        elif is_arm64():
+            gdb.execute("pagewalk arm64 {}".format(arguments))
+        elif is_riscv64() or is_riscv32():
+            gdb.execute("pagewalk riscv {}".format(arguments))
         return
 
 

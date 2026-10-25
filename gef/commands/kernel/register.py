@@ -1661,7 +1661,7 @@ class IdtInfoCommand(GenericCommand, BufferingOutput):
     ]
     _note_ = "\n".join(_note_)
 
-    # arch/x86/include/asm/trapnr.h
+    # arch/x86/include/asm/trapnr.h; X86_TRAP_IRET (32) is not an IDT vector.
     INTERRUPT_DESCRIPTION = {
         0: "#DE: Divide-by-zero",
         1: "#DB: Debug",
@@ -1686,32 +1686,57 @@ class IdtInfoCommand(GenericCommand, BufferingOutput):
         20: "#VE: Virtualization Exception",
         21: "#CP: Control Protection Exception",
         29: "#VC: VMM Communication Exception",
-        32: "#IRET: IRET Exception",
     }
 
     @staticmethod
-    def idt_unpack(val):
+    def idt_unpack(val, entry_size=None):
+        if entry_size is None:
+            entry_size = IdtInfoCommand.get_entry_size()
         idt = {}
         idt["value"] = val
 
         idt["offset"] = val & 0xffff
-        idt["offset"] = idt["offset"] | ((val >> 32) & (0xffff_0000))
-        idt["offset"] = ((val >> 32) & (0xffff_ffff_0000_0000)) | idt["offset"]
         idt["segment"] = (val >> 16) & 0xffff
-        idt["ist"] = (val >> 32) & 0b111 # codespell:ignore
-        idt["gate_type"] = (val >> 40) & (0b1111)
-        idt["dpl"] = (val >> 45) & (0b11)
-        idt["present"] = (val >> 47) & (0b1)
+        if entry_size == 16: # codespell:ignore
+            idt["ist"] = (val >> 32) & 0b111
+        else:
+            idt["ist"] = 0
+        if entry_size != 4:
+            idt["gate_type"] = (val >> 40) & 0b1111
+        else:
+            idt["gate_type"] = None
+        if entry_size != 4:
+            idt["dpl"] = (val >> 45) & 0b11
+        else:
+            idt["dpl"] = None
+        if entry_size != 4:
+            idt["present"] = (val >> 47) & 1
+        else:
+            idt["present"] = None
 
-        Idt = collections.namedtuple("Idt", idt.keys())
-        return Idt(*idt.values())
+        if entry_size == 16 or idt["gate_type"] in (14, 15):
+            idt["offset"] |= (val >> 32) & 0xffff_0000
+        if entry_size == 16:
+            idt["offset"] |= (val >> 32) & 0xffff_ffff_0000_0000
+        elif idt["gate_type"] == 5:
+            idt["offset"] = 0
+
+        return GefUtil.dict_to_namedtuple("Idt", idt)
 
     @staticmethod
-    def idtval2str(value):
-        val_width = runtime.current_arch.ptrsize * 4 + 2
-        ofs_width = runtime.current_arch.ptrsize * 2 + 2
+    def get_entry_size():
+        return {"real": 4, "protected": 8, "long": 16}[GefUtil.get_x86_descriptor_mode()]
 
-        idt = IdtInfoCommand.idt_unpack(value)
+    @staticmethod
+    def idtval2str(value, entry_size=None):
+        if entry_size is None:
+            entry_size = IdtInfoCommand.get_entry_size()
+        val_width = entry_size * 2 + 2
+        ofs_width = entry_size + 2
+
+        idt = IdtInfoCommand.idt_unpack(value, entry_size)
+        if entry_size == 4:
+            return "{:#010x} {:#06x}:{:#06x}".format(idt.value, idt.segment, idt.offset)
         if idt.present == 0:
             return "(none)"
 
@@ -1725,9 +1750,13 @@ class IdtInfoCommand(GenericCommand, BufferingOutput):
         return out
 
     @staticmethod
-    def idtval2str_legend():
-        val_width = runtime.current_arch.ptrsize * 4 + 2
-        ofs_width = runtime.current_arch.ptrsize * 2 + 2
+    def idtval2str_legend(entry_size=None):
+        if entry_size is None:
+            entry_size = IdtInfoCommand.get_entry_size()
+        if entry_size == 4:
+            return "{:3s} {:36s} {:10s} {:6s}:{:6s}".format("#", "name", "value", "segm", "offset")
+        val_width = entry_size * 2 + 2
+        ofs_width = entry_size + 2
         return "{:3s} {:36s} {:{:d}s} {:3s} {:3s} {:3s} {:3s} {:6s}:{:{:d}s}".format(
             "#", "name", "value", val_width, "typ",
             "ist", "dpl", "p", "segm", "offset", ofs_width, # codespell:ignore
@@ -1735,7 +1764,7 @@ class IdtInfoCommand(GenericCommand, BufferingOutput):
 
     def print_idt_example(self):
         # print title
-        if is_x86_64() or is_emulated32():
+        if GefUtil.get_x86_descriptor_mode() == "long":
             self.out.append(titlify("IDT Entry (x64 sample)"))
         else:
             self.out.append(titlify("IDT Entry (x86 sample)"))
@@ -1745,7 +1774,7 @@ class IdtInfoCommand(GenericCommand, BufferingOutput):
         self.out.append(GefUtil.make_legend(self.idtval2str_legend()))
 
         # print entry
-        if is_x86_64() or is_emulated32():
+        if GefUtil.get_x86_descriptor_mode() == "long":
             entries = [
                 # idx, value
                 [0,    0x00_0000_0000_ffff_ffff_8160_8e00_0010_0c30],
@@ -1810,64 +1839,78 @@ class IdtInfoCommand(GenericCommand, BufferingOutput):
 
     def print_idt_real(self):
         # parse real value
-        if is_qemu_system():
-            res = gdb.execute("monitor info registers", to_string=True)
-            r = re.search(r"IDT\s*=\s*(\S+) (\S+)", res)
-        elif is_vmware():
-            res = gdb.execute("monitor r idtr", to_string=True)
-            r = re.search(r"idtr base=(\S+) limit=(\S+)", res)
-
-        if not r:
+        base, limit = GefUtil.get_x86_descriptor_table_register("idtr")
+        if base is None:
             self.err_add_out("Could not find IDTR")
             return
 
-        base = int(r.group(1), 16)
-        limit = int(r.group(2), 16)
+        entry_size = self.get_entry_size()
 
         # print title
         self.out.append(titlify("IDT Entry: base:{:#x} / limit:{:#x}".format(base, limit)))
 
         # print legend
-        self.out.append(GefUtil.make_legend(self.idtval2str_legend()))
+        self.out.append(GefUtil.make_legend(self.idtval2str_legend(entry_size)))
 
-        # check initialized or not
+        # Reset IDTR values can also name a live table; keep this guard to avoid dumping up to 256 unset vectors.
         if (base == 0x0 and limit == 0xffff) or limit == 0x0:
             self.err_add_out("IDT is uninitialized")
             return
 
         try:
-            idt_data = read_memory(base, min(limit + 1, runtime.current_arch.ptrsize * 2 * 256))
+            size = min(limit + 1, entry_size * 256)
+            idt_data = GefUtil.read_x86_descriptor_table(base, size - size % entry_size)
         except gdb.MemoryError:
             self.err_add_out("Memory read error")
             return
-        entries = slice_unpack(idt_data, runtime.current_arch.ptrsize * 2)
+        entries = slice_unpack(idt_data, entry_size)
 
         # print entry
         for i, b in enumerate(entries):
             int_name = self.INTERRUPT_DESCRIPTION.get(i, "User defined Interrupt {:#x}".format(i))
-            valstr = self.idtval2str(b)
-            sym = Symbol.get_symbol_string(self.idt_unpack(b).offset, nosymbol_string=" <NO_SYMBOL>")
+            valstr = self.idtval2str(b, entry_size)
+            idt = self.idt_unpack(b, entry_size)
+            if entry_size == 4:
+                address = (idt.segment << 4) + idt.offset
+            else:
+                address = idt.offset
+            sym = ""
+            if entry_size == 4 or (idt.present and idt.gate_type != 5):
+                sym = " " + Symbol.format(address, missing="NO_SYMBOL")
             self.out.append("{:<3d} {:36s} {:s}{:s}".format(i, int_name, valstr, sym))
         return
 
     def print_idt_entry_legend(self):
+        entry_size = self.get_entry_size()
+        if entry_size == 4:
+            self.out.append(titlify("legend (Real-mode interrupt vector)"))
+            self.out.append("| Segment 31:16 | Offset 15:0 | 4byte")
+            self.out.append(" * handler address : (segment << 4) + offset")
+            return
         self.out.append(titlify("legend (Normal IDT entry)"))
         self.out.append(" 31                                 15  14    13  12     8       3     0bit")
+        if entry_size == 16:
+            self.out.append("------------------------------------------------------------------------")
+            self.out.append("|                              RESERVED                                | 12byte")
+            self.out.append("------------------------------------------------------------------------")
+            self.out.append("|                            OFFSET2 63:32                             | 8byte")
         self.out.append("------------------------------------------------------------------------")
-        self.out.append("|                              RESERVED                                | 12byte")
-        self.out.append("------------------------------------------------------------------------")
-        self.out.append("|                            OFFSET2 63:32                             | 8byte")
-        self.out.append("------------------------------------------------------------------------")
-        self.out.append("|         OFFSET1 31:16            | P | DPL | 0 | Type | 00000 | IST  | 4byte") # codespell:ignore
+        if entry_size == 16:
+            self.out.append("|         OFFSET1 31:16            | P | DPL | 0 | Type | 00000 | IST  | 4byte") # codespell:ignore
+        else:
+            self.out.append("|         OFFSET1 31:16            | P | DPL | 0 | Type |   RESERVED   | 4byte")
         self.out.append("------------------------------------------------------------------------")
         self.out.append("|         Segment Selector         |           OFFSET0 15:0            | 0byte")
         self.out.append("------------------------------------------------------------------------")
         self.out.append(" * segment selector : Segment selector for destination code segment")
         self.out.append(" * offset           : Offset to handler procedure entry point")
-        self.out.append(" * ist              : Interrupt stack table") # codespell:ignore
+        if entry_size == 16:
+            self.out.append(" * ist              : Interrupt stack table") # codespell:ignore
         self.out.append(" * type             : One of following")
-        self.out.append("                        0x5: Task gate")
-        self.out.append("                        0xC: Call gate")
+        if entry_size == 8:
+            self.out.append("                        0x5: Task gate (segment selects a TSS; no handler offset)")
+            self.out.append("                        0x6: 16-bit interrupt gate")
+            self.out.append("                        0x7: 16-bit trap gate")
         self.out.append("                        0xE: 32/64-bit interrupt gate")
         self.out.append("                        0xF: 32/64-bit trap gate")
         self.out.append(" * dpl              : Descriptor privilege level")
@@ -1892,6 +1935,7 @@ class IdtInfoCommand(GenericCommand, BufferingOutput):
 
         self.print_output(check_terminal_size=True)
         return
+
 
 
 @register_command
@@ -2081,21 +2125,51 @@ class CetCommand(GenericCommand):
 
     TRACKER_STATES = {0: "IDLE", 1: "WAIT_FOR_ENDBRANCH"}
 
-    def decode_cet_bits(self, val):
+    @staticmethod
+    def get_capabilities():
+        from gef.commands.registers.view import CpuidCommand
+        maximum, _, _, _ = CpuidCommand.execute_cpuid(0)
+        if maximum >= 7:
+            _, _, ecx, edx = CpuidCommand.execute_cpuid(7, 0)
+        else:
+            ecx = edx = 0
+        maximum, _, _, _ = CpuidCommand.execute_cpuid(0x8000_0000)
+        long_mode = False
+        if maximum >= 0x8000_0001:
+            _, _, _, extended_edx = CpuidCommand.execute_cpuid(0x8000_0001)
+            long_mode = bool(extended_edx & (1 << 29))
+        return {"ss": bool(ecx & (1 << 7)), "ibt": bool(edx & (1 << 20)), "long_mode": long_mode}
+
+    def decode_cet_bits(self, val, capabilities):
         if val is None:
             return None
+        if not capabilities["long_mode"]:
+            val &= 0xffff_ffff
         d = {}
         for name, bit in self.U_S_COMMON_BITS.items():
-            d[name] = (val >> bit) & 1
-        tracker = (val >> 11) & 0x1
-        d["TRACKER"] = "{:d} ({:s})".format(d["TRACKER"], self.TRACKER_STATES[tracker])
-        d["EB_LEG_BITMAP_BASE"] = AddressUtil.format_address(val & ~0xfff)
+            if bit < 2:
+                supported = capabilities["ss"]
+            else:
+                supported = capabilities["ibt"]
+            if supported:
+                d[name] = (val >> bit) & 1
+            else:
+                d[name] = "N/A (unsupported)"
+        if capabilities["ibt"]:
+            tracker = d["TRACKER"]
+            d["TRACKER"] = "{:d} ({:s})".format(tracker, self.TRACKER_STATES[tracker])
+            memalign_size = 4
+            if capabilities["long_mode"]:
+                memalign_size = 8
+            d["EB_LEG_BITMAP_BASE"] = AddressUtil.format_address(val & ~0xfff, memalign_size=memalign_size)
+        else:
+            d["EB_LEG_BITMAP_BASE"] = "N/A (unsupported)"
         return d
 
     def print_cet_bits(self, title, d):
         gef_print(titlify(title))
         for k, v in d.items():
-            if k in ["TRACKER", "EB_LEG_BITMAP_BASE"]:
+            if isinstance(v, str):
                 gef_print("{:20s} : {:s}".format(k, v))
             else:
                 gef_print("{:20s} : {:x}".format(k, v))
@@ -2108,40 +2182,85 @@ class CetCommand(GenericCommand):
     @only_if_in_kernel
     @only_if_kvm_disabled
     def do_invoke(self, args):
+        try:
+            capabilities = self.get_capabilities()
+        except gdb.error as e:
+            err("Could not read CET capabilities: {!s}".format(e))
+            return
         cr4 = get_register("cr4", use_monitor=True)
         gef_print(titlify("CET summary"))
+        gef_print("Selected CPU: GDB thread {:d}".format(Cache.cpu_context()))
+        gef_print("CPUID.7.0: CET_SS = {:d}, CET_IBT = {:d}".format(capabilities["ss"], capabilities["ibt"]))
         if cr4 is not None:
             cet_master = (cr4 >> 23) & 1
             gef_print("CR4 = {:#x} (CR4.CET = {:#x})".format(cr4, cet_master))
         else:
             gef_print("CR4 = N/A")
 
-        IA32_U_CET = MsrCommand.read_msr(0x6a0)
-        ud = self.decode_cet_bits(IA32_U_CET)
+        supported = capabilities["ss"] or capabilities["ibt"]
+        IA32_U_CET = None
+        if supported:
+            IA32_U_CET = MsrCommand.read_msr(0x6a0)
+        ud = self.decode_cet_bits(IA32_U_CET, capabilities)
         if ud is not None:
             self.print_cet_bits("IA32_U_CET ({:#x})".format(IA32_U_CET), ud)
+        elif not supported:
+            gef_print("IA32_U_CET = N/A (unsupported)")
         else:
-            gef_print("IA_32_U_CET = N/A")
+            gef_print("IA32_U_CET = N/A")
 
-        IA32_S_CET = MsrCommand.read_msr(0x6a2)
-        sd = self.decode_cet_bits(IA32_S_CET)
+        IA32_S_CET = None
+        if supported:
+            IA32_S_CET = MsrCommand.read_msr(0x6a2)
+        sd = self.decode_cet_bits(IA32_S_CET, capabilities)
         if sd is not None:
-            self.print_cet_bits("IA32_S_CET ({:#x})".format(IA32_S_CET), ud)
+            self.print_cet_bits("IA32_S_CET ({:#x})".format(IA32_S_CET), sd)
+        elif not supported:
+            gef_print("IA32_S_CET = N/A (unsupported)")
         else:
-            gef_print("IA_32_U_CET = N/A")
+            gef_print("IA32_S_CET = N/A")
+
+        gef_print(titlify("SSP MSRs"))
+        if not capabilities["ss"]:
+            gef_print("PL0_SSP = N/A (unsupported)")
+            gef_print("PL1_SSP = N/A (unsupported)")
+            gef_print("PL2_SSP = N/A (unsupported)")
+            gef_print("PL3_SSP = N/A (unsupported)")
+            gef_print("IA32_INTERRUPT_SSP_TABLE_ADDR = N/A (unsupported)")
+            return
 
         IA32_PL0_SSP = MsrCommand.read_msr(0x6a4)
         IA32_PL1_SSP = MsrCommand.read_msr(0x6a5)
         IA32_PL2_SSP = MsrCommand.read_msr(0x6a6)
         IA32_PL3_SSP = MsrCommand.read_msr(0x6a7)
         IA32_INT_SSP_TAB = MsrCommand.read_msr(0x6a8)
-        gef_print(titlify("SSP MSRs"))
-        gef_print("PL0_SSP = {:s}".format(AddressUtil.format_address(IA32_PL0_SSP)))
-        gef_print("PL1_SSP = {:s}".format(AddressUtil.format_address(IA32_PL1_SSP)))
-        gef_print("PL2_SSP = {:s}".format(AddressUtil.format_address(IA32_PL2_SSP)))
-        gef_print("PL3_SSP = {:s}".format(AddressUtil.format_address(IA32_PL3_SSP)))
-        gef_print("IA32_INTERRUPT_SSP_TABLE_ADDR = {:s}".format(AddressUtil.format_address(IA32_INT_SSP_TAB)))
+        memalign_size = 4
+        if capabilities["long_mode"]:
+            memalign_size = 8
+
+        if IA32_PL0_SSP is None:
+            gef_print("PL0_SSP = N/A")
+        else:
+            gef_print("PL0_SSP = {:s}".format(AddressUtil.format_address(IA32_PL0_SSP, memalign_size=memalign_size)))
+        if IA32_PL1_SSP is None:
+            gef_print("PL1_SSP = N/A")
+        else:
+            gef_print("PL1_SSP = {:s}".format(AddressUtil.format_address(IA32_PL1_SSP, memalign_size=memalign_size)))
+        if IA32_PL2_SSP is None:
+            gef_print("PL2_SSP = N/A")
+        else:
+            gef_print("PL2_SSP = {:s}".format(AddressUtil.format_address(IA32_PL2_SSP, memalign_size=memalign_size)))
+        if IA32_PL3_SSP is None:
+            gef_print("PL3_SSP = N/A")
+        else:
+            gef_print("PL3_SSP = {:s}".format(AddressUtil.format_address(IA32_PL3_SSP, memalign_size=memalign_size)))
+        if IA32_INT_SSP_TAB is None:
+            gef_print("IA32_INTERRUPT_SSP_TABLE_ADDR = N/A")
+        else:
+            gef_print("IA32_INTERRUPT_SSP_TABLE_ADDR = {:s}".format(
+                AddressUtil.format_address(IA32_INT_SSP_TAB, memalign_size=memalign_size)))
         return
+
 
 
 @register_command

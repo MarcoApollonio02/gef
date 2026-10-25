@@ -11,6 +11,8 @@ References to `gef.commands.*` (e.g. BreakRelativeVirtualAddressCommand) are
 late-imported inside the referencing method.
 """
 import contextlib
+import os
+import re
 
 import gdb
 
@@ -43,6 +45,9 @@ class EventHandler:
         return
 
     __gef_check_once__ = True # the flag to process only once at startup
+    continue_hooks_enabled = False
+    kpti_transition_active = False
+    qemu_pipe_pids = {}
     __gef_check_disabled_bp__ = False # the flag to remove unnecessary breakpoints
 
     @staticmethod
@@ -148,6 +153,171 @@ class EventHandler:
     def regchanged_handler(_event):
         """GDB event handler for reg changes cases."""
         Cache.reset_gef_caches()
+        return
+
+    @staticmethod
+    def get_handlers():
+        handlers = [
+            ("stop", EventHandler.hook_stop_handler),
+            ("new_objfile", EventHandler.new_objfile_handler),
+            ("free_objfile", EventHandler.del_objfile_handler),
+            ("clear_objfiles", EventHandler.del_objfile_handler),
+            ("exited", EventHandler.exit_handler),
+            ("gdb_exiting", EventHandler.gdb_exiting_handler),
+            ("connection_removed", EventHandler.connection_removed_handler),
+            ("memory_changed", EventHandler.state_changed_handler),
+            ("register_changed", EventHandler.state_changed_handler),
+        ]
+        if hasattr(gdb.events, "selected_context"):
+            handlers.extend([
+                ("selected_context", EventHandler.selected_context_handler),
+                ("new_thread", EventHandler.new_thread_handler),
+            ])
+        return handlers
+
+    @staticmethod
+    def connect():
+        EventHandler.set_continue_hooks(True)
+        for name, handler in EventHandler.get_handlers():
+            registry = getattr(gdb.events, name, None)
+            if registry is not None:
+                registry.connect(handler)
+        if hasattr(gdb.events, "selected_context"):
+            EventHandler.update_continue_hooks()
+        return
+
+    @staticmethod
+    def set_continue_hooks(enabled):
+        from gef.commands.debugging.context import ContextExtraCommand, ContextRegistersCommand
+        if enabled == EventHandler.continue_hooks_enabled:
+            return
+
+        handlers = (
+            ContextRegistersCommand.update_registers,
+            ContextExtraCommand.empty_extra_messages,
+            EventHandler.continue_handler,
+        )
+        if enabled:
+            hook = EventHooking.gef_on_continue_hook
+        else:
+            hook = EventHooking.gef_on_continue_unhook
+        for handler in handlers:
+            hook(handler)
+        EventHandler.continue_hooks_enabled = enabled
+        return
+
+    @staticmethod
+    def update_continue_hooks():
+        return EventHandler.set_continue_hooks(gdb.selected_thread() is not None)
+
+    @staticmethod
+    def del_objfile_handler(_event):
+        from gef.core.utils import GefUtil
+        """GDB event handler for removed object file cases.
+        `remove-symbol-file`, an actual shared library unload and `file` replacing the whole
+        symbol file set stale the same caches as loading a new one does."""
+        progspace = getattr(_event, "progspace", None)
+        if progspace is not None and not progspace.objfiles():
+            GefUtil.clear_user_bases(progspace=progspace)
+        Cache.reset_gef_caches(new_objfile=True)
+        return
+
+    @staticmethod
+    def gdb_exiting_handler(event):
+        """Stop QEMU children launched through a pipe before GDB waits for them."""
+        for inferior in gdb.inferiors():
+            connection = inferior.connection
+            if connection is None or connection.type not in ("remote", "extended-remote"):
+                continue
+            if not (connection.details or "").lstrip().startswith("|"):
+                continue
+            if inferior != gdb.selected_inferior():
+                gdb.execute("inferior {:d}".format(inferior.num), to_string=True)
+            Cache.reset_gef_caches(all=True)
+            EventHandler.track_qemu_pipe()
+            if connection.num not in EventHandler.qemu_pipe_pids:
+                continue
+            try:
+                gdb.execute("kill", to_string=True)
+            except gdb.error:
+                pass
+        return
+
+    @staticmethod
+    def connection_removed_handler(_event):
+        from gef.commands.memory.patch import PatchCommand
+        from gef.core.kernel import KernelVersion
+        from gef.core.utils import GefUtil
+        """GDB event handler for removed target connections."""
+        child = EventHandler.qemu_pipe_pids.pop(_event.connection.num, None)
+        if child is not None:
+            import signal
+            pid, started = child
+            try:
+                current = open("/proc/{:d}/stat".format(pid)).read().rsplit(")", 1)[1].split()[19]
+                if current == started:
+                    os.kill(pid, signal.SIGKILL)
+            except (FileNotFoundError, ProcessLookupError):
+                pass
+        PatchCommand.invalidate_history(connection_num=_event.connection.num)
+        KernelVersion.clear_override(connection_num=_event.connection.num)
+        GefUtil.clear_user_bases(connection_num=_event.connection.num)
+        Cache.reset_gef_caches(all=True)
+        return
+
+    @staticmethod
+    def state_changed_handler(_event):
+        """Invalidate caches after memory or register changes."""
+        Cache.reset_gef_caches()
+        return
+
+    @staticmethod
+    def selected_context_handler(_event):
+        """Enable continue handlers only when the selected inferior has a thread."""
+        return EventHandler.update_continue_hooks()
+
+    @staticmethod
+    def new_thread_handler(_event):
+        gdb.post_event(EventHandler.update_continue_hooks)
+        return
+
+    @staticmethod
+    def track_qemu_pipe():
+        from gef.core.process import Pid, is_qemu_system
+        inferior = gdb.selected_inferior()
+        connection = getattr(inferior, "connection", None)
+        if connection is None or connection.type not in ("remote", "extended-remote"):
+            return
+        if connection.num in EventHandler.qemu_pipe_pids:
+            return
+        if not (connection.details or "").lstrip().startswith("|") or not is_qemu_system():
+            return
+        qemu_pid = pid = Pid.get_pid()
+        while pid and pid != os.getpid():
+            try:
+                status = open("/proc/{:d}/status".format(pid)).read()
+            except OSError:
+                return
+            parent = re.search(r"^PPid:\s+(\d+)$", status, re.MULTILINE)
+            if parent:
+                pid = int(parent.group(1))
+            else:
+                pid = None
+        if pid == os.getpid():
+            try:
+                started = open("/proc/{:d}/stat".format(qemu_pid)).read().rsplit(")", 1)[1].split()[19]
+            except OSError:
+                return
+            EventHandler.qemu_pipe_pids[connection.num] = (qemu_pid, started)
+        return
+
+    @staticmethod
+    def disconnect():
+        EventHandler.set_continue_hooks(False)
+        for name, handler in EventHandler.get_handlers():
+            registry = getattr(gdb.events, name, None)
+            if registry is not None:
+                registry.disconnect(handler)
         return
 
 

@@ -1,11 +1,13 @@
 """Abstract base class for all architectures supported by GEF."""
 
 import abc
+import functools
 
 import gdb
 
 from gef.core import runtime
 from gef.core.address import AddressUtil
+from gef.core.cache import Cache
 from gef.core.color import Color
 from gef.core.registers import get_register
 
@@ -290,3 +292,41 @@ class Architecture:
                 flag_str = value_table[i].lower()
             flags.append(flag_str)
         return "{:#x} [{}]".format(reg_value, " ".join(flags))
+
+    @property
+    @Cache.cache_this_session(until_new_objfile=True)
+    def ptr_mangle_rotation(self):
+        from gef.core.utils import get_libc_version
+        # glibc 2.44 check
+        libc_version = get_libc_version(silent=True)
+        if libc_version is not None and libc_version >= (2, 44):
+            return runtime.current_arch.ptrsize * 2 + 1
+        return None
+
+    def decode_cookie_legacy(self, value, cookie):
+        return value
+
+    def encode_cookie_legacy(self, value, cookie):
+        return value
+
+    @functools.cached_property
+    def aliased_registers(self):
+        # {"$zero":"$zero/$x0", ...}
+        aliased_registers = {}
+        for reg in self.all_registers:
+            if self.alias_registers and reg in self.alias_registers:
+                reg_str = "{:s}/{:s}".format(reg, self.alias_registers[reg])
+            else:
+                reg_str = reg
+            aliased_registers[reg] = reg_str
+        return aliased_registers
+
+    @functools.cached_property
+    def aliased_registers_name_max_len(self):
+        # max(len("$zero/$x0"), ...)
+        return max(len(v) for v in self.get_aliased_registers().values() if v != self.flag_register)
+
+    @functools.cached_property
+    def registers_name_max_len(self):
+        # max(len("$x0"), ...)
+        return max(len(v) for v in self.all_registers if v != self.flag_register)

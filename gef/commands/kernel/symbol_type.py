@@ -13,6 +13,7 @@ import re
 import shlex
 import struct
 import subprocess
+import tempfile
 
 import gdb
 
@@ -757,54 +758,74 @@ class KtypesLoadCommand(KtypesCommand):
     parser.add_argument("-r", "--rescan", action="store_true", help="do not use cache.")
     _syntax_ = parser.format_help()
 
+    def get_compiler(self):
+        try:
+            if is_x86_64():
+                return GefUtil.which("gcc"), []
+            if is_x86_32():
+                return GefUtil.which("gcc"), ["-m32"]
+            if is_arm64():
+                return GefUtil.which("aarch64-linux-gnu-gcc"), []
+            if is_arm32():
+                return GefUtil.which("arm-linux-gnueabihf-gcc"), []
+            if is_riscv64():
+                return GefUtil.which("riscv64-linux-gnu-gcc"), []
+            if is_riscv32():
+                try:
+                    return GefUtil.which("riscv32-linux-gnu-gcc"), []
+                except FileNotFoundError:
+                    return GefUtil.which("riscv64-linux-gnu-gcc"), ["-march=rv32imac", "-mabi=ilp32"]
+        except FileNotFoundError as e:
+            err("{}".format(e))
+        return None
+
+    def check_command(self):
+        return super().check_command() and self.get_compiler() is not None
+
     def build_obj_file(self, header_path):
-        source_path = header_path[:-2] + ".c"
-        obj_path = source_path[:-2]
+        compiler = self.get_compiler()
+        if compiler is None:
+            return None
+        gcc, opt = compiler
+        with open(header_path, "rb") as file:
+            content = file.read()
+        options = [gcc] + opt + ["-std=c11", "-fms-extensions", "-g", "-O0", "-fno-eliminate-unused-debug-types", "-w", "-c"]
+        h = hashlib.sha256(content + repr(options).encode()).hexdigest()
+        obj_path = header_path[:-2] + "-" + h + ".o"
 
         # use cache
         if not self.args.rescan:
             if os.path.exists(obj_path) and os.path.getsize(obj_path) > 0:
                 return obj_path
 
-        # copy vmlinux.h to vmlinux.c
-        open(source_path, "wb").write(open(header_path, "rb").read())
-
-        try:
-            if is_x86_64():
-                gcc, opt = GefUtil.which("gcc"), ""
-            elif is_x86_32():
-                gcc, opt = GefUtil.which("gcc"), "-m32"
-            elif is_arm64():
-                gcc, opt = GefUtil.which("aarch64-linux-gnu-gcc"), ""
-            elif is_arm32():
-                gcc, opt = GefUtil.which("arm-linux-gnueabihf-gcc"), ""
-        except FileNotFoundError as e:
-            err("{}".format(e))
-            return None
-
-        # build with debug types
-        cmd = "{!r} {:s} -std=c11 -g -O0 -fno-eliminate-unused-debug-types -w -c {!r} -o {!r}".format(
-            gcc, opt, source_path, obj_path,
-        )
-        info(cmd)
-        os.system(cmd)
-
-        if not os.path.exists(obj_path):
-            return None
-
+        with tempfile.TemporaryDirectory(dir=GEF_TEMP_DIR) as directory:
+            source_path = os.path.join(directory, "vmlinux.c")
+            temp_obj = os.path.join(directory, "vmlinux.o")
+            with open(source_path, "wb") as file:
+                file.write(content)
+            cmd = options + [source_path, "-o", temp_obj]
+            info(" ".join(shlex.quote(arg) for arg in cmd))
+            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+            if result.returncode != 0:
+                err("Failed to compile kernel types: {:s}".format(result.stdout.strip()))
+                return None
+            elf = Elf.get_elf(temp_obj)
+            if elf is None or not elf.has_debuginfo():
+                err("Compiled object contains no debug information")
+                return None
+            os.replace(temp_obj, obj_path)
         return obj_path
 
     @parse_args
     @only_if_gdb_running
     @only_if_specific_gdb_mode(mode=("qemu-system", "vmware"))
-    @only_if_specific_arch(arch=("x86_32", "x86_64", "ARM32", "ARM64"))
+    @only_if_specific_arch(arch=("x86_32", "x86_64", "ARM32", "ARM64", "RISCV32", "RISCV64"))
     def do_invoke(self, args):
         if not self.check_command():
             return
 
         header_path = self.build_header_file()
         if header_path is None:
-            warn("This kernel may be CONFIG_DEBUG_INFO_BTF=n")
             return
 
         obj_path = self.build_obj_file(header_path)
@@ -813,9 +834,10 @@ class KtypesLoadCommand(KtypesCommand):
             return
 
         info(obj_path)
-        gdb.execute("file {:s}".format(obj_path), to_string=True)
+        gdb.execute("file {:s}".format(GefUtil.quote_gdb_argument(obj_path)), to_string=True)
         info("Kernel types are loaded successfully")
         return
+
 
 
 @register_command

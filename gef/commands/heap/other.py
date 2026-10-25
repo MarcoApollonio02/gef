@@ -34,6 +34,7 @@ from gef.core.display import ProgressBar
 from gef.core.elf import Elf
 from gef.core.heap import uClibcNgHeap
 from gef.core.memory import (
+    is_double_link_list,
     hexdump,
     is_single_link_list,
     is_valid_addr,
@@ -55,6 +56,7 @@ from gef.core.process import (
     ProcessMap,
     get_pagesize,
     get_pagesize_mask_high,
+    get_pagesize_mask_low,
     is_32bit,
     is_64bit,
     is_m68k,
@@ -2549,6 +2551,21 @@ class SnmallocHeapDumpCommand(GenericCommand, BufferingOutput):
             pass
 
         # slow path
+        tls = runtime.current_arch.get_tls()
+        if tls is None:
+            return None
+        offset = self.get_thread_alloc_tls_offset()
+        if offset is None:
+            return None
+        val = read_int_from_memory(tls + offset, safe=True)
+        if not val or val & get_pagesize_mask_low():
+            return None
+        if not is_valid_addr(val) or not is_single_link_list(val):
+            return None
+        return val
+
+    @Cache.cache_until_next(per_inferior=True)
+    def get_thread_alloc_tls_offset(self):
         """
         gef> tls
         ------------------------ TLS-0x80 -----------------------
@@ -2562,32 +2579,30 @@ class SnmallocHeapDumpCommand(GenericCommand, BufferingOutput):
               0x7ffff7f3f780|+0x0000|+000: 0x00007ffff7f3f780
               0x7ffff7f3f788|+0x0008|+001: 0x00007ffff7f40120
         """
-        tls = runtime.current_arch.get_tls()
-        for i in range(1, 16):
-            addr = tls - (runtime.current_arch.ptrsize * i)
-            val = read_int_from_memory(addr)
-            if not is_valid_addr(val):
-                continue
-            if val & 0xf_ffff:
-                continue
-            if not is_single_link_list(val):
-                continue
-            return val
+        with ContextManager.threads() as threads:
+            for _thread in threads:
+                tls = runtime.current_arch.get_tls()
+                if tls is None:
+                    continue
+                for i in range(1, 16):
+                    offset = -(runtime.current_arch.ptrsize * i)
+                    val = read_int_from_memory(tls + offset, safe=True)
+                    if not val or val & 0xf_ffff:
+                        continue
+                    if not is_valid_addr(val) or not is_single_link_list(val):
+                        continue
+                    return offset
         return None
 
     def get_thread_alloc_list(self, all_thread=False):
         if all_thread:
             # travarse all threads
-            orig_thread = gdb.selected_thread()
-            orig_frame = gdb.selected_frame()
             thread_allocs = []
-            for thread in gdb.selected_inferior().threads():
-                thread.switch() # change thread
-                thread_alloc = self.get_current_thread_alloc()
-                if thread_alloc:
-                    thread_allocs.append((thread.num, thread_alloc))
-            orig_thread.switch() # revert thread
-            orig_frame.select()
+            with ContextManager.threads() as threads:
+                for thread in threads:
+                    thread_alloc = self.get_current_thread_alloc()
+                    if thread_alloc:
+                        thread_allocs.append((thread.num, thread_alloc))
             return thread_allocs
         else:
             thread_alloc = self.get_current_thread_alloc()
@@ -2595,10 +2610,8 @@ class SnmallocHeapDumpCommand(GenericCommand, BufferingOutput):
                 return [(gdb.selected_thread().num, thread_alloc)]
         return None
 
+    @Cache.cache_this_session(cache_None=False)
     def initialize(self):
-        if hasattr(self, "initialized") and self.initialized:
-            return True
-
         try:
             self.NUM_SMALL_SIZECLASSES = AddressUtil.parse_address('snmalloc::NUM_SMALL_SIZECLASSES')
         except gdb.error:
@@ -2635,18 +2648,23 @@ class SnmallocHeapDumpCommand(GenericCommand, BufferingOutput):
             self.offset_alloc_classes = AddressUtil.parse_address("&((('snmalloc::Alloc'*)0)->alloc_classes)")
         except gdb.error:
             self.offset_alloc_classes = 0x1b80 # hardcoded value
+            thread_alloc = self.get_current_thread_alloc()
+            if thread_alloc:
+                for offset in (0x1b80, 0x1b78):
+                    if all(is_double_link_list(thread_alloc + offset + 0x18 * i)
+                           for i in range(self.NUM_SMALL_SIZECLASSES)):
+                        self.offset_alloc_classes = offset
+                        break
 
         try:
             self.offset_laden = AddressUtil.parse_address("&((('snmalloc::Alloc'*)0)->laden)")
         except gdb.error:
-            self.offset_laden = 0x1f88 # hardcoded value
+            self.offset_laden = self.offset_alloc_classes + 0x18 * self.NUM_SMALL_SIZECLASSES
 
         try:
             self.offset_remote_alloc = AddressUtil.parse_address("&((('snmalloc::Alloc'*)0)->remote_alloc)")
         except gdb.error:
             self.offset_remote_alloc = 0x2000 # hardcoded value
-
-        self.initialized = True
         return True
 
     @Cache.cache_this_session
@@ -2658,7 +2676,10 @@ class SnmallocHeapDumpCommand(GenericCommand, BufferingOutput):
                 MANTISSA_MASK = (1 << MANTISSA_BITS) - 1
                 m = m_e & MANTISSA_MASK
                 e = m_e >> MANTISSA_BITS
-                b = 0 if e == 0 else 1
+                if e == 0:
+                    b = 0
+                else:
+                    b = 1
                 shifted_e = e - b
                 extended_m = (m + (b << MANTISSA_BITS))
                 return extended_m << (shifted_e + LOW_BITS)
@@ -2669,11 +2690,12 @@ class SnmallocHeapDumpCommand(GenericCommand, BufferingOutput):
 
     def parse_single_link_list(self, head):
         """Return the single linked list (including the head) and error message."""
-        corrupted_msg_color = Config.get_gef_setting("theme.heap_corrupted_msg")
+        corrupted_msg_color = Config.get("theme.heap_corrupted_msg")
 
         # travase next
         cur = head
         seen = []
+        seen_addresses = set()
         while True:
             if cur == 0:
                 seen.append(cur)
@@ -2681,40 +2703,44 @@ class SnmallocHeapDumpCommand(GenericCommand, BufferingOutput):
             if not is_valid_addr(cur):
                 seen.append(cur)
                 return seen, Color.colorify("(corrupted)", corrupted_msg_color)
-            if cur in seen:
+            if cur in seen_addresses:
                 seen.append(cur)
                 return seen, Color.colorify("(loop detected)", corrupted_msg_color)
             seen.append(cur)
+            seen_addresses.add(cur)
             cur = read_int_from_memory(cur)
         return seen, None
 
     def parse_double_link_list(self, head):
         """Return the double linked list (excluding the head) and error message."""
-        corrupted_msg_color = Config.get_gef_setting("theme.heap_corrupted_msg")
+        corrupted_msg_color = Config.get("theme.heap_corrupted_msg")
 
-        # travarse next
-        cur = head
         seen = []
-        while True:
-            if not is_valid_addr(cur):
-                seen.append(cur)
-                return seen, Color.colorify("(corrupted)", corrupted_msg_color)
-            if cur in seen:
-                break
+        seen_addresses = set()
+        cur = read_int_from_memory(head, safe=True)
+        tail = read_int_from_memory(head + runtime.current_arch.ptrsize, safe=True)
+        if cur is None or tail is None:
+            return seen, Color.colorify("(corrupted @ {:#x})".format(head), corrupted_msg_color)
+
+        prev = head
+        while cur != head:
+            if not cur or not is_valid_addr(cur):
+                return seen, Color.colorify("(corrupted @ {:#x})".format(cur), corrupted_msg_color)
+            if cur in seen_addresses:
+                return seen, Color.colorify("(loop detected @ {:#x})".format(cur), corrupted_msg_color)
+            next_cur = read_int_from_memory(cur, safe=True)
+            p = read_int_from_memory(cur + runtime.current_arch.ptrsize, safe=True)
+            if next_cur is None or p is None:
+                return seen, Color.colorify("(corrupted @ {:#x})".format(cur), corrupted_msg_color)
             seen.append(cur)
-            cur = read_int_from_memory(cur)
+            seen_addresses.add(cur)
+            if p != prev:
+                return seen, Color.colorify("(corrupted: invalid prev @ {:#x})".format(cur), corrupted_msg_color)
+            prev = cur
+            cur = next_cur
 
-        if cur != seen[0]:
-            return seen, Color.colorify("(loop detected)", corrupted_msg_color)
-
-        # check prev
-        for i, x in enumerate(seen):
-            p = read_int_from_memory(x + runtime.current_arch.ptrsize)
-            if p != seen[i - 1]:
-                return seen, Color.colorify("(corrupted)", corrupted_msg_color)
-
-        if head in seen:
-            seen = [x for x in seen if x != head]
+        if tail != prev:
+            return seen, Color.colorify("(corrupted: invalid prev @ {:#x})".format(head), corrupted_msg_color)
         return seen, None
 
     def dump_small_fast(self, thread_alloc):
@@ -2732,7 +2758,7 @@ class SnmallocHeapDumpCommand(GenericCommand, BufferingOutput):
             thread_alloc,
         )))
 
-        freed_address_color = Config.get_gef_setting("theme.heap_chunk_address_freed")
+        freed_address_color = Config.get("theme.heap_chunk_address_freed")
 
         # travarse small_fast_free_lists[0-42]
         printed_flag = False
@@ -2749,8 +2775,8 @@ class SnmallocHeapDumpCommand(GenericCommand, BufferingOutput):
             # print
             self.out.append("small_fast_free_lists[{:d}, size={:s}] @ {!s}:".format(
                 i,
-                Color.colorify_hex(self.class_to_size(i), Config.get_gef_setting("theme.heap_chunk_size")),
-                ProcessMap.lookup_address(free_list_i),
+                Color.colorify_hex(self.class_to_size(i), Config.get("theme.heap_chunk_size")),
+                ProcessMap.lookup(free_list_i),
             ))
             for i, chunk in enumerate(free_list):
                 chunk_str = Color.colorify_hex(chunk, freed_address_color)
@@ -2805,7 +2831,7 @@ class SnmallocHeapDumpCommand(GenericCommand, BufferingOutput):
         gef>
         """
 
-        freed_address_color = Config.get_gef_setting("theme.heap_chunk_address_freed")
+        freed_address_color = Config.get("theme.heap_chunk_address_freed")
         offset_free_queue = 0x10
         offset_needed_ = 0x22
         offset_sleeping_ = 0x24
@@ -2823,7 +2849,7 @@ class SnmallocHeapDumpCommand(GenericCommand, BufferingOutput):
         if cl is None:
             cl_msg = "???"
         else:
-            cl_msg = Color.colorify_hex(self.class_to_size(cl), Config.get_gef_setting("theme.heap_chunk_size"))
+            cl_msg = Color.colorify_hex(self.class_to_size(cl), Config.get("theme.heap_chunk_size"))
         is_laden = cl is None
 
         needed_ = read_int16_from_memory(slab_meta + offset_needed_)
@@ -2832,7 +2858,7 @@ class SnmallocHeapDumpCommand(GenericCommand, BufferingOutput):
 
         # print
         self.out.append("free_queue[size={:s}, needed_={:#x}, sleeping_={:#x}, large_={:#x}] @ {!s}:".format(
-            cl_msg, needed_, sleeping_, large_, ProcessMap.lookup_address(free_queue),
+            cl_msg, needed_, sleeping_, large_, ProcessMap.lookup(free_queue),
         ))
         for i, chunk in enumerate(free_list):
             if is_laden:
@@ -2893,14 +2919,20 @@ class SnmallocHeapDumpCommand(GenericCommand, BufferingOutput):
 
             self.out.append("SlabMetadataCache[{:d}, size={:s}] @ {!s}: {:#x} slab(s)".format(
                 i,
-                Color.colorify_hex(self.class_to_size(i), Config.get_gef_setting("theme.heap_chunk_size")),
-                ProcessMap.lookup_address(entry),
+                Color.colorify_hex(self.class_to_size(i), Config.get("theme.heap_chunk_size")),
+                ProcessMap.lookup(entry),
                 length,
             ))
 
             # travarse SlabMetadataCache[i].available
             for slab_meta in slab_meta_list:
-                self.dump_slab_meta(slab_meta, cl=i)
+                try:
+                    self.dump_slab_meta(slab_meta, cl=i)
+                except gdb.MemoryError:
+                    self.err_add_out("Cannot read slab metadata @ {:#x}".format(slab_meta))
+                    break
+            if error:
+                self.err_add_out(error)
 
             printed_flag = True
 
@@ -2922,9 +2954,16 @@ class SnmallocHeapDumpCommand(GenericCommand, BufferingOutput):
 
         printed_flag = False
         for slab_meta in slab_meta_list:
-            printed_flag |= self.dump_slab_meta(slab_meta, cl=None)
+            try:
+                printed_flag |= self.dump_slab_meta(slab_meta, cl=None)
+            except gdb.MemoryError:
+                self.err_add_out("Cannot read slab metadata @ {:#x}".format(slab_meta))
+                printed_flag = True
+                break
+        if error:
+            self.err_add_out(error)
 
-        if printed_flag is False:
+        if printed_flag is False and error is None:
             self.out.append("Nothing to dump")
         return
 
@@ -2970,7 +3009,7 @@ class SnmallocHeapDumpCommand(GenericCommand, BufferingOutput):
     @only_if_specific_arch(arch=("x86_64",))
     def do_invoke(self, args):
         self.out = []
-        if self.initialize() is False:
+        if not self.initialize():
             return
 
         # get thread_alloc
@@ -2994,6 +3033,7 @@ class SnmallocHeapDumpCommand(GenericCommand, BufferingOutput):
         # print
         self.print_output()
         return
+
 
 
 @register_command

@@ -8,6 +8,7 @@ import struct
 import gdb
 
 from gef.core import runtime
+from gef.core.instruction import get_insn
 from gef.core.arch_base import Architecture
 from gef.core.address import AddressUtil
 from gef.core.color import Color
@@ -138,5 +139,24 @@ class OR1K(Architecture):
 
     def encode_cookie(self, value, cookie):
         return value
+
+    def decode_cookie_legacy(self, value, cookie):
+        return value
+
+    def encode_cookie_legacy(self, value, cookie):
+        return value
+
+    def get_pending_branch(self):
+        # Stopped at a delay slot: $ppc points to the branch which takes effect after the slot.
+        try:
+            ppc = get_register("$ppc")
+            if ppc is None or ppc + 4 != self.pc:
+                return None
+            insn = get_insn(ppc)
+        except gdb.error:
+            return None
+        if insn and (self.is_jump(insn) or self.is_call(insn)):
+            return insn
+        return None
 
 

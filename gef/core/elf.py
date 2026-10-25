@@ -1221,6 +1221,155 @@ class Elf:
                 self.__module__, self.__class__.__name__, id(self), self.sh_name,
             )
 
+    def get_gnu_properties(self):
+        from gef.core.utils import align
+        """Return the entries in a NT_GNU_PROPERTY_TYPE_0 note."""
+        data = self.read_phdr(Elf.Phdr.PT_GNU_PROPERTY)
+        if not data:
+            data = self.read_shdr(".note.gnu.property")
+        if not data:
+            return {}
+
+        if self.e_endianness == Elf.LITTLE_ENDIAN:
+            endian = "<"
+        else:
+            endian = ">"
+        if self.e_class == Elf.ELF_64_BITS:
+            property_align = 8
+        else:
+            property_align = 4
+        properties = {}
+        note_pos = 0
+
+        while note_pos + 12 <= len(data):
+            namesz, descsz, note_type = struct.unpack_from("{}III".format(endian), data, note_pos)
+            note_pos += 12
+            if note_pos + namesz > len(data):
+                break
+            name = data[note_pos:note_pos + namesz]
+            note_pos = align(note_pos + namesz, 4)
+            if note_pos + descsz > len(data):
+                break
+            desc = data[note_pos:note_pos + descsz]
+            note_pos = align(note_pos + descsz, 4)
+
+            if note_type != 5 or name.rstrip(b"\0") != b"GNU": # NT_GNU_PROPERTY_TYPE_0
+                continue
+
+            property_pos = 0
+            while property_pos + 8 <= len(desc):
+                property_type, property_size = struct.unpack_from("{}II".format(endian), desc, property_pos)
+                value_pos = property_pos + 8
+                value_end = value_pos + property_size
+                if value_end > len(desc):
+                    break
+                properties[property_type] = desc[value_pos:value_end]
+                property_pos = align(value_end, property_align)
+        return properties
+
+    def get_gnu_property_value(self, property_type):
+        data = self.get_gnu_properties().get(property_type)
+        if data is None or len(data) < 4:
+            return None
+        if self.e_endianness == Elf.LITTLE_ENDIAN:
+            endian = "<"
+        else:
+            endian = ">"
+        return struct.unpack("{}I".format(endian), data[:4])[0]
+
+    def get_imported_symbols(self):
+        """Return undefined symbols from .dynsym."""
+        dynsym = self.get_shdr(".dynsym")
+        dynstr = self.read_shdr(".dynstr")
+        data = self.read_shdr(".dynsym")
+        if dynsym is None or dynstr is None or data is None:
+            return None
+
+        entry_size = dynsym.sh_entsize
+        if not entry_size:
+            if self.e_class == Elf.ELF_64_BITS:
+                entry_size = 24
+            else:
+                entry_size = 16
+        if self.e_class == Elf.ELF_64_BITS:
+            minimum_entry_size = 24
+        else:
+            minimum_entry_size = 16
+        if entry_size < minimum_entry_size:
+            return None
+        if self.e_endianness == Elf.LITTLE_ENDIAN:
+            endian = "<"
+        else:
+            endian = ">"
+        symbols = set()
+
+        for pos in range(0, len(data) - entry_size + 1, entry_size):
+            name_offset = struct.unpack_from("{}I".format(endian), data, pos)[0]
+            if self.e_class == Elf.ELF_64_BITS:
+                section_index = struct.unpack_from("{}H".format(endian), data, pos + 6)[0]
+            else:
+                section_index = struct.unpack_from("{}H".format(endian), data, pos + 14)[0]
+            if section_index != 0 or name_offset >= len(dynstr): # SHN_UNDEF
+                continue
+            end = dynstr.find(b"\0", name_offset)
+            if end < 0:
+                continue
+            symbols.add(dynstr[name_offset:end])
+        return symbols
+
+    def get_wx_load_ranges(self):
+        from gef.core.process import get_pagesize
+        from gef.core.utils import align
+        """Return direct RWX PT_LOAD ranges and page-rounded W/X overlaps."""
+        load_segments = [
+            phdr for phdr in self.phdrs
+            if phdr.p_type == Elf.Phdr.PT_LOAD and phdr.p_memsz
+        ]
+        direct = [
+            (phdr.p_vaddr, phdr.p_vaddr + phdr.p_memsz)
+            for phdr in load_segments
+            if phdr.p_flags & Elf.Phdr.PF_W and phdr.p_flags & Elf.Phdr.PF_X
+        ]
+
+        try:
+            page_size = get_pagesize()
+        except Exception:
+            page_size = 0x1000
+
+        writable = [phdr for phdr in load_segments if phdr.p_flags & Elf.Phdr.PF_W]
+        executable = [phdr for phdr in load_segments if phdr.p_flags & Elf.Phdr.PF_X]
+        overlaps = []
+        for writable_phdr in writable:
+            writable_start = writable_phdr.p_vaddr & ~(page_size - 1)
+            writable_end = align(writable_phdr.p_vaddr + writable_phdr.p_memsz, page_size)
+            for executable_phdr in executable:
+                if writable_phdr is executable_phdr:
+                    continue
+                executable_start = executable_phdr.p_vaddr & ~(page_size - 1)
+                executable_end = align(executable_phdr.p_vaddr + executable_phdr.p_memsz, page_size)
+                start = max(writable_start, executable_start)
+                end = min(writable_end, executable_end)
+                if start < end:
+                    overlaps.append((start, end))
+
+        def merge_ranges(ranges):
+            merged = []
+            for start, end in sorted(set(ranges)):
+                if merged and start <= merged[-1][1]:
+                    merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+                else:
+                    merged.append((start, end))
+            return merged
+
+        return merge_ranges(direct), merge_ranges(overlaps)
+
+    def is_shared_object(self):
+        # note: executables including static-pie have DT_DEBUG, and DF_1_PIE if the linker is new
+        if self.e_type != Elf.ET_DYN or self.get_dynamic_value(0x15) is not None: # DT_DEBUG
+            return False
+        flags_1 = self.get_dynamic_value(0x6fff_fffb) or 0 # DT_FLAGS_1
+        return not flags_1 & 0x0800_0000 # DF_1_PIE
+
 
 class Checksec:
     """Manage checksec related functions."""
@@ -1347,3 +1496,22 @@ class Checksec:
         uq = lambda a: struct.unpack("<q", a)[0]
         u2i = lambda a: uq(pQ(a))
         return u2i(ret)
+
+    @staticmethod
+    @Cache.cache_until_next
+    def get_gcs_status():
+        from gef.commands.base import ContextManager
+        """Return the arm64 Guarded Control Stack status flags."""
+        sp = runtime.current_arch.sp
+        with ContextManager.temporary_memory(sp, length=runtime.current_arch.ptrsize):
+            try:
+                res = gdb.execute("call-syscall prctl 74 {:#x} 0 0 0".format(sp), to_string=True) # PR_GET_SHADOW_STACK_STATUS
+                output_line = res.splitlines()[-1]
+                ret = int(output_line.split()[2], 0)
+                status = read_int_from_memory(sp)
+            except (gdb.error, gdb.MemoryError, IndexError, ValueError):
+                return None
+
+        if ret != 0:
+            return None
+        return status

@@ -19,6 +19,7 @@ import sys
 import gdb
 
 from gef.commands.base import (
+    ContextManager,
     BufferingOutput,
     GenericCommand,
     only_if_gdb_running,
@@ -440,49 +441,13 @@ class BreakSecureMemAddrCommand(GenericCommand):
     ]
     _example_ = "\n".join(_example_).format(_cmdline_)
 
-    def aarch64_get_page_maps_el3(self):
-        res = PageMap.get_page_maps_by_pagewalk("pagewalk 3 --quiet --no-pager --no-merge --disable-color")
-        res = sorted(set(res.splitlines()))
-        res = list(filter(lambda line: line.endswith("]"), res))
-        res = list(filter(lambda line: "[+]" not in line, res))
-        maps = []
-        for line in res:
-            vrange, prange, *_ = line.split()
-            vstart, vend = [int(x, 16) for x in vrange.split("-")]
-            pstart, pend = [int(x, 16) for x in prange.split("-")]
-            maps.append((vstart, vend, pstart, pend))
+    def aarch64_get_maps_el3(self):
+        maps = AddrMap.get_maps(command="pagewalk 3 --quiet --no-pager --no-merge --disable-color")
         if maps == []:
             warn("Make sure you are in EL1 (=kernel mode)")
             warn("Make sure qemu 3.x or higher")
             return None
         return maps
-
-    def aarch64_switch_el(self, target_el):
-        cpsr = get_register("$cpsr") & 0xffff_ffff
-        current_el = int((cpsr >> 2) & 0b11)
-        if target_el == current_el:
-            info("Current EL{:d} == Target EL{:d}".format(current_el, target_el))
-            return 0
-
-        # change EL
-        try:
-            saved_cpsr = cpsr
-            cpsr = cpsr & ~(0b11 << 2) # clear EL
-            cpsr |= target_el << 2 # set desired EL
-            gdb.parse_and_eval("$cpsr = {:#x}".format(cpsr))
-            info("Moving to EL{:d}".format(target_el))
-        except gdb.error:
-            err("Maybe unsupported to change to EL{:d}".format(target_el))
-            return 0
-        return saved_cpsr
-
-    def aarch64_revert_el(self, saved_cpsr):
-        if saved_cpsr == 0:
-            return
-        gdb.parse_and_eval("$cpsr = {:#x}".format(saved_cpsr))
-        saved_el = (saved_cpsr >> 2) & 0b11
-        info("Moving back to EL{:d}".format(saved_el))
-        return
 
     @parse_args
     @only_if_gdb_running
@@ -493,19 +458,22 @@ class BreakSecureMemAddrCommand(GenericCommand):
             info("Phys address: {:#x}".format(args.location))
 
         if is_arm64():
-            maps = self.aarch64_get_page_maps_el3()
+            maps = self.aarch64_get_maps_el3()
             if maps:
-                virt_addrs = PageMap.p2v_from_map(args.location, maps)
-                # change to EL3 and set bp
-                saved_cpsr = self.aarch64_switch_el(target_el=3)
-                for virt_addr in virt_addrs:
-                    gdb.execute("break *{:#x}".format(virt_addr))
-                self.aarch64_revert_el(saved_cpsr)
+                virt_addrs = AddrMap.p2v(args.location, maps=maps)
                 # found any, fast return
                 if virt_addrs:
+                    with ContextManager.exception_level(3, info=info) as switched:
+                        if switched:
+                            for virt_addr in virt_addrs:
+                                gdb.execute("break *{:#x}".format(virt_addr))
                     return
 
-        virt_addrs = XSecureMemAddrCommand.p2v_secure(args.location, args.verbose)
+        maps = AddrMap.get_maps(force_secure=True, verbose=args.verbose)
+        virt_addrs = AddrMap.p2v(args.location, maps=maps)
+        if args.verbose:
+            for virt_addr in virt_addrs:
+                info("p2v: {:#x} -> {:#x}".format(args.location, virt_addr))
         if virt_addrs == []:
             warn("Could not find virtual address")
             return
@@ -513,6 +481,7 @@ class BreakSecureMemAddrCommand(GenericCommand):
         for virt_addr in virt_addrs:
             gdb.execute("break *{:#x}".format(virt_addr))
         return
+
 
 
 class OpteeThreadEnterUserModeBreakpoint(gdb.Breakpoint):

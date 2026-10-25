@@ -23,11 +23,13 @@ from gef.commands.base import (
 from gef.core import runtime
 from gef.core.address import AddressUtil
 from gef.core.auxv import Auxv
-from gef.core.color import Color, err, gef_print, titlify, warn
+from gef.core.color import Color, err, gef_print, info, titlify, warn
 from gef.core.elf import Elf
 from gef.core.instruction import Disasm
 from gef.core.memory import hexdump, is_valid_addr, read_cstring_from_memory, read_int_from_memory
 from gef.core.process import (
+    is_m68k,
+    is_x86,
     Path,
     Pid,
     ProcessMap,
@@ -49,7 +51,7 @@ from gef.core.process import (
     is_x86_64,
 )
 from gef.core.strings import String
-from gef.core.utils import GefUtil
+from gef.core.utils import GefUtil, align
 
 @register_command
 class AuxvCommand(GenericCommand):
@@ -427,6 +429,20 @@ class DumpArgsCommand(GenericCommand):
                         help="assume here is out of the function.")
     _syntax_ = parser.format_help()
 
+    @staticmethod
+    def get_entry_sp():
+        """Return the stack pointer at the function entry, recovered from the caller frame (or None)."""
+        try:
+            caller = gdb.selected_frame().older()
+            if caller is None:
+                return None
+            sp = int(caller.read_register("sp")) & AddressUtil.get_vmem_end_mask()
+        except (gdb.error, ValueError):
+            return None
+        if is_x86() or is_m68k():
+            sp -= runtime.current_arch.ptrsize # the return address pushed by the call
+        return sp
+
     @parse_args
     @only_if_gdb_running
     @require_arch_set
@@ -443,14 +459,19 @@ class DumpArgsCommand(GenericCommand):
         else:
             count = len(ret.splitlines())
 
-        for i in range(count):
-            key, val = runtime.current_arch.get_ith_parameter(i, in_func=not args.out_of_function)
+        if args.out_of_function:
+            entry_sp = None
+        else:
+            entry_sp = self.get_entry_sp()
+        params = [runtime.current_arch.get_ith_parameter(i, in_func=not args.out_of_function, sp=entry_sp) for i in range(count)]
+        if entry_sp is not None and entry_sp != runtime.current_arch.sp and any(key.startswith("[sp") for key, _ in params):
+            info("Stack arguments are read from the stack pointer at the function entry ({:#x})".format(entry_sp))
 
-            width = len(key)
-            while width % 4:
-                width += 1
+        for key, val in params:
+            width = align(len(key), 4)
             gef_print("{:>{:d}s} = {:s}".format(key, width, AddressUtil.recursive_dereference_to_string(val)))
         return
+
 
 
 @register_command
