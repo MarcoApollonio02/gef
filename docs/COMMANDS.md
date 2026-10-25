@@ -9329,13 +9329,14 @@ Dump the BPF information.
 ### Syntax
 
 ```text
-usage: kbpf [-h] [-hh] [-p] [-m] [-n] [-v] [-q]
+usage: kbpf [-h] [-hh] [-p] [-m] [--meta] [-n] [-v] [-q]
 
 options:
   -h, --help          show this help message and exit
   -hh, --help-simple  show help without ASCII diagram.
   -p, --only-progs    print progs only.
   -m, --only-maps     print maps only.
+  --meta              display offset information.
   -n, --no-pager      do not use the pager.
   -v, --verbose       enable verbose mode.
   -q, --quiet         show result only.
@@ -9455,11 +9456,12 @@ Dump the clocksource list.
 ### Syntax
 
 ```text
-usage: kclock-source [-h] [-hh] [-n] [-q]
+usage: kclock-source [-h] [-hh] [--meta] [-n] [-q]
 
 options:
   -h, --help          show this help message and exit
   -hh, --help-simple  show help without ASCII diagram.
+  --meta              display offset information.
   -n, --no-pager      do not use the pager.
   -q, --quiet         enable quiet mode.
 ```
@@ -9475,6 +9477,14 @@ Simplified clocksource structure:
 | list_head        |--->| list        |--->...
 +------------------+    | ...         |
                         +-------------+
+
+- The list is sorted by `rating` in descending order. `active` is the one `curr_clocksource` points to.
+- `frequency` is derived from `mult` and `shift` (ns = (cycles * mult) >> shift), and `bits` from `mask`.
+- `flags`: CONT (IS_CONTINUOUS), VERIFY (MUST_VERIFY), CALIB (CALIBRATED), WD (WATCHDOG),
+  HRES (VALID_FOR_HRES), UNSTABLE, NONSTOP (SUSPEND_NONSTOP), RESELECT,
+  VERIFY_PERCPU (~v7.0) or INLINE (CAN_INLINE_READ; v7.1~), COUPLED (HAS_COUPLED_CLOCK_EVENT), WDTEST, WDTEST_PERCPU.
+- The module is shown for a clocksource registered by a loadable module.
+- The member offsets come from the debug information (vmlinux or `ktypes-load`) when available.
 ```
 
 ## kconfig
@@ -9715,18 +9725,18 @@ log_buf points to active storage, which may differ from the initial __log_buf.
 
 Dump filesystems.
 
-- Alias: `kmounts`
 
 ### Syntax
 
 ```text
-usage: kfilesystems [-h] [-hh] [-s] [-n] [-q]
+usage: kfilesystems [-h] [-hh] [-s] [--meta] [-n] [-q]
 
 options:
   -h, --help            show this help message and exit
   -hh, --help-simple    show help without ASCII diagram.
   -s, --skip-mount-path
                         skip resolving path.
+  --meta                display offset information.
   -n, --no-pager        do not use the pager.
   -q, --quiet           enable quiet mode.
 ```
@@ -9734,7 +9744,7 @@ options:
 ### Notes
 
 ```text
-This command requires CONFIG_RANDSTRUCT=n.
+This command requires CONFIG_RANDSTRUCT=n unless vmlinux with debug information is loaded.
 
 Simplified file_systems structure:
 
@@ -9878,39 +9888,47 @@ Dump IRQ (interrupt request) information.
 ### Syntax
 
 ```text
-usage: kirq [-h] [-hh] [-n] [-v] [-q]
+usage: kirq [-h] [-hh] [--meta] [-n] [-v] [-q]
 
 options:
   -h, --help          show this help message and exit
   -hh, --help-simple  show help without ASCII diagram.
+  --meta              display offset information.
   -n, --no-pager      do not use the pager.
-  -v, --verbose       enable verbose mode.
+  -v, --verbose       also show unused IRQs, the count, the flow handler and the affinity.
   -q, --quiet         show result only.
 ```
 
 ### Notes
 
 ```text
+Each action of a shared IRQ is shown on its own line. `count` is the sum of the per-cpu counts (-v).
+The affinity is shown only with the debug information (vmlinux or `ktypes-load`).
+
 Simplified irq structure:
 
-+-irq_desc_tree(~6.5)-+   +--->+-xa_node---------+   +--->+-irq_desc----+
-| xa_lock             |   |    | shift           |   |    | ...         |
-| xa_flags            |   |    | ...             |   |    | irq_data    |
-| xa_head             |---+    | count           |   |    |   ...       |
-+---------------------+        | ...             |   |    |   irq       |
-                               | slots[0]        |---+    |   ...       |
-                               | slots[1]        |   ^    | ...         |
-                               | ...             |   |    | action      |
-                               | slots[15 or 63] |   |    |   handler   |
-                               | ...             |   |    |   ...       |
-                               +-----------------+   |    |   name      |
-                                                     |    |   ...       |
-+-sparce_irq(6.5~)-+   +-->+-maple_node------+       |    | ...         |
-| ...              |   |   | ...             |       |    +-------------+
-| ma_root          |---+   | mr64|ma64|alloc |       |
-| ...              |       |   ...           |       |
-+------------------+       |   slot[]        |-------+
-                           +-----------------+
++-irq_desc_tree(~6.5)-+   +--->+-radix/xa node---+   +--->+-irq_desc------+
+| lock                |   |    | shift           |   |    | ...           |
+| flags               |   |    | ...             |   |    | irq_data      |
+| rnode/xa_head       |---+    | count           |   |    |   irq         |
++---------------------+        | ...             |   |    |   hwirq       |
+                               | slots[0]        |---+    |   chip        |--->name
+                               | slots[1]        |   ^    |   ...         |
+                               | ...             |   |    | kstat_irqs    |--->per-cpu count
+                               | slots[15 or 63] |   |    | handle_irq    |
+                               | ...             |   |    | action        |---+
+                               +-----------------+   |    | ...           |   |
+                                                     |    +---------------+   |
++-sparse_irqs(6.5~)-+   +-->+-maple_node------+      |                        |
+| ...               |   |   | ...             |      |    +-irqaction-+<------+
+| ma_root           |---+   | mr64|ma64|alloc |      |    | handler   |
+| ...               |       |   ...           |      |    | ...       |
++-------------------+       |   slot[]        |------+    | next      |--->irqaction (shared IRQ)
+                            +-----------------+      |    | ...       |
+                                                     |    | name      |
++-irq_desc[NR_IRQS] (CONFIG_SPARSE_IRQ=n)-+          |    +-----------+
+| irq_desc[0], irq_desc[1], ...           |----------+
++-----------------------------------------+
 ```
 
 ## klsm
@@ -10727,7 +10745,7 @@ Dump the sysctl parameters.
 ### Syntax
 
 ```text
-usage: ksysctl [-h] [-hh] [-f FILTER] [-s] [-e] [-r] [-v] [-n] [-q]
+usage: ksysctl [-h] [-hh] [-f FILTER] [-s] [-e] [-d] [--meta] [-r] [-v] [-n] [-q]
 
 options:
   -h, --help           show this help message and exit
@@ -10735,8 +10753,10 @@ options:
   -f, --filter FILTER  REGEXP filter.
   -s, --skip-symlink   do not follow symlink (net.* and user.*).
   -e, --exact          use exact match.
+  -d, --decimal        display integer values in decimal.
+  --meta               display offset information.
   -r, --rescan         do not use cache.
-  -v, --verbose        dump zero-sized entries too.
+  -v, --verbose        dump zero-sized entries and proc_handler too.
   -n, --no-pager       do not use the pager.
   -q, --quiet          enable quiet mode.
 ```
@@ -10744,13 +10764,18 @@ options:
 ### Examples
 
 ```gdb
-ksysctl -q
+ksysctl --filter modprobe             # filter by parameter name
+ksysctl --filter kernel.modprobe -e   # exact match
+ksysctl -s                            # skip symlink (improves performance with many .net.* and user.* entries)
 ```
 
 ### Notes
 
 ```text
-This command requires CONFIG_RANDSTRUCT=n.
+This command requires CONFIG_RANDSTRUCT=n unless vmlinux with debug information is loaded.
+ParamValue is decoded as proc_handler (or the known handler it calls) reads it:
+strings, integer vectors in hex (decimal with -d), bit ranges of a bitmap, or `raw:` bytes if unknown.
+The unit is the one of the stored value (e.g., `jiffies`), not of /proc/sys. MaxLen of a bitmap is in bits.
 
 Simplified sysctl_table structure:
 
