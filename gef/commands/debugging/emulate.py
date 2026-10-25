@@ -6,6 +6,7 @@ Auto-discovered by gef.bootstrap via pkgutil.walk_packages.
 """
 import argparse
 import contextlib
+import tempfile
 import io
 import os
 import re
@@ -15,6 +16,7 @@ import gdb
 
 from gef.arch.x86 import X86
 from gef.commands.base import (
+    ContextManager,
     BufferingOutput,
     GenericCommand,
     exclude_specific_gdb_mode,
@@ -49,7 +51,8 @@ from gef.core.process import (
     is_x86_64,
 )
 from gef.core.registers import get_register
-from gef.core.symbols import ModuleLoader
+from gef.core.process import get_pagesize_mask_low
+from gef.core.symbols import ModuleLoader, Symbol
 from gef.core.syscall import Syscall
 from gef.core.unicorn import UnicornEmulator, UnicornKeystoneCapstone
 from gef.core.utils import GEF_TEMP_DIR, GefUtil
@@ -256,7 +259,7 @@ class UnicornEmulateScriptCommand(GenericCommand):
     _syntax_ = parser.format_help()
 
     _example_ = [
-        "{0:s} -g 10               # from $pc to the point where 4 instructions are executed",
+        "{0:s} -g 10               # from $pc to the point where 10 gadgets are executed",
         "{0:s} -n 5                # from $pc to 5 later instructions (assume it is no branch)",
         "{0:s} -t 0x805678a4 -s    # from $pc to specified address with saving script",
     ]
@@ -281,9 +284,7 @@ class UnicornEmulateScriptCommand(GenericCommand):
 
     def get_filename(self):
         if is_remote_debug():
-            filepath = gdb.current_progspace().filename
-            if filepath.startswith("target:"):
-                filepath = filepath[7:]
+            filepath = Path.get_remote_filepath()
             filename = os.path.basename(filepath)
         else:
             filename = Path.get_filename()
@@ -389,10 +390,10 @@ class UnicornEmulateScriptCommand(GenericCommand):
         content += "    return\n"
         content += "\n"
         content += "def mem_invalid_hook(emu, access, address, size, value, user_data):\n"
-        content += "    if access == unicorn.UC_MEM_WRITE_INVALID:\n"
+        content += "    if access in (unicorn.UC_MEM_WRITE_UNMAPPED, unicorn.UC_MEM_WRITE_PROT):\n"
         content += "        fmt = '  --> Invalid memory access; addr:{:#x}, size:{:#x}, value:{:#x}'\n"
         content += "        print(fmt.format(address, size, value))\n"
-        content += "    elif access == unicorn.UC_MEM_READ_INVALID:\n"
+        content += "    elif access in (unicorn.UC_MEM_READ_UNMAPPED, unicorn.UC_MEM_READ_PROT):\n"
         content += "        fmt = '  --> Invalid memory access; addr:{:#x}, size:{:#x}'\n"
         content += "        print(fmt.format(address, size))\n"
         content += "    return\n"
@@ -525,20 +526,22 @@ class UnicornEmulateScriptCommand(GenericCommand):
             content += "        emu.reg_write(registers['{:s}'], current_brk)\n".format(brk_entry.ret_regs[0])
             content += "        return True\n"
             content += "\n"
-            content += "    if a1 > current_brk:\n"
+            content += "    # brk is byte-granular, but the heap mapping is bounded by page-aligned breaks\n"
+            content += "    old_end = (current_brk + {0:#x}) & ~{0:#x}\n".format(get_pagesize_mask_low())
+            content += "    new_end = (a1 + {0:#x}) & ~{0:#x}\n".format(get_pagesize_mask_low())
+            content += "    if new_end > old_end:\n"
+            content += "        map_perm = unicorn.UC_PROT_READ | unicorn.UC_PROT_WRITE # for a new heap\n"
             content += "        for r in emu.mem_regions(): # get the permission of current brk region\n"
-            content += "            if r[1] + 1 == current_brk:\n"
+            content += "            if r[1] + 1 == old_end:\n"
             content += "                map_perm = r[2]\n"
             content += "                break\n"
-            content += "        else:\n"
-            content += "            return False # something is wrong\n"
             content += "        try:\n"
-            content += "            emu.mem_map(current_brk, a1 - current_brk, map_perm)\n"
+            content += "            emu.mem_map(old_end, new_end - old_end, map_perm)\n"
             content += "        except Exception:\n"
             content += "            return False\n"
-            content += "    else:\n"
+            content += "    elif new_end < old_end:\n"
             content += "        try:\n"
-            content += "            emu.mem_unmap(a1, current_brk - a1)\n"
+            content += "            emu.mem_unmap(new_end, old_end - new_end)\n"
             content += "        except Exception:\n"
             content += "            return False\n"
             content += "\n"
@@ -624,12 +627,14 @@ class UnicornEmulateScriptCommand(GenericCommand):
             content += "        # compare Rs with memory and store Rt only when they are equal\n"
             content += "        store_val = (emu.reg_read(dst_reg) & mask) if dst_reg is not None else 0\n"
             content += "        if src_val == mem_val:\n"
+            content += "            mem_write_hook(emu, unicorn.UC_MEM_WRITE, mem_addr, width, store_val, None)\n"
             content += "            emu.mem_write(mem_addr, i2b(store_val, width))\n"
             content += "        if src_reg is not None: # cas always loads the original memory into Rs\n"
             content += "            reg_write(emu, src_reg, width, mem_val)\n"
             content += "    else:\n"
             content += "        # swp stores Rs as-is; ld<op>/st<op> store mem <op> Rs\n"
             content += "        store_val = src_val if base == 'swp' else arm64_atomic_op(op, mem_val, src_val, width) & mask\n"
+            content += "        mem_write_hook(emu, unicorn.UC_MEM_WRITE, mem_addr, width, store_val, None)\n"
             content += "        emu.mem_write(mem_addr, i2b(store_val, width))\n"
             content += "        if dst_reg is not None: # swp/ld<op> load the original memory into Rt\n"
             content += "            reg_write(emu, dst_reg, width, mem_val)\n"
@@ -740,17 +745,22 @@ class UnicornEmulateScriptCommand(GenericCommand):
             # If TLS is not initialized, the fixed address 0x2000 is used.
             content += "    set_tls(emu, {:#x})\n".format(runtime.current_arch.get_tls() or 0x2000)
         if is_arm32() or is_arm64():
-            content += "    # need first. because other register values may be broken when $cpsr is set.\n"
             cpsr = get_register("$cpsr")
-            content += "    emu.reg_write({:s}, {:#x})\n".format(unicorn_registers["$cpsr"], cpsr)
+            if cpsr is not None:
+                content += "    # need first. because other register values may be broken when $cpsr is set.\n"
+                content += "    emu.reg_write({:s}, {:#x})\n".format(unicorn_registers["$cpsr"], cpsr)
         if is_arm64():
             tpidr = get_register("$TPIDR_EL0")
             if tpidr is None:
                 tpidr = get_register("$tpidr")
-            content += "    emu.reg_write({:s}, {:#x})\n".format(unicorn_registers["$tpidr_el0"], tpidr)
+            if tpidr is None:
+                tpidr = runtime.current_arch.get_tls()
+            if tpidr is not None:
+                content += "    emu.reg_write({:s}, {:#x})\n".format(unicorn_registers["$tpidr_el0"], tpidr)
         if is_arm32():
             tls = runtime.current_arch.get_tls()
-            content += "    emu.reg_write({:s}, {:#x})\n".format(unicorn_registers["$c13_c0_3"], tls)
+            if tls is not None:
+                content += "    emu.reg_write({:s}, {:#x})\n".format(unicorn_registers["$c13_c0_3"], tls)
         # special register (XMM)
         if kwargs["add_sse"]:
             lines = Color.remove_color(gdb.execute("xmm", to_string=True))
@@ -769,6 +779,8 @@ class UnicornEmulateScriptCommand(GenericCommand):
             if (is_arm32() or is_arm64()) and reg == "$cpsr":
                 continue
             regvalue = get_register(reg)
+            if regvalue is None:
+                continue
             content += "    emu.reg_write({:s}, {:#x})\n".format(unicorn_registers[reg], regvalue)
         content += "    return\n"
         content += "\n"
@@ -787,8 +799,9 @@ class UnicornEmulateScriptCommand(GenericCommand):
             if sect.permission & Permission.READ:
                 code = read_memory(sect.page_start, sect.size)
                 loc = os.path.join(kwargs["dloc"], "{:s}-{:#x}.raw".format(filename, sect.page_start))
-                open(loc, "wb").write(bytes(code))
-                content += "    emu.mem_write({:#x}, open('{:s}', 'rb').read())\n".format(sect.page_start, loc)
+                with open(loc, "wb") as fdw:
+                    fdw.write(bytes(code))
+                content += "    emu.mem_write({:#x}, open({!r}, 'rb').read())\n".format(sect.page_start, loc)
 
         # memory patch to avoid avx/neon optimized function
         if kwargs["patch_got"] and (is_x86_64() or is_arm32()):
@@ -814,13 +827,11 @@ class UnicornEmulateScriptCommand(GenericCommand):
                     continue
 
                 # get original function (e.g., __memmove_avx_unaligned_erms -> __memmove)
-                try:
-                    base_func_addr = int(gdb.parse_and_eval("&{:s}".format(base_func_name)))
-                except (gdb.error, ValueError):
-                    try:
-                        base_func_name = "__" + base_func_name # e.g., __memmove_chk
-                        base_func_addr = int(gdb.parse_and_eval("&{:s}".format(base_func_name)))
-                    except (gdb.error, ValueError):
+                base_func_addr = Symbol.resolve_address(base_func_name)
+                if base_func_addr is None:
+                    base_func_name = "__" + base_func_name # e.g., __memmove_chk
+                    base_func_addr = Symbol.resolve_address(base_func_name)
+                    if base_func_addr is None:
                         continue
 
                 content += "    emu.mem_write({:#x}, ({:#x}).to_bytes({:d}, byteorder='little')) # {:s} -> {:s}\n".format(
@@ -873,8 +884,11 @@ class UnicornEmulateScriptCommand(GenericCommand):
         return content
 
     def run_unicorn(self, content, kwargs):
-        tmp_fd, tmp_filename = GefUtil.mkstemp(prefix="unicorn-emulate", suffix=".py", dt=kwargs["dt"])
-        os.fdopen(tmp_fd, "w").write(content)
+        tmp_fd, tmp_filename = GefUtil.mkstemp(
+            prefix="unicorn-emulate", dir=kwargs["dloc"], suffix=".py", dt=kwargs["dt"],
+        )
+        with os.fdopen(tmp_fd, "w") as fdw:
+            fdw.write(content)
         if kwargs["skip_emulation"]:
             info("Unicorn script generated as '{:s}'".format(tmp_filename))
             os.chmod(tmp_filename, 0o600)
@@ -942,27 +956,25 @@ class UnicornEmulateScriptCommand(GenericCommand):
             "only_insns": args.only_insns,
             "skip_emulation": args.skip_emulation,
             "dt": dt, # datetime
-            "dloc": os.path.join(GEF_TEMP_DIR, "unicorn-emulate-" + dt), # memory dump directory
+            "dloc": tempfile.mkdtemp(dir=GEF_TEMP_DIR, prefix="unicorn-emulate-{:s}-".format(dt)), # memory dump directory
             "patch_got": args.avoid_avx_neon_opt_func,
             "emulate_mmap": args.emulate_mmap,
         }
-        os.mkdir(kwargs["dloc"])
 
-        # thread locking
-        sched_lock = gdb.parameter("scheduler-locking")
-        gdb.execute("set scheduler-locking on", to_string=True)
-        # generate
-        script = self.make_script(kwargs)
-        # revert
-        gdb.execute("set scheduler-locking {:s}".format(sched_lock), to_string=True)
-
-        # run
-        self.run_unicorn(script, kwargs)
-
-        # cleanup
-        if not kwargs["skip_emulation"]:
-            GefUtil.rmdir(kwargs["dloc"])
+        saved = False
+        try:
+            # thread locking
+            with ContextManager.gdb_parameter("scheduler-locking", "on"):
+                script = self.make_script(kwargs)
+            if script is None:
+                return
+            self.run_unicorn(script, kwargs)
+            saved = kwargs["skip_emulation"]
+        finally:
+            if not saved:
+                GefUtil.rmdir(kwargs["dloc"])
         return
+
 
 
 @register_command
@@ -1000,6 +1012,7 @@ class FutureCallsCommand(GenericCommand, BufferingOutput):
     _note_ = "\n".join([
         "This command is a best-effort concrete preview based on Unicorn emulation.",
         "Only x86, x86-64, ARM32, and ARM64 are supported.",
+        "A loop is cut only when the registers and written memory repeat; other loops run until --nb-insn.",
     ])
 
     def __init__(self):
@@ -1041,8 +1054,14 @@ class FutureCallsCommand(GenericCommand, BufferingOutput):
         if self.args.debug:
             operands = ", ".join(insn.operands)
             text = "{:#x}: {:s}{:s}".format(insn.address, insn.mnemonic, " " + operands if operands else "")
-            opcodes = bytes(insn.opcodes).hex() if getattr(insn, "opcodes", None) else ""
-            extra = ", bytes={:s}".format(opcodes) if opcodes else ""
+            if getattr(insn, "opcodes", None):
+                opcodes = bytes(insn.opcodes).hex()
+            else:
+                opcodes = ""
+            if opcodes:
+                extra = ", bytes={:s}".format(opcodes)
+            else:
+                extra = ""
             colored_reason = UnicornEmulator.Node.color_reason(reason)
             if tracer.last_fault is None:
                 event = "{:s} -> {:s}{:s}".format(text, colored_reason, extra)
@@ -1054,8 +1073,14 @@ class FutureCallsCommand(GenericCommand, BufferingOutput):
                         if isinstance(val, int):
                             val = "{:#x}".format(val)
                         extra += ", {:s}={:s}".format(key, str(val))
-                pc = "None" if fault.get("pc") is None else "{:#x}".format(fault.get("pc"))
-                addr = "None" if fault.get("address") is None else "{:#x}".format(fault.get("address"))
+                if fault.get("pc") is None:
+                    pc = "None"
+                else:
+                    pc = "{:#x}".format(fault.get("pc"))
+                if fault.get("address") is None:
+                    addr = "None"
+                else:
+                    addr = "{:#x}".format(fault.get("address"))
                 event = "{:s} -> {:s}, pc={:s}, access={:s}, fault={:s}, size={:d}, mapped={!s}{:s}".format(
                     text, colored_reason, pc, fault["access"], addr,
                     fault["size"], fault.get("mapped"), extra,
@@ -1065,6 +1090,34 @@ class FutureCallsCommand(GenericCommand, BufferingOutput):
         self.mark_truncated(parent, reason)
         return False
 
+    def mem_write_hook(self, emu, _access, address, size, value, _user_data):
+        """Update the digest of the memory written by the emulation."""
+        try:
+            if size <= 8:
+                before = emu.mem_read(address, size)
+            else:
+                before = None
+        except Exception:
+            before = None
+        if before is None:
+            # the written bytes are unknown, so make every later state unique
+            self.mem_writes += 1
+            self.mem_digest ^= hash(("unknown", self.mem_writes))
+            return
+        for i in range(size):
+            self.mem_digest ^= hash((address + i, before[i])) ^ hash((address + i, (value >> (8 * i)) & 0xff))
+        return
+
+    def get_state(self, tracer):
+        """Return the emulation state, which repeats only when the path loops forever."""
+        regs = []
+        for uc_reg in tracer.regs.values():
+            try:
+                regs.append(tracer.emu.reg_read(uc_reg))
+            except tracer.unicorn.UcError:
+                regs.append(None)
+        return tuple(regs), self.mem_digest
+
     def walk(self, parent, tracer, start_address, depth, return_address=None):
         """Walk one concrete path and recursively collect future calls."""
         if not self.valid_target(start_address):
@@ -1072,7 +1125,7 @@ class FutureCallsCommand(GenericCommand, BufferingOutput):
             return False
         tracer.write_pc(start_address)
         seen_pcs = set()
-        seen_edges = set()
+        seen_states = set()
 
         while True:
             if self.node_count >= self.args.nb_node:
@@ -1085,10 +1138,14 @@ class FutureCallsCommand(GenericCommand, BufferingOutput):
             pc = tracer.from_emu(tracer.emu.reg_read(tracer.pc_reg))
             if return_address is not None and pc == return_address:
                 return True
+            # a finite loop changes its state, so only a repeated state means an infinite loop
             if pc in seen_pcs:
-                parent.error = "loop detected"
-                self.stop_reasons.add("loop detected")
-                return False
+                state = self.get_state(tracer)
+                if state in seen_states:
+                    parent.error = "loop detected"
+                    self.stop_reasons.add("loop detected")
+                    return False
+                seen_states.add(state)
             seen_pcs.add(pc)
 
             if pc is None or pc == 0:
@@ -1103,6 +1160,13 @@ class FutureCallsCommand(GenericCommand, BufferingOutput):
                 return False
 
             if runtime.current_arch.is_ret(insn):
+                # a conditional return falls through if it is not taken
+                if runtime.current_arch.is_conditional_branch(insn):
+                    if not self.step(tracer, parent, insn):
+                        return False
+                    if tracer.from_emu(tracer.emu.reg_read(tracer.pc_reg)) == insn.address + len(insn.opcodes):
+                        continue
+                    return self.add_child(parent, UnicornEmulator.Node(return_address, insn.address, kind="ret")) is not None
                 child = self.add_child(parent, UnicornEmulator.Node(return_address, insn.address, kind="ret"))
                 if child is None or return_address is None:
                     return child is not None
@@ -1119,8 +1183,6 @@ class FutureCallsCommand(GenericCommand, BufferingOutput):
                     static_target = None
                 regs = {}
                 for reg, uc_reg in tracer.regs.items():
-                    if tracer.skip_register(reg):
-                        continue
                     try:
                         regs[reg] = tracer.emu.reg_read(uc_reg)
                     except tracer.unicorn.UcError:
@@ -1128,19 +1190,19 @@ class FutureCallsCommand(GenericCommand, BufferingOutput):
                 reason = None
                 if self.step(tracer, parent, insn):
                     target = tracer.from_emu(tracer.emu.reg_read(tracer.pc_reg))
+                    # a conditional call falls through if it is not taken
+                    if target == next_pc and runtime.current_arch.is_conditional_branch(insn):
+                        continue
                 else:
                     reason = parent.error
                     if self.stop_reasons.intersection(("node limit reached", "instruction limit reached")):
                         return False
                     parent.error = None
                     parent.truncated = False
-                    target = static_target if self.valid_target(static_target) else None
-
-                edge = (insn.address, target)
-                if edge in seen_edges:
-                    tracer.skip_to(regs, next_pc)
-                    continue
-                seen_edges.add(edge)
+                    if self.valid_target(static_target):
+                        target = static_target
+                    else:
+                        target = None
 
                 label = None
                 if not self.valid_target(target):
@@ -1194,7 +1256,10 @@ class FutureCallsCommand(GenericCommand, BufferingOutput):
         self.stop_reasons = set()
         self.truncated_reasons = set()
         self.debug_events = []
-        start_address = self.args.address or runtime.current_arch.pc
+        if self.args.address is None:
+            start_address = runtime.current_arch.pc
+        else:
+            start_address = self.args.address
         root = UnicornEmulator.Node(start_address, kind="root")
 
         with UnicornEmulateCommand.emulation_session({
@@ -1207,9 +1272,12 @@ class FutureCallsCommand(GenericCommand, BufferingOutput):
             "only_insns": True,
             "patch_got": False,
             "emulate_mmap": False,
+            "mem_write_callback": self.mem_write_hook,
         }) as tracer:
             if tracer is None:
                 return
+            self.mem_digest = 0
+            self.mem_writes = 0
             self.walk(root, tracer, start_address, self.args.depth)
 
         self.out.extend(root.lines())
@@ -1233,6 +1301,7 @@ class FutureCallsCommand(GenericCommand, BufferingOutput):
                 self.out.append("- ... {:d} more".format(len(self.debug_events) - 32))
         self.print_output(check_terminal_size=not self.args.no_pager)
         return
+
 
 
 @register_command

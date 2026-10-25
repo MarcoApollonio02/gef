@@ -127,6 +127,136 @@ class Symbol:
             return None
         return v
 
+    @staticmethod
+    @Cache.cache_this_session(until_new_objfile=True)
+    def resolve_address(name):
+        """resolve_address("main") -> 0x401000.
+        resolve_address("missing") -> None.
+        """
+        from gef.core.registers import to_unsigned_long
+        try:
+            return to_unsigned_long(gdb.parse_and_eval("&{:s}".format(name)))
+        except (gdb.error, OverflowError, ValueError):
+            return None
+
+    @staticmethod
+    def resolve_kdb_address(name):
+        """resolve_kdb_address("_stext") -> 0xffffffff81000000.
+        resolve_kdb_address("missing") -> None.
+        """
+        from gef.core.process import is_kdb
+        if not is_kdb():
+            return None
+        text = gdb.execute("monitor {:s}".format(name), to_string=True)
+        match = re.search(re.escape(name) + r" = 0x([0-9a-fA-F]+)\b", text)
+        if not match:
+            return None
+        address = int(match.group(1), 16)
+        if is_valid_addr(address):
+            return address
+        else:
+            return None
+
+
+    @staticmethod
+    @Cache.cache_this_session(until_new_objfile=True)
+    def lookup_gdb(address):
+        """lookup_gdb(0x401042) -> ("main", 0x42).
+        lookup_gdb(0x1) -> None.
+        """
+        if address is None:
+            return None
+        # gdb.format_address can miss symbols loaded by add-symbol-temporary.
+        text = gdb.execute("info symbol {:#x}".format(address), to_string=True).strip()
+        if not text or text.startswith("No symbol matches"):
+            return None
+        text = text.partition(" in section ")[0]
+        name, separator, offset = text.rpartition(" + ")
+        if separator and offset.isdigit():
+            return name, int(offset)
+        return text, 0
+
+    @staticmethod
+    def lookup(address, ksym="cached"):
+        """ksym="off": query GDB only.
+        ksym="cached" (default): query GDB first; on a miss in kernel mode, use already parsed kallsyms without scanning.
+        ksym="prefer": try an exact kallsyms address first (parsing if needed), then use the "cached" policy.
+
+        lookup(0x401042, ksym="off") -> ("main", 0x42).
+        lookup(0xffffffff81001042, ksym="cached") -> ("schedule", 0x42).
+        lookup(0xffffffff81001000, ksym="prefer") -> ("schedule", 0).
+        lookup(0x1) -> None.
+        """
+        from gef.core.process import is_in_kernel
+        # runtime-only core dependency, allowed by layering rule 1
+        from gef.core.kernel import Ksym
+        if ksym not in ("off", "cached", "prefer"):
+            raise ValueError("Unknown kallsyms mode: {!r}".format(ksym))
+        if address is None:
+            return None
+        try:
+            if ksym == "prefer":
+                name = Ksym.get_name(address)
+                if name:
+                    return name, 0
+            try:
+                ret = Symbol.lookup_gdb(address)
+            except (ValueError, gdb.error):
+                ret = None
+            if ret is None and ksym != "off" and is_in_kernel():
+                ret = Ksym.get_location_from_peek(address)
+            return ret
+        except (ValueError, gdb.error):
+            return None
+
+    @staticmethod
+    def format(addr, missing="", show_offset=True, ksym="cached", bracket="<>", show_address=False, nocolor=False):
+        """ksym uses the same "cached" (default), "prefer" and "off" policies as Symbol.lookup().
+
+        format(0x401042) -> "<main+0x42>".
+        format(0x401042, show_offset=False) -> "<main>".
+        format(0x401042, bracket="") -> "main+0x42".
+        format(0x401042, bracket="()") -> "(main+0x42)".
+        format(0x401042, bracket="[]") -> "[main+0x42]".
+        format(0x401042, show_address=True) -> "0x000000401042 <main+0x42>".
+        format(0x401042, show_address=True, nocolor=True) -> "0x000000401042 <main+0x42>" (no mapping lookup or color).
+        format(0x1, missing="NO_SYMBOL") -> "<NO_SYMBOL>".
+        format(0x1) -> "".
+        format(0xffffffff81001000, ksym="prefer") -> "<schedule>".
+        """
+        from gef.core.address import AddressUtil
+        from gef.core.process import ProcessMap
+
+        if len(bracket) not in (0, 2):
+            raise ValueError("Expected an empty string or two bracket characters")
+        if isinstance(addr, str):
+            try:
+                addr = int(Color.remove_color(addr), 16)
+            except ValueError:
+                addr = None
+
+        symbol = missing
+        if addr:
+            ret = Symbol.lookup(addr, ksym=ksym)
+            if ret is not None:
+                name, offset = ret
+                if addr - offset != 0:
+                    name = Instruction.smartify_text(name)
+                    if show_offset and offset:
+                        name += "+{:#x}".format(offset)
+                    symbol = name
+        if symbol and bracket:
+            symbol = "{:s}{:s}{:s}".format(bracket[0], symbol, bracket[1])
+        if show_address and addr is not None:
+            if nocolor:
+                address = AddressUtil.format_address(addr)
+            else:
+                address = ProcessMap.lookup(addr)
+            return "{!s}{:s}".format(address, " " + symbol if symbol else "")
+        return symbol
+
+
+
 
 class ModuleLoader:
     def load_capstone(f):

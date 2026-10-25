@@ -301,6 +301,12 @@ class ARC(Architecture):
     def encode_cookie(self, value, cookie):
         return value
 
+    def decode_cookie_legacy(self, value, cookie):
+        return value
+
+    def encode_cookie_legacy(self, value, cookie):
+        return value
+
 
 class ARCv3(ARC):
     """GEF representation of ARC-v3-32 architecture."""

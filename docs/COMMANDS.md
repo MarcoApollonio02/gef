@@ -42,7 +42,7 @@
 - [06-i. Qemu-system/KGDB Cooperation - Linux Dynamic Inspection](#06-i-qemu-systemkgdb-cooperation---linux-dynamic-inspection)
 - [06-j. Qemu-system/KGDB Cooperation - TrustZone](#06-j-qemu-systemkgdb-cooperation---trustzone)
 - [06-k. Qemu-system/KGDB Cooperation - Other](#06-k-qemu-systemkgdb-cooperation---other)
-- [06-k. Qemu-system/KGDB Cooperation - SMM](#06-k-qemu-systemkgdb-cooperation---smm)
+- [06-l. Qemu-system/KGDB Cooperation - SMM](#06-l-qemu-systemkgdb-cooperation---smm)
 - [07-a. Misc - Conversion](#07-a-misc---conversion)
 - [07-b. Misc - Search](#07-b-misc---search)
 - [07-c. Misc - Generation](#07-c-misc---generation)
@@ -552,13 +552,14 @@ regdump-break 0x55555555aab9 -t "state changed" -r rax
 ### Syntax
 
 ```text
-usage: continue-for-qemu-user [-h] [ARGS ...]
+usage: continue-for-qemu-user [-h] [-a] [IGNORE-COUNT]
 
 positional arguments:
-  ARGS        An array of arguments to pass as is to the continue command. (default: None)
+  IGNORE-COUNT  Ignore the current breakpoint N-1 times.
 
 options:
-  -h, --help  show this help message and exit
+  -h, --help    show this help message and exit
+  -a            Continue all stopped threads in non-stop mode.
 ```
 
 ### Notes
@@ -567,7 +568,7 @@ options:
 Only when qemu-user or pin, the `c` command is redirected to `continue-for-qemu-user`.
 This setting is done only once, when hook_stop_handler is called for the first time.
 Nested `c` command causes a problem, so in that case gef executes the original continue command instead.
-Internally, SIGINT is monitored in a forked child process (default) or another thread.
+Internally, SIGINT is monitored in a forked child process.
 ```
 
 ## down
@@ -619,16 +620,16 @@ multi-line x/4xg $rax; ---t TAG; x/4xg $rbx  # `---t TAG`: bold white line (`=`)
 
 ## nexti-for-qemu-user
 
-`ni` wrapper for some specific architectures (OpenRISC 1000 and CRIS).
+`ni` wrapper for specific architectures; COUNT is unsupported.
 
 
 ### Syntax
 
 ```text
-usage: nexti-for-qemu-user [-h] [ARGS ...]
+usage: nexti-for-qemu-user [-h] [COUNT]
 
 positional arguments:
-  ARGS        An array of arguments to pass as is to the nexti command. (default: None)
+  COUNT       Unsupported. Run this command without COUNT to step once.
 
 options:
   -h, --help  show this help message and exit
@@ -639,6 +640,7 @@ options:
 ```text
 Only when qemu-user with specific architecture, the `ni` command is redirected to `nexti-for-qemu-user`.
 This setting is done only once, when `hook_stop_handler` is called for the first time.
+COUNT arguments are not supported.
 
 Target architecture:
   OpenRISC 1000: branch operations don't work well, so GEF uses breakpoints to simulate.
@@ -664,21 +666,21 @@ options:
 ```text
 Only for AArch64 + kgdb.
 Temporarily masks IRQ before `stepi`, then restores the original state
-unless the stepped instruction intentionally modified DAIF.I.
+unless the stepped instruction intentionally modified DAIF.I or entered an exception.
 ```
 
 ## stepi-for-qemu-user
 
-`si` wrapper for some specific architectures (OpenRISC 1000 and CRIS).
+`si` wrapper for specific architectures; COUNT is unsupported.
 
 
 ### Syntax
 
 ```text
-usage: stepi-for-qemu-user [-h] [ARGS ...]
+usage: stepi-for-qemu-user [-h] [COUNT]
 
 positional arguments:
-  ARGS        An array of arguments to pass as is to the stepi command. (default: None)
+  COUNT       Unsupported. Run this command without COUNT to step once.
 
 options:
   -h, --help  show this help message and exit
@@ -689,6 +691,7 @@ options:
 ```text
 Only when qemu-user with specific architecture, the `si` command is redirected to `stepi-for-qemu-user`.
 This setting is done only once, when `hook_stop_handler` is called for the first time.
+COUNT arguments are not supported.
 
 Target architecture:
   OpenRISC 1000: branch operations don't work well, so GEF uses breakpoints to simulate.
@@ -774,7 +777,7 @@ exec-until syscall                              # execute until syscall instruct
 exec-until ret                                  # execute until ret instruction
 exec-until all-branch                           # execute until call/jmp/ret instruction
 exec-until indirect-branch                      # execute until indirect branch instruction (x64/x86 only)
-exec-until memaccess                            # execute until '[' is included by the instruction
+exec-until memaccess                            # execute until memory access instruction
 exec-until keyword "call +r[ab]x"               # execute until specified keyword (regex)
 exec-until cond "$rax==0xdead && $rbx==0xcafe"  # execute until specified condition is filled
 exec-until user-code                            # execute until user code
@@ -971,6 +974,14 @@ options:
                         the address to exclude from breakpoints.
 ```
 
+### Notes
+
+```text
+Classifies potential data accesses by instruction family for each architecture.
+Implicit stack accesses (e.g., push, pop, call, and ret on x86) are included.
+Address computations (e.g., lea on x86) and register-indirect branches are excluded.
+```
+
 ## exec-until region-change
 
 Execute until different region.
@@ -1069,6 +1080,33 @@ options:
   -N, --skip-lib        use `ni` instead of `si` if instruction is `call xxx@plt`.
   -e, --exclude EXCLUDE
                         the address to exclude from breakpoints.
+```
+
+## strings-continue
+
+Single-step and print ASCII strings referenced by general-purpose registers.
+
+
+### Syntax
+
+```text
+usage: strings-continue [-h] [-m MAX_LENGTH] [-n MIN_LENGTH]
+
+options:
+  -h, --help            show this help message and exit
+  -m, --max-length MAX_LENGTH
+                        maximum C-string length to inspect. (default: 256)
+  -n, --min-length MIN_LENGTH
+                        minimum C-string length to display. (default: 4)
+```
+
+### Notes
+
+```text
+Context output is hidden while stepping.
+Only registers whose values change are inspected after the initial stop.
+Stops on a user breakpoint, a signal, inferior exit, or Ctrl+C.
+Duplicate strings are suppressed for each invocation.
 ```
 
 ## xskip
@@ -1679,7 +1717,7 @@ usage: memory watch [-h] ADDRESS [COUNT] [{byte,word,dword,qword,pointers}]
 
 positional arguments:
   ADDRESS               the memory address to register for display in `context memory`.
-  COUNT                 the count of displayed units. (default: 16)
+  COUNT                 the number of pointers, or bytes for byte/word/dword/qword. (default: 16)
   {byte,word,dword,qword,pointers}
                         the size of unit. (default: pointers)
 
@@ -1742,19 +1780,15 @@ Redirect the file descriptor during execution.
 ### Syntax
 
 ```text
-usage: hijack-fd [-h] [--fd-adjust-connect FD_ADJUST_CONNECT] [--fd-adjust-dup3 FD_ADJUST_DUP3] [-q] OLD_FD NEW_OUTPUT
+usage: hijack-fd [-h] [-q] OLD_FD NEW_OUTPUT
 
 positional arguments:
-  OLD_FD                file descriptor number to redirect.
-  NEW_OUTPUT            the location redirected data is stored.
+  OLD_FD       file descriptor number to redirect.
+  NEW_OUTPUT   the location redirected data is stored.
 
 options:
-  -h, --help            show this help message and exit
-  --fd-adjust-connect FD_ADJUST_CONNECT
-                        slide value when `connect` syscall result and the actual opened FD differ (for old qemu-user).
-  --fd-adjust-dup3 FD_ADJUST_DUP3
-                        slide value when `dup3` syscall result and the actual opened FD differ (for old qemu-user).
-  -q, --quiet           quiet execution.
+  -h, --help   show this help message and exit
+  -q, --quiet  quiet execution.
 ```
 
 ### Examples
@@ -1764,7 +1798,13 @@ hijack-fd 2 /tmp/gef/stderr.txt
 hijack-fd 2 localhost:8000  # determined as the socket by the presence of `:`.
 ```
 
-## killthreads
+### Notes
+
+```text
+`socketcall` is not supported; on i386 with Linux < 4.3 (or old qemu-user), the socket redirection fails with ENOSYS.
+```
+
+## kill-threads
 
 Invoke pthread_exit(0) for a specific THREAD_ID.
 
@@ -1772,7 +1812,7 @@ Invoke pthread_exit(0) for a specific THREAD_ID.
 ### Syntax
 
 ```text
-usage: killthreads [-h] [-a] [-e EXCLUDE] [-c] [THREAD_ID ...]
+usage: kill-threads [-h] [-a] [-e EXCLUDE] [-c] [THREAD_ID ...]
 
 positional arguments:
   THREAD_ID             the thread id (not TID) to kill.
@@ -1788,7 +1828,7 @@ options:
 ### Examples
 
 ```gdb
-killthreads 2 3   # kill threads that `Thread Id` is 2 or 3
+kill-threads 2 3   # kill threads that `Thread Id` is 2 or 3
 ```
 
 ## mmap
@@ -1803,7 +1843,7 @@ usage: mmap [-h] [LOCATION] [SIZE] [PERMISSION]
 
 positional arguments:
   LOCATION    the address to allocate. (default: None)
-  SIZE        the size to allocate. (default: 4096)
+  SIZE        the size to allocate. (default: one target page)
   PERMISSION  the permission to allocate. `_` is interpreted as `-`. (default: rwx)
 
 options:
@@ -1978,7 +2018,7 @@ Hooked syscalls:
   write-like: write, sendto, sendmsg, sendmmsg, pwrite64, pwritev, pwritev2, writev
 
 - Relies on `catch syscall`.
-- Auto-continues; stops on a user breakpoint or Ctrl+C.
+- Auto-continues; stops on a user breakpoint, signal, or Ctrl+C.
 - qemu-user is unsupported: its gdbstub does not update the return-value register
   at syscall-return, so read-like sizes are wrong. Use a native target.
 ```
@@ -2068,6 +2108,7 @@ future-calls --debug                 # show Unicorn fault details
 ```text
 This command is a best-effort concrete preview based on Unicorn emulation.
 Only x86, x86-64, ARM32, and ARM64 are supported.
+A loop is cut only when the registers and written memory repeat; other loops run until --nb-insn.
 ```
 
 ## unicorn-emulate
@@ -2155,7 +2196,7 @@ options:
 ### Examples
 
 ```gdb
-unicorn-emulate-script -g 10               # from $pc to the point where 4 instructions are executed
+unicorn-emulate-script -g 10               # from $pc to the point where 10 gadgets are executed
 unicorn-emulate-script -n 5                # from $pc to 5 later instructions (assume it is no branch)
 unicorn-emulate-script -t 0x805678a4 -s    # from $pc to specified address with saving script
 ```
@@ -2380,6 +2421,7 @@ options:
 
 Dump each file under `/proc/PID`.
 
+- Alias: `prd`
 
 ### Syntax
 
@@ -2564,6 +2606,13 @@ options:
 
 ```gdb
 tls -vvv  # repeat `-v` to display more lines
+```
+
+### Notes
+
+```text
+Under qemu-user, multi-threaded mips/mipsn32/mips64/m68k targets may produce unreliable TLS/heap results
+because ExecAsm/ExecSyscall can fail after thread switches.
 ```
 
 # 02-c. Process Information - Memory/Section
@@ -2820,6 +2869,45 @@ options:
 ```
 
 # 02-e. Process Information - Complex Structure Information
+## cpp-vtable
+
+Dump C++ virtual tables and RTTI from an object or base subobject.
+
+
+### Syntax
+
+```text
+usage: cpp-vtable [-h] [-c COUNT] [-n] ADDRESS
+
+positional arguments:
+  ADDRESS            the address of a C++ object or polymorphic base subobject.
+
+options:
+  -h, --help         show this help message and exit
+  -c, --count COUNT  maximum number of virtual function entries per table. (default: 64)
+  -n, --no-pager     do not use the pager.
+```
+
+### Examples
+
+```gdb
+cpp-vtable 0x55555556b2a0
+cpp-vtable '&object'
+cpp-vtable '(Base2 *)&object' -c 8
+```
+
+### Notes
+
+```text
+Uses the Itanium C++ ABI with pointer-sized virtual function entries (Linux GCC/Clang).
+No debug information is required; RTTI is decoded from target memory.
+Stripped functions are shown by address; class names are recovered from RTTI.
+Relative vtables and function descriptors are unsupported.
+RTTI supplies inheritance and secondary tables, including virtual base offsets.
+Without RTTI, only the specified subobject's table is displayed.
+Function enumeration stops at non-code entries or --count; the ABI stores no table length.
+```
+
 ## dtor-dump
 
 Display registered destructor functions.
@@ -3042,17 +3130,39 @@ options:
 
 ## iouring-dump
 
-Dump the iouring area (x64 only).
+Dump the userland io_uring rings.
 
 
 ### Syntax
 
 ```text
-usage: iouring-dump [-h] [-n]
+usage: iouring-dump [-h] [-r RINGS] [-s SQES] [--no-scan] [-n]
 
 options:
-  -h, --help      show this help message and exit
-  -n, --no-pager  do not use the pager.
+  -h, --help         show this help message and exit
+  -r, --rings RINGS  the address of the rings set up with IORING_SETUP_NO_MMAP (p->cq_off.user_addr).
+  -s, --sqes SQES    the address of the SQEs set up with IORING_SETUP_NO_MMAP (p->sq_off.user_addr).
+  --no-scan          do not search writable memory for the rings set up with IORING_SETUP_NO_MMAP.
+  -n, --no-pager     do not use the pager.
+```
+
+### Examples
+
+```gdb
+iouring-dump                                      # dump mmapped rings and search IORING_SETUP_NO_MMAP rings
+iouring-dump -r 0x7ffff7fb2000 -s 0x7ffff7fb1000  # dump IORING_SETUP_NO_MMAP rings at the specified address
+```
+
+### Notes
+
+```text
+The layout of the rings is recognized from their metadata, not from the kernel version.
+  Linux v5.1-v5.3: IORING_OFF_SQ_RING and IORING_OFF_CQ_RING map struct io_sq_ring and struct io_cq_ring.
+  Linux v5.4-    : both offsets map the same struct io_rings (IORING_FEAT_SINGLE_MMAP).
+Linux v5.1-v6.9 (except some later v6.1.y/v6.6.y) maps the rings with remap_pfn_range(), so gdb cannot read them.
+Then, on x86/ARM/AArch64, they are copied to a temporary mapping in the inferior if the mapping is readable.
+The rings set up with IORING_SETUP_NO_MMAP (Linux v6.5-) are in user memory, not in an io_uring mapping.
+They are searched in writable memory. Their SQEs are guessed from the liburing layout, or specify --sqes.
 ```
 
 ## link-map
@@ -3100,6 +3210,33 @@ options:
   -n, --no-pager  do not use the pager.
 ```
 
+## unwind-info
+
+Show the effective DWARF unwind rules at the current or specified PC.
+
+
+### Syntax
+
+```text
+usage: unwind-info [-h] [-v] [PC]
+
+positional arguments:
+  PC             the program counter to inspect. (default: current_arch.pc)
+
+options:
+  -h, --help     show this help message and exit
+  -v, --verbose  decode the selected CIE and FDE.
+```
+
+### Examples
+
+```gdb
+unwind-info
+unwind-info $pc
+unwind-info -v $pc
+unwind-info 0x55555555529a
+```
+
 # 02-f. Process Information - Security
 ## aslr
 
@@ -3120,7 +3257,7 @@ options:
 
 ## canary
 
-Display the canary value of the current process from auxv information.
+Display the canary value of the current process.
 
 
 ### Syntax
@@ -3228,14 +3365,16 @@ Demangle a mangled value by PTR_MANGLE.
 ### Syntax
 
 ```text
-usage: ptr-demangle [-h] (--source | VALUE)
+usage: ptr-demangle [-h] [-f] (--source | VALUE)
 
 positional arguments:
-  VALUE       the value to demangle.
+  VALUE                 the value to demangle.
 
 options:
-  -h, --help  show this help message and exit
-  --source    shows the source instead of displaying demangled value.
+  -h, --help            show this help message and exit
+  --source              shows the source instead of displaying demangled value.
+  -f, --force-heuristic
+                        do not use symbols to detect PTR_MANGLE
 ```
 
 ## ptr-mangle
@@ -3246,14 +3385,16 @@ Mangle a pointer value by PTR_MANGLE.
 ### Syntax
 
 ```text
-usage: ptr-mangle [-h] (--source | VALUE)
+usage: ptr-mangle [-h] [-f] (--source | VALUE)
 
 positional arguments:
-  VALUE       the value to mangle.
+  VALUE                 the value to mangle.
 
 options:
-  -h, --help  show this help message and exit
-  --source    shows the source instead of displaying mangled value.
+  -h, --help            show this help message and exit
+  --source              shows the source instead of displaying mangled value.
+  -f, --force-heuristic
+                        do not use symbols to detect PTR_MANGLE
 ```
 
 ## search-mangled-ptr
@@ -3265,11 +3406,29 @@ Search for mangled values in RW memory.
 ### Syntax
 
 ```text
-usage: search-mangled-ptr [-h] [-v]
+usage: search-mangled-ptr [-h] [-f] [-v]
 
 options:
-  -h, --help     show this help message and exit
-  -v, --verbose  shows the section currently being searched.
+  -h, --help            show this help message and exit
+  -f, --force-heuristic
+                        do not use symbols to detect PTR_MANGLE
+  -v, --verbose         shows the section currently being searched.
+```
+
+## sighands
+
+Display the signal dispositions of the current process.
+
+- Alias: `sigactions`
+
+### Syntax
+
+```text
+usage: sighands [-h] [-n]
+
+options:
+  -h, --help      show this help message and exit
+  -n, --no-pager  do not use the pager.
 ```
 
 # 02-g. Process Information - Symbol
@@ -3638,7 +3797,7 @@ positional arguments:
   {byte,word,dword,qword}
                         dump mode. It also works if you specify the first character. (default: byte)
   LOCATION              the memory address to dump.
-  COUNT                 the count of displayed units. (default: 256)
+  COUNT                 the number of bytes to dump, regardless of the display unit. (default: 256)
 
 options:
   -h, --help            show this help message and exit
@@ -3678,6 +3837,32 @@ hexdump-flexible "2Q2I2H2B" $rsp 4  # "Show qword*2, dword*2, short*2, byte*2" f
 hexdump-flexible "4Q-2Q" $rsp 4     # "Show qword*4 and skip qword*2" from $rsp and repeat 4 times
 ```
 
+## jmpbuf
+
+Display the registers saved in a jmp_buf or sigjmp_buf of glibc, with PTR_MANGLE decoded.
+
+
+### Syntax
+
+```text
+usage: jmpbuf [-h] [-f] LOCATION
+
+positional arguments:
+  LOCATION              the address of jmp_buf or sigjmp_buf.
+
+options:
+  -h, --help            show this help message and exit
+  -f, --force-heuristic
+                        do not use symbols to detect PTR_MANGLE
+```
+
+### Examples
+
+```gdb
+jmpbuf &env                 # jmp_buf env; / sigjmp_buf env;
+jmpbuf $rdi                 # the 1st argument of setjmp, longjmp, siglongjmp, etc.
+```
+
 ## json
 
 The base command to pretty print for JSON.
@@ -3703,20 +3888,23 @@ Pretty print JSON from memory values.
 ### Syntax
 
 ```text
-usage: json memory [-h] [-n] LOCATION
+usage: json memory [-h] [-r MAX_READ] [-n] LOCATION
 
 positional arguments:
-  LOCATION        start address for json.
+  LOCATION              start address for json.
 
 options:
-  -h, --help      show this help message and exit
-  -n, --no-pager  do not use the pager.
+  -h, --help            show this help message and exit
+  -r, --max-read MAX_READ
+                        maximum bytes to inspect, including the NUL terminator. (default: 1048576)
+  -n, --no-pager        do not use the pager.
 ```
 
 ### Examples
 
 ```gdb
 json memory $rdi
+json memory $rdi --max-read 0x20_0000
 ```
 
 ## json value
@@ -3751,45 +3939,41 @@ Display stack values for sigreturn syscall.
 ### Syntax
 
 ```text
-usage: sigreturn [-h] [-n] [LOCATION]
+usage: sigreturn [-h] [-r] [-n] [LOCATION]
 
 positional arguments:
-  LOCATION        the address interpreted as the beginning of a sigframe. (default: current_arch.sp)
+  LOCATION        the address interpreted as the beginning of a sigframe, or the ucontext_t on architectures other than x86/arm. (default: current_arch.sp)
 
 options:
   -h, --help      show this help message and exit
+  -r, --rt        interpret the frame as a realtime (SA_SIGINFO) frame on i386/ARM32.
   -n, --no-pager  do not use the pager.
 ```
 
-## walk-link-list
+## ucontext
 
-Walk the link list.
+Display the register state saved in a ucontext_t or mcontext_t.
 
-- Alias: `chain`
 
 ### Syntax
 
 ```text
-usage: walk-link-list [-h] [-o NEXT_OFFSET] [-A DUMP_BYTES_AFTER] [-B DUMP_BYTES_BEFORE] [--adjust-output ADJUST_OUTPUT] [-n] ADDRESS
+usage: ucontext [-h] [-m] [-n] LOCATION
 
 positional arguments:
-  ADDRESS               start address to walk.
+  LOCATION        the address of ucontext_t (or mcontext_t if -m is specified).
 
 options:
-  -h, --help            show this help message and exit
-  -o NEXT_OFFSET        offset of the next(or prev) pointer in the target structure.
-  -A DUMP_BYTES_AFTER   dump bytes after link-list location.
-  -B DUMP_BYTES_BEFORE  dump bytes before link-list location.
-  --adjust-output ADJUST_OUTPUT
-                        displays the result of subtracting a specific value to the output.
-  -n, --no-pager        do not use the pager.
+  -h, --help      show this help message and exit
+  -m, --mcontext  interpret LOCATION as mcontext_t (e.g. &uc->uc_mcontext, struct sigcontext).
+  -n, --no-pager  do not use the pager.
 ```
 
 ### Examples
 
 ```gdb
-walk-link-list 0xffff9c60800597e0       # walk list_head.next
-walk-link-list -o 8 0xffff9c60800597e0  # walk list_head.prev
+ucontext $rdx                 # the 3rd argument of a SA_SIGINFO handler, setcontext, etc.
+ucontext -m 0x7fffffffd9e8    # struct sigcontext
 ```
 
 ## xc
@@ -3824,7 +4008,7 @@ Dump string like x/s command, but with hex-string style.
 ### Syntax
 
 ```text
-usage: xs [-h] [-l MAX_LENGTH] [-H] [-n] [-q] [COUNT] ADDRESS
+usage: xs [-h] [-l MAX_LENGTH] [-r MAX_READ] [-H] [-n] [-q] [COUNT] ADDRESS
 
 positional arguments:
   COUNT                 repeat count for displaying.
@@ -3834,6 +4018,8 @@ options:
   -h, --help            show this help message and exit
   -l, --max-length MAX_LENGTH
                         maximum number of characters to display. 0 means unlimited.
+  -r, --max-read MAX_READ
+                        maximum bytes to inspect per string. 0 means unlimited. (default: 0)
   -H, --hex             show in hex style.
   -n, --no-pager        do not use the pager.
   -q, --quiet           quiet mode.
@@ -4081,13 +4267,13 @@ The base command to write specified values to the specified address.
 ### Syntax
 
 ```text
-usage: patch [-h] {byte,word,dword,qword,string,hex,pattern,nop,inf,trap,ret,syscall,range-replace,history,revert} ...
+usage: patch [-h] {byte,word,dword,qword,string,hex,pattern,nop,inf,trap,ret,syscall,range-replace,history,revert,undo,redo} ...
 
 options:
   -h, --help            show this help message and exit
 
 command:
-  {byte,word,dword,qword,string,hex,pattern,nop,inf,trap,ret,syscall,range-replace,history,revert}
+  {byte,word,dword,qword,string,hex,pattern,nop,inf,trap,ret,syscall,range-replace,history,revert,undo,redo}
 ```
 
 ## patch byte
@@ -4181,12 +4367,13 @@ Display the patch history stack.
 ### Syntax
 
 ```text
-usage: patch history [-h] [-n] [-v]
+usage: patch history [-h] [-n] [-v] [--redo]
 
 options:
   -h, --help      show this help message and exit
   -n, --no-pager  do not use the pager.
   -v, --verbose   verbose output.
+  --redo          display patches available to redo.
 ```
 
 ## patch inf
@@ -4197,14 +4384,15 @@ Patch the instruction(s) at the given address with an infinite loop.
 ### Syntax
 
 ```text
-usage: patch inf [-h] [--phys] [LOCATION]
+usage: patch inf [-h] [--mode {arm,thumb}] [--phys] [LOCATION]
 
 positional arguments:
-  LOCATION    the memory address to patch. (default: current_arch.pc)
+  LOCATION            the memory address to patch. (default: current_arch.pc)
 
 options:
-  -h, --help  show this help message and exit
-  --phys      treat LOCATION as a physical address (qemu-system only).
+  -h, --help          show this help message and exit
+  --mode {arm,thumb}  select the instruction mode at LOCATION (ARM32 only).
+  --phys              treat LOCATION as a physical address (qemu-system only).
 ```
 
 ### Examples
@@ -4222,16 +4410,17 @@ Patch the instruction(s) at the given address with NOP.
 ### Syntax
 
 ```text
-usage: patch nop [-h] [--phys] [-b BYTE_LENGTH | -i INST_COUNT] [LOCATION]
+usage: patch nop [-h] [--mode {arm,thumb}] [--phys] [-b BYTE_LENGTH | -i INST_COUNT] [LOCATION]
 
 positional arguments:
-  LOCATION        the memory address to patch. (default: current_arch.pc)
+  LOCATION            the memory address to patch. (default: current_arch.pc)
 
 options:
-  -h, --help      show this help message and exit
-  --phys          treat LOCATION as a physical address (qemu-system only).
-  -b BYTE_LENGTH  the patch length in bytes. (default: None)
-  -i INST_COUNT   the number of instructions to patch. (default: 1)
+  -h, --help          show this help message and exit
+  --mode {arm,thumb}  select the instruction mode at LOCATION (ARM32 only).
+  --phys              treat LOCATION as a physical address (qemu-system only).
+  -b BYTE_LENGTH      the patch length in bytes. (default: None)
+  -i INST_COUNT       the number of instructions to patch. (default: 1)
 ```
 
 ### Examples
@@ -4308,9 +4497,9 @@ usage: patch range-replace [-h] [--phys] START_ADDR END_ADDR HEX_STR_FROM HEX_ST
 
 positional arguments:
   START_ADDR    start address to search.
-  END_ADDR      end address to search.
+  END_ADDR      exclusive end address for searching and writing.
   HEX_STR_FROM  the hex string to search for (source pattern).
-  HEX_STR_TO    the hex string to replace it with (replacement pattern).
+  HEX_STR_TO    the replacement bytes; all writes must fit in the range and must not overlap.
 
 options:
   -h, --help    show this help message and exit
@@ -4323,6 +4512,38 @@ options:
 patch range-replace 0x400000 0x401000 "ebfe" "9090"
 ```
 
+## patch redo
+
+Reapply the most recently undone patch groups.
+
+
+### Syntax
+
+```text
+usage: patch redo [-h] [--all | COUNT]
+
+positional arguments:
+  COUNT       the number of patch groups to redo. (default: 1)
+
+options:
+  -h, --help  show this help message and exit
+  --all       redo all undone patch groups.
+```
+
+### Examples
+
+```gdb
+patch redo        # redo the last undone patch command.
+patch redo 2      # redo the next two undone patch commands.
+patch redo --all  # redo all undone patch commands.
+```
+
+### Notes
+
+```text
+A new patch or a successful patch revert discards the redo history for the current target.
+```
+
 ## patch ret
 
 Patch the instruction(s) at the given address with return.
@@ -4331,14 +4552,19 @@ Patch the instruction(s) at the given address with return.
 ### Syntax
 
 ```text
-usage: patch ret [-h] [--phys] [LOCATION]
+usage: patch ret [-h] [--mode {arm,thumb}] [--phys] [--return-mode {leaf,windowed}] [--interworking | --no-interworking] [LOCATION]
 
 positional arguments:
-  LOCATION    the memory address to patch. (default: current_arch.pc)
+  LOCATION              the memory address to patch. (default: current_arch.pc)
 
 options:
-  -h, --help  show this help message and exit
-  --phys      treat LOCATION as a physical address (qemu-system only).
+  -h, --help            show this help message and exit
+  --mode {arm,thumb}    select the instruction mode at LOCATION (ARM32 only).
+  --phys                treat LOCATION as a physical address (qemu-system only).
+  --return-mode {leaf,windowed}
+                        select the SPARC return form: retl/nop or ret/restore.
+  --interworking        use BX LR when ARM interworking support cannot be detected.
+  --no-interworking     use MOV PC, LR for ARM CPUs without interworking support.
 ```
 
 ### Examples
@@ -4408,14 +4634,15 @@ Patch the instruction(s) at the given address with syscall instruction.
 ### Syntax
 
 ```text
-usage: patch syscall [-h] [--phys] [LOCATION]
+usage: patch syscall [-h] [--mode {arm,thumb}] [--phys] [LOCATION]
 
 positional arguments:
-  LOCATION    the memory address to patch. (default: current_arch.pc)
+  LOCATION            the memory address to patch. (default: current_arch.pc)
 
 options:
-  -h, --help  show this help message and exit
-  --phys      treat LOCATION as a physical address (qemu-system only).
+  -h, --help          show this help message and exit
+  --mode {arm,thumb}  select the instruction mode at LOCATION (ARM32 only).
+  --phys              treat LOCATION as a physical address (qemu-system only).
 ```
 
 ### Examples
@@ -4432,20 +4659,53 @@ Patch the instruction(s) at the given address with breakpoint or trap (if availa
 ### Syntax
 
 ```text
-usage: patch trap [-h] [--phys] [LOCATION]
+usage: patch trap [-h] [--mode {arm,thumb}] [--phys] [LOCATION]
 
 positional arguments:
-  LOCATION    the memory address to patch. (default: current_arch.pc)
+  LOCATION            the memory address to patch. (default: current_arch.pc)
 
 options:
-  -h, --help  show this help message and exit
-  --phys      treat LOCATION as a physical address (qemu-system only).
+  -h, --help          show this help message and exit
+  --mode {arm,thumb}  select the instruction mode at LOCATION (ARM32 only).
+  --phys              treat LOCATION as a physical address (qemu-system only).
 ```
 
 ### Examples
 
 ```gdb
 patch trap $pc
+```
+
+## patch undo
+
+Undo the most recent patch groups.
+
+
+### Syntax
+
+```text
+usage: patch undo [-h] [--all | COUNT]
+
+positional arguments:
+  COUNT       the number of patch groups to undo. (default: 1)
+
+options:
+  -h, --help  show this help message and exit
+  --all       undo all patch groups.
+```
+
+### Examples
+
+```gdb
+patch undo        # undo the last patch command.
+patch undo 2      # undo the last two patch commands.
+patch undo --all  # undo all patch commands.
+```
+
+### Notes
+
+```text
+A new patch or a successful patch revert discards the redo history for the current target.
 ```
 
 ## patch word
@@ -4510,13 +4770,52 @@ The base command to decode baseN.
 ### Syntax
 
 ```text
-usage: base-n-decode [-h] {memory,value} ...
+usage: base-n-decode [-h] {memory,file,value} ...
+
+options:
+  -h, --help           show this help message and exit
+
+command:
+  {memory,file,value}
+```
+
+### Notes
+
+```text
+For integer bases other than base1, each leading zero symbol represents one zero byte.
+```
+
+## base-n-decode file
+
+Decode baseN from file.
+
+
+### Syntax
+
+```text
+usage: base-n-decode file [-h] [-n] FILE [START_POS] [SIZE]
+
+positional arguments:
+  FILE            the filepath for baseN decoding.
+  START_POS       the start position for baseN decoding.
+  SIZE            the size for baseN decoding.
 
 options:
   -h, --help      show this help message and exit
+  -n, --no-pager  do not use the pager.
+```
 
-command:
-  {memory,value}
+### Examples
+
+```gdb
+base-n-decode file /tmp/data.bin
+base-n-decode file /tmp/data.bin 0x10 0x20
+```
+
+### Notes
+
+```text
+For integer bases other than base1, each leading zero symbol represents one zero byte.
 ```
 
 ## base-n-decode memory
@@ -4542,6 +4841,12 @@ options:
 
 ```gdb
 base-n-decode memory $rsp 0x20
+```
+
+### Notes
+
+```text
+For integer bases other than base1, each leading zero symbol represents one zero byte.
 ```
 
 ## base-n-decode value
@@ -4570,6 +4875,12 @@ base-n-decode value "\\x51\\x55\\x46\\x42"
 base-n-decode value --hex "51 55 46 42"
 ```
 
+### Notes
+
+```text
+For integer bases other than base1, each leading zero symbol represents one zero byte.
+```
+
 ## base-n-encode
 
 The base command to encode baseN.
@@ -4578,13 +4889,52 @@ The base command to encode baseN.
 ### Syntax
 
 ```text
-usage: base-n-encode [-h] {memory,value} ...
+usage: base-n-encode [-h] {memory,file,value} ...
+
+options:
+  -h, --help           show this help message and exit
+
+command:
+  {memory,file,value}
+```
+
+### Notes
+
+```text
+For integer bases other than base1, each leading zero symbol represents one zero byte.
+```
+
+## base-n-encode file
+
+Encode baseN from file.
+
+
+### Syntax
+
+```text
+usage: base-n-encode file [-h] [-n] FILE [START_POS] [SIZE]
+
+positional arguments:
+  FILE            the filepath for baseN encoding.
+  START_POS       the start position for baseN encoding.
+  SIZE            the size for baseN encoding.
 
 options:
   -h, --help      show this help message and exit
+  -n, --no-pager  do not use the pager.
+```
 
-command:
-  {memory,value}
+### Examples
+
+```gdb
+base-n-encode file /tmp/data.bin
+base-n-encode file /tmp/data.bin 0x10 0x20
+```
+
+### Notes
+
+```text
+For integer bases other than base1, each leading zero symbol represents one zero byte.
 ```
 
 ## base-n-encode memory
@@ -4612,6 +4962,12 @@ options:
 base-n-encode memory $rsp 0x20
 ```
 
+### Notes
+
+```text
+For integer bases other than base1, each leading zero symbol represents one zero byte.
+```
+
 ## base-n-encode value
 
 Encode baseN from specified values.
@@ -4636,6 +4992,12 @@ options:
 ```gdb
 base-n-encode value "\\x41\\x42\\x43\\x44"
 base-n-encode value --hex "41 42 43 44"
+```
+
+### Notes
+
+```text
+For integer bases other than base1, each leading zero symbol represents one zero byte.
 ```
 
 ## crc
@@ -4778,7 +5140,7 @@ The salt for BLAKE2s and BLAKE2b is blank.
 The key for KMAC128 and KMAC256 is blank.
 The key for SipHash is "\0" * 16.
 The key for HalfSipHash is "\0" * 8.
-To calculate FSB hash, you need the `gmpy2` package (uv pip install gmpy2).
+To calculate FSB hash, install `gmpy2` into the Python environment used by GEF.
 ```
 
 ## hash file
@@ -4814,7 +5176,7 @@ The salt for BLAKE2s and BLAKE2b is blank.
 The key for KMAC128 and KMAC256 is blank.
 The key for SipHash is "\0" * 16.
 The key for HalfSipHash is "\0" * 8.
-To calculate FSB hash, you need the `gmpy2` package (uv pip install gmpy2).
+To calculate FSB hash, install `gmpy2` into the Python environment used by GEF.
 ```
 
 ## hash known-collision
@@ -4840,7 +5202,7 @@ The salt for BLAKE2s and BLAKE2b is blank.
 The key for KMAC128 and KMAC256 is blank.
 The key for SipHash is "\0" * 16.
 The key for HalfSipHash is "\0" * 8.
-To calculate FSB hash, you need the `gmpy2` package (uv pip install gmpy2).
+To calculate FSB hash, install `gmpy2` into the Python environment used by GEF.
 ```
 
 ## hash list
@@ -4900,7 +5262,7 @@ The salt for BLAKE2s and BLAKE2b is blank.
 The key for KMAC128 and KMAC256 is blank.
 The key for SipHash is "\0" * 16.
 The key for HalfSipHash is "\0" * 8.
-To calculate FSB hash, you need the `gmpy2` package (uv pip install gmpy2).
+To calculate FSB hash, install `gmpy2` into the Python environment used by GEF.
 ```
 
 ## hash test
@@ -4911,7 +5273,7 @@ Calculate and check hash from constant inputs.
 ### Syntax
 
 ```text
-usage: hash test [-h] [-f REGEX] [-l LENGTH_FILTER] [-s] [-t | -T] [--size SIZE] [--no-cffi] [-n]
+usage: hash test [-h] [-f REGEX] [-l LENGTH_FILTER] [-s] [--extended | -t | -T] [--size SIZE] [--no-cffi] [-n]
 
 options:
   -h, --help            show this help message and exit
@@ -4919,6 +5281,7 @@ options:
   -l, --length-filter LENGTH_FILTER
                         filter by hash byte length.
   -s, --smart           show only failed.
+  --extended            also check split input, repeated digests and independent instances.
   -t, --time            measure the time taken to compute the hash using large bytes of data.
   -T, --time-with-sort  measure and sort the time taken to compute the hash using large bytes of data.
   --size SIZE           the data size of 'AAAA...' to measure the time taken to compute the hash.
@@ -4965,7 +5328,7 @@ The salt for BLAKE2s and BLAKE2b is blank.
 The key for KMAC128 and KMAC256 is blank.
 The key for SipHash is "\0" * 16.
 The key for HalfSipHash is "\0" * 8.
-To calculate FSB hash, you need the `gmpy2` package (uv pip install gmpy2).
+To calculate FSB hash, install `gmpy2` into the Python environment used by GEF.
 ```
 
 ## is-mem-zero
@@ -5004,6 +5367,12 @@ command:
   {memory,value}
 ```
 
+### Notes
+
+```text
+Uses one space between letters and three spaces between words.
+```
+
 ## morse-decode memory
 
 Decode morse code from memory values.
@@ -5026,6 +5395,12 @@ options:
 
 ```gdb
 morse-decode memory $rsp 0x20
+```
+
+### Notes
+
+```text
+Uses one space between letters and three spaces between words.
 ```
 
 ## morse-decode value
@@ -5051,6 +5426,12 @@ options:
 morse-decode value -- ".- -... -.-. -.."
 ```
 
+### Notes
+
+```text
+Uses one space between letters and three spaces between words.
+```
+
 ## morse-encode
 
 The base command to encode morse code.
@@ -5066,6 +5447,12 @@ options:
 
 command:
   {memory,value}
+```
+
+### Notes
+
+```text
+Uses one space between letters and three spaces between words.
 ```
 
 ## morse-encode memory
@@ -5092,6 +5479,12 @@ options:
 morse-encode memory $rsp 0x20
 ```
 
+### Notes
+
+```text
+Uses one space between letters and three spaces between words.
+```
+
 ## morse-encode value
 
 Encode morse code from specified values.
@@ -5113,6 +5506,12 @@ options:
 
 ```gdb
 morse-encode value AAAA
+```
+
+### Notes
+
+```text
+Uses one space between letters and three spaces between words.
 ```
 
 ## seq-length
@@ -5398,7 +5797,7 @@ freq-analysis $rax 0x1000 -e 00 -e 01   # exclude some characters
 
 ## peek-pageflags
 
-Read the page flags of a page frame (needs root).
+Read the local host's page flags of a page frame (needs root).
 
 - Alias: `ppfl`
 
@@ -5419,6 +5818,15 @@ options:
 
 ```gdb
 peek-pageflags 0x6b2ae3
+```
+
+### Notes
+
+```text
+PFNs always refer to the local host, including during remote debugging.
+Reads /proc/kpagecount and /proc/kpageflags on the machine running GDB.
+The mapping count can be an average for pages in a large allocation, depending on the kernel configuration.
+Bit 23 is BALLOON before Linux 5.1 and OFFLINE since Linux 5.1.
 ```
 
 ## peek-pageframe
@@ -5453,6 +5861,15 @@ peek-pageframe 0x555555555060                       # read pagemap of single add
 peek-pageframe -f 0x7ffffffdd000 -t 0x7ffffffff000  # read pagemap of an address range
 ```
 
+### Notes
+
+```text
+Reads the local host's /proc/PID/pagemap; qemu-user is not supported.
+Range flags: P=present, S=swapped, F=file/shared-anon, D=soft-dirty, E=exclusive, U=uffd-wp.
+Unknown or unavailable flags are shown as '?' (or 'unknown' for a single address).
+On Linux 3.11-4.1, bits 55-60 are decoded only when the entry identifies the format.
+```
+
 ## sixel-memory
 
 Show image (png, jpg, bmp, etc.) to terminal by imagemagick.
@@ -5470,6 +5887,51 @@ positional arguments:
 options:
   -h, --help            show this help message and exit
   -b, --decode-barcode  decode barcode if found.
+```
+
+## stack-recover
+
+Heuristically recover the call chain from the stack when `bt` is unusable.
+
+
+### Syntax
+
+```text
+usage: stack-recover [-h] [-l LENGTH] [-v] [-n] [ADDRESS]
+
+positional arguments:
+  ADDRESS              the stack address to start scanning from. (default: current_arch.sp)
+
+options:
+  -h, --help           show this help message and exit
+  -l, --length LENGTH  the number of bytes to scan. (default: up to the end of the stack)
+  -v, --verbose        also show the code pointers that are not adopted.
+  -n, --no-pager       do not use the pager.
+```
+
+### Examples
+
+```gdb
+stack-recover                         # scan from $sp to the end of the stack
+stack-recover 0x7fffffffe000 -l 0x800 # scan 0x800 bytes from the specified address
+stack-recover -v                      # also show rejected candidates
+```
+
+### Notes
+
+```text
+The link register and each code pointer on the stack are candidates only if the instruction
+before it is a call. Among them, the most consistent chain is selected by scoring:
+  - the direct call target matches the function of the callee frame (strong).
+  - the call target is unknown (indirect call, PLT, thunk) (weak).
+  - the direct call target differs, i.e., some frames may be missing (penalty).
+  - a saved frame pointer links to the frame (bonus; x86, ARM, RISC-V, LoongArch).
+  - the frame is inside the callee frame according to its frame pointer (penalty).
+  - the same function appears again across an unconfirmed link (penalty; stale sub-chain).
+confidence=high:   the call target matches the callee, or a frame pointer links to it.
+confidence=medium: the call target is unknown, or the caller is confirmed by the next frame.
+confidence=low:    only the preceding call instruction supports it.
+On SPARC, frames still held in the register windows are not found.
 ```
 
 ## vdump
@@ -5498,7 +5960,7 @@ options:
   -Ab, --auto-inclement-begin-width AUTO_INCLEMENT_BEGIN_WIDTH
                         auto inclement begin width. (default: 16)
   -Ae, --auto-inclement-end-width AUTO_INCLEMENT_END_WIDTH
-                        auto inclement end width. (default: min(len(data) // begin_width, 512)
+                        auto inclement end width. (default: max(begin_width, min(len(data) // begin_width, 512)))
   -As, --auto-inclement-step-width AUTO_INCLEMENT_STEP_WIDTH
                         auto inclement step width. (default: 2)
 ```
@@ -5676,6 +6138,7 @@ edit-flags             # show the flag register
 edit-flags zero+       # set ZERO flag
 edit-flags direction-  # unset DIRECTION flag
 edit-flags sign~       # toggle SIGN flag
+edit-flags z+ c-       # a unique prefix of the flag name is also accepted
 edit-flags -v          # verbose output
 ```
 
@@ -5769,6 +6232,9 @@ Supports up to glibc 2.43.
 - 2.42: tcache_perthread_struct.counts changes to num_slots.
 - 2.43: fastbins are removed.
 - 2.43: TCACHE_FILL_COUNT 7->16.
+
+Under qemu-user, multi-threaded mips/mipsn32/mips64/m68k targets may produce unreliable TLS/heap results
+because ExecAsm/ExecSyscall can fail after thread switches.
 ```
 
 ## heap arena
@@ -6583,7 +7049,9 @@ partition-alloc-dump ab            # same above
 ### Notes
 
 ```text
-Chromium mainline is too fast to develop. So if parse is failed, you need fix this gef.py.
+Version numbers do not identify the build layout; the fixed layout is checked against the heap.
+Requires 4 KiB system pages, 2 MiB super pages and 32-byte metadata entries.
+Settings must occupy 0x40, 0x80 or 0xc0 bytes; metadata placement is checked against the extents.
 
 Simplified partition alloc structure:
 
@@ -6628,7 +7096,7 @@ Simplified partition alloc structure:
 
 `extent`, `slot_span` and `slot` are in super_page.
 
-     [~v144.x]                    [v145.x~; PA_CONFIG(MOVE_METADATA_OUT_OF_GIGACAGE)=y]
+     [inline layout]              [PA_CONFIG(MOVE_METADATA_OUT_OF_GIGACAGE)=y]
      +-super_page-(2MB)-----+      +-super_page(for meta)-+ +-super_page(for chunk)+
 4KB  | Guard Page           |      | Guard Page           | | Guard Page           |
      +----------------------+      +----------------------+ +----------------------+
@@ -6666,7 +7134,7 @@ Print v8 tagged object, or load more commands from internet.
 ### Syntax
 
 ```text
-usage: v8 [-h] (-l | -L | ADDRESS)
+usage: v8 [-h] [--revision REVISION] (-l | -L | ADDRESS)
 
 positional arguments:
   ADDRESS               target map address.
@@ -6676,6 +7144,7 @@ options:
   -l, --load-v8-gdbinit
                         load gdbinit for v8 from internet.
   -L, --list-command    show newly added commands from v8 gdbinit.
+  --revision REVISION   V8 revision or tag for the external gdbinit.
 ```
 
 ## v8-dump-space
@@ -6760,7 +7229,7 @@ Also, since it uses V8 commands internally, `_v8_internal_Print_Object` must be 
 # 05-c. Heap - Other
 ## go-heap-dump
 
-go language v1.24.4 mheap dumper (x64 only).
+Go mheap dumper.
 
 
 ### Syntax
@@ -6821,7 +7290,10 @@ Simplified Go heap structure:
 
 * `allspans` is used as the entry point for this command.
 * `spanClass >> 1` is used as the size class, and the size class is converted to chunk size.
-* `allocBits` is used to distinguish allocated/free objects in a span.
+* `freeindex` and `allocBits` distinguish allocated/free objects in an in-use span.
+* Large objects use `elemsize`; non-heap spans are shown only with `--verbose`, without object data.
+* Without debug types, the command assumes the Go 1.22.2 layout for the target pointer size.
+* If the runtime.mheap_ symbol is stripped, specify its address with `--mheap`.
 * `arenas`, `central`, and walking from `mspan.next` are currently unsupported.
 ```
 
@@ -6885,22 +7357,137 @@ Simplified Hoard structure:
 * `reapableObjects` is displayed as the number of unused objects left.
 ```
 
-## mimalloc-heap-dump
+## jemalloc-heap-dump
 
-mimalloc heap free-list viewer (x64 only).
+jemalloc (v3.0~) arena/bin/slab(run)/large/tcache viewer.
 
 
 ### Syntax
 
 ```text
-usage: mimalloc-heap-dump [-h] [-hh] [-m MI_HEAP_MAIN] [-D] [-n]
+usage: jemalloc-heap-dump [-h] [-hh] [-A ARENAS] [-V JEMALLOC_VERSION] [-i ARENA_INDEX] [-b BIN_INDEX] [-x ADDRESS] [-t] [-n] [-q] [-v] [--meta]
+
+options:
+  -h, --help            show this help message and exit
+  -hh, --help-simple    show help without ASCII diagram.
+  -A, --arenas ARENAS   the address of je_arenas (the arena pointer array; v5.x only).
+  -V, --jemalloc-version JEMALLOC_VERSION
+                        the jemalloc version (e.g. 5.3.0) if the embedded version string is not found.
+  -i, --arena-index ARENA_INDEX
+                        dump only the specified arena and the tcaches bound to it.
+  -b, --bin-index BIN_INDEX
+                        dump only the specified size class index (small or large).
+  -x, --address ADDRESS
+                        show the arena, size class, slab region and state of this address.
+  -t, --tcache          also dump the tcache of each thread.
+  -n, --no-pager        do not use the pager.
+  -q, --quiet           quiet mode.
+  -v, --verbose         also dump the state of each region.
+  --meta                display offset information.
+```
+
+### Examples
+
+```gdb
+jemalloc-heap-dump                    # dump small and large allocations of all arenas
+jemalloc-heap-dump -t -i 0            # dump arena[0] and the tcaches bound to it
+jemalloc-heap-dump -t -b 1            # dump bin[1] (size=0x10) of all arenas and tcaches
+jemalloc-heap-dump -x 0x7ffff701d008  # show which region the address belongs to
+```
+
+### Notes
+
+```text
+Simplified jemalloc (v5.x) structure:
+
++-je_arenas[]-+    +-arena_t-----------------+
+| arena[0]    |--->| ...                     |
+| arena[1]    |    | bins[] (v5.2: bins_t)   |
+| ...         |    |  bin_t                  |
++-------------+    |   slabcur               |---------------------------+
+                   |   slabs_nonfull         |--> pairing heap of slabs  |
+                   |   slabs_full            |--> list of slabs          |
+                   |  ...                    |                           |
+                   +-------------------------+                           |
+                                                                         |
+  +----------------------------------------------------------------------+
+  |
+  v
++-extent_t (v5.0~v5.2) / edata_t (v5.3~)-+       +-slab------+
+| e_bits (arena, slab, szind, nfree)     |       | region[0] |
+| e_addr                                 |------>| region[1] |
+| e_size_esn                             |       | ...       |
+| ...                                    |       +-----------+
+| slab_data.bitmap[] (bit=1 means free)  |
++----------------------------------------+
+
++-tsd (TLS)-------------------------------------+
+| tcache.bins_small[] (~v5.2) / bins[] (v5.3~)  |
+|  v5.0~v5.2: avail      -> objs[-ncached..-1]  |
+|  v5.3~    : stack_head -> objs[0..ncached-1]  |
++-----------------------------------------------+
+
+Simplified jemalloc (v3.x/v4.x) structure:
+
++-arena_t-------------+    +-chunk (v3.x: 4MB, v4.x: 2MB)-----------------+
+| ind                 |<---| arena_chunk_t                                |
+| ...                 |    |  arena                                       |
+| bins[]              |    |  map[] / map_bits[] (page state, bin index)  |
+|  arena_bin_t        |    |  map_misc[] (v4.x)                           |
+|   runcur            |--->|   arena_run_t (v4.x: binind, nfree, bitmap)  |
+|   runs (nonfull)    |    |  ...                                         |
++---------------------+    | run pages                                    |
+                           |  arena_run_t (v3.x: bin, nextind, nfree)     |
+                           |  bitmap (v3.x)                               |
+                           |  region[0], region[1], ...                   |
+                           +----------------------------------------------+
+
++-TLS--------------------------------------------------------+
+| tcache_tls (v3.x) / tsd.tcache (v4.x) --> tcache_t.tbins[] |
+|  v3.x~v4.0: avail[0..ncached-1]                            |
+|  v4.1~    : avail -> objs[-ncached..-1]                    |
++------------------------------------------------------------+
+
+* Objects cached in tcache are marked as used in the slab/run bitmap.
+* Full slabs/runs are not linked from the bin. GEF finds them by scanning the
+  writable memory (v5.x shows them as `unlinked`).
+* The offsets vary with the version and the build config.
+  GEF uses debug types if available, else built-in values for the version and
+  the architecture, and derives the arena layout from memory if they disagree.
+* v5.x: if symbols are not available, GEF scans the writable memory for je_arenas.
+* v3.x/v4.x: GEF finds the chunks by scanning memory and reads their arena,
+  so je_arenas is not needed.
+* The page size of jemalloc (--with-lg-page) may differ from that of the system.
+  v3.x/v4.x: GEF uses chunk_npages if debug symbols are available,
+  else derives it from the runs in the chunk page map.
+  v5.x: GEF derives it from the slabs (ARM64 uses 64KB by default since v5.3.1).
+* Large allocations: v3.x/v4.x read the chunk page map; v5.x reads the rtree.
+  v4.x displays the run range: cache-oblivious allocation addresses are randomized within its first page.
+  v4.x/v5.x assume cache-oblivious padding unless debug symbols specify otherwise.
+  v5.3.1~: when large size classes are disabled, the size class index is an upper bound;
+  the displayed allocation size comes from the extent itself.
+* v3.x/v4.x huge allocations (outside arena chunks) and jemalloc v2.x or older are not supported.
+```
+
+## mimalloc-heap-dump
+
+mimalloc heap free-list viewer.
+
+
+### Syntax
+
+```text
+usage: mimalloc-heap-dump [-h] [-hh] [-m MI_HEAP_MAIN] [-f] [-D] [--meta] [-n]
 
 options:
   -h, --help            show this help message and exit
   -hh, --help-simple    show help without ASCII diagram.
   -m, --mi-heap-main MI_HEAP_MAIN
-                        the address of _mi_heap_main (v2.x) / heap_main (v3.x).
+                        address of a mi_heap_t (default: resolve the main heap).
+  -f, --force-heuristic
+                        use heuristic detection.
   -D, --dump-chunk      dump each chunks.
+  --meta                display offset information.
   -n, --no-pager        do not use the pager.
 ```
 
@@ -6912,18 +7499,19 @@ Simplified mimalloc structure:
 +-mi_heap_t(_mi_heap_main / heap_main)-+
 | ...                                  |
 | next                                 |----> mi_heap_t --> ...
-| pages_free_direct[130] (v2.x/v3.0.x) |------+
-| theap / theaps (v3.1.x~)             |---+  |
+| pages_free_direct[] (v2.x/v3.0/v3.1) |------+
+| pages[]                              |------+
+| theap / theaps (v3.2.x~)             |---+  |
 +--------------------------------------+   |  |
                                            |  |
   +----------------------------------------+  |
   |                                           |
   v                                           |
-+-mi_theap_t(v3.1.x~)------------------+      |
++-mi_theap_t(v3.2.x~)------------------+      |
 | heap                                 |      |
 | ...                                  |      |
 | tnext / hnext                        |      |
-| pages_free_direct[130]               |------+
+| pages_free_direct[]                  |------+
 | pages[]                              |      |
 +--------------------------------------+      |
                                               |
@@ -6947,28 +7535,32 @@ Simplified mimalloc structure:
 
 * In mimalloc, the member offsets of important structures vary depending on the version.
 * You should be able to check the version with a command like `strings libmimalloc.so | grep git`.
-* If you cannot determine it, please choose an option that can successfully decode it.
 
-* For `_mi_heap_main` (v2.x) or `heap_main` (v3.x), GEF tries to resolve the address from symbol.
+* GEF resolves `_mi_heap_main`, `heap_main`, or `mi_process_heap_main` from symbols when available.
 * If symbols are not available, GEF scans the TLS area for automatic detection.
+* Use -m with stripped binaries when automatic TLS detection is unavailable.
+* All size-class queues, including huge and full pages, are visited once per page owner.
+* --meta reports whether the layout comes from debug information or memory heuristics.
 ```
 
 ## musl-heap-dump
 
-musl v1.2.6 (src/malloc/mallocng) heap reusable chunks viewer (x64/x86 only).
+musl mallocng heap reusable chunks viewer.
 
 
 ### Syntax
 
 ```text
-usage: musl-heap-dump [-h] [-i ACTIVE_IDX] [-n] [-v] [{ctx,unused}]
+usage: musl-heap-dump [-h] [--malloc-context MALLOC_CONTEXT] [-i {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47}] [-n] [-v] [{ctx,unused}]
 
 positional arguments:
   {ctx,unused}          dump mode (default: unused).
 
 options:
   -h, --help            show this help message and exit
-  -i, --active-idx ACTIVE_IDX
+  --malloc-context MALLOC_CONTEXT
+                        use a specific mallocng context address.
+  -i, --active-idx {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47}
                         the active index of dump target.
   -n, --no-pager        do not use the pager.
   -v, --verbose         also dump an empty active index.
@@ -6977,6 +7569,10 @@ options:
 ### Notes
 
 ```text
+Supports musl mallocng (1.2.1 and later), not the legacy malloc implementation.
+Without the __malloc_context symbol, specify --malloc-context; x86 also has heuristic detection.
+Only groups on active[48] are listed; individually mapped large allocations are not enumerated.
+
 Simplified musl mallocng structure:
 
 +-malloc_context------+
@@ -7016,7 +7612,7 @@ Simplified musl mallocng structure:
 
 ## scalloc-heap-dump
 
-scalloc heap free-list viewer (x64 only).
+scalloc heap free-list viewer.
 
 
 ### Syntax
@@ -7074,7 +7670,10 @@ Simplified scalloc structure:
 * `size_class_` is converted to object size and capacity by fixed tables.
 * `local_free_list_.list_` points to the local free-list.
 * `local_free_list_.bump_pointer_` points to the next unused object area (top).
-* `remote_free_list_.top_` is a tagged pointer and is decoded before dumping.
+* `remote_free_list_.top_` is a tagged 64-bit value with a 48-bit pointer and a 16-bit tag.
+* Pointers must fit in 48 bits (with bit 47 sign-extended on 64-bit targets).
+* Upstream scalloc targets x86-64; other architectures require a compatible allocator port.
+* Layouts use debug types when available, otherwise the upstream field order and target pointer size.
 ```
 
 ## snmalloc-heap-dump
@@ -7137,7 +7736,7 @@ SSMalloc heap free-list viewer (x64 only).
 ### Syntax
 
 ```text
-usage: ssmalloc-heap-dump [-h] [-hh] [--local_heap LOCAL_HEAP] [--global_pool GLOBAL_POOL] [-a] [-g] [-n] [-v]
+usage: ssmalloc-heap-dump [-h] [-hh] [--local_heap LOCAL_HEAP] [--global_pool GLOBAL_POOL] [-a] [-g] [--global-only] [-n] [-v]
 
 options:
   -h, --help            show this help message and exit
@@ -7148,6 +7747,7 @@ options:
                         use specific address for global_pool.
   -a, --all             dump all local_heap.
   -g, --global          dump global_pool queues.
+  --global-only         dump only global_pool queues without inspecting TLS.
   -n, --no-pager        do not use the pager.
   -v, --verbose         display also empty freelists.
 ```
@@ -7190,22 +7790,22 @@ Simplified SSMalloc structure:
 * Allocation from a `dchunk_t` pops `free_head` first; if it is empty, allocation advances `free_mem`.
 ```
 
-## tcmalloc-dump
+## tcmalloc-heap-dump
 
-tcmalloc (google-perftools/gperftools) free-list viewer (x64 only).
+tcmalloc (google-perftools/gperftools) free-list viewer.
 
 
 ### Syntax
 
 ```text
-usage: tcmalloc-dump [-h] [-hh] [-c] [-f] [-n] [-q]
+usage: tcmalloc-heap-dump [-h] [-hh] [-c] [-f] [-n] [-q]
 
 options:
   -h, --help            show this help message and exit
   -hh, --help-simple    show help without ASCII diagram.
   -c, --central         show central cache instead of thread caches.
   -f, --force-heuristic
-                        use heuristic detection.
+                        use heuristic address detection.
   -n, --no-pager        do not use the pager.
   -q, --quiet           quiet mode.
 ```
@@ -7213,13 +7813,18 @@ options:
 ### Examples
 
 ```gdb
-tcmalloc-dump            # print freelist of thread cache for all thread
-tcmalloc-dump --central  # print freelist of central cache
+tcmalloc-heap-dump            # print freelist of thread cache for all thread
+tcmalloc-heap-dump --central  # print freelist of central cache
 ```
 
 ### Notes
 
 ```text
+Debug types are optional; without them, known gperftools layouts are validated against target memory.
+Without symbols, SizeMap and cache addresses are detected from writable memory and TLS.
+Google's separate google/tcmalloc allocator is not supported.
+--central shows transfer-cache chains, not all free objects in spans.
+
 Simplified tcmalloc/gperftools heap structure:
 
 Static Area (Central Cache)
@@ -7227,7 +7832,7 @@ Static Area (Central Cache)
 | Static::sizemap_             |
 |  class_to_size_[class]       |
 +------------------------------+
-| Static::central_cache_[128]  |
+| Static::central_cache_[N]    |
 |  CentralFreeList[class]      |
 |   empty_ / nonempty_         |
 |   tc_slots_[slot].head       |---> free obj -> free obj -> NULL
@@ -7238,10 +7843,10 @@ Static Area (Central Cache)
 
 Thread cache list
 +----------------------------+  +-->+-ThreadCache---------+       +-ThreadCache---------+
-| ThreadCache::thread_heaps_ |--+   | list_[128]          |    +->| list_[128]          |    +-> ...
+| ThreadCache::thread_heaps_ |--+   | list_[N]            |    +->| list_[N]            |    +-> ...
 +----------------------------+      |  FreeList::list_    |--+ |  |  FreeList::list_    |--+ |
                                     |  FreeList::length_  |  | |  |  FreeList::length_  |  | |
-                                    |  FreeList::size_    |  | |  |  FreeList::size_    |  | |
+                                    |  SizeMap[class]     |  | |  |  SizeMap[class ]    |  | |
                                     | next_               |----+  | next_               |----+
                                     | prev_               |  |    | prev_               |  |
                                     +---------------------+  |    +---------------------+  |
@@ -7306,7 +7911,7 @@ uclibc-ng (libc/stdlib/malloc-standard) heap reusable chunks viewer (x64/x86 onl
 ### Syntax
 
 ```text
-usage: uclibc-ng-heap-dump [-h] [--malloc_state MALLOC_STATE] [-n] [-v]
+usage: uclibc-ng-heap-dump [-h] [--malloc_state MALLOC_STATE] [-n] [-v] [-s]
 
 options:
   -h, --help            show this help message and exit
@@ -7314,6 +7919,8 @@ options:
                         use specific address for malloc_context.
   -n, --no-pager        do not use the pager.
   -v, --verbose         also dump an empty active index.
+  -s, --safe-linking-decode
+                        decode Safe-Linking fastbin links during traversal and display (default: plain links).
 ```
 
 ### Notes
@@ -7323,7 +7930,8 @@ The main structural differences between uclibc-ng (malloc-standard) and glibc ar
 - No tcache. There are fastbins, an unsorted bin, small bins, and large bins.
 - No thread arena. Therefore, chunks do not have the NON_MAIN_ARENA flag.
 The structure of malloc-standard has remained largely unchanged from version 1.0 to the latest.
-As a result, it should be usable with any version.
+Only libc/stdlib/malloc-standard is supported, not malloc or malloc-simple.
+Links are plain by default. Use -s for builds with Safe-Linking, including uClibc-ng 1.0.54 and 1.0.58.
 Since the final version of uclibc (not uclibc-ng) uses the same structure,
 this command should also be usable with uclibc.
 ```
@@ -7349,7 +7957,7 @@ options:
   -f, --full            display the same line without omitting.
   -d, --dark-color      use the dark color if chunk is allocated.
   -s, --safe-linking-decode
-                        decode safe-linking encoded pointer if tcache or fastbins.
+                        decode Safe-Linking fastbin links during traversal and display (default: plain links).
   -n, --no-pager        do not use the pager.
 ```
 
@@ -7360,7 +7968,8 @@ The main structural differences between uclibc-ng (malloc-standard) and glibc ar
 - No tcache. There are fastbins, an unsorted bin, small bins, and large bins.
 - No thread arena. Therefore, chunks do not have the NON_MAIN_ARENA flag.
 The structure of malloc-standard has remained largely unchanged from version 1.0 to the latest.
-As a result, it should be usable with any version.
+Only libc/stdlib/malloc-standard is supported, not malloc or malloc-simple.
+Links are plain by default. Use -s for builds with Safe-Linking, including uClibc-ng 1.0.54 and 1.0.58.
 Since the final version of uclibc (not uclibc-ng) uses the same structure,
 this command should also be usable with uclibc.
 ```
@@ -7383,8 +7992,8 @@ positional arguments:
 options:
   -h, --help            show this help message and exit
   -U, --exclude-user    exclude userland memory.
-  -i, --include-esp-fixup-stacks
-                        include `%esp fixup stacks` area (sometimes heavy memory use; x64 only).
+  -i, --include-aliased-pages
+                        include aliased pages such as espfix stacks and KASAN shadow (heavy memory use; x64 only).
   -v, --verbose         increase output verbosity. (-v, -vv, -vvv)
   -n, --no-pager        do not use the pager.
   -q, --quiet           quiet execution.
@@ -7394,7 +8003,7 @@ options:
 
 The base command to dump page tables.
 
-- Alias: `pw`, `ptdump`, `pt`
+- Alias: `ptdump`, `pt`
 
 ### Syntax
 
@@ -7410,7 +8019,7 @@ command:
 
 ## pagewalk arm
 
-Dump pagetable for ARM Cortex-A. PL2 pagewalk is unsupported.
+Dump page tables for ARM32 Cortex-A. PL2 pagewalk is unsupported.
 
 - Alias: `pagewalk arm32`
 
@@ -7441,8 +8050,9 @@ options:
 
 ## pagewalk arm64
 
-Dump pagetable for ARM64 Cortex-A (ARM v8.7 base).
+Dump page tables for ARM64 Cortex-A (ARM v8.7 base).
 
+- Alias: `pagewalk aarch64`
 
 ### Syntax
 
@@ -7474,7 +8084,7 @@ options:
 
 ## pagewalk riscv
 
-Dump pagetable for riscv64/32.
+Dump page tables for RISC-V 32/64.
 
 - Alias: `pagewalk riscv32`, `pagewalk riscv64`
 
@@ -7502,14 +8112,14 @@ options:
 
 ## pagewalk x64
 
-Dump pagetable for x64/x86.
+Dump page tables for x86/64.
 
 - Alias: `pagewalk x86`
 
 ### Syntax
 
 ```text
-usage: pagewalk x64 [-h] [-L] [-N] [-P] [-Q] [-f REGEX] [-v VADDR] [-p PADDR] [-t VADDR] [-i] [-U] [--cr3 USER_SPECIFIED_CR3] [--cr4 USER_SPECIFIED_CR4] [--ept] [-D] [-c] [-n] [-q]
+usage: pagewalk x64 [-h] [-L] [-N] [-P] [-Q] [-f REGEX] [-v VADDR] [-p PADDR] [-t VADDR] [-i] [-U] [--cr3 USER_SPECIFIED_CR3] [--cr4 USER_SPECIFIED_CR4] [--ept] [--ept-levels {4,5}] [-D] [-c] [-n] [-q]
 
 options:
   -h, --help            show this help message and exit
@@ -7522,14 +8132,15 @@ options:
   -v, --vrange VADDR    filter by map included specified virtual address.
   -p, --prange PADDR    filter by map included specified physical address.
   -t, --trace VADDR     show all level pagetables only associated specified address.
-  -i, --include-esp-fixup-stacks
-                        include `%esp fixup stacks` area (sometimes heavy memory use; x64 only).
+  -i, --include-aliased-pages
+                        include aliased pages such as espfix stacks and KASAN shadow (heavy memory use; x64 only).
   -U, --user-pt         print userland pagetables (for KPTI, x64 only, in kernel context).
   --cr3 USER_SPECIFIED_CR3
                         use specified value as cr3.
   --cr4 USER_SPECIFIED_CR4
                         use specified value as cr4.
   --ept                 parse cr3 as EPT (Extended Page Table).
+  --ept-levels {4,5}    EPT walk length, independent of CR4.LA57 (default: 4).
   -D, --disable-color   disable RWX colored output
   -c, --use-cache       use previous result.
   -n, --no-pager        do not use the pager.
@@ -7559,15 +8170,16 @@ Print GDT/LDT entries. If user-land, show sample entries.
 ### Syntax
 
 ```text
-usage: gdtinfo [-h] [--only-gdt] [--only-ldt] [-q] [-v] [-n]
+usage: gdtinfo [-h] [--only-gdt] [--only-ldt] [--ldt-base ADDRESS] [-q] [-v] [-n]
 
 options:
-  -h, --help      show this help message and exit
-  --only-gdt      show only GDT entries (qemu-system only).
-  --only-ldt      show only LDT entries (qemu-system only).
-  -q, --quiet     enable quiet mode.
-  -v, --verbose   also display bit information of gdt entries.
-  -n, --no-pager  do not use the pager.
+  -h, --help          show this help message and exit
+  --only-gdt          show only GDT entries (qemu-system only).
+  --only-ldt          show only LDT entries (qemu-system only).
+  --ldt-base ADDRESS  supply a known full cached LDT base instead of inferring it from the GDT.
+  -q, --quiet         enable quiet mode.
+  -v, --verbose       also display bit information of gdt entries.
+  -n, --no-pager      do not use the pager.
 ```
 
 ### Notes
@@ -7577,6 +8189,9 @@ This command is intended to dump the GDTR and LDTR when working with qemu-system
 When you're debugging a normal userland app you can't read the GDTR or LDTR,
 so this is just to show you an example of what information is stored there.
 However, the segment registers show the correct (real) values.
+In long-mode compatibility code, QEMU may print only the low 32 bits of the cached LDT base.
+The full LDT base is inferred from a matching GDT descriptor; it may differ from the CPU's cached value.
+Use --ldt-base with a known full address to override this inference.
 ```
 
 ## idtinfo
@@ -7706,6 +8321,7 @@ read-system-register-for-qemu-arm TTBR0
 
 ```text
 Attempting to read a non-existing register raises an undefined exception.
+Context-dependent EL0 timer aliases CNTHPS_*, CNTHV_* and CNTHVS_* are not accepted.
 ```
 
 ## switch-el
@@ -7822,26 +8438,107 @@ options:
   -h, --help  show this help message and exit
 ```
 
-## kversion
+## kpercpu
 
-Display kernel version string.
+Resolve the per-cpu variables and the per-cpu areas.
 
 
 ### Syntax
 
 ```text
-usage: kversion [-h] [-r] [-q]
+usage: kpercpu [-h] [-c CPU] [--online] [-o OFFSET] [-l] [-x SIZE] [-n] [-q] [SYMBOL|ADDRESS]
+
+positional arguments:
+  SYMBOL|ADDRESS       a per-cpu symbol name to resolve, or an address to reverse-resolve.
+
+options:
+  -h, --help           show this help message and exit
+  -c, --cpu CPU        filter by specific cpu.
+  --online             filter by online cpus.
+  -o, --offset OFFSET  add this offset to the resolved symbol.
+  -l, --list           list all the static per-cpu symbols.
+  -x, --dump SIZE      hexdump SIZE bytes at each resolved address.
+  -n, --no-pager       do not use the pager.
+  -q, --quiet          show result only.
+```
+
+### Examples
+
+```gdb
+kpercpu                        # show the per-cpu area of each cpu
+kpercpu runqueues              # show per_cpu(runqueues, cpu) of each cpu
+kpercpu --online runqueues     # show per_cpu(runqueues, cpu) of each online cpu
+kpercpu -o 0x120 runqueues     # add an offset to the resolved symbol
+kpercpu 0xffff888100600120     # tell which cpu and which variable the address belongs to
+kpercpu -l                     # list all the static per-cpu symbols
+```
+
+### Notes
+
+```text
+per_cpu(var, cpu) is based on the static per-cpu symbol representation and the
+per-cpu offset selected for the detected kernel layout. Older x86-64 kernels use
+a zero-based representation; x86-64 v6.15 and later use relative offsets as well.
+
+`__per_cpu_start` and the per-cpu variables are data symbols, so a
+CONFIG_KALLSYMS_ALL=n kernel has none of them. `__per_cpu_start` is recovered from
+the code of `__is_kernel_percpu_address`, which keeps the areas and the reverse
+lookup working, but there the variables cannot be named nor looked up by name.
+CONFIG_SMP=n has no `__per_cpu_offset` at all, and `&var` is the address as is.
+Whether it is CONFIG_SMP=n or just unresolved is told by the "SMP" of the banner.
+
+The cpu-id upper bound comes from `nr_cpu_ids` or the possible cpu mask; it is
+estimated from `__per_cpu_offset[]` if both are unknown. Each cpu is tagged with the masks,
+which are recovered from `init_cpu_*()`/`set_cpu_online()` without the symbols.
+```
+
+## ks-selftest
+
+Compare kernel-address heuristic finders with kallsyms results.
+
+
+### Syntax
+
+```text
+usage: ks-selftest [-h] [-n] [-q] [--failures-only]
+
+options:
+  -h, --help       show this help message and exit
+  -n, --no-pager   do not use the pager.
+  -q, --quiet      enable quiet mode.
+  --failures-only  show only failed finders.
+```
+
+### Notes
+
+```text
+False means explicitly unsupported; None means not found; '-' means unavailable or not run.
+$ks_selftest_failures is nonzero if the test cannot run, otherwise it is the number of failed results.
+```
+
+## kversion
+
+Display or override the kernel version.
+
+
+### Syntax
+
+```text
+usage: kversion [-h] [-r] [-q] [VERSION]
+
+positional arguments:
+  VERSION       use this kernel version (e.g. 6.18.0).
 
 options:
   -h, --help    show this help message and exit
-  -r, --rescan  do not use cache.
+  -r, --rescan  clear the version override and do not use cache.
   -q, --quiet   enable quiet mode.
 ```
 
 # 06-d. Qemu-system/KGDB Cooperation - Virt/Phys/Page
 ## highmem-dump
 
-Dump HighMem mappings.
+Dump HighMem mappings made by kmap().
 
 
 ### Syntax
@@ -7857,10 +8554,18 @@ options:
   -q, --quiet         show result only.
 ```
 
+### Notes
+
+```text
+This command dumps page_address_htable, which exists only if CONFIG_HIGHMEM=y.
+It has the mappings made by kmap(), but not the ones made by kmap_atomic(), kmap_local_page() and vmap().
+```
+
 ## p2v
 
 Translate from physical address to virtual address.
 
+- Alias: `phys2virt`
 
 ### Syntax
 
@@ -7904,6 +8609,8 @@ command:
 ### Notes
 
 ```text
+These conversions do not verify RAM presence or the memory hotplug state.
+
 Simplified page structure:
 
 [x86_64 / CONFIG_SPARSEMEM_VMEMMAP]
@@ -7960,7 +8667,7 @@ mem_map--------------->+-struct page[]--------------+
                        +----------------------------+
 
 
-[x86_32 or arm32 / CONFIG_SPARSEMEM]
+[x86_32 / arm32 / arm64 / CONFIG_SPARSEMEM]
 * This pattern uses `mem_section[]`, i.e. multiple section-specific mem_maps.
 * `section_id` can be obtained from `page->flags`.
 * `section_mem_map` is encoded and used to locate the page descriptor array.
@@ -7980,7 +8687,7 @@ mem_map--------------->+-struct page[]--------------+
                                     |  flags                       |
                                     +------------------------------+
 
-* CONFIG_SPARSEMEM_EXTREME is currently unsupported by this command.
+* CONFIG_SPARSEMEM_EXTREME is supported on arm64.
 ```
 
 ## page from_phys
@@ -8091,7 +8798,7 @@ Convert between slab-virtual addresses and page addresses.
 ### Syntax
 
 ```text
-usage: slab-virtual [-h] [-r] [-q] {to_virt,to_page,from_virt,from_page} ADDRESS
+usage: slab-virtual [-h] [--meta] [-r] [-q] [{to_virt,to_page,from_virt,from_page}] [ADDRESS]
 
 positional arguments:
   {to_virt,to_page,from_virt,from_page}
@@ -8100,6 +8807,7 @@ positional arguments:
 
 options:
   -h, --help            show this help message and exit
+  --meta                display offset information.
   -r, --rescan          do not use cache.
   -q, --quiet           quiet execution.
 ```
@@ -8163,6 +8871,7 @@ CONFIG_SLAB_VIRTUAL=y (mitigated kernel):
 
 Translate from virtual address to physical address.
 
+- Alias: `virt2phys`
 
 ### Syntax
 
@@ -8217,13 +8926,31 @@ Load the vmlinux without a load address.
 ### Syntax
 
 ```text
-usage: kload [-h] VMLINUX_PATH
+usage: kload [-h] [-f] VMLINUX_PATH
 
 positional arguments:
   VMLINUX_PATH  path of the vmlinux.
 
 options:
   -h, --help    show this help message and exit
+  -f, --force   load the vmlinux even if it does not match the running kernel.
+```
+
+### Notes
+
+```text
+The KASLR offset is resolved in the following order and applied to all sections.
+  1. The address of `linux_banner` in memory and in the vmlinux (this also checks that they match)
+  2. The address of `_stext` in kallsyms and in the vmlinux
+  3. The exception vector address and its symbol in the vmlinux
+Sections linked below the image (e.g., x86_64 zero-based .data..percpu, ARM32 .vectors) are not relocated.
+
+Then the vmlinux is verified against the running kernel with:
+  - the ELF class, machine and endianness
+  - the GNU build ID in `.notes`, read from the relocated address in memory
+  - the linux_banner
+  - the addresses of sampled global functions in kallsyms
+A clear mismatch is not loaded without `--force`.
 ```
 
 ## kmod-load
@@ -8234,7 +8961,7 @@ Load the kernel module without a load address.
 ### Syntax
 
 ```text
-usage: kmod-load [-h] [-n] [-q] name path
+usage: kmod-load [-h] [--force] [--meta] [-n] [-q] name path
 
 positional arguments:
   name            name of the loaded module to search for by `kmod`.
@@ -8242,6 +8969,8 @@ positional arguments:
 
 options:
   -h, --help      show this help message and exit
+  --force         load even if the file does not match the loaded module.
+  --meta          display offset information.
   -n, --no-pager  do not use the pager.
   -q, --quiet     enable quiet mode.
 ```
@@ -8255,8 +8984,14 @@ kmod-load sample /path/to/sample.ko
 ### Notes
 
 ```text
-This command requires CONFIG_RANDSTRUCT=n.
+This command requires CONFIG_RANDSTRUCT=n, CONFIG_KALLSYMS=y and CONFIG_SYSFS=y (module->sect_attrs).
 It is useful if you have a kernel module with debuginfo at hand.
+
+The file is verified against the loaded module before loading:
+- ELF type, machine, class and endianness
+- The allocated section names
+- The .note.gnu.build-id section in memory, or the symbol addresses of the module kallsyms if it is unavailable
+A clear mismatch is rejected unless --force is specified.
 ```
 
 ## ksymaddr-remote
@@ -8268,7 +9003,7 @@ Resolve kernel symbols from kallsyms table.
 ### Syntax
 
 ```text
-usage: ksymaddr-remote [-h] [-t TYPE] [-e] [-r] [-s] [--vmlinux-file VMLINUX_FILE] [-I] [--print-saved-config] [-n] [-v] [-q] [KEYWORD ...]
+usage: ksymaddr-remote [-h] [-t TYPE] [-e] [-r] [-s] [-V FILE | -M FILE] [-I] [-C] [-n] [-v] [-q] [KEYWORD ...]
 
 positional arguments:
   KEYWORD               filter by specific symbol name.
@@ -8279,11 +9014,14 @@ options:
   -e, --exact           use exact match.
   -r, --rescan          do not use cache.
   -s, --smart           filter __pfx_*, __ksymtab_*, etc.
-  --vmlinux-file VMLINUX_FILE
+  -V, --vmlinux-file FILE
                         force use your vmlinux file which includes symbols.
+  -M, --system-map FILE
+                        read and relocate symbols from a System.map file.
   -I, --ignore-loaded-vmlinux
                         force skip parsing loaded vmlinux.
-  --print-saved-config  print saved (cached) config contents.
+  -C, --print-saved-config
+                        print saved (cached) config contents.
   -n, --no-pager        do not use the pager.
   -v, --verbose         enable verbose mode.
   -q, --quiet           enable quiet mode.
@@ -8293,16 +9031,20 @@ options:
 
 ```gdb
 ksymaddr-remote commit_creds prepare_kernel_cred  # OR search
+ksymaddr-remote --system-map /boot/System.map commit_creds
 ```
 
 ### Notes
 
 ```text
 GEF caches offset information for parsing kallsyms to speed up this command.
-Each cache is used based on kernel version strings.
-In other words, in cases where the kernel version is exactly the same and
-the CONFIG is slightly different, the offset will be applied incorrectly.
-In this case, rescan with `ks -rv` or clear the cache with `gef reset-cache --hard`.
+Each cache is used based on kernel version strings, so kernels of the same version
+share one cache even if the CONFIG is different. GEF checks the cached offsets
+against the running kernel and parses again when they do not match.
+To drop a cache by hand, rescan with `ks -rv` or use `gef reset-cache --hard`.
+`--system-map` and `--vmlinux-file` check the KASLR offset against the exception entry and linux_banner.
+With only one anchor, it warns that the kernel build could not be verified.
+Absolute symbols and symbols linked outside the kernel image are not relocated.
 ```
 
 ## ksymaddr-remote-apply
@@ -8380,10 +9122,84 @@ usage: vmlinux-to-elf-apply [-h] [-r]
 
 options:
   -h, --help    show this help message and exit
-  -r, --rescan  force applying again. (default: reuse vmlinux-to-elf-dump-memory.elf if exists)
+  -r, --rescan  regenerate the ELF instead of reusing a matching symbol cache.
 ```
 
 # 06-f. Qemu-system/KGDB Cooperation - Linux Task
+## kcred
+
+Dump the credentials of each task.
+
+
+### Syntax
+
+```text
+usage: kcred [-h] [-hh] [-T TASK_FILTER] [-c CRED_FILTER] [-f FILTER] [-s] [-v] [-t] [-u] [--meta] [-n] [-q] [PID]
+
+positional arguments:
+  PID                   the pid of the task to display.
+
+options:
+  -h, --help            show this help message and exit
+  -hh, --help-simple    show help without ASCII diagram.
+  -T, --task-filter TASK_FILTER
+                        task address filter.
+  -c, --cred-filter CRED_FILTER
+                        cred address filter.
+  -f, --filter FILTER   comm string REGEXP filter.
+  -s, --shared          list the tasks that share the same cred, instead of dumping each cred.
+  -v, --verbose         dump each cred in detail even if no task is specified.
+  -t, --print-thread    display by thread (LWP), not by process.
+  -u, --user-process-only
+                        display user-land process (+ thread) only.
+  --meta                display offset information.
+  -n, --no-pager        do not use the pager.
+  -q, --quiet           enable quiet mode.
+```
+
+### Examples
+
+```gdb
+kcred -q
+kcred 1337
+kcred 1337 --shared
+kcred -f 'sh$' -v
+```
+
+### Notes
+
+```text
+This command requires CONFIG_RANDSTRUCT=n unless vmlinux with debug information is loaded.
+
+Simplified credential structure:
+
++-task_struct---+    +--->+-cred--------------------+
+| ...           |    |    | usage                   |
+| real_cred     |----+    | uid, gid                |
+| cred          |----+    | suid, sgid              |
+| comm[16]      |         | euid, egid              |
+| ...           |         | fsuid, fsgid            |
++---------------+         | securebits              |
+                          | cap_inheritable         |
+                          | cap_permitted           |
+                          | cap_effective           |
+                          | cap_bset                |
+                          | cap_ambient (v4.3~)     |
+                          | (keyrings; CONFIG_KEYS) |
+                          | security                |--->LSM blob
+                          | user                    |
+                          | user_ns                 |--->user_namespace
+                          | ucounts (branch/config) |
+                          | group_info              |--->+-group_info-+
+                          | ...                     |    | usage      |
+                          +-------------------------+    | ngroups    |
+                                                         | gid[]      |
+                                                         +------------+
+
+`real_cred` is the objective credential, `cred` is the subjective one. They differ only
+while the task acts on behalf of another (e.g., inside override_creds()).
+```
+
 ## kfiles
 
 Display open files for each process (shortcut for `ktask -quF`).
@@ -8397,6 +9213,110 @@ usage: kfiles [-h] [-n]
 options:
   -h, --help      show this help message and exit
   -n, --no-pager  do not use the pager.
+```
+
+## kkeyring
+
+Display the keyrings referenced by tasks, or inspect an arbitrary struct key.
+
+
+### Syntax
+
+```text
+usage: kkeyring [-h] [-hh] [-p PID] [-T TASK_FILTER] [-f FILTER] [-d MAX_DEPTH] [--max-keys MAX_KEYS] [--meta] [-n] [-v] [-q] [KEY_ADDR]
+
+positional arguments:
+  KEY_ADDR              inspect this `struct key` directly instead of walking task credentials.
+
+options:
+  -h, --help            show this help message and exit
+  -hh, --help-simple    show help without ASCII diagram.
+  -p, --pid PID         filter by task pid.
+  -T, --task-filter TASK_FILTER
+                        filter by specific task_struct address.
+  -f, --filter FILTER   comm string REGEXP filter.
+  -d, --max-depth MAX_DEPTH
+                        maximum nested keyring depth (default: 6).
+  --max-keys MAX_KEYS   maximum number of keys to walk (default: 0x1000).
+  --meta                display offset information.
+  -n, --no-pager        do not use the pager.
+  -v, --verbose         display ownership and internal key details.
+  -q, --quiet           show result only.
+```
+
+### Examples
+
+```gdb
+kkeyring -p 1337
+kkeyring -p 1337 -v
+kkeyring -f 'bash$'
+kkeyring 0xffff888012345000
+```
+
+### Notes
+
+```text
+Simplified keyring structures:
+
+[v3.8~]
++-task_struct-+    +-cred-------------+
+| cred        |--->| session_keyring  |----+
++-------------+    | process_keyring  |----+
+                   | thread_keyring   |----+--->struct key
+                   | request_key_auth |----+
+                   +------------------+
+[~v3.7]
++-task_struct-+    +-cred-------------+
+| cred        |--->| thread_keyring   |---------------------------->struct key
++-------------+    | request_key_auth |---------------------------->struct key
+                   | tgcred           |--->+-thread_group_cred-+
+                   +------------------+    | session_keyring   |--->struct key
+                                           | process_keyring   |--->struct key
+                                           +-------------------+
++-key----------------------------+
+| usage                          |
+| serial                         |
+| uid, gid, perm                 |
+| expiry                         |
+| flags                          |
+| state (v4.14~)                 |
+| type                           |
+| description                    |
+| payload.subscriptions (~v3.12) |---->struct keyring_list
+| payload.data[0] (auth key)     |---->struct request_key_auth
+| keys.root (v3.13~)             |---->assoc_array_ptr
++--------------------------------+
+
++-request_key_auth-+
+| rcu (v5.3~)      |
+| usage (v7.2~)    |
+| target_key       |---->struct key (being constructed)
+| dest_keyring     |---->struct key
+| cred             |---->struct cred (requester)
+| callout_info     |
+| callout_len      |
+| pid              |
+| op[8] (v5.0~)    |
++------------------+
+
+[~v3.12]
++-keyring_list-+
+| nkeys        |
+| keys[]       |---->struct key ...
++--------------+
+
+[v3.13~]
+keys.root ---> assoc_array_ptr (tagged)
+                +-- leaf -----> struct key (bit 1 is set if it is a keyring)
+                +-- node -----> +-assoc_array_node-----+
+                |               | slots[16]            |---> assoc_array_ptr ...
+                |               +----------------------+
+                +-- shortcut -> +-assoc_array_shortcut-+
+                                | next_node            |---> assoc_array_ptr
+                                +----------------------+
+
+A keyring leaf may itself be another keyring, so the command walks child keys recursively.
+The request-key authorisation key held by an upcall helper is shown as the `request` root.
 ```
 
 ## knamespaces
@@ -8427,6 +9347,51 @@ usage: kregs [-h] [-n]
 options:
   -h, --help      show this help message and exit
   -n, --no-pager  do not use the pager.
+```
+
+## ksched
+
+Dump the scheduler state of each task (cpu, state, class, priority, policy).
+
+
+### Syntax
+
+```text
+usage: ksched [-h] [-f FILTER] [-t] [-u] [--meta] [-n] [-q] [PID|TASK_ADDRESS]
+
+positional arguments:
+  PID|TASK_ADDRESS      dump a single task in detail, selected by its pid or task_struct address.
+
+options:
+  -h, --help            show this help message and exit
+  -f, --filter FILTER   comm string REGEXP filter.
+  -t, --print-thread    display by thread (LWP), not by process.
+  -u, --user-process-only
+                        display user-land process (+ thread) only.
+  --meta                display offset information.
+  -n, --no-pager        do not use the pager.
+  -q, --quiet           enable quiet mode.
+```
+
+### Examples
+
+```gdb
+ksched            # per-cpu current tasks and a table of every task
+ksched 1337       # dump the scheduler state of the task whose pid is 1337
+ksched -f bash    # filter the table by comm
+```
+
+### Notes
+
+```text
+This command requires CONFIG_RANDSTRUCT=n unless vmlinux with debug information is loaded.
+
+Without debug information, `state`, the prio cluster and the scheduler class are resolved on
+every supported version, `on_rq` up to v7.1, and `policy` on v5.3 or later. The scheduler class
+needs the `*_sched_class` symbols (CONFIG_KALLSYMS_ALL=y). The other fields (`on_cpu`, `cpu`)
+are shown only when debug information is loaded. The running cpu of each current task comes from
+`kcurrent`, which reads it from the cpu context rather than from `task_struct`.
+The exit state is included when its offset can be resolved; `--meta` reports a warning otherwise.
 ```
 
 ## ksighands
@@ -8482,13 +9447,15 @@ options:
 ### Examples
 
 ```gdb
-ktask -q
+ktask -T 0xffff888012345000  # task address filter
+ktask -f bash                # comm string filter
+ktask --all                  # it means -mritFsSN
 ```
 
 ### Notes
 
 ```text
-This command requires CONFIG_RANDSTRUCT=n.
+This command requires CONFIG_RANDSTRUCT=n unless vmlinux with debug information is loaded.
 
 Simplified task_struct structure:
 
@@ -8553,10 +9520,11 @@ Display block device list.
 ### Syntax
 
 ```text
-usage: kbdev [-h] [-n] [-q]
+usage: kbdev [-h] [--meta] [-n] [-q]
 
 options:
   -h, --help      show this help message and exit
+  --meta          display offset information.
   -n, --no-pager  do not use the pager.
   -q, --quiet     enable quiet mode.
 ```
@@ -8570,10 +9538,17 @@ kbdev -q
 ### Notes
 
 ```text
-This command requires CONFIG_RANDSTRUCT=n.
-If there are too many block devices, detection may fail.
-This is because block devices are not managed in a single location,
-so the list of bdev_cache obtained from the slub-dump results is used.
+This command requires CONFIG_RANDSTRUCT=n unless vmlinux with debug information is loaded.
+
+If the debug information has struct block_device, block devices are listed from the inodes of the bdev
+pseudo filesystem. Otherwise, the bdev_cache dump, which does not include full slabs, is supplemented with
+block devices referenced by mounted filesystems. The others are found by the layout measured with them,
+from the block devices in devices_kset (v5.11~) or from the inodes of the bdev pseudo filesystem (~v5.10).
+RISC-V is supported only with the debug information.
+
+The name is built from bd_disk->disk_name and the partition number, in the same way as the kernel.
+Before v5.11, bd_disk is set only while the block device is opened.
+If it cannot be resolved, the name is guessed from the major/minor number and marked as `(guessed)`.
 ```
 
 ## kbpf
@@ -8584,13 +9559,14 @@ Dump the BPF information.
 ### Syntax
 
 ```text
-usage: kbpf [-h] [-hh] [-p] [-m] [-n] [-v] [-q]
+usage: kbpf [-h] [-hh] [-p] [-m] [--meta] [-n] [-v] [-q]
 
 options:
   -h, --help          show this help message and exit
   -hh, --help-simple  show help without ASCII diagram.
   -p, --only-progs    print progs only.
   -m, --only-maps     print maps only.
+  --meta              display offset information.
   -n, --no-pager      do not use the pager.
   -v, --verbose       enable verbose mode.
   -q, --quiet         show result only.
@@ -8650,20 +9626,29 @@ Display character device list.
 ### Syntax
 
 ```text
-usage: kcdev [-h] [-hh] [-n] [-v] [-q]
+usage: kcdev [-h] [-hh] [-N] [-n] [-v] [-q]
 
 options:
   -h, --help          show this help message and exit
   -hh, --help-simple  show help without ASCII diagram.
+  -N, --nodes         list the device nodes (struct device with devt) instead of the registered ranges.
   -n, --no-pager      do not use the pager.
   -v, --verbose       enable verbose mode.
   -q, --quiet         enable quiet mode.
 ```
 
+### Examples
+
+```gdb
+kcdev -n
+kcdev -n -v
+kcdev -n --nodes
+```
+
 ### Notes
 
 ```text
-This command requires CONFIG_RANDSTRUCT=n.
+This command requires CONFIG_RANDSTRUCT=n unless vmlinux with debug information is loaded.
 
 Simplified cdev structure:
 
@@ -8685,6 +9670,12 @@ Simplified cdev structure:
 
 The character devices are managed at chrdevs[] and cdev_map.
 This command use each of them for getting structure information.
+
+Each line is a registered range of minors, not a device node.
+`name (guessed)` is guessed from the static major/minor table only when the range has a single minor.
+`-v` also shows the cdevs registered in the middle of a range (e.g., each tty port).
+`--nodes` lists the device nodes from devices_kset with their sysfs names and the cdev that serves each.
+Block devices are excluded from them.
 ```
 
 ## kclock-source
@@ -8695,11 +9686,12 @@ Dump the clocksource list.
 ### Syntax
 
 ```text
-usage: kclock-source [-h] [-hh] [-n] [-q]
+usage: kclock-source [-h] [-hh] [--meta] [-n] [-q]
 
 options:
   -h, --help          show this help message and exit
   -hh, --help-simple  show help without ASCII diagram.
+  --meta              display offset information.
   -n, --no-pager      do not use the pager.
   -q, --quiet         enable quiet mode.
 ```
@@ -8715,6 +9707,14 @@ Simplified clocksource structure:
 | list_head        |--->| list        |--->...
 +------------------+    | ...         |
                         +-------------+
+
+- The list is sorted by `rating` in descending order. `active` is the one `curr_clocksource` points to.
+- `frequency` is derived from `mult` and `shift` (ns = (cycles * mult) >> shift), and `bits` from `mask`.
+- `flags`: CONT (IS_CONTINUOUS), VERIFY (MUST_VERIFY), CALIB (CALIBRATED), WD (WATCHDOG),
+  HRES (VALID_FOR_HRES), UNSTABLE, NONSTOP (SUSPEND_NONSTOP), RESELECT,
+  VERIFY_PERCPU (~v7.0) or INLINE (CAN_INLINE_READ; v7.1~), COUPLED (HAS_COUPLED_CLOCK_EVENT), WDTEST, WDTEST_PERCPU.
+- The module is shown for a clocksource registered by a loadable module.
+- The member offsets come from the debug information (vmlinux or `ktypes-load`) when available.
 ```
 
 ## kconfig
@@ -8743,13 +9743,15 @@ Dump I/O-port and I/O-memory information.
 ### Syntax
 
 ```text
-usage: kdevio [-h] [-hh] [-n] [-q]
+usage: kdevio [-h] [-hh] [--meta] [--resource RESOURCE] [-n] [-q]
 
 options:
-  -h, --help          show this help message and exit
-  -hh, --help-simple  show help without ASCII diagram.
-  -n, --no-pager      do not use the pager.
-  -q, --quiet         show result only.
+  -h, --help           show this help message and exit
+  -hh, --help-simple   show help without ASCII diagram.
+  --meta               display resource layout information.
+  --resource RESOURCE  walk a resource tree at ADDRESS.
+  -n, --no-pager       do not use the pager.
+  -q, --quiet          show result only.
 ```
 
 ### Notes
@@ -8790,11 +9792,12 @@ Dump DMA-BUF information.
 ### Syntax
 
 ```text
-usage: kdmabuf [-h] [-hh] [-n] [-q]
+usage: kdmabuf [-h] [-hh] [--meta] [-n] [-q]
 
 options:
   -h, --help          show this help message and exit
   -hh, --help-simple  show help without ASCII diagram.
+  --meta              display offset information.
   -n, --no-pager      do not use the pager.
   -q, --quiet         show result only.
 ```
@@ -8841,12 +9844,13 @@ Dump the ring buffer of the dmesg area.
 ### Syntax
 
 ```text
-usage: kdmesg [-h] [-hh] [-c] [-n] [-q]
+usage: kdmesg [-h] [-hh] [-c] [--meta] [-n] [-q]
 
 options:
   -h, --help          show this help message and exit
   -hh, --help-simple  show help without ASCII diagram.
   -c, --use-cache     use previous result.
+  --meta              display offset information.
   -n, --no-pager      do not use the pager.
   -q, --quiet         enable quiet mode.
 ```
@@ -8860,9 +9864,11 @@ kdmesg -q
 ### Notes
 
 ```text
-The information such as [T1] is the thread ID.
+The information such as [T1] or [C0] is the caller context ID.
 Originally, this information is displayed when CONFIG_PRINTK_CALLER=y.
 However it is always displayed because it is useful.
+
+prb points to the active ringbuffer; it may point to storage other than printk_rb_static.
 
 Simplified dmesg structure (5.10~):
 
@@ -8903,7 +9909,7 @@ Simplified dmesg structure (5.10~):
   2-A. (Seq-based printk_info): Preserving text data length, time, thread ID, etc. for each entry.
   2-B. (Id-based printk_info): Preserving seq for ring buffer reuse.
 
-Simplified dmesg structure (~5.10):
+Simplified dmesg structure (3.5~5.9):
 
 +-----------+
 | __log_buf |-------->+-log_buffer-----+   ^     ^
@@ -8929,24 +9935,41 @@ Simplified dmesg structure (~5.10):
                       | ...            |         |
                       | text[text_len] |         |
                       +----------------+         v
+
+Simplified dmesg structure (~3.4):
+
++-----------+
+| log_buf   |-------->+-log_buffer-----+         ^
++-----------+         | text bytes     |         |
+                      | ...            |         |
+                      | text bytes     |         |
++-----------+         |                |         |    +-------------+
+| log_end   |-------->| next write     |         |<---| log_buf_len |
++-----------+         | text bytes     |         |    +-------------+
+ % log_buf_len        | ...            |         |
+                      | text bytes     |         |
+                      +----------------+         v
+The buffer is one circular byte array; there are no per-record headers.
+log_end is a byte counter; its position in the buffer is log_end % log_buf_len.
+log_buf points to active storage, which may differ from the initial __log_buf.
 ```
 
 ## kfilesystems
 
 Dump filesystems.
 
-- Alias: `kmounts`
 
 ### Syntax
 
 ```text
-usage: kfilesystems [-h] [-hh] [-s] [-n] [-q]
+usage: kfilesystems [-h] [-hh] [-s] [--meta] [-n] [-q]
 
 options:
   -h, --help            show this help message and exit
   -hh, --help-simple    show help without ASCII diagram.
   -s, --skip-mount-path
                         skip resolving path.
+  --meta                display offset information.
   -n, --no-pager        do not use the pager.
   -q, --quiet           enable quiet mode.
 ```
@@ -8954,7 +9977,7 @@ options:
 ### Notes
 
 ```text
-This command requires CONFIG_RANDSTRUCT=n.
+This command requires CONFIG_RANDSTRUCT=n unless vmlinux with debug information is loaded.
 
 Simplified file_systems structure:
 
@@ -8979,6 +10002,71 @@ Simplified file_systems structure:
                                                      +--------------+
 ```
 
+## kio-uring
+
+Display the kernel-side io_uring object graph.
+
+
+### Syntax
+
+```text
+usage: kio-uring [-h] [-t {auto,ctx,request,file}] [-p PID] [-f FD] [--no-requests] [--meta] [-n] [-v] [-q] [ADDRESS]
+
+positional arguments:
+  ADDRESS               the address of struct io_ring_ctx, io_kiocb or file.
+
+options:
+  -h, --help            show this help message and exit
+  -t, --type {auto,ctx,request,file}
+                        the type of ADDRESS. (default: auto)
+  -p, --pid PID         select rings owned by this pid.
+  -f, --fd FD           select this ring fd (requires --pid).
+  --no-requests         do not walk pending request lists.
+  --meta                display layout and discovery information.
+  -n, --no-pager        do not use the pager.
+  -v, --verbose         show request flags and user_data.
+  -q, --quiet           show result only.
+```
+
+### Examples
+
+```gdb
+kio-uring
+kio-uring --pid 1337 --fd 4
+kio-uring --type ctx 0xffff888012340000
+kio-uring --type request 0xffff888056780000 -v
+```
+
+### Notes
+
+```text
+`iouring-dump` dumps userland io_uring mappings; this command follows kernel objects.
+io_uring first appeared in Linux v5.1. Older kernels are detected without scanning.
+DWARF is used when available. Without it, ring discovery uses open fd paths and validated ring metadata.
+ADDRESS with `--type ctx` or `--type request` needs neither the task list nor the VFS layout.
+Live request lists are transient and may be incomplete while another CPU is running.
+
+Kernel object graph:
+
+task_struct
+  +-- files -> fdtable[fd] -> file (anon_inode:[io_uring])
+  |                             +-- private_data -> io_ring_ctx
+  +-- io_uring -> io_uring_task
+                    +-- last ---------------------> io_ring_ctx
+                    +-- registered_rings[] -------> file
+                    +-- io_wq --------------------> io-wq workers
+
+io_ring_ctx
+  +-- rings ----------------------> io_rings (SQ / CQ)
+  +-- file table -----------------> file / io_rsrc_node
+  +-- buffer table ---------------> io_mapped_ubuf / io_rsrc_node
+  +-- iopoll/timeout/defer lists -> io_kiocb
+  |                                   +-- opcode / state / refs
+  |                                   +-- file / buffer node
+  |                                   +-- callback / linked request
+  +-- submitter / sq thread ------> task_struct
+```
+
 ## kipcs
 
 Dump IPCs information (System V semaphore, message queue and shared memory).
@@ -8987,12 +10075,13 @@ Dump IPCs information (System V semaphore, message queue and shared memory).
 ### Syntax
 
 ```text
-usage: kipcs [-h] [-hh] [-v] [-n] [-q]
+usage: kipcs [-h] [-hh] [-v] [--meta] [-n] [-q]
 
 options:
   -h, --help          show this help message and exit
   -hh, --help-simple  show help without ASCII diagram.
   -v, --verbose       dump the beginning of msg_msg.
+  --meta              display offset information.
   -n, --no-pager      do not use the pager.
   -q, --quiet         show result only.
 ```
@@ -9001,6 +10090,7 @@ options:
 
 ```text
 This command requires CONFIG_RANDSTRUCT=n.
+Until v6.17, the IPC namespaces not used by any task (e.g., held only by a file descriptor) are not shown.
 
 Simplified ipc structure:
 
@@ -9033,39 +10123,140 @@ Dump IRQ (interrupt request) information.
 ### Syntax
 
 ```text
-usage: kirq [-h] [-hh] [-n] [-v] [-q]
+usage: kirq [-h] [-hh] [--meta] [-n] [-v] [-q]
 
 options:
   -h, --help          show this help message and exit
   -hh, --help-simple  show help without ASCII diagram.
+  --meta              display offset information.
   -n, --no-pager      do not use the pager.
-  -v, --verbose       enable verbose mode.
+  -v, --verbose       also show unused IRQs, the count, the flow handler and the affinity.
   -q, --quiet         show result only.
 ```
 
 ### Notes
 
 ```text
+Each action of a shared IRQ is shown on its own line. `count` is the sum of the per-cpu counts (-v).
+The affinity is shown only with the debug information (vmlinux or `ktypes-load`).
+
 Simplified irq structure:
 
-+-irq_desc_tree(~6.5)-+   +--->+-xa_node---------+   +--->+-irq_desc----+
-| xa_lock             |   |    | shift           |   |    | ...         |
-| xa_flags            |   |    | ...             |   |    | irq_data    |
-| xa_head             |---+    | count           |   |    |   ...       |
-+---------------------+        | ...             |   |    |   irq       |
-                               | slots[0]        |---+    |   ...       |
-                               | slots[1]        |   ^    | ...         |
-                               | ...             |   |    | action      |
-                               | slots[15 or 63] |   |    |   handler   |
-                               | ...             |   |    |   ...       |
-                               +-----------------+   |    |   name      |
-                                                     |    |   ...       |
-+-sparce_irq(6.5~)-+   +-->+-maple_node------+       |    | ...         |
-| ...              |   |   | ...             |       |    +-------------+
-| ma_root          |---+   | mr64|ma64|alloc |       |
-| ...              |       |   ...           |       |
-+------------------+       |   slot[]        |-------+
-                           +-----------------+
++-irq_desc_tree(~6.5)-+   +--->+-radix/xa node---+   +--->+-irq_desc------+
+| lock                |   |    | shift           |   |    | ...           |
+| flags               |   |    | ...             |   |    | irq_data      |
+| rnode/xa_head       |---+    | count           |   |    |   irq         |
++---------------------+        | ...             |   |    |   hwirq       |
+                               | slots[0]        |---+    |   chip        |--->name
+                               | slots[1]        |   ^    |   ...         |
+                               | ...             |   |    | kstat_irqs    |--->per-cpu count
+                               | slots[15 or 63] |   |    | handle_irq    |
+                               | ...             |   |    | action        |---+
+                               +-----------------+   |    | ...           |   |
+                                                     |    +---------------+   |
++-sparse_irqs(6.5~)-+   +-->+-maple_node------+      |                        |
+| ...               |   |   | ...             |      |    +-irqaction-+<------+
+| ma_root           |---+   | mr64|ma64|alloc |      |    | handler   |
+| ...               |       |   ...           |      |    | ...       |
++-------------------+       |   slot[]        |------+    | next      |--->irqaction (shared IRQ)
+                            +-----------------+      |    | ...       |
+                                                     |    | name      |
++-irq_desc[NR_IRQS] (CONFIG_SPARSE_IRQ=n)-+          |    +-----------+
+| irq_desc[0], irq_desc[1], ...           |----------+
++-----------------------------------------+
+```
+
+## klsm
+
+Dump the registered Linux Security Module hooks.
+
+
+### Syntax
+
+```text
+usage: klsm [-h] [-hh] [-a] [--task] [-p PID] [-T TASK_FILTER] [-f FILTER] [-v] [--meta] [-n] [-q] [HOOK ...]
+
+positional arguments:
+  HOOK                  the hook point name, or a part of it. (e.g., file_open)
+
+options:
+  -h, --help            show this help message and exit
+  -hh, --help-simple    show help without ASCII diagram.
+  -a, --all             also show the hook points that have no callback.
+  --task                show the LSM security blobs of each task instead of the hooks.
+  -p, --pid PID         with --task, filter by task pid.
+  -T, --task-filter TASK_FILTER
+                        with --task, filter by specific task_struct address.
+  -f, --filter FILTER   with --task, comm string REGEXP filter.
+  -v, --verbose         with --task, decode the blobs of the open files of each task too.
+  --meta                display offset information.
+  -n, --no-pager        do not use the pager.
+  -q, --quiet           show result only.
+```
+
+### Examples
+
+```gdb
+klsm                   # list every hook point that has a callback
+klsm file_open         # list the callbacks of the hook points matching `file_open`
+klsm -a                # list every hook point including the empty ones
+klsm --task            # list the security blob and the LSM labels of each task
+klsm --task -p 1337    # decode the blobs of the task, its cred and its open files and inodes
+```
+
+### Notes
+
+```text
+The layout of the LSM framework changed twice, and all three are supported:
+
+  ~v4.1  : a single `struct security_operations` pointed to by `security_ops`
+  v4.2~  : `security_hook_heads`, an array of the lists of `struct security_hook_list`
+  v6.12~ : one static call slot per (hook point, LSM), `__SCK__lsm_static_call_*`
+
++-security_ops(~v4.1)-+
+| name[]              |
+| ptrace_access_check |--> callback
+| ptrace_traceme      |--> callback
+| ...                 |
++---------------------+
+
++-security_hook_heads(v4.2~)-+     +-security_hook_list--+
+| ptrace_access_check        |---->| list                |--> next hook_list
+| ptrace_traceme             |     | head                |--> the head at the left
+| ...                        |     | hook                |--> callback
++----------------------------+     | lsm (v4.12~)        |--> "selinux"
+                                   +---------------------+
+
++-__SCK__lsm_static_call_<hook>_<N>(v6.12~)-+
+| func                                      |--> callback
++-------------------------------------------+
+
+Before v6.12, hook point names are recovered from each `security_*` dispatcher and
+the head or member offset it references. A head that no dispatcher pointed at is
+shown as `hook[NN]`. On v6.12 and later, names are read from generated static-call
+symbols such as `__SCK__lsm_static_call_<hook>_<N>`.
+
+When CONFIG_KALLSYMS_ALL=n removes these data symbols, x86 decodes the trampolines
+`__SCT__lsm_static_call_<hook>_<N>` (text symbols), and the other architectures take
+the keys each `security_*` dispatcher loads. The latter names a hook point after its
+dispatcher and misses the ones no dispatcher calls (e.g., inode_free_security_rcu).
+
+`--task` follows the security blobs instead. Until v5.0 the active major LSM owns each
+blob as a whole. From v5.1 the LSMs share one blob per object, and the offset of each
+part is read from `<lsm>_blob_sizes`; without the symbol it is guessed from the samples.
+
++-task_struct-+                    +-cred-----+     +-file-------+    +-inode------+
+| security    |--> blob (v5.1~)    | ...      |     | ...        |    | i_sb       |
+| cred        |------------------->| security |-+   | f_security |-+  | i_mapping  |
++-------------+                    +----------+ |   +------------+ |  | i_security |-+
+                                                |                  |  +------------+ |
+   +-blob--------------+ <----------------------+------------------+-----------------+
+   | part of LSM A     | <-- offset from <lsmA>_blob_sizes.lbs_*
+   | part of LSM B     | <-- offset from <lsmB>_blob_sizes.lbs_*
+   +-------------------+
+
+SELinux, Smack, AppArmor, TOMOYO and Landlock parts are decoded. This mode requires
+CONFIG_RANDSTRUCT=n unless vmlinux with debug information is loaded.
 ```
 
 ## kmod
@@ -9076,7 +10267,7 @@ Display kernel module list.
 ### Syntax
 
 ```text
-usage: kmod [-h] [-hh] [-s | -a] [--symbol-unsort] [-f FILTER] [-n] [-q]
+usage: kmod [-h] [-hh] [-s | -a] [--symbol-unsort] [-f FILTER] [--meta] [-n] [-q]
 
 options:
   -h, --help            show this help message and exit
@@ -9085,6 +10276,7 @@ options:
   -a, --apply-symbol    try to apply symbol in the form 'module_name.symbol'.
   --symbol-unsort       print resolved symbols without sorting by address.
   -f, --filter FILTER   REGEXP filter.
+  --meta                display offset information.
   -n, --no-pager        do not use the pager.
   -q, --quiet           enable quiet mode.
 ```
@@ -9102,37 +10294,114 @@ This command requires CONFIG_RANDSTRUCT=n.
 
 Simplified module structure:
 
-                   +-module------------------+
-+-modules-----+    | ...                     |
-| list_head   |--->| list                    |--->...
-+-------------+    | name[]                  |
-                   | ...                     |
-                   | mem[] (v6.4~)           |
-                   |     base                |
-                   |     size                |
-                   |     ...                 |
-                   | init_layout (v4.5~v6.4) |
-                   |     base                |
-                   |     size                |
-                   |     text_size           |
-                   |     ro_size             |
-                   |     ro_after_init_size  |
-                   |     ...                 |
-                   | module_core    (~v4.4)  |
-                   | init_size      (~v4.4)  |
-                   | core_size      (~v4.4)  |
-                   | init_text_size (~v4.4)  |  +-->+-mod_kallsyms---+
-                   | core_text_size (~v4.4)  |  |   | symtab         |
-                   | ...                     |  |   | num_symtab     |
-                   | kallsyms                |--+   | strtab         |
-                   | ...                     |      | typetab (v5.2~)|
-                   +-------------------------+      +----------------+
+                   +-module-------------------------+
++-modules-----+    | ...                            |
+| list_head   |--->| list                           |--->...
++-------------+    | name[]                         |
+                   | ...                            |
+                   | mem[] (v6.4~)                  |
+                   |     base                       |
+                   |     size                       |
+                   |     ...                        |
+                   | core_layout (v4.5~v6.4)        |
+                   |     base                       |
+                   |     size                       |
+                   |     text_size                  |
+                   |     ro_size                    |
+                   |     ro_after_init_size (v4.8~) |
+                   |     ...                        |
+                   | module_core    (~v4.4)         |
+                   | init_size      (~v4.4)         |
+                   | core_size      (~v4.4)         |
+                   | init_text_size (~v4.4)         |  +-->+-mod_kallsyms---+
+                   | core_text_size (~v4.4)         |  |   | symtab         |
+                   | ...                            |  |   | num_symtab     |
+                   | kallsyms                       |--+   | strtab         |
+                   | ...                            |      | typetab (v5.2~)|
+                   +--------------------------------+      +----------------+
+
+Since v6.4, each type of mem[] (text, data, rodata, ro_after_init, init_*) is allocated separately,
+so each allocated type is displayed on its own line. Before v6.4, the whole core is displayed as `core`.
 
 Notes for -a option:
 - You can check the added symbols with the `symbols` command.
+- Symbols are applied per region of the module memory. Symbols outside them (e.g., per-cpu variables) are skipped.
 - Added symbols are in the format `module_name.symbol` to avoid collisions.
   When used from the command line, they must be enclosed in single quotes.
   e.g., `p 'virtio_net.__this_module'`
+```
+
+## kmount
+
+Dump the mount tree of each mount namespace.
+
+
+### Syntax
+
+```text
+usage: kmount [-h] [-hh] [-p PID] [-T TASK] [-a] [-t] [-v] [--meta] [-n] [-q]
+
+options:
+  -h, --help          show this help message and exit
+  -hh, --help-simple  show help without ASCII diagram.
+  -p, --pid PID       dump the mount namespace of this pid.
+  -T, --task TASK     dump the mount namespace of this task_struct.
+  -a, --all           dump every mount namespace.
+  -t, --tasks         list the tasks of each mount namespace.
+  -v, --verbose       also show mnt_id, peer_group, mnt_master and propagation.
+  --meta              display offset information.
+  -n, --no-pager      do not use the pager.
+  -q, --quiet         enable quiet mode.
+```
+
+### Examples
+
+```gdb
+kmount
+kmount --pid 1337
+kmount --all --tasks
+```
+
+### Notes
+
+```text
+This command requires CONFIG_RANDSTRUCT=n unless vmlinux with debug information is loaded.
+
+- Walks `mnt_mounts/mnt_child`, so all mounts in the namespace are shown, including bind mounts sharing a `super_block`.
+  `kfilesystems` instead shows filesystem types and all their `super_block`s, mounted or not.
+- Mount namespaces are inferred from mounts reachable through tasks, so namespaces with no task are invisible.
+- Without `--pid/--task`, the whole namespace is shown with absolute paths.
+  With either option, output is rooted at `task->fs->root`; unreachable mounts are marked `outside-root`.
+
+Simplified mount tree structure:
+
++-task_struct--+     +-fs_struct-+     +-path----+
+| ...          |     | ...       |     | mnt     |--+
+| fs           |---->| root      |---->| dentry  |  |
+| ...          |     | pwd       |     +---------+  |
++--------------+     +-----------+                  |
+                                                    |
+    +-----------------------------------------------+
+    |
+    v
++-mount----------+<-+     +-mount----------+<-+     +-mount----------+
+| mnt_parent     |--+<----| mnt_parent     |  +<----| mnt_parent     |
+| mnt_mountpoint |     +--| mnt_mountpoint |     +--| mnt_mountpoint |
+| mnt (vfsmount) |     |  | mnt (vfsmount) |     |  | mnt (vfsmount) |
+|   mnt_root     |     |  |   mnt_root     |     |  |   mnt_root     |
+|   mnt_sb       |-+   |  |   mnt_sb       |     |  |   mnt_sb       |
+|   mnt_flags    | |   |  |   mnt_flags    |     |  |   mnt_flags    |
+| mnt_mounts     |-|-+ |  | mnt_mounts     |--+  |  | mnt_mounts     |
+| mnt_child      | | +-|->| mnt_child      |  +--|->| mnt_child      |
+| mnt_devname    | |   |  | mnt_devname    |     |  | mnt_devname    |
++----------------+ |   |  +----------------+     |  +----------------+
+                   |   +-->dentry                +-->dentry
+                   v
+            +-super_block-+     +-file_system_type-+
+            | ...         |     | name             |-->"ext4"
+            | s_type      |---->| ...              |
+            | ...         |     +------------------+
+            +-------------+
 ```
 
 ## knetdev
@@ -9143,11 +10412,12 @@ Dump net device information.
 ### Syntax
 
 ```text
-usage: knetdev [-h] [-hh] [-n] [-q]
+usage: knetdev [-h] [-hh] [--meta] [-n] [-q]
 
 options:
   -h, --help          show this help message and exit
   -hh, --help-simple  show help without ASCII diagram.
+  --meta              display offset information.
   -n, --no-pager      do not use the pager.
   -q, --quiet         show result only.
 ```
@@ -9164,6 +10434,95 @@ Simplified net_device structure:
 | dev_base_head |--->| dev_list          |--->| dev_list          |--->...
 | ...           |    | ...               |    | ...               |
 +---------------+    +-------------------+    +-------------------+
+```
+
+## knft
+
+Dump the nftables (netfilter) object graph.
+
+
+### Syntax
+
+```text
+usage: knft [-h] [-hh] [-R] [-E] [-F FAMILY] [-T NAME] [-k {chain,set,object,flowtable}] [-N NAME] [-H HANDLE] [--net NET] [-v] [--meta] [-n] [-q] [ADDRESS]
+
+positional arguments:
+  ADDRESS               reverse-lookup: report an exact/containing known nftables object, or the nearest known object.
+
+options:
+  -h, --help            show this help message and exit
+  -hh, --help-simple    show help without ASCII diagram.
+  -R, --no-rules        do not decode or render rules and expressions.
+  -E, --no-elements     do not decode or render set elements.
+  -F, --family FAMILY   only show tables of this family (inet, ip, ip6, arp, bridge, netdev).
+  -T, --table NAME      only show tables with this name.
+  -k, --kind {chain,set,object,flowtable}
+                        only show this kind of table child. It can be specified multiple times.
+  -N, --name NAME       only show chains, sets, objects and flowtables with this name.
+  -H, --handle HANDLE   only show the rule with this handle (implies `-k chain`).
+  --net NET             only show the network namespace with this struct net address or ns inode number.
+  -v, --verbose         show object attributes, hooks and expression contents (mostly needs type information).
+  --meta                display discovery information.
+  -n, --no-pager        do not use the pager.
+  -q, --quiet           show result only.
+```
+
+### Examples
+
+```gdb
+knft                          # dump the whole nftables object graph
+knft -R                       # dump the graph without rules and expressions
+knft -E                       # dump the graph without set elements
+knft -F inet -T filter -k set # show only the sets of the inet table `filter`
+knft -T filter -N input -v    # show chain `input` with attributes, hook and expressions
+knft -T filter -H 12 -v       # show rule handle 12 and its decoded expressions
+knft --net 4026531840         # show only the network namespace net:[4026531840]
+knft 0xffff888012345600       # find which nftables object owns this address
+```
+
+### Notes
+
+```text
+Walks table -> chain -> rule -> expr and table -> set -> element / object / flowtable.
+The mainline location of the table list changed over time:
+
+  v3.13~v4.15 : net.nft.af_info -> nft_af_info.tables (one list per family)
+  v4.16~v5.12 : net.nft.tables (one list for every family)
+  v5.13~      : net_generic(net, nf_tables_net_id) -> nftables_pernet.tables
+
+nftables first appeared in mainline v3.13. Older kernels have no nftables object graph.
+
++-nftables_pernet-+   +-nft_table---+   +-nft_chain--+   +-nft_rule_blob-+
+| tables          |-->| list        |   | blob_gen_0 |-->| size          |
+| ...             |   | chains      |-->| list       |   | data[]        |
++-----------------+   | sets        |   | name       |   +-------+-------+
+                      | objects     |   +------------+           |  (one nft_rule_dp per rule)
+                      | flowtables  |                            v
+                      | name        |                     +-nft_rule_dp-+
+                      +-------------+                     | is_last     |
+                                                          | dlen,handle |
+                                                          | data[]      |--> +-nft_expr-+
+                                                          +-------------+    | ops      |--> type->name
+                                                                             +----------+
+
+On v4.16 and later, chains / sets / objects / flowtables hang off nft_table as four
+consecutive list_head fields; legacy tables have the lists available in that kernel release.
+Table discovery first validates this list topology and child->table back-references, then
+uses rule/expression decoding only for the actual chains instead of for every table candidate.
+
+Rule headers, blob fields, set extensions and backend layouts prefer kernel type information.
+Stripped targets use versioned layout fallbacks; --meta reports the selected source and offsets.
+Broken walks keep validated entries where possible and mark the output as partial.
+nftables names may be up to 255 bytes; identifier-like names are preferred only as a heuristic
+and are not a kernel validity rule. The datapath representation changed from linked nft_rule objects before
+v5.17 to a contiguous nft_rule_blob in mainline v5.17 and later; the control-plane rule list
+still exists on newer kernels, and both representations are understood where applicable.
+
+Filters are applied after the table list is discovered; only the selected chains and sets are
+decoded. With -v, the table handle/flags/genmask/owner come from the validated nft_table layout
+and the rule genmask/userdata from the rule header even on stripped kernels. The chain, base
+chain hook, set, object and flowtable attributes and the expression private data are printed
+only when type information (e.g., vmlinux and nf_tables.ko debug info) is loaded.
 ```
 
 ## kops
@@ -9198,7 +10557,8 @@ kops -V 6.6.0 file_operations
 ### Notes
 
 ```text
-This command requires CONFIG_RANDSTRUCT=n.
+Reading values requires debug information or a known kernel config for conditional members.
+Without debug information, CONFIG_RANDSTRUCT=n is required.
 
 Currently it supports from 3.0 to 7,0-rc7.
 
@@ -9214,6 +10574,76 @@ Supported structure:
   ucsi_operations, vm_operations_struct,
 ```
 
+## kpath
+
+Reconstruct the pathname of a dentry, path, file or mount.
+
+
+### Syntax
+
+```text
+usage: kpath [-h] [-hh] [-t {auto,dentry,path,file,mount,vfsmount}] [-p PID] [-T TASK] [-a] [--meta] [-n] [-q] ADDRESS
+
+positional arguments:
+  ADDRESS               the address of struct dentry, path, file, mount or vfsmount.
+
+options:
+  -h, --help            show this help message and exit
+  -hh, --help-simple    show help without ASCII diagram.
+  -t, --type {auto,dentry,path,file,mount,vfsmount}
+                        the type of ADDRESS. (default: auto)
+  -p, --pid PID         resolve the path as the task of this pid sees it.
+  -T, --task TASK       resolve the path as this task_struct sees it.
+  -a, --all             print every mount the dentry is reachable through.
+  --meta                display offset information.
+  -n, --no-pager        do not use the pager.
+  -q, --quiet           enable quiet mode.
+```
+
+### Examples
+
+```gdb
+kpath 0xffff888003b0a000
+kpath --pid 1 0xffff888003b0a000
+kpath --all 0xffff888003b0a000
+```
+
+### Notes
+
+```text
+This command requires CONFIG_RANDSTRUCT=n unless vmlinux with debug information is loaded.
+
+- Without `--pid/--task`, paths are resolved to the mount-namespace root.
+  With either option, resolution stops at `task->fs->root`; `outside-root` means the target lies outside it.
+- A bare dentry has no mount information. If multiple mounts match, `ambiguous` is shown; use `--all` to list them.
+- The target mount namespace is searched first, then other namespaces reachable through scanned tasks.
+  `no-mount` means no matching reachable mount was found, which is normal for pseudo-filesystems or unmounted mounts.
+- Only a bare dentry and `--pid/--task` need the task list. The other types are resolved from the object alone.
+
+Simplified path structure:
+
++-file-----------+     +-path----+
+| ...            |     | mnt     |--+
+| f_path         |---->| dentry  |--|--+
+| ...            |     +---------+  |  |
++----------------+                  |  |
+                                    |  |
+    +-------------------------------+  |
+    |                                  |
+    v                                  v
++-mount----------+<-+     +----------->+-dentry-----+
+| mnt_hash       |  |     |            | ...        |
+| mnt_parent     |--+     |            | d_parent   |-->dentry
+| mnt_mountpoint |--------+            | ...        |
+| mnt (vfsmount) |                     | d_name     |
+|   mnt_root     |-------------------->|   name     |-->"foo"
+|   mnt_sb       |-->super_block       | d_inode    |-->inode
+| ...            |                     | d_iname    |
+| mnt_mounts     |--+                  +------------+
+| mnt_child      |  |
++----------------+  +-->child mounts
+```
+
 ## kpcidev
 
 Dump the PCI devices.
@@ -9222,10 +10652,11 @@ Dump the PCI devices.
 ### Syntax
 
 ```text
-usage: kpcidev [-h] [-n] [-v] [-q]
+usage: kpcidev [-h] [--meta] [-n] [-v] [-q]
 
 options:
   -h, --help      show this help message and exit
+  --meta          display offset information.
   -n, --no-pager  do not use the pager.
   -v, --verbose   enable verbose mode.
   -q, --quiet     enable quiet mode.
@@ -9276,7 +10707,7 @@ Dump pipe information.
 ### Syntax
 
 ```text
-usage: kpipe [-h] [-hh] [-i INODE_FILTER] [-f FILE_FILTER] [-n] [-q]
+usage: kpipe [-h] [-hh] [-i INODE_FILTER] [-f FILE_FILTER] [-r] [--meta] [-n] [-q]
 
 options:
   -h, --help            show this help message and exit
@@ -9285,6 +10716,8 @@ options:
                         filter by specific struct inode.
   -f, --file-filter FILE_FILTER
                         filter by specific struct file.
+  -r, --rescan          do not use cached offset.
+  --meta                display offset information.
   -n, --no-pager        do not use the pager.
   -q, --quiet           show result only.
 ```
@@ -9298,7 +10731,8 @@ kpipe -q
 ### Notes
 
 ```text
-This command requires CONFIG_RANDSTRUCT=n.
+This command requires CONFIG_RANDSTRUCT=n unless vmlinux with debug information is loaded.
+A notification pipe (CONFIG_WATCH_QUEUE) can hold more entries than `max`.
 
 Simplified pipe structure:
 
@@ -9326,6 +10760,229 @@ Simplified pipe structure:
                                                                      +-------------+
 ```
 
+## krefs
+
+Search the kernel pointers that reference the specified address.
+
+
+### Syntax
+
+```text
+usage: krefs [-h] [-d] [-p] [-c CACHE] [-o OBJECT] [-r RANGE] [-M] [-t TOLERANCE] [-l LIMIT] [--no-owner] [-n] [-q] ADDRESS
+
+positional arguments:
+  ADDRESS               the address which the found pointers refer to.
+
+options:
+  -h, --help            show this help message and exit
+  -d, --data            scan the static data of the kernel image. (default if no area is given)
+  -p, --percpu          scan the per-cpu areas.
+  -c, --cache CACHE     scan the slab pages of this kmem_cache.
+  -o, --object OBJECT   scan the slab object that contains this address. (e.g., a task_struct)
+  -r, --range RANGE     scan this address range. (START-END or START+SIZE)
+  -M, --kernel-writable, --physmap
+                        scan every writable kernel mapping. (--physmap is a legacy alias; very slow)
+  -t, --tolerance TOLERANCE
+                        also report the pointers into [ADDRESS, ADDRESS+TOLERANCE].
+  -l, --limit LIMIT     stop after this many hits. 0 means unlimited. (default: 256)
+  --no-owner            do not resolve the owner of each hit.
+  -n, --no-pager        do not use the pager.
+  -q, --quiet           show result only.
+```
+
+### Examples
+
+```gdb
+krefs 0xffff888012345600                        # scan the static data of the kernel image
+krefs -p 0xffff888012345600                     # scan the per-cpu areas too
+krefs -c filp 0xffff888012345600                # scan the slab pages of the filp cache
+krefs -o 0xffff888045670000 0xffff888012345600  # scan one slab object (e.g. a task_struct)
+krefs -r 0xffff888012340000+0x1000 0xffff888012345600
+krefs -t 0x100 0xffff888012345600               # also catch the interior pointers
+```
+
+### Notes
+
+```text
+- Full-memory scans are too slow over a gdb stub, so the default search is limited to kernel static data,
+  where global object references commonly live.
+- Hits are annotated with their likely context: the preceding kallsyms symbol, per-cpu variable and CPU,
+  or slab cache and object boundary. Kallsyms ownership is only a heuristic.
+- Only pointer-size-aligned raw pointers are found; encoded, tagged, XORed, mangled, or unaligned pointers are missed.
+- `-c` scans the slab pages reachable from the per-cpu and per-node lists and the sheaves.
+  SLUB links no full slab without CONFIG_SLUB_DEBUG, and SLOB has no slab page owned by a cache.
+- Overlapping virtual ranges are scanned once. Physical aliases are reported at each virtual address.
+- The slab cache of a hit is resolved on x86 and ARM only.
+- Use `kobj ADDRESS` to identify the referenced object.
+```
+
+## kskb
+
+Parse a single sk_buff and show its buffer layout, refcount and fragment information.
+
+
+### Syntax
+
+```text
+usage: kskb [-h] [-hh] [-d] [--meta] [-n] [-q] [SKB_ADDR]
+
+positional arguments:
+  SKB_ADDR            a `struct sk_buff` address.
+
+options:
+  -h, --help          show this help message and exit
+  -hh, --help-simple  show help without ASCII diagram.
+  -d, --dump          hexdump the first 64 bytes of the linear packet data.
+  --meta              display offset information.
+  -n, --no-pager      do not use the pager.
+  -q, --quiet         show result only.
+```
+
+### Examples
+
+```gdb
+kskb 0xffff888012345000
+kskb -d 0xffff888012345000
+```
+
+### Notes
+
+```text
+Simplified sk_buff structure:
+
++-sk_buff----+
+| next, prev |  list linkage (rbnode/list in a union)
+| ...        |
+| len        |  total length (headlen + data_len)
+| data_len   |  bytes held in fragments (nonlinear)
+| ...        |
+| tail       |  offset of the end of packet data
+| end        |  offset of skb_shared_info
+| head       |  start of the allocated buffer
+| data       |  start of packet data
+| truesize   |
+| users      |  refcount
+| ...        |
++------------+
+
+head        data          tail          head+end
+|           |             |             |
+v           v             v             v
++-----------+-------------+-------------+------------------+
+|  headroom | packet data |  tailroom   | skb_shared_info  |
++-----------+-------------+-------------+------------------+
+|<-- data ->|             |             |
+|<-------- tail --------->|             |
+|<---------------- end ---------------->|
+
+skb_shared_info (at head + end) holds nr_frags, frag_list, frags[] ...
+On 64-bit, tail/end are u32 offsets from head; on 32-bit they are absolute pointers.
+The offsets are taken from the debug information if available, otherwise probed from the memory.
+frags[] is decoded only with the debug information.
+truesize is an accounting value (e.g., 2 for a local TCP pure ACK), not the buffer size.
+```
+
+## ksock
+
+Walk from a file descriptor (or a raw struct sock) through socket, sock and its skb queues.
+
+
+### Syntax
+
+```text
+usage: ksock [-h] [-hh] [-F FD] [-T TASK_FILTER] [-f COMM_FILTER] [-l] [-d] [--meta] [-n] [-q] [SOCK_ADDR]
+
+positional arguments:
+  SOCK_ADDR             a raw `struct sock` address to inspect directly.
+
+options:
+  -h, --help            show this help message and exit
+  -hh, --help-simple    show help without ASCII diagram.
+  -F, --fd FD           filter by this file descriptor number.
+  -T, --task-filter TASK_FILTER
+                        filter by specific task_struct address.
+  -f, --comm-filter COMM_FILTER
+                        comm string REGEXP filter.
+  -l, --list-skb        list each skb address in the queues.
+  -d, --dump            hexdump the first 64 bytes of each listed skb's linear packet data (implies --list-skb).
+  --meta                display offset information.
+  -n, --no-pager        do not use the pager.
+  -q, --quiet           show result only.
+```
+
+### Examples
+
+```gdb
+ksock -q
+ksock --fd 5
+ksock -d --fd 5
+ksock 0xffff888012345000
+```
+
+### Notes
+
+```text
+This command requires CONFIG_RANDSTRUCT=n unless vmlinux with debug information is loaded.
+
+Simplified socket structure:
+
++-file------+  +->+-socket----+  +->+-sock--------------------+
+| ...       |  |  | state     |  |  | (sock_common)           |
+| private   |--+  | type      |  |  |   skc_family            |
+| ...       |     | flags     |  |  |   skc_state             |
++-----------+     | file      |  |  |   skc_prot              |--->struct proto (name)
+                  | sk        |--+  | ...                     |
+                  | ops       |     | sk_receive_queue        |--->skb->skb->...
+                  | ...       |     | sk_write_queue          |--->skb->skb->...
+                  +-----------+     | sk_error_queue          |--->skb->skb->...
+                                    | sk_state_change         |
+                                    | sk_data_ready           |
+                                    | sk_write_space          |
+                                    | sk_error_report         |
+                                    | ...                     |
+                                    | sk_destruct             |
+                                    +-------------------------+
+
+The skc_state value is protocol-dependent; TCP_* names are shown only when the
+resolved protocol is TCP-like. The offsets are taken from the debug information if available,
+otherwise recovered heuristically because struct sock varies with the kernel version and configuration.
+The protocol is shown only when its `struct proto` is verified.
+
+Use `kskb ADDR` to inspect a single sk_buff in detail.
+```
+
+## ksyscalls
+
+Display syscall_table entries.
+
+- Alias: `kst`, `syscall-table-view`
+
+### Syntax
+
+```text
+usage: ksyscalls [-h] [-f FILTER] [-n] [-q]
+
+options:
+  -h, --help           show this help message and exit
+  -f, --filter FILTER  REGEXP syscall name filter.
+  -n, --no-pager       do not use the pager.
+  -q, --quiet          enable quiet mode.
+```
+
+### Examples
+
+```gdb
+ksyscalls
+ksyscalls --filter write
+```
+
+### Notes
+
+```text
+On x86, Linux v6.9 and later dispatch syscalls via switch statements.
+This command shows a table for readability; remaining syscall tables are used for tracing, not dispatch.
+```
+
 ## ksysctl
 
 Dump the sysctl parameters.
@@ -9334,7 +10991,7 @@ Dump the sysctl parameters.
 ### Syntax
 
 ```text
-usage: ksysctl [-h] [-hh] [-f FILTER] [-s] [-e] [-r] [-v] [-n] [-q]
+usage: ksysctl [-h] [-hh] [-f FILTER] [-s] [-e] [-d] [--meta] [-r] [-v] [-n] [-q]
 
 options:
   -h, --help           show this help message and exit
@@ -9342,8 +10999,10 @@ options:
   -f, --filter FILTER  REGEXP filter.
   -s, --skip-symlink   do not follow symlink (net.* and user.*).
   -e, --exact          use exact match.
+  -d, --decimal        display integer values in decimal.
+  --meta               display offset information.
   -r, --rescan         do not use cache.
-  -v, --verbose        dump zero-sized entries too.
+  -v, --verbose        dump zero-sized entries and proc_handler too.
   -n, --no-pager       do not use the pager.
   -q, --quiet          enable quiet mode.
 ```
@@ -9351,13 +11010,18 @@ options:
 ### Examples
 
 ```gdb
-ksysctl -q
+ksysctl --filter modprobe             # filter by parameter name
+ksysctl --filter kernel.modprobe -e   # exact match
+ksysctl -s                            # skip symlink (improves performance with many .net.* and user.* entries)
 ```
 
 ### Notes
 
 ```text
-This command requires CONFIG_RANDSTRUCT=n.
+This command requires CONFIG_RANDSTRUCT=n unless vmlinux with debug information is loaded.
+ParamValue is decoded as proc_handler (or the known handler it calls) reads it:
+strings, integer vectors in hex (decimal with -d), bit ranges of a bitmap, or `raw:` bytes if unknown.
+The unit is the one of the stored value (e.g., `jiffies`), not of /proc/sys. MaxLen of a bitmap is in bits.
 
 Simplified sysctl_table structure:
 
@@ -9398,11 +11062,14 @@ Dump the timer.
 ### Syntax
 
 ```text
-usage: ktimer [-h] [-hh] [-n] [-q]
+usage: ktimer [-h] [-hh] [--classic-only | --hr-only] [--meta] [-n] [-q]
 
 options:
   -h, --help          show this help message and exit
   -hh, --help-simple  show help without ASCII diagram.
+  --classic-only      dump only classic timers.
+  --hr-only           dump only high-resolution timers.
+  --meta              display offset information.
   -n, --no-pager      do not use the pager.
   -q, --quiet         enable quiet mode.
 ```
@@ -9412,66 +11079,500 @@ options:
 ```text
 Simplified timer structure (per-cpu):
 
-+-timer_bases[0]----+    +-timer_list--+    +-timer_list--+
-| ...               |    | entry       |    | entry       |
-| vectors[0]        |--->|   next      |--->|   next      |--->...
-| ...               |    |   pprev     |    |   pprev     |
-| vectors[512or576] |    | expires     |    | expires     |
-| ...               |    | function    |    | function    |
-+-timer_bases[1]----+    | ...         |    | ...         |
-| ...               |    +-------------+    +-------------+
-| vectors[0]        |
-| ...               |
-| vectors[512or576] |
-| ...               |
-+-------------------+
++-timer_bases[0]-----+    +-timer_list--+    +-timer_list--+
+| ...                |    | entry       |    | entry       |
+| vectors[0]         |--->|   next      |--->|   next      |--->...
+| ...                |    |   pprev     |    |   pprev     |
+| vectors[512or576]  |    | expires     |    | expires     |
+| ...                |    | function    |    | function    |
++-timer_bases[1]-----+    | ...         |    | ...         |
+| ...                |    +-------------+    +-------------+
+| vectors[0]         |
+| ...                |
+| vectors[512or576]  |
+| ...                |
++-timer_bases[2]-----+ <-- v6.10~
+| ...                |
++--------------------+
+
+Before v4.8, each cpu has one `tvec_base` (pointed by `tvec_bases` before v4.2) with 512 buckets
+(tv1 to tv5). They are `struct list_head` before v4.2, and `struct hlist_head` after.
 
 Simplified hrtimer structure (per-cpu):
 
-+-hrtimer_cpu_bases-+
-| ...               |
-| clock_bases[0]    |   +--->+-hrtimer------+
-|   ...             |   |    | node         |
-|   clockid         |   |    |   node       |
-|   ...             |   |    |     color    |
-|   active          |   |    |     right    |--->hrtimer
-|      rb_root      |   |    |     left     |--->hrtimer
-|        rb_root    |---+    |   expires    |
-|        ...        |        | ...          |
-|   get_time        |        | function     |
-|   ...             |        | ...          |
-| ...               |        +--------------+
-| clock_bases[8]    |
-|   ...             |
-+-------------------+
++-hrtimer_cpu_bases--+
+| ...                |
+| clock_bases[0]     |   +--->+-hrtimer-------+
+|   ...              |   |    | node          |
+|   clockid          |   |    |   node        |
+|   ...              |   |    |     color     |
+|   active           |   |    |     right     |--->hrtimer
+|      rb_root       |   |    |     left      |--->hrtimer
+|        rb_root     |---+    |   prev(v7.1~) |--->hrtimer
+|        ...         |        |   next(v7.1~) |--->hrtimer
+|   get_time(~v6.17) |        |   expires     |
+|   ...              |        | ...           |
+| ...                |        | function      |
+| clock_bases[8]     |        | ...           |
+|   ...              |        +---------------+
++--------------------+
+
+- Classic timers are sorted by `time_to_expired`, the signed difference from `jiffies` in unsigned long.
+- hrtimers are sorted by `expires`, since they are listed in the order of the rbtree.
+- The member offsets come from the debug information (vmlinux or `ktypes-load`) when available.
+  They are verified by `timer_base.cpu` and `hrtimer_clock_base.cpu_base` and `index`.
 ```
 
-## syscall-table-view
+## kvfs
 
-Display syscall_table entries.
+Display the VFS object graph of a file descriptor or VFS object.
 
-- Alias: `kst`
 
 ### Syntax
 
 ```text
-usage: syscall-table-view [-h] [-f FILTER] [-n] [-q]
+usage: kvfs [-h] [-hh] [-t {auto,file,dentry,inode}] [-p PID] [-f FD] [--meta] [-n] [-q] [ADDRESS]
+
+positional arguments:
+  ADDRESS               the address of struct file, dentry or inode.
 
 options:
-  -h, --help           show this help message and exit
-  -f, --filter FILTER  REGEXP filter.
-  -n, --no-pager       do not use the pager.
-  -q, --quiet          enable quiet mode.
+  -h, --help            show this help message and exit
+  -hh, --help-simple    show help without ASCII diagram.
+  -t, --type {auto,file,dentry,inode}
+                        the type of ADDRESS. (default: auto)
+  -p, --pid PID         select a file descriptor from this pid.
+  -f, --fd FD           select this file descriptor (requires --pid).
+  --meta                display offset information.
+  -n, --no-pager        do not use the pager.
+  -q, --quiet           enable quiet mode.
 ```
 
 ### Examples
 
 ```gdb
-syscall-table-view
-syscall-table-view --filter write
+kvfs --pid 1337 --fd 3
+kvfs 0xffff888003b0a000
+kvfs --type inode 0xffff888003b0a000
+```
+
+### Notes
+
+```text
+This command requires CONFIG_RANDSTRUCT=n unless vmlinux with debug information is loaded.
+
+ADDRESS is detected as struct file, dentry or inode unless --type is specified.
+The filesystem type and mount device are best-effort when debug information is unavailable.
+
+Simplified VFS object graph:
+
++-file-----+
+| ...      |
+| f_path   |
+|   mnt    |    +-dentry--+
+|   dentry |--->| d_name  |    +-inode-+
+| ...      |    | d_inode |--->| i_ino |    +-super_block-+
++----------+    +---------+    | i_sb  |--->| s_type      |
+                               +-------+    | s_dev       |
+                                            +-------------+
+```
+
+## kwalk
+
+The base command to dump the entries held by the well-known kernel data structures.
+
+
+### Syntax
+
+```text
+usage: kwalk [-h] [-hh] {list,rbtree,radix,xarray,maple} ...
+
+options:
+  -h, --help            show this help message and exit
+  -hh, --help-simple    show help without ASCII diagram.
+
+command:
+  {list,rbtree,radix,xarray,maple}
+```
+
+### Notes
+
+```text
+Which sub-command holds the index-to-pointer mapping depends on the kernel version:
+
+  ~v4.19: radix_tree -> `kwalk radix`
+  v4.20~: xarray     -> `kwalk xarray` (radix-tree API remains as a compatibility interface)
+  v6.1~ : maple_tree -> `kwalk maple`  (only where it replaced the rbtree or the xarray)
+
+`kwalk list` and `kwalk rbtree` work on any version, and also outside the kernel.
+
+Simplified structures:
+
++-list_head---+              +-rb_root-------------+
+| next        |--> entry     | rb_node             |--+
+| prev        |--> entry     +---------------------+  |
++-------------+                                       v
+                                   +-rb_node-------------+
+                                   | __rb_parent_color   |
+                                   | rb_right            |--> sub-tree
+                                   | rb_left             |--> sub-tree
+                                   +---------------------+
+
++-radix_tree_root(~v4.19)-+  +-xarray(v4.20~)-+
+| height (~v4.6)          |  | xa_lock        |
+| gfp_mask                |  | xa_flags       |
+| rnode                   |  | xa_head        |
++-------------------------+  +----------------+
+             |                        |
+             +------------+-----------+
+                          v
+           +-radix_tree_node / xa_node-+
+           | shift                     |
+           | offset                    |
+           | count                     |
+           | ...                       |
+           | slots[0]                  |--> entry
+           | slots[1]                  |--> entry or sub-node
+           | ...                       |
+           | slots[15 or 63]           |
+           +---------------------------+
+
++-maple_tree(v6.1~)-+  +-->+-maple_node------+
+| ma_lock           |  |   | ...             |
+| ma_flags          |  |   | mr64|ma64|alloc |
+| ma_root           |--+   |   ...           |
++-------------------+      |   slot[]        |--> entry or sub-node
+                           +-----------------+
+```
+
+## kwalk list
+
+Walk the link list.
+
+- Alias: `walk-link-list`, `chain`, `list-dump`
+
+### Syntax
+
+```text
+usage: kwalk list [-h] [-o NEXT_OFFSET] [-A DUMP_BYTES_AFTER] [-B DUMP_BYTES_BEFORE] [-C CONTAINER_OF] [-n] [-q] ADDRESS
+
+positional arguments:
+  ADDRESS               start address to walk.
+
+options:
+  -h, --help            show this help message and exit
+  -o NEXT_OFFSET        offset of the next(or prev) pointer in the target structure.
+  -A DUMP_BYTES_AFTER   dump bytes after link-list location.
+  -B DUMP_BYTES_BEFORE  dump bytes before link-list location.
+  -C, --container-of CONTAINER_OF
+                        also displays each entry minus this offset, like container_of().
+  -n, --no-pager        do not use the pager.
+  -q, --quiet           show result only.
+```
+
+### Examples
+
+```gdb
+kwalk list 0xffff9c60800597e0                      # walk list_head.next
+kwalk list -o 8 0xffff9c60800597e0                 # walk list_head.prev
+kwalk list --container-of 0x10 0xffff9c60800597e0  # also show each entry as container_of()
+```
+
+### Notes
+
+```text
+`-o` is the offset of the pointer to follow, so it is 0 for list_head.next,
+the pointer size for list_head.prev, and offsetof(the struct, next) for a
+singly linked list of the structs.
+ADDRESS is the starting node or head; the first displayed entry is the pointer
+read from ADDRESS+OFFSET, not ADDRESS itself. NULL and a returning sentinel head
+are therefore also shown as the final entry.
+```
+
+## kwalk maple
+
+Dump the entries of the maple tree.
+
+- Alias: `maple-dump`
+
+### Syntax
+
+```text
+usage: kwalk maple [-h] [-o ROOT_OFFSET] [-m MAX_OFFSET] [-C CONTAINER_OF] [-n] [-q] ADDRESS
+
+positional arguments:
+  ADDRESS               the address of the struct including the maple_tree.
+
+options:
+  -h, --help            show this help message and exit
+  -o, --root-offset ROOT_OFFSET
+                        offsetof(the struct, ma_root). it is searched if not given.
+  -m, --max-offset MAX_OFFSET
+                        the search range of offsetof(the struct, ma_root). (default: ptrsize*0x20)
+  -C, --container-of CONTAINER_OF
+                        also displays each entry minus this offset, like container_of().
+  -n, --no-pager        do not use the pager.
+  -q, --quiet           show result only.
+```
+
+### Examples
+
+```gdb
+kwalk maple 0xffff972801b78a00          # dump the vm_area_structs of mm_struct.mm_mt
+kwalk maple -o 0x48 0xffff972801b78a00  # skip searching offsetof(the struct, ma_root)
+```
+
+### Notes
+
+```text
+The maple_tree is introduced at v6.1 for mm_struct.mm_mt, and v6.5 for sparse_irqs.
+A tree holding a single entry stored directly in ma_root cannot be auto-detected;
+pass `--root-offset` for it. With the offset given, the single entry is shown correctly.
+```
+
+## kwalk radix
+
+Dump the entries of the radix tree.
+
+- Alias: `radix-dump`
+
+### Syntax
+
+```text
+usage: kwalk radix [-h] [-o RNODE_OFFSET] [-m MAX_OFFSET] [-C CONTAINER_OF] [-n] [-q] ADDRESS
+
+positional arguments:
+  ADDRESS               the address of the struct including the radix_tree_root.
+
+options:
+  -h, --help            show this help message and exit
+  -o, --rnode-offset RNODE_OFFSET
+                        offsetof(the struct, rnode). it is searched if not given.
+  -m, --max-offset MAX_OFFSET
+                        the search range of offsetof(the struct, rnode). (default: ptrsize*0x20)
+  -C, --container-of CONTAINER_OF
+                        also displays each entry minus this offset, like container_of().
+  -n, --no-pager        do not use the pager.
+  -q, --quiet           show result only.
+```
+
+### Examples
+
+```gdb
+kwalk radix 0xffffffff82640e60        # dump the entries of irq_desc_tree
+kwalk radix -o 8 0xffffffff82640e60   # skip searching offsetof(the struct, rnode)
+```
+
+### Notes
+
+```text
+The radix_tree_root is renamed to xarray at v4.20, so use `kwalk xarray` for v4.20 and later.
+A tree holding only one item keeps it in rnode without the tag, which is indistinguishable
+from any other pointer. Pass `--rnode-offset` explicitly for such a tree.
+```
+
+## kwalk rbtree
+
+Dump the nodes of the red-black tree.
+
+- Alias: `rbtree-dump`
+
+### Syntax
+
+```text
+usage: kwalk rbtree [-h] [-r] [-C CONTAINER_OF] [-n] [-q] ADDRESS
+
+positional arguments:
+  ADDRESS               the address of the struct rb_root (or rb_root_cached).
+
+options:
+  -h, --help            show this help message and exit
+  -r, --rb-node         treat ADDRESS as a struct rb_node instead of a struct rb_root.
+  -C, --container-of CONTAINER_OF
+                        also displays each entry minus this offset, like container_of().
+  -n, --no-pager        do not use the pager.
+  -q, --quiet           show result only.
+```
+
+### Examples
+
+```gdb
+kwalk rbtree 0xffff9c6081b3d7a0        # dump the rb_nodes under the rb_root
+kwalk rbtree -r 0xffff9c6081b3d7a8     # dump the rb_nodes under the rb_node
+```
+
+### Notes
+
+```text
+The entries are dumped in pre-order, not sorted by key.
+struct rb_root_cached starts with a struct rb_root, so pass its address as is.
+```
+
+## kwalk xarray
+
+Dump the entries of the xarray.
+
+- Alias: `xarray-dump`
+
+### Syntax
+
+```text
+usage: kwalk xarray [-h] [-o HEAD_OFFSET] [-m MAX_OFFSET] [-C CONTAINER_OF] [-n] [-q] ADDRESS
+
+positional arguments:
+  ADDRESS               the address of the struct including the xarray.
+
+options:
+  -h, --help            show this help message and exit
+  -o, --head-offset HEAD_OFFSET
+                        offsetof(the struct, xa_head). it is searched if not given.
+  -m, --max-offset MAX_OFFSET
+                        the search range of offsetof(the struct, xa_head). (default: ptrsize*0x20)
+  -C, --container-of CONTAINER_OF
+                        also displays each entry minus this offset, like container_of().
+  -n, --no-pager        do not use the pager.
+  -q, --quiet           show result only.
+```
+
+### Examples
+
+```gdb
+kwalk xarray 0xffffffff82640e60        # dump the entries of irq_desc_tree
+kwalk xarray -o 8 0xffffffff82640e60   # skip searching offsetof(the struct, xa_head)
+```
+
+### Notes
+
+```text
+The xarray is introduced at v4.20, so use `kwalk radix` for v4.19 and earlier.
+struct idr starts with a struct radix_tree_root (or xarray), so pass its address as is.
+An empty tree or one holding a single entry stored directly in xa_head cannot be
+auto-detected, because no internal node proves the offset; pass `--head-offset` for it.
+```
+
+## kworkqueue
+
+Dump workqueue items and inspect embedded work_struct objects.
+
+
+### Syntax
+
+```text
+usage: kworkqueue [-h] [-hh] [--object OBJECT] [--size SIZE] [--meta] [-n] [-q]
+
+options:
+  -h, --help          show this help message and exit
+  -hh, --help-simple  show help without ASCII diagram.
+  --object OBJECT     the address of the object to inspect (e.g. the head of a heap object), scanned for an embedded work_struct/delayed_work.
+  --size SIZE         the size of the range scanned by --object (default: 0x1000).
+  --meta              display offset information.
+  -n, --no-pager      do not use the pager.
+  -q, --quiet         enable quiet mode.
+```
+
+### Examples
+
+```gdb
+kworkqueue
+kworkqueue --object 0xffff888012340000
+kworkqueue --object 0xffff888012340000 --size 0x400
+```
+
+### Notes
+
+```text
+Simplified workqueue structures (`==>` shows where each column comes from):
+
+                   +-workqueue_struct-+
++-workqueues-+     | pwqs             |--+
+| list       |<--->| list             |<--->...
++------------+     | name             |  |      ==> `queue`
+                   | ...              |  |
+                   +------------------+  |
+                     ^                   |
+                     |                   |
+                     |                   v
+                     |       +-pool_workqueue-+
+                     |       | pool           |---+
+                     +-------| wq             |   |
+                             | inactive_works |   |  ==> state `inactive`
+                             +----------------+   |
+                               ^                  |
+       work_struct.data -------+                  |
+       & WORK_STRUCT_PWQ_MASK (pwq)               |
+                    +-work_struct-+               v
+                    | data        |         +-worker_pool-+
+                    | entry       |-------->| worklist    |  ==> state `pending`
+                    | func        |         | busy_hash   |  ==> state `running`
+                    +-------------+         | cpu         |  ==> `cpu`
+                      ^                     +-------------+
+                      |
+                    +-delayed_work-+
+                    | work         |
+                    | timer        |<--- per-cpu timer wheel  ==> state `delayed`
+                    | wq           |
+                    +--------------+
+
+- `running` means the work is held in `worker.current_work`.
+- When `WORK_STRUCT_PWQ` is set, `queue` and `cpu` are decoded from `work_struct.data`; off-queue work uses it differently.
+- For `delayed` work, `cpu` is the CPU whose timer wheel holds the timer.
+- `--object` scans `[object, object+size)` for initialized `work_struct`s, including unqueued `idle` work.
+  `delayed_work` is recognized by its `delayed_work_timer_fn` timer when available.
+  It does not need the workqueue list, though `queue` is then unknown.
+- The running work is found from `worker_pool.busy_hash` (`global_cwq` before v3.6).
+- `delayed` needs the `ktimer` layout; other states are listed without it.
+- The member offsets come from the debug information (vmlinux or `ktypes-load`) when available.
 ```
 
 # 06-h. Qemu-system/KGDB Cooperation - Linux Allocator
+## buddy-contains
+
+Resolves which buddy block an address belongs to.
+
+
+### Syntax
+
+```text
+usage: buddy-contains [-h] [-p] [-L] [-Q] [-M] [--MIGRATE_PCPTYPES {3,4}] [--meta] [-r] [-q] ADDRESS
+
+positional arguments:
+  ADDRESS               target address.
+
+options:
+  -h, --help            show this help message and exit
+  -p, --page            interpret ADDRESS as a `struct page` address instead of a virtual address.
+  -L, --skip-free-list  do not walk the free lists use struct page metadata only. pcp free pages and zone/mtype/cpu cannot be reported in this mode.
+  -Q, --skip-phys       skip virt -> phys translation.
+  -M, --use-physmap     use physmap for virt -> phys translation (x64/arm64 only).
+  --MIGRATE_PCPTYPES {3,4}
+                        use specify value; linux: 3, android: 4 (2023~).
+  --meta                display offset information.
+  -r, --rescan          do not use cache.
+  -q, --quiet           show result only.
+```
+
+### Examples
+
+```gdb
+buddy-contains 0xffff96a7c2144000
+buddy-contains -p 0xffffca7640004040    # ADDRESS is a struct page
+buddy-contains -L 0xffff96a7c2144000    # Skip free lists
+```
+
+### Notes
+
+```text
+Given an address, resolves which buddy allocator block contains it.
+
+A free block of order N is described by its head page only, page->private holds the
+order and PG_buddy is set on the head, while the tail pages carry neither. So a page
+that was merged into a higher order block cannot be identified from its own struct
+
+Two modes:
+  default: walk the free lists like buddy-dump and locate the block.
+  -L     : read struct page flags only but cannot report pcp free pages.
+```
+
 ## buddy-dump
 
 Dump the zone of the page allocator (buddy allocator) free-list.
@@ -9481,7 +11582,7 @@ Dump the zone of the page allocator (buddy allocator) free-list.
 ### Syntax
 
 ```text
-usage: buddy-dump [-h] [-hh] [-z {DMA,DMA32,Normal,HighMem,Movable,Device}] [-o ORDER_FILTER] [-m MTYPE_FILTER] [-p PCP_INDEX_FILTER] [-P] [-F] [--cpu CPU] [-s] [-S] [-Q] [-M] [--MIGRATE_PCPTYPES {3,4}] [-r] [-c N] [-v] [-vv] [-n] [-q]
+usage: buddy-dump [-h] [-hh] [-z {DMA,DMA32,Normal,HighMem,Movable,Device}] [-o ORDER_FILTER] [-m MTYPE_FILTER] [-p PCP_INDEX_FILTER] [-P] [-F] [--cpu CPU] [-s] [-S] [-Q] [-M] [--MIGRATE_PCPTYPES {3,4}] [--meta] [-r] [-c N] [-v] [-vv] [-n] [-q]
 
 options:
   -h, --help            show this help message and exit
@@ -9503,6 +11604,7 @@ options:
   -M, --use-physmap     use physmap for virt -> phys translation to speed up (when KGDB mode, x64/arm64 only).
   --MIGRATE_PCPTYPES {3,4}
                         use specify value; linux: 3, android: 4 (2023~).
+  --meta                display offset information.
   -r, --rescan          do not use cache.
   -c, --count N         max entries to read per list (default: 5, 0=unlimited). -s/-S/-v/-vv override this to 0.
   -v, --verbose         show all entries for non-sort mode. equivalent to -c 0.
@@ -9573,7 +11675,7 @@ Resolve the slab cache (kmem_cache) alias.
 ### Syntax
 
 ```text
-usage: kmem-cache-alias [-h] [-s] [-m] [-n] [-q] [names ...]
+usage: kmem-cache-alias [-h] [-s] [-m] [--meta] [-n] [-q] [names ...]
 
 positional arguments:
   names               filter by specific cache name(s) (substring match).
@@ -9582,6 +11684,7 @@ options:
   -h, --help          show this help message and exit
   -s, --sort-by-size  sort by object size.
   -m, --merged-only   show only merged caches grouped by physical cache.
+  --meta              display offset information.
   -n, --no-pager      do not use the pager.
   -q, --quiet         show result only.
 ```
@@ -9590,6 +11693,44 @@ options:
 
 ```text
 This command requires CONFIG_SYSFS=y.
+CONFIG_SLUB_TINY=y is unsupported because slab sysfs is unavailable.
+```
+
+## kobj
+
+Identify an arbitrary kernel address: mapping, allocator, slab cache, object base/offset and a type candidate.
+
+
+### Syntax
+
+```text
+usage: kobj [-h] [-v] [-r] [-q] ADDRESS
+
+positional arguments:
+  ADDRESS        target address.
+
+options:
+  -h, --help     show this help message and exit
+  -v, --verbose  also list caches merged into the same physical cache.
+  -r, --rescan   do not use cache in underlying commands.
+  -q, --quiet    suppress progress messages, show result only.
+```
+
+### Examples
+
+```gdb
+kobj 0xffff888012345678
+```
+
+### Notes
+
+```text
+Unified resolver combining kvmmap/virt2page/pageinfo/slab-contains/buddy-contains/vmalloc-dump.
+The type candidate is inferred from the slab cache name, so `Confidence` is reported honestly:
+mergeable caches (kmalloc-*) and unaligned addresses lower it. SLUB may merge dedicated caches,
+so use -v to list the caches sharing the same physical kmem_cache via kmem-cache-alias.
+GEF's pageinfo-based page classification currently supports v4.18 and later;
+slab object resolution works on older kernels too.
 ```
 
 ## slab-contains
@@ -9601,16 +11742,16 @@ Resolve the slab cache (kmem_cache) that an object belongs to (for slab/slub/slu
 ### Syntax
 
 ```text
-usage: slab-contains [-h] [-r] [-v] [-q] ADDRESS
+usage: slab-contains [-h] [-r] [--meta] [-q] ADDRESS
 
 positional arguments:
-  ADDRESS        target address.
+  ADDRESS       target address.
 
 options:
-  -h, --help     show this help message and exit
-  -r, --rescan   do not use cache.
-  -v, --verbose  enable verbose mode.
-  -q, --quiet    show result only.
+  -h, --help    show this help message and exit
+  -r, --rescan  do not use cache.
+  --meta        display offset information.
+  -q, --quiet   show result only.
 ```
 
 ### Notes
@@ -10044,7 +12185,7 @@ options:
   -h, --help            show this help message and exit
   -hh, --help-simple    show help without ASCII diagram.
   --only-used           display only used area.
-  --only-freed          display only freed area.
+  --only-freed          display only free area.
   --meta                display offset information.
   --hexdump-used SIZE   hexdump `used chunks` if layout is resolved.
   --telescope-used SIZE
@@ -10064,17 +12205,17 @@ vmalloc-dump -q
 
 ```text
 Simplified vmalloc structure:
-                           +-vmap_area--+
-                           | va_start   |
-(~v6.8)                    | va_end     |
-+---------------------+    | ...        |
-| vmap_area_list      |--->| list       |--->...
-+---------------------+    | ...        |
-                           | vm         |---->+-vm_struct--+
-                           | ...        |     | ...        |
-                           +------------+     | flags      |
-                                              | ...        |
-                                              +------------+
+                                       +-vmap_area--+
+                                       | va_start   |
+                                       | va_end     |
++---------------------------------+    | ...        |
+| vmap_area_list (~v6.8)          |--->| list       |--->...
+| vmap_nodes[i].busy.head (v6.9~) |    | ...        |
++---------------------------------+    | vm         |---->+-vm_struct--+
+                                       | ...        |     | ...        |
+                                       +------------+     | flags      |
+                                                          | ...        |
+                                                          +------------+
                            +-vmap_area--+
                            | va_start   |
 (v5.2~)                    | va_end     |
@@ -10082,6 +12223,12 @@ Simplified vmalloc structure:
 | free_vmap_area_list |--->| list       |--->...
 +---------------------+    | ...        |
                            +------------+
+
+`unpurged` is an area freed lazily but not purged yet. It is still linked to vmap_area_list (~v5.3),
+or linked to vmap_purge_list (v5.4~v5.10), purge_vmap_area_list (v5.11~v6.8) or vmap_nodes[i].lazy.head (v6.9~).
+`pooled` is a purged area kept in vmap_nodes[i].pool[] for reuse (v6.9~).
+`free` is an unallocated range of the vmalloc space, not a history of vfree().
+--hexdump-used and --telescope-used skip VM_IOREMAP areas, since reading device registers may have side effects.
 ```
 
 # 06-i. Qemu-system/KGDB Cooperation - Linux Dynamic Inspection
@@ -10093,7 +12240,7 @@ Call predefined system-calls and print kmalloc-N chunks allocated and freed (x64
 ### Syntax
 
 ```text
-usage: kmalloc-allocated-by [-h] [-f FILTER] [-N] [-t] [-d] [-v]
+usage: kmalloc-allocated-by [-h] [-f FILTER] [-N] [-t] [-d] [--meta]
 
 options:
   -h, --help           show this help message and exit
@@ -10101,7 +12248,7 @@ options:
   -N, --print-null     display free(NULL).
   -t, --backtrace      display backtrace.
   -d, --dump-chunk     dump the first 0x40 bytes of each chunk.
-  -v, --verbose        print meta information.
+  --meta               display offset information.
 ```
 
 ### Examples
@@ -10128,7 +12275,7 @@ Collect and display information when kmalloc/kfree.
 ### Syntax
 
 ```text
-usage: kmalloc-tracer [-h] [-f FILTER] [-T TASK_NAME] [-N] [-t] [-d] [-p] [-v]
+usage: kmalloc-tracer [-h] [-f FILTER] [-T TASK_NAME] [-N] [-t] [-d] [-p] [--meta]
 
 options:
   -h, --help            show this help message and exit
@@ -10140,7 +12287,7 @@ options:
   -d, --dump-chunk      dump the first 0x40 bytes of each chunk.
   -p, --enable-page-allocator-trace
                         in addition to kmalloc and kfree, it also monitors __alloc_pages and __free_pages.
-  -v, --verbose         print meta information.
+  --meta                display offset information.
 ```
 
 ### Examples
@@ -10159,34 +12306,119 @@ Tracing `kmem_cache_alloc` type is not supported.
 This command requires CONFIG_RANDSTRUCT=n.
 ```
 
-## ktrace
+## kpage-watch
 
-Trace kernel functions and arguments.
+Track the alloc/free/slab lifecycle of a physical page (PFN) for cross-cache analysis.
 
 
 ### Syntax
 
 ```text
-usage: ktrace [-h] [--task-name TASK_NAME] [--task-addr TASK_ADDR] [-f FILTER] [-e EXCLUDE] [-c] [-q]
+usage: kpage-watch [-h] [-p PAGE] [--pfn PFN] [-s] [-t] [ADDRESS ...]
+
+positional arguments:
+  ADDRESS              the virtual address(es) whose backing page is watched.
 
 options:
-  -h, --help            show this help message and exit
-  --task-name TASK_NAME
-                        task name (from `ktask`) for filtering.
-  --task-addr TASK_ADDR
-                        task address for filtering.
-  -f, --filter FILTER   function include filter (REGEXP).
-  -e, --exclude EXCLUDE
-                        function exclude filter (REGEXP).
-  -c, --commit          actually perform ktrace.
-  -q, --quiet           skip tqdm and displaying function name.
+  -h, --help           show this help message and exit
+  -p, --page PAGE      watch by `struct page` address instead of a virtual address (can be repeated).
+  --pfn PFN            watch by page frame number (PFN) (can be repeated).
+  -s, --stop-on-reuse  stop at the first reuse (a re-allocation after a free).
+  -t, --backtrace      display a backtrace for each event.
+```
+
+### Examples
+
+```gdb
+kpage-watch 0xffff888012345600                           # watch the page backing this virtual address
+kpage-watch 0xffff888012345600 0xffff888012346000        # watch several pages at once
+kpage-watch -p 0xffffea000048d140 -p 0xffffea000048d180  # watch by struct page address
+kpage-watch --pfn 0x12345 --pfn 0x12346                  # watch by PFN
+kpage-watch 0xffff888012345600 -s                        # stop at the first reuse
 ```
 
 ### Notes
 
 ```text
-If you set breakpoints in some commonly called functions, it became too slow to be useful.
-Use filtering options to reduce the number of functions targeted by breakpoints as much as possible.
+Disable `-enable-kvm` option for qemu-system (#PF may occur).
+Append `tsc=unstable` option for kernel cmdline.
+ADDRESS, --page and --pfn can be mixed; each resolves to one watched PFN.
+This records events touching the watched PFNs, so the page-allocator/SLUB/page-table boundary is visible.
+Only events reached while continuing are recorded; the history before the command started is not.
+On SLAB the slab-assign hook may be missing (its helpers are inlined); page alloc/free and slab-release are still shown.
+This command requires CONFIG_RANDSTRUCT=n.
+```
+
+## ktrace
+
+Trace arguments and returns of the specified kernel functions.
+
+
+### Syntax
+
+```text
+usage: ktrace [-h] [--asmlinkage] FUNCTION [FUNCTION ...]
+
+positional arguments:
+  FUNCTION      exact kernel function names.
+
+options:
+  -h, --help    show this help message and exit
+  --asmlinkage  use the i386 stack ABI for selected functions.
+```
+
+### Examples
+
+```gdb
+ktrace commit_creds prepare_kernel_cred
+```
+
+### Notes
+
+```text
+All definitions of each exact function name are included; duplicate addresses are skipped.
+Arguments are six guessed machine words; function prototypes and pt_regs syscall arguments are not decoded.
+Tracing continues until interrupted or stopped by another breakpoint; tracing breakpoints are then removed.
+Tail calls and non-local exits may have no observed return.
+```
+
+## kuaf-watch
+
+Track the alloc/free/reuse lifecycle of a slab object (or an entire cache) for UAF analysis.
+
+
+### Syntax
+
+```text
+usage: kuaf-watch [-h] [-c CACHE] [-s] [-t] [ADDRESS ...]
+
+positional arguments:
+  ADDRESS              the slab object address(es) (or interior pointer) to watch.
+
+options:
+  -h, --help           show this help message and exit
+  -c, --cache CACHE    follow an entire slab cache by name instead of specific objects.
+  -s, --stop-on-reuse  stop at the first reuse (re-allocation) event.
+  -t, --backtrace      display a backtrace for each event.
+```
+
+### Examples
+
+```gdb
+kuaf-watch 0xffff888012345600                     # watch one object's alloc/free/reuse
+kuaf-watch 0xffff888012345600 0xffff888012345700  # watch several objects at once
+kuaf-watch --cache kmalloc-256                    # watch every object of a cache
+kuaf-watch 0xffff888012345600 -s                  # break at the first reuse
+```
+
+### Notes
+
+```text
+Disable `-enable-kvm` option for qemu-system (#PF may occur).
+Append `tsc=unstable` option for kernel cmdline.
+This is a higher-level view built on the same allocator breakpoints as kmalloc-tracer.
+In --cache mode the slab cache of every alloc/free is resolved, which is slower than single-object mode.
+This command requires CONFIG_RANDSTRUCT=n.
 ```
 
 ## thunk-tracer
@@ -10215,6 +12447,13 @@ usage: usermodehelper-tracer [-h]
 
 options:
   -h, --help  show this help message and exit
+```
+
+### Notes
+
+```text
+Linux 6.14 removed automatic binfmt module loading for unrecognized executable formats.
+Executing a file containing four 0xff bytes no longer triggers a usermode helper via that path.
 ```
 
 # 06-j. Qemu-system/KGDB Cooperation - TrustZone
@@ -10250,13 +12489,15 @@ Dump bget allocator of OPTEE-Trusted-App.
 ### Syntax
 
 ```text
-usage: optee-bget-dump [-h] [-hh] [-m OFFSET_malloc_ctx] [-n] [-v]
+usage: optee-bget-dump [-h] [-hh] [-m OFFSET_malloc_ctx] [--ta-bits {32,64}] [--ta-base TA_BASE] [-n] [-v]
 
 options:
   -h, --help            show this help message and exit
   -hh, --help-simple    show help without ASCII diagram.
   -m, --malloc_ctx OFFSET_malloc_ctx
                         The offset of `malloc_ctx` at OPTEE-TA.
+  --ta-bits {32,64}     TA ABI width (required when the TA ABI cannot be read from user execution state).
+  --ta-base TA_BASE     select the executable user mapping starting at this address.
   -n, --no-pager        do not use the pager.
   -v, --verbose         verbose output.
 ```
@@ -10270,6 +12511,10 @@ optee-bget-dump 0x2a408
 ### Notes
 
 ```text
+TA ABI is independent of the TEE core ABI. Use --ta-bits 32 for an AArch32 TA on an AArch64 core.
+Without --ta-bits, the ABI is taken from the current user execution state; core stops require it explicitly.
+Use --ta-base to select a mapping when ldelf is absent or more than two executable mappings are present.
+
 Simplified heap structure:
 
 +-malloc_ctx-------------------+         +-freed chunk------------+
@@ -10304,7 +12549,7 @@ Set a breakpoint to OPTEE-TA.
 ### Syntax
 
 ```text
-usage: optee-break-ta [-h] [-v] (-f TA_FILE | TA_OFFSET)
+usage: optee-break-ta [-h] [--ta-base TA_BASE] [--persistent] [-v] (-f TA_FILE | TA_OFFSET)
 
 positional arguments:
   TA_OFFSET             The breakpoint target offset of OPTEE-TA.
@@ -10313,6 +12558,8 @@ options:
   -h, --help            show this help message and exit
   -f, --ta-file TA_FILE
                         parse the TA file (or ELF file) and stop at the entry point.
+  --ta-base TA_BASE     select the executable user mapping starting at this address.
+  --persistent          arm a new temporary breakpoint on every TA entry.
   -v, --verbose         show memory map if stopped at __thread_enter_user_mode.
 ```
 
@@ -10337,6 +12584,11 @@ Now, thread_enter_user_mode calls __thread_enter_user_mode.
 This __thread_enter_user_mode in TEE OS is written directly in assembly.
 Because of this, it is immune to compiler optimizations. By searching memory for the fixed byte sequence
 of this assembly routine, we can reliably locate its offset and set your breakpoint there.
+
+By default, exactly two executable user mappings are required; the higher one is selected as the TA.
+Use --ta-base when ldelf is absent or shared libraries add mappings. Offsets are relative to this mapping.
+After two unsuccessful selections, execution stops and the internal breakpoint is disabled.
+The internal breakpoint is deleted after arming the target once; --persistent keeps tracking TA entries.
 ```
 
 ## optee-shm-list
@@ -10347,11 +12599,12 @@ List dynamic shared-memory buffers currently registered in OP-TEE (for OP-TEE v4
 ### Syntax
 
 ```text
-usage: optee-shm-list [-h] [-n]
+usage: optee-shm-list [-h] [--phys-bits {32,64}] [-n]
 
 options:
-  -h, --help      show this help message and exit
-  -n, --no-pager  do not use the pager.
+  -h, --help           show this help message and exit
+  --phys-bits {32,64}  paddr_t width (default: debug type, otherwise core pointer width).
+  -n, --no-pager       do not use the pager.
 ```
 
 ## optee-smc-service-dump
@@ -10502,6 +12755,50 @@ xsm /16xw --virt 0x783ae3d0  # secure memory ASLR is supported
 ```
 
 # 06-k. Qemu-system/KGDB Cooperation - Other
+## kdiff
+
+Compare kernel information at two points in time.
+
+
+### Syntax
+
+```text
+usage: kdiff [-h] {save,list,diff,clear} ...
+
+options:
+  -h, --help            show this help message and exit
+
+command:
+  {save,list,diff,clear}
+    save                append a snapshot.
+    list                list saved snapshots.
+    diff                compare snapshots or a snapshot with current state.
+    clear               delete saved snapshots.
+```
+
+### Examples
+
+```gdb
+kdiff save                         # append a snapshot
+kdiff list                         # list saved snapshots
+kdiff diff 0 2                     # compare two saved snapshots
+kdiff diff 2                       # compare snapshot 2 with current state
+kdiff diff                         # compare the latest snapshot with current state
+kdiff clear 0 1                    # delete snapshots 0 and 1
+kdiff clear all                    # delete all snapshots
+kdiff save -t task -t syscall      # select targets
+kdiff save -c 'kops file_operations 0xffffffff81000000'
+```
+
+### Notes
+
+```text
+Snapshots are kept in /tmp/gef/kdiff-UID until `kdiff clear` removes them.
+Compare snapshots taken from the same kernel instance.
+Without -t, task/module/sysctl/irq/syscall and, on x86, IDT/GDT are compared.
+Use -c to include address-specific tables such as `kops file_operations ADDRESS`.
+```
+
 ## ksearch-code-ptr
 
 Search the code pointer in kernel data area.
@@ -10510,7 +12807,7 @@ Search the code pointer in kernel data area.
 ### Syntax
 
 ```text
-usage: ksearch-code-ptr [-h] [-d DEPTH] [-r MAX_RANGE] [-n]
+usage: ksearch-code-ptr [-h] [-d DEPTH] [-r MAX_RANGE] [-n] [-q]
 
 options:
   -h, --help            show this help message and exit
@@ -10518,6 +12815,7 @@ options:
   -r, --max-range MAX_RANGE
                         allowable offset range for each reference. (default: 0)
   -n, --no-pager        do not use the pager.
+  -q, --quiet           enable quiet mode.
 ```
 
 ## qemu-device-info
@@ -10528,25 +12826,35 @@ Dump device information for qemu-escape.
 ### Syntax
 
 ```text
-usage: qemu-device-info [-h] [-d DEVICE] [-n]
+usage: qemu-device-info [-h] [-d DEVICE | -l] [--qemu-binary QEMU_BINARY] [-N | -A] [-n]
 
 options:
-  -h, --help           show this help message and exit
-  -d, --device DEVICE  device name.
-  -n, --no-pager       do not use the pager.
+  -h, --help            show this help message and exit
+  -d, --device DEVICE   exact device name, id, or QOM path.
+  -l, --list            list active devices and owner-linked memory entries.
+  --qemu-binary QEMU_BINARY
+                        path to the qemu-system binary.
+  -N, --no-nm           do not show QEMU symbols from nm.
+  -A, --all-nm          show all symbols from nm.
+  -n, --no-pager        do not use the pager.
 ```
 
 ### Examples
 
 ```gdb
-qemu-device-info -d cydf-vga  # Specify a device name
-qemu-device-info -d cydf      # Specify a characteristic part of the device name
+qemu-device-info -l                           # List devices and owner-linked entry counts
+qemu-device-info -d cydf-vga                  # Select exact device name
+qemu-device-info -d net0                      # Select exact device id
+qemu-device-info -d /machine/peripheral/net0  # Select exact QOM path
+qemu-device-info -d net0 -N                   # Skip nm symbols
+qemu-device-info -d net0 -A                   # Show all nm symbols
 ```
 
 ### Notes
 
 ```text
 qemu-system must be running on the local host.
+Use `qemu-system-memory-region-dump` for more detailed physical memory-region information.
 ```
 
 ## uefi-ovmf-info
@@ -10557,23 +12865,20 @@ Print UEFI OVMF info.
 ### Syntax
 
 ```text
-usage: uefi-ovmf-info [-h]
+usage: uefi-ovmf-info [-h] [--start START] [--end END] [--pei-bits {32,64}] [--dxe-bits {32,64}]
 
 options:
-  -h, --help  show this help message and exit
+  -h, --help          show this help message and exit
+  --start START       physical search range start (inclusive).
+  --end END           physical search range end (exclusive).
+  --pei-bits {32,64}  override PEI table pointer width.
+  --dxe-bits {32,64}  override DXE table pointer width.
 ```
 
-# 06-k. Qemu-system/KGDB Cooperation - SMM
+# 06-l. Qemu-system/KGDB Cooperation - SMM
 ## smm-dump
 
-Dump SMRAM to disk when the CPU is in System Management Mode.
-
-By default dumps only when :func:`is_in_smm` is True (i.e. ``$pc`` lies
-inside the SMRAM physical range) -- otherwise prints a warning and exits.
-Pass ``--force`` to dump regardless of the in-SMM verdict (useful for
-inspecting SMRAM contents without first driving the guest into SMM) and
-``--commit`` to actually write bytes (without it the command is a dry run,
-mirroring :class:`SmartMemoryDumpCommand`).
+Dump the detected SMRAM range to a file.
 
 
 ### Syntax
@@ -10583,22 +12888,23 @@ usage: smm-dump [-h] [-f] [-c]
 
 options:
   -h, --help    show this help message and exit
-  -f, --force   dump even if the CPU is not currently in SMM.
-  -c, --commit  actually write the dump file (without this flag, dry run only).
+  -f, --force   try to dump even when the current CPU is not in SMM.
+  -c, --commit  actually perform the dump.
 ```
 
 ### Examples
 
 ```gdb
-smm-dump                   # dry run; prints where the dump would go
-smm-dump --commit          # dump SMRAM only if in SMM
-smm-dump --commit --force  # dump SMRAM regardless of in-SMM status
+smm-dump
+smm-dump --commit
+smm-dump --commit --force
 ```
 
 ### Notes
 
 ```text
-When `is_in_smm()` is True, SMRAM is read via virtmode :func:`read_memory` (GDB's `m` packet routes through the CPU's current AS, which during SMM is the per-CPU SMM AS); falls back to :func:`read_physmem` only if the virtmode read is empty. Physmode/`monitor xp`/`monitor gpa2hva` paths use the system AS, where the chipset's SMRAM overlay is masked by D_OPEN and reads return `0xff` or `pc.ram` zero-fill, never real SMM bytes.
+An in-SMM dump uses the current CPU's SMM address space.
+A forced dump outside SMM is best-effort because chipset access controls may return masked bytes.
 ```
 
 ## smm-info
@@ -10637,55 +12943,53 @@ Only meaningful when debugging qemu-system-x86[_64]. SMBASE is polled best-effor
 
 ## smm-status
 
-Tell whether the CPU is currently in System Management Mode (SMM).
-
-Detection heuristic: in SMM the CPU executes from a code window inside the
-SMRAM physical region (SMBASE + 0x8000 in the legacy DOS layout, an
-arbitrary address inside TSEG on modern Q35). ``$pc in SMRAM`` is therefore
-a reliable in-SMM indicator on QEMU. The command also scans
-``monitor info registers`` for an SMM token as a secondary cross-check and
-reports whichever signals fire.
+Display the current SMM status and an SMRAM preview.
 
 
 ### Syntax
 
 ```text
-usage: smm-status [-h] [-q]
+usage: smm-status [-h] [-q] [-n]
 
 options:
-  -h, --help   show this help message and exit
-  -q, --quiet  print only `in_smm` or `not_in_smm` (scriptable).
+  -h, --help      show this help message and exit
+  -q, --quiet     print only in_smm, not_in_smm, or unknown.
+  -n, --no-pager  do not use the pager.
 ```
 
 ### Examples
 
 ```gdb
-smm-status        # show in-SMM verdict with rationale
-smm-status --quiet # script-friendly single-token output
+smm-status
+smm-status --quiet
 ```
 
 ### Notes
 
 ```text
-Only meaningful when debugging qemu-system-x86[_64]. SMM has no dedicated architectural flag exposed via the gdb stub, so detection relies on $pc lying within the SMRAM physical range resolved from `monitor info mtree -f`.
+The QEMU monitor SMM flag is preferred.
+On older QEMU builds, the physical instruction address is compared with the detected SMRAM range.
+The preview uses the physical instruction address in SMRAM, or the detected SMRAM base.
 ```
 
 # 07-a. Misc - Conversion
 ## addressify
 
-Convert reverse-order hex values to address.
+Convert hex bytes to an address using the specified byte order.
 
 
 ### Syntax
 
 ```text
-usage: addressify [-h] VALUE [VALUE ...]
+usage: addressify [-h] [-b {little,big}] VALUE [VALUE ...]
 
 positional arguments:
-  VALUE       the string to convert.
+  VALUE                 the string to convert.
 
 options:
-  -h, --help  show this help message and exit
+  -h, --help            show this help message and exit
+  -b, --byte-order {little,big}
+                        the input byte order (default: little, independent of the target).
 ```
 
 ### Examples
@@ -10693,6 +12997,7 @@ options:
 ```gdb
 addressify "00 30 e0 f7 ff 7f"
 addressify 00 30 e0 f7 ff 7f
+addressify --byte-order big 7f ff f7 e0 30 00
 ```
 
 ## convert
@@ -10766,9 +13071,80 @@ convert value "\\x41\\x42\\x43\\x44" -v
 convert value --hex "41 42 43 44" -v
 ```
 
+## cpp-demangle
+
+Demangle C++ names by the Itanium C++ ABI.
+
+
+### Syntax
+
+```text
+usage: cpp-demangle [-h] [-t] NAME [NAME ...]
+
+positional arguments:
+  NAME        the mangled name to demangle.
+
+options:
+  -h, --help  show this help message and exit
+  -t, --type  demangle types such as RTTI names (e.g., `St9exception`).
+```
+
+### Examples
+
+```gdb
+cpp-demangle _ZNK2ns3Foo3barEiPKc
+cpp-demangle _ZTV3Foo _ZTI3Foo
+cpp-demangle -t N2ns3FooE
+```
+
+### Notes
+
+```text
+Uses the demangler of GDB (`demangle -l c++`).
+```
+
+## cpp-mangle
+
+Mangle a C++ name by the Itanium C++ ABI.
+
+
+### Syntax
+
+```text
+usage: cpp-mangle [-h] [-t] NAME [NAME ...]
+
+positional arguments:
+  NAME        the demangled name to mangle.
+
+options:
+  -h, --help  show this help message and exit
+  -t, --type  mangle a type (the form of RTTI names) instead of a function or variable.
+```
+
+### Examples
+
+```gdb
+cpp-mangle 'ns::Foo::bar(int, char const*) const'
+cpp-mangle 'std::vector<int, std::allocator<int> >::push_back(int const&)'
+cpp-mangle 'vtable for ns::Foo'
+cpp-mangle -t 'ns::Foo*'
+```
+
+### Notes
+
+```text
+Uses the Itanium C++ ABI (Linux GCC/Clang). NAME is written in the form printed by `cpp-demangle`.
+Typedefs and default template arguments are not expanded (e.g., write std::basic_string<...> instead of std::string).
+Constructors and destructors are encoded as the complete object variants (C1/D1).
+An operator with one parameter in a scope is treated as a binary member operator.
+Template parameter references (T_), parameter packs and internal linkage are not recovered from the demangled form,
+so function templates and such symbols may differ from the compiler output.
+Lambdas, unnamed types and expressions in template arguments are unsupported.
+```
+
 ## u2d
 
-Convert type (unsigned long <-> double/float).
+Compare bit reinterpretation and numeric conversion for double/float and unsigned integers.
 
 
 ### Syntax
@@ -10777,7 +13153,7 @@ Convert type (unsigned long <-> double/float).
 usage: u2d [-h] VALUE
 
 positional arguments:
-  VALUE       the hex value or double value.
+  VALUE       an integer (decimal/hex) or floating-point value.
 
 options:
   -h, --help  show this help message and exit
@@ -10794,7 +13170,9 @@ u2d 1.2345e-1
 ### Notes
 
 ```text
-Only ~64bit supported (Unsupported 80bit, 128bit)
+Supports 32-bit float/uint and 64-bit double/ull (not 80-bit or 128-bit).
+Integer inputs use their low 64/32 bits; use a decimal point or exponent for floating-point input.
+Integer round trips outside the unsigned range are marked <out of range>.
 ```
 
 ## unsigned
@@ -10823,25 +13201,27 @@ unsigned -- -0xa0
 # 07-b. Misc - Search
 ## constgrep
 
-Grep for lines with #define in files under /usr/include.
+Grep for lines with #define in header files (default: host /usr/include).
 
 
 ### Syntax
 
 ```text
-usage: constgrep [-h] GREP_PATTERN
+usage: constgrep [-h] [-r DIRECTORY] GREP_PATTERN
 
 positional arguments:
-  GREP_PATTERN  filter by regex.
+  GREP_PATTERN          filter by regex.
 
 options:
-  -h, --help    show this help message and exit
+  -h, --help            show this help message and exit
+  -r, --root DIRECTORY  header search directory (e.g. SYSROOT/usr/include; default: host /usr/include).
 ```
 
 ### Examples
 
 ```gdb
 constgrep '__NR_*'
+constgrep -r /path/to/sysroot/usr/include '__NR_*'
 ```
 
 # 07-c. Misc - Generation
@@ -10913,7 +13293,7 @@ Search for the cyclic de Bruijn pattern generated by the `pattern create`.
 ### Syntax
 
 ```text
-usage: pattern search [-h] [-c CHARSET] PATTERN [SIZE]
+usage: pattern search [-h] [-c CHARSET] [-w {1,2,4,8}] PATTERN [SIZE]
 
 positional arguments:
   PATTERN               the pattern to offset search.
@@ -10923,6 +13303,8 @@ options:
   -h, --help            show this help message and exit
   -c, --charset CHARSET
                         the charset of pattern. (default: abc..z)
+  -w, --width {1,2,4,8}
+                        the integer search width in bytes. (default: target pointer size)
 ```
 
 ### Examples
@@ -10967,6 +13349,7 @@ print-format -f py -b 8 -l 256 $rsp
 ```text
 "hexn" means hex with new-line.
 "hexs" means hex with separator.
+JavaScript uses BigInt for 64-bit values.
 ```
 
 # 07-d. Misc - Show Example
@@ -10992,14 +13375,16 @@ Hint for sigreturn oriented programming.
 ### Syntax
 
 ```text
-usage: srop-hint [-h] [{x86,x64,arm,aarch64}]
+usage: srop-hint [-h] [--abi {linux,linux-compat,qemu-user}] [{x86,x64,arm,aarch64,riscv32,riscv64,mips,mipsn32,mips64,ppc64,s390x,loongarch64,sparc64,sh4,m68k,alpha,hppa}]
 
 positional arguments:
-  {x86,x64,arm,aarch64}
+  {x86,x64,arm,aarch64,riscv32,riscv64,mips,mipsn32,mips64,ppc64,s390x,loongarch64,sparc64,sh4,m68k,alpha,hppa}
                         the target architecture.
 
 options:
   -h, --help            show this help message and exit
+  --abi {linux,linux-compat,qemu-user}
+                        the signal frame ABI for SPARC64, m68k or PA-RISC32. (default: detect QEMU-user, else Linux)
 ```
 
 # 07-e. Misc - Calculation
@@ -11225,13 +13610,16 @@ Dump memory regions for qemu-system.
 ### Syntax
 
 ```text
-usage: qemu-system-memory-region-dump [-h] [-s] [-n] [-q]
+usage: qemu-system-memory-region-dump [-h] [-s] [--meta] [--qemu-version VERSION] [-n] [-q]
 
 options:
-  -h, --help      show this help message and exit
-  -s, --smart     show only entries where read or write is not the default.
-  -n, --no-pager  do not use the pager.
-  -q, --quiet     enable quiet mode.
+  -h, --help            show this help message and exit
+  -s, --smart           show unique ops with read/write callbacks, including attribute-aware callbacks.
+  --meta                display offset information.
+  --qemu-version VERSION
+                        QEMU version when debug information is unavailable.
+  -n, --no-pager        do not use the pager.
+  -q, --quiet           enable quiet mode.
 ```
 
 # 99. GEF Maintenance Command
@@ -11260,7 +13648,7 @@ Add the command alias.
 ### Syntax
 
 ```text
-usage: aliases add [-h] [-r] ALIAS COMMAND [COMMAND ...]
+usage: aliases add [-h] [-r] ALIAS ...
 
 positional arguments:
   ALIAS         the name of new alias.
@@ -11268,7 +13656,7 @@ positional arguments:
 
 options:
   -h, --help    show this help message and exit
-  -r, --repeat  enforce repeat feature.
+  -r, --repeat  enforce repeat feature (before ALIAS).
 ```
 
 ### Examples
@@ -11509,7 +13897,7 @@ options:
 
 ## gef reset-cache
 
-Reset all caches (both Cache.cache_until_next and Cache.cache_this_session).
+Reset all caches.
 
 - Alias: `reset-cache`
 

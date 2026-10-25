@@ -29,7 +29,7 @@ from gef.commands.base import (
 from gef.core import runtime
 from gef.core.address import AddressUtil, Permission
 from gef.core.cache import Cache
-from gef.core.color import Color, err, gef_print, ok, titlify, warn
+from gef.core.color import Color, err, gef_print, info, ok, titlify, warn
 from gef.core.config import Config
 from gef.core.events import EventHooking
 from gef.core.heap import GlibcHeapBinsDump
@@ -118,6 +118,9 @@ class GlibcHeapCommand(GenericCommand):
         "- 2.42: tcache_perthread_struct.counts changes to num_slots.",
         "- 2.43: fastbins are removed.",
         "- 2.43: TCACHE_FILL_COUNT 7->16.",
+        "",
+        "Under qemu-user, multi-threaded mips/mipsn32/mips64/m68k targets may produce unreliable TLS/heap results",
+        "because ExecAsm/ExecSyscall can fail after thread switches.",
     ]
     _note_ = "\n".join(_note_)
 
@@ -133,6 +136,7 @@ class GlibcHeapCommand(GenericCommand):
     def do_invoke(self, args):
         self.usage()
         return
+
 
 
 @register_command
@@ -3573,6 +3577,15 @@ class TraceFreeBreakpoint(gdb.Breakpoint):
 
         return False
 
+    def check_nested(self, to_free):
+        tid = Pid.get_tid()
+        for bp in gdb.breakpoints():
+            if isinstance(bp, TraceFreeRetBreakpoint) and bp.enabled:
+                if (bp.traced_inferior == self.traced_inferior
+                        and bp.tid == tid and bp.to_free == to_free.value):
+                    return True
+        return False
+
 
 @register_command
 class GlibcHeapTracerCommand(GenericCommand):
@@ -3594,40 +3607,53 @@ class GlibcHeapTracerCommand(GenericCommand):
     ]
     _note_ = "\n".join(_note_)
 
-    heap_allocated_list = []
-    heap_freed_list = []
-    heap_breakpoints = []
-    heap_action_index = 0
+    heap_states = {}
 
     @staticmethod
-    def clear_disabled_breakpoints(force=False):
-        names = [
-            "TraceMallocRetBreakpoint",
-            "TraceReallocRetBreakpoint",
-        ]
+    def get_state(inferior=None):
+        if inferior is None:
+            inferior = gdb.selected_inferior()
+        return GlibcHeapTracerCommand.heap_states.get(inferior, {
+            "allocated": [], "freed": [], "breakpoints": [], "action_index": 0,
+        })
 
-        for bp in gdb.breakpoints():
-            try:
-                if bp.__class__.__name__ not in names:
+    @staticmethod
+    def add_breakpoint(bp):
+        bp.traced_inferior = gdb.selected_inferior()
+        bp.state = GlibcHeapTracerCommand.get_state(bp.traced_inferior)
+        if hasattr(gdb.Breakpoint, "inferior") and bp.thread is None:
+            bp.inferior = bp.traced_inferior.num
+        bp.state["breakpoints"].append(bp)
+        return
+
+    @staticmethod
+    def clear_disabled_breakpoints(force=False, inferior=None):
+        state = GlibcHeapTracerCommand.get_state(inferior)
+        for bp in state["breakpoints"][:]:
+            if not bp.is_valid():
+                state["breakpoints"].remove(bp)
+                continue
+            if force is False:
+                if not isinstance(bp, (TraceMallocRetBreakpoint, TraceReallocRetBreakpoint, TraceFreeRetBreakpoint)):
                     continue
-                if force is False and bp.enabled:
+                if bp.enabled:
                     continue
-                bp.delete()
-            except Exception:
-                pass
+            bp.delete()
+            state["breakpoints"].remove(bp)
         return
 
     def dump_tracked_allocations(self):
-        if GlibcHeapTracerCommand.heap_allocated_list:
+        state = self.get_state()
+        if state["allocated"]:
             ok("Tracked as in-use chunks:")
-            for action_idx, addr, sz in GlibcHeapTracerCommand.heap_allocated_list:
+            for action_idx, addr, sz in state["allocated"]:
                 gef_print("{:d}: {!s} = allocate({:#x})".format(action_idx, addr, sz))
         else:
             ok("No allocated chunk tracked")
 
-        if GlibcHeapTracerCommand.heap_freed_list:
+        if state["freed"]:
             ok("Tracked as freed chunks:")
-            for action_idx, addr, _sz in GlibcHeapTracerCommand.heap_freed_list:
+            for action_idx, addr, _sz in state["freed"]:
                 gef_print("{:#d}: free({!s})".format(action_idx, addr))
         else:
             ok("No freed chunk tracked")
@@ -3638,15 +3664,18 @@ class GlibcHeapTracerCommand(GenericCommand):
         def setup_breakpoints(bp_class, name):
             try:
                 address = AddressUtil.parse_address(name)
-                address = ProcessMap.lookup_address(address)
+                address = ProcessMap.lookup(address)
             except gdb.error:
-                warn("breakpoint setup failed: {:#x}".format(name))
+                warn("breakpoint setup failed: {:s}".format(name))
                 return
-            bp = bp_class(name, address, self.output_filename)
-            GlibcHeapTracerCommand.heap_breakpoints.append(bp)
+            bp_class(name, address, self.output_filename)
             return
 
         self.clean(None)
+        if not GlibcHeapTracerCommand.heap_states:
+            EventHooking.gef_on_exit_hook(self.clean)
+        inferior = gdb.selected_inferior()
+        GlibcHeapTracerCommand.heap_states[inferior] = self.get_state(inferior)
 
         ok("Tracking malloc()")
         setup_breakpoints(TraceMallocBreakpoint, "malloc")
@@ -3671,27 +3700,21 @@ class GlibcHeapTracerCommand(GenericCommand):
         ok("Tracking valloc()")
         setup_breakpoints(TraceMallocBreakpoint, "valloc")
 
-        EventHooking.gef_on_exit_hook(self.clean)
         return
 
     def clean(self, event):
+        if event is not None:
+            inferior = event.inferior
+        else:
+            inferior = gdb.selected_inferior()
+        if inferior not in GlibcHeapTracerCommand.heap_states:
+            return
         ok("{:s} - Cleaning up".format(Color.colorify("Heap-Analysis", "bold yellow")))
-        for bp in GlibcHeapTracerCommand.heap_breakpoints:
-            try:
-                bp.delete()
-            except Exception:
-                pass
+        GlibcHeapTracerCommand.clear_disabled_breakpoints(force=True, inferior=inferior)
+        del GlibcHeapTracerCommand.heap_states[inferior]
 
-        GlibcHeapTracerCommand.clear_disabled_breakpoints(force=True)
-        GlibcHeapTracerCommand.heap_breakpoints = []
-        GlibcHeapTracerCommand.heap_allocated_list = []
-        GlibcHeapTracerCommand.heap_freed_list = []
-        GlibcHeapTracerCommand.heap_action_index = 0
-
-        try:
+        if not GlibcHeapTracerCommand.heap_states:
             EventHooking.gef_on_exit_unhook(self.clean)
-        except Exception:
-            pass
         return
 
     @parse_args
@@ -3714,4 +3737,25 @@ class GlibcHeapTracerCommand(GenericCommand):
             self.output_filename = ""
 
         self.setup()
+        return
+
+
+class TraceFreeRetBreakpoint(gdb.FinishBreakpoint):
+    """Track the lifetime of a free() call."""
+
+    def __init__(self, to_free):
+        super().__init__(gdb.newest_frame(), internal=True)
+        self.silent = True
+        self.tid = Pid.get_tid()
+        self.to_free = to_free.value
+        GlibcHeapTracerCommand.clear_disabled_breakpoints()
+        GlibcHeapTracerCommand.add_breakpoint(self)
+        return
+
+    def stop(self):
+        self.enabled = False
+        return False
+
+    def out_of_scope(self): # noqa: V105
+        self.enabled = False
         return

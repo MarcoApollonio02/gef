@@ -191,6 +191,12 @@ class RISCV(Architecture):
     def encode_cookie(self, value, cookie):
         return value
 
+    def decode_cookie_legacy(self, value, cookie):
+        return value
+
+    def encode_cookie_legacy(self, value, cookie):
+        return value
+
 
 class RISCV64(RISCV):
     """GEF representation of RISCV-64 architecture."""

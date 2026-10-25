@@ -598,7 +598,7 @@ further debugging may prove unreliable.
 ...
 ```
 If so, this is caused by the `continue-for-qemu-user` command.
-This problem occurs only when the configuration option `continue_for_qemu_user.use_fork` is set to `False`.
+The command always monitors `Ctrl+C` in a forked child process, so there is no setting to switch its mode.
 
 `continue-for-qemu-user` is a wrapper for the `c`(`continue`) command that allows `Ctrl+C` to be accepted even during `continue` under `qemu-user`.
 On some architectures, this wrapper may not work properly when running dynamically linked binaries with `qemu-user`.

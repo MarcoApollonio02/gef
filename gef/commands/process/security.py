@@ -12,6 +12,7 @@ import struct
 import gdb
 
 from gef.commands.base import (
+    ContextManager,
     BufferingOutput,
     GenericCommand,
     exclude_specific_arch,
@@ -24,21 +25,26 @@ from gef.commands.base import (
     require_arch_set,
 )
 from gef.core import runtime
-from gef.core.address import Address, AddressUtil, Permission
+from gef.core.address import Address, AddressUtil, Endian, Permission
 from gef.core.auxv import Auxv
 from gef.core.bitinfo import BitInfo
 from gef.core.cache import Cache
 from gef.core.color import Color, err, gef_print, info, ok, titlify, warn
 from gef.core.config import Config
 from gef.core.elf import Checksec, Elf
-from gef.core.exec import ExecAsm
+from gef.core.exec import ExecAsm, ExecSyscall
+from gef.core.syscall import Syscall
 from gef.core.instruction import get_insn
-from gef.core.memory import is_valid_addr, read_int_from_memory, read_memory, u32, u64
+from gef.core.memory import is_valid_addr, read_int_from_memory, read_memory, u32, u64, write_memory
 from gef.core.process import (
+    LinuxSignal,
     Path,
     Pid,
     ProcessMap,
     get_pagesize,
+    is_core_file,
+    is_32bit,
+    is_64bit,
     is_alive,
     is_arm32,
     is_arm32_cortex_m,
@@ -57,11 +63,11 @@ from gef.core.process import (
     is_x86_64,
 )
 from gef.core.symbols import Symbol
-from gef.core.utils import GefUtil, slice_unpack
+from gef.core.utils import GefUtil, slice_unpack, u2i, align_to_ptrsize, get_libc_version
 
 @register_command
 class CanaryCommand(GenericCommand):
-    """Display the canary value of the current process from auxv information."""
+    """Display the canary value of the current process."""
 
     _cmdline_ = "canary"
     _category_ = "02-f. Process Information - Security"
@@ -70,23 +76,52 @@ class CanaryCommand(GenericCommand):
     _syntax_ = parser.format_help()
 
     @staticmethod
-    @Cache.cache_this_session
+    @Cache.cache_this_session(cache_None=False, until_new_objfile=True)
     def gef_read_canary():
-        """Read the canary of a running process using Auxiliary Vector.
-        Return a tuple of (canary, location) if found, None otherwise."""
+        """Read the current stack canary and return its value and location."""
         if is_in_kernel():
             return None
 
-        try:
-            auxval = Auxv.get_auxiliary_values()
-            if not auxval:
+        libc_version = get_libc_version(silent=True)
+        if SignalHandlersCommand.get_libc() == "musl" or (libc_version and libc_version >= (2, 44)):
+            # musl uses the TLS guard; from glibc 2.44, AT_RANDOM will be refilled
+            canary_offset = runtime.current_arch.get_canary_offset()
+            if canary_offset is not None:
+                try:
+                    tls = runtime.current_arch.get_tls()
+                    if tls is not None:
+                        canary_location = tls + canary_offset
+                        canary = read_int_from_memory(canary_location)
+                        # The canary address in TLS differs between threads, so only cache its value.
+                        return canary, None
+                except Exception:
+                    return None
+            else:
+                try:
+                    canary_location = Symbol.resolve_address("__stack_chk_guard")
+                    if canary_location is None:
+                        return None
+                    canary = read_int_from_memory(canary_location)
+                    return canary, canary_location
+                except (gdb.error, gdb.MemoryError):
+                    return None
+        else:
+            try:
+                auxval = Auxv.get_auxiliary_values()
+                if not auxval:
+                    return None
+                canary_location = auxval["AT_RANDOM"]
+                canary = read_int_from_memory(canary_location)
+                if Endian.is_big_endian():
+                    if is_64bit():
+                        canary &= 0x00ff_ffff_ffff_ffff
+                    elif is_32bit():
+                        canary &= 0x00ff_ffff
+                else:
+                    canary &= ~0xff
+                return canary, canary_location
+            except (KeyError, gdb.MemoryError):
                 return None
-            canary_location = auxval["AT_RANDOM"]
-            canary = read_int_from_memory(canary_location)
-            canary &= ~0xff
-            return canary, canary_location
-        except (KeyError, gdb.MemoryError):
-            return None
 
     def dump_canary(self):
         res = CanaryCommand.gef_read_canary()
@@ -94,16 +129,17 @@ class CanaryCommand(GenericCommand):
             err("Failed to get the canary")
             return
 
-        canary, location = res
+        canary, canary_location = res
         gef_print(titlify("Canary value"))
-        info("Found AT_RANDOM at {!s}, reading {:d} bytes".format(
-            ProcessMap.lookup_address(location), runtime.current_arch.ptrsize,
-        ))
+        if canary_location is not None:
+            info("Found canary at {!s}, reading {:d} bytes".format(
+                ProcessMap.lookup(canary_location), runtime.current_arch.ptrsize,
+            ))
         info("The canary is {:s}".format(Color.colorify_hex(canary, "bold")))
 
         gef_print(titlify("Found canaries"))
         vmmap = ProcessMap.get_process_maps_exclude_special_regions(allow_vdso=True)
-        unpack = u32 if runtime.current_arch.ptrsize == 4 else u64
+        unpack = GefUtil.get_unpack()
         sp = runtime.current_arch.sp
         printed_flag_sp = False
         for m in vmmap:
@@ -111,9 +147,8 @@ class CanaryCommand(GenericCommand):
                 continue
             if not (m.permission & Permission.WRITE):
                 continue
-            try:
-                data = read_memory(m.page_start, m.page_end - m.page_start)
-            except gdb.MemoryError:
+            data = read_memory(m.page_start, m.page_end - m.page_start, safe=True)
+            if data is None:
                 continue
             prev_addr = -1
             for pos in range(0, m.page_end - m.page_start, runtime.current_arch.ptrsize):
@@ -127,14 +162,14 @@ class CanaryCommand(GenericCommand):
                     path = m.path
                 if prev_addr <= sp <= addr:
                     if printed_flag_sp is False:
-                        info("(Stack pointer is at {!s})".format(ProcessMap.lookup_address(sp)))
+                        info("(Stack pointer is at {!s})".format(ProcessMap.lookup(sp)))
                         printed_flag_sp = True
                 if path == "[stack]":
                     info("Found at {!s} in {!r} (sp{:+#x})".format(
-                        ProcessMap.lookup_address(addr), path, addr - sp,
+                        ProcessMap.lookup(addr), path, addr - sp,
                     ))
                 else:
-                    info("Found at {!s} in {!r}".format(ProcessMap.lookup_address(addr), path))
+                    info("Found at {!s} in {!r}".format(ProcessMap.lookup(addr), path))
                 prev_addr = addr
         return
 
@@ -144,6 +179,144 @@ class CanaryCommand(GenericCommand):
     @require_arch_set
     def do_invoke(self, args):
         self.dump_canary()
+        return
+
+
+
+@register_command
+class SignalHandlersCommand(GenericCommand, BufferingOutput):
+    """Display the signal dispositions of the current process."""
+
+    _cmdline_ = "sighands"
+    _category_ = "02-f. Process Information - Security"
+    _aliases_ = ["sigactions"]
+
+    parser = argparse.ArgumentParser(prog=_cmdline_)
+    parser.add_argument("-n", "--no-pager", action="store_true", help="do not use the pager.")
+    _syntax_ = parser.format_help()
+
+    @staticmethod
+    def get_rt_sigaction_number():
+        syscall_table = Syscall.get_syscall_table()
+        if syscall_table is None:
+            return None
+        for entry in syscall_table.nr_table.values():
+            if is_x86_64() and entry.nr >= 0x4000_0000:
+                continue
+            if entry.name == "rt_sigaction":
+                return entry.nr
+        return None
+
+    @staticmethod
+    def get_libc():
+        """Return the inferior's libc ("glibc" or "musl"), or None if it is unknown."""
+        for objfile in gdb.objfiles():
+            name = os.path.basename(objfile.filename or "")
+            if re.fullmatch(r"libc\.so\.6|libc-2\.\d+\.so", name):
+                return "glibc"
+            if re.fullmatch(r"(?:ld-musl|libc\.musl)-\w+\.so\.1", name):
+                return "musl"
+        if is_alive():
+            if Symbol.resolve_address("__init_libc") and Symbol.resolve_address("__libc"):
+                return "musl"
+            if is_x86_64():
+                try:
+                    tls = runtime.current_arch.get_tls()
+                    if tls is not None and read_int_from_memory(tls + 0x30) == gdb.selected_thread().ptid[1]:
+                        return "musl"
+                except (gdb.error, gdb.MemoryError, AttributeError):
+                    pass
+        return None
+
+    @staticmethod
+    def get_layout():
+        if is_64bit():
+            return {"size": 32, "handler": 0, "flags": 8, "restorer": 16, "mask": 24}
+        return {"size": 20, "handler": 0, "flags": 4, "restorer": 8, "mask": 12}
+
+    @staticmethod
+    def unpack_word(data, offset):
+        size = runtime.current_arch.ptrsize
+        unpack = GefUtil.get_unpack(size)
+        return unpack(data[offset:offset + size])
+
+    def query(self, syscall_number, signal_number, address, layout):
+        write_memory(address, b"\x00" * layout["size"])
+        state = ExecSyscall(syscall_number, [signal_number, 0, address, 8]).exec_code()
+        result = state["reg"][runtime.current_arch.return_register]
+        result = u2i(result, runtime.current_arch.ptrsize * 8)
+        if result != 0:
+            return result, None
+
+        data = read_memory(address, layout["size"])
+        action = {name: self.unpack_word(data, offset) for name, offset in layout.items() if name != "size"}
+        if runtime.current_arch.ptrsize == 4:
+            action["mask"] = u64(data[layout["mask"]:layout["mask"] + 8])
+        return 0, action
+
+    @staticmethod
+    def format_handler(handler):
+        if handler == 0:
+            return "SIG_DFL"
+        if handler == 1:
+            return "SIG_IGN"
+        symbol = Symbol.format(handler)
+        value = AddressUtil.format_address(handler, long_fmt=True)
+        return "{:s} {:s}".format(value, symbol).rstrip()
+
+    @parse_args
+    @only_if_gdb_running
+    @exclude_specific_gdb_mode(mode=("qemu-system", "kgdb", "vmware", "rr", "wine"))
+    @only_if_specific_arch(arch=("x86_32", "x86_64", "ARM32", "ARM64"))
+    @require_arch_set
+    def do_invoke(self, args):
+        syscall_number = self.get_rt_sigaction_number()
+        if syscall_number is None:
+            err("Could not find the rt_sigaction system call")
+            return
+
+        layout = self.get_layout()
+        address = runtime.current_arch.sp
+        with ContextManager.temporary_memory(address, length=layout["size"], safe=True) as backup:
+            if backup is None:
+                err("Could not reserve scratch space on the inferior stack")
+                return
+
+            actions = []
+            with ContextManager.gdb_parameter("suppress-cli-notifications", "on", ignore_error=True):
+                for signal_number in range(1, 65):
+                    result, action = self.query(syscall_number, signal_number, address, layout)
+                    if result == -22 and signal_number in (9, 19): # SIGKILL and SIGSTOP cannot be queried.
+                        action = {"handler": 0, "flags": 0, "restorer": 0, "mask": 0}
+                    elif result != 0:
+                        err("rt_sigaction({:d}) failed with errno {:d}".format(signal_number, -result))
+                        return
+                    actions.append((signal_number, action))
+
+        libc = self.get_libc()
+        names = {number: name for number, name in LinuxSignal.NAMES.items() if number < 32}
+        names.update(LinuxSignal.LIBC_NAMES.get(libc, {}))
+
+        rows = []
+        for signal_number, action in actions:
+            rows.append((
+                str(signal_number), names.get(signal_number, "SIG{:d}".format(signal_number)),
+                self.format_handler(action["handler"]), LinuxSignal.format_flags(action["flags"]),
+                LinuxSignal.format_mask(action["mask"], names),
+            ))
+
+        handler_width = max(30, max(len(Color.remove_color(row[2])) for row in rows))
+        fmt = "{:<3s} {:<14s} {:s}{:s} {:<42s} {:s}"
+        header = fmt.format("Num", "Signal", "Handler", " " * (handler_width - len("Handler")), "Flags", "Mask")
+        if libc:
+            title = "Signal dispositions ({:s})".format(libc)
+        else:
+            title = "Signal dispositions"
+        self.out = [titlify(title), GefUtil.make_legend(header)]
+        for number, name, handler, flags, mask in rows:
+            padding = " " * (handler_width - len(Color.remove_color(handler)))
+            self.out.append(fmt.format(number, name, handler, padding, flags, mask).rstrip())
+        self.print_output(check_terminal_size=True)
         return
 
 
@@ -355,41 +528,225 @@ class PtrDemangleCommand(GenericCommand):
                        help="the value to demangle.")
     group.add_argument("--source", action="store_true",
                        help="shows the source instead of displaying demangled value.")
+    parser.add_argument("-f", "--force-heuristic", action="store_true", help="do not use symbols to detect PTR_MANGLE")
     _syntax_ = parser.format_help()
 
     @staticmethod
+    def get_relro_range(base):
+        elf = Elf.get_elf(base)
+        if elf is None:
+            return None
+        phdr = elf.get_phdr(Elf.Phdr.PT_GNU_RELRO)
+        if phdr is None:
+            return None
+
+        if elf.e_type == Elf.ET_DYN:
+            load_bias = base
+        else:
+            load_bias = 0
+        start = align_to_ptrsize(load_bias + phdr.p_vaddr)
+        end = align_to_ptrsize(load_bias + phdr.p_vaddr + phdr.p_memsz)
+        if start + runtime.current_arch.ptrsize > end:
+            return None
+        return start, end
+
+    @staticmethod
+    def get_cookie_from_rtld_relro(libc_version):
+        # Find _dl_argv and nearby guard variables in rtld RELRO when available.
+        try:
+            auxv = Auxv.get_auxiliary_values()
+            if not auxv or not auxv.get("AT_BASE"):
+                return None
+            relro = PtrDemangleCommand.get_relro_range(auxv["AT_BASE"])
+        except (gdb.error, gdb.MemoryError):
+            return None
+        if relro is None:
+            return None
+
+        def is_stack_address(addr):
+            return ProcessMap.lookup(addr).is_in_stack_segment()
+
+        start, end = relro
+        ptrsize = runtime.current_arch.ptrsize
+        # _dl_skip_args occupied one slot between _dl_argv and the guards until glibc 2.35.
+        guard_distance = 1 + int(libc_version < (2, 36)) + int(runtime.current_arch.get_canary_offset() is None)
+
+        """
+        x86_64 glibc 2.44
+        0x7ffff7ffcab0|+0x0000|+000: __pointer_chk_guard_local: 0xc1e710f8603f8d46
+        0x7ffff7ffcab8|+0x0008|+001: _dl_argv                 : 0x00007fffffffe538  ->  0x00007fffffffe769  ->  ...
+        0x7ffff7ffcac0|+0x0010|+002: _dl_argc                 : 0x0000000000000001
+
+        x86_64 glibc 2.35
+        0x7ffff7ffcab0|+0x0000|+000: __pointer_chk_guard_local: 0xf6bede021604f3c4
+        0x7ffff7ffcab8|+0x0008|+001: _dl_skip_args            : 0x0000000000000000
+        0x7ffff7ffcac0|+0x0010|+002: _dl_argv                 : 0x00007fffffffe738  ->  0x00007fffffffe93e  ->  ...
+        0x7ffff7ffcac8|+0x0018|+003: _dl_argc                 : 0x0000000000000001
+        """
+
+        for argv_slot in range(start, end, ptrsize):
+            try:
+                argv = read_int_from_memory(argv_slot)
+                if not is_stack_address(argv) or not is_stack_address(read_int_from_memory(argv)):
+                    continue
+            except (gdb.error, gdb.MemoryError, TypeError):
+                continue
+
+            for direction in (-1, 1):
+                argc_slot = argv_slot + direction * ptrsize
+                if argc_slot < start or argc_slot + 4 > end:
+                    continue
+                try:
+                    # _dl_argc check
+                    argc = u32(read_memory(argc_slot, 4))
+                    if not 1 <= argc <= 0x1000:
+                        continue
+                    # _dl_argv_check
+                    if any(not is_stack_address(read_int_from_memory(argv + i * ptrsize)) for i in range(min(argc, 4))):
+                        continue
+                    if read_int_from_memory(argv + argc * ptrsize) != 0:
+                        continue
+
+                    guard_slot = argv_slot - direction * ptrsize * guard_distance
+                    if not start <= guard_slot or guard_slot + ptrsize > end:
+                        continue
+                    cookie = read_int_from_memory(guard_slot)
+                    if cookie != 0:
+                        return cookie
+                except (gdb.error, gdb.MemoryError, TypeError):
+                    pass
+        return None
+
+    @staticmethod
+    def get_cookie_from_static_relro():
+        # In a stripped static binary, keep only RELRO slots that are zero in the file and randomized at runtime.
+        codebase = ProcessMap.get_codebase()
+        if codebase is None:
+            return None
+
+        elf = Elf.get_elf(codebase)
+        if elf is None or not elf.is_static():
+            return None
+
+        relro = PtrDemangleCommand.get_relro_range(codebase)
+        if relro is None:
+            return None
+
+        canary = None
+        try:
+            res = CanaryCommand.gef_read_canary()
+            if res is not None:
+                canary = res[0]
+        except Exception:
+            pass
+
+        start, end = relro
+        ptrsize = runtime.current_arch.ptrsize
+        unpack = GefUtil.get_unpack(ptrsize)
+        bits = ptrsize * 8
+        candidates = []
+        files = {}
+        for addr in range(start, end, ptrsize):
+            cookie = read_int_from_memory(addr, safe=True)
+            if cookie is None:
+                continue
+            if cookie == 0 or cookie == canary or is_valid_addr(cookie):
+                continue
+            ones = bin(cookie).count("1")
+            if not bits // 4 <= ones <= bits * 3 // 4:
+                continue
+
+            section = ProcessMap.process_lookup_address(addr)
+            if section is None or not section.path or section.path.startswith("["):
+                continue
+            if section.path not in files:
+                files[section.path], _ = GefUtil.read_mapped_file(section)
+            data = files[section.path]
+            if data is None:
+                continue
+            pos = section.offset + addr - section.page_start
+            original = data[pos:pos + ptrsize]
+            if len(original) == ptrsize and unpack(original) == 0:
+                candidates.append(cookie)
+
+        candidates = list(dict.fromkeys(candidates))
+        if len(candidates) == 1:
+            return candidates[0]
+        return None
+
+    @staticmethod
+    @Cache.cache_this_session(until_new_objfile=True)
+    def get_cookie_symbols():
+        """Return the pointer guard symbols that gdb is able to resolve.
+        gdb keeps no cache for a symbol it failed to find, so it rescans every symtab on
+        each attempt (2.5ms once the glibc debug symbols are loaded). get_cookie runs on
+        every stop, so the symbols that do not exist are dropped here once."""
+        symbols = []
+        for symbol in ("&__pointer_chk_guard", "&__pointer_chk_guard_local"):
+            try:
+                AddressUtil.parse_address(symbol)
+            except (gdb.error, OverflowError, ValueError):
+                continue
+            symbols.append(symbol)
+        return symbols
+
+    @staticmethod
     @Cache.cache_until_next
-    def get_cookie():
+    def get_cookie(force_heuristic=False):
         if is_in_kernel():
+            return None
+        if SignalHandlersCommand.get_libc() == "musl":
             return None
         if is_arm32_cortex_m():
             return None
         if is_qiling():
             return None
 
+        if not force_heuristic:
+            # glibc 2.44 stores the pointer guard in a RELRO variable on every architecture.
+            # rtld and several architectures used these variables before 2.44.
+            for symbol in PtrDemangleCommand.get_cookie_symbols():
+                try:
+                    cookie_ptr = AddressUtil.parse_address(symbol)
+                    return read_int_from_memory(cookie_ptr)
+                except (gdb.error, OverflowError):
+                    pass
+
+        libc_version = get_libc_version(silent=True)
+        if libc_version is None:
+            return None
+
+        # rtld keeps a RELRO copy of the pointer guard.
+        cookie = PtrDemangleCommand.get_cookie_from_rtld_relro(libc_version)
+        if cookie is not None:
+            return cookie
+
+        if libc_version >= (2, 44):
+            return PtrDemangleCommand.get_cookie_from_static_relro()
+
+        # fast path for x86/x64
         try:
+            # x86 stored the pointer guard in the TCB.
             if is_x86_64():
                 tls = runtime.current_arch.get_tls()
-                cookie = read_int_from_memory(tls + 0x30)
-                return cookie
-            elif is_x86_32():
+                if tls is not None:
+                    return read_int_from_memory(tls + 0x30)
+            if is_x86_32():
                 tls = runtime.current_arch.get_tls()
-                cookie = read_int_from_memory(tls + 0x18)
-                return cookie
-            elif is_arm32() or is_arm64():
-                cookie_ptr = AddressUtil.parse_address("&__pointer_chk_guard_local")
-                cookie = read_int_from_memory(cookie_ptr)
-                return cookie
+                if tls is not None:
+                    return read_int_from_memory(tls + 0x18)
         except (gdb.error, OverflowError):
             pass
 
-        # generic
+        # generic slow path
         try:
             auxv = Auxv.get_auxiliary_values()
             if auxv is None:
                 Cache.reset_gef_caches()
                 auxv = Auxv.get_auxiliary_values()
+            # The pointer guard is derived from the second uintptr_t at AT_RANDOM.
             if auxv and "AT_RANDOM" in auxv:
+                # Old s390x instead reused the stack guard with its least significant byte cleared.
                 if is_s390x():
                     cookie = read_int_from_memory(auxv["AT_RANDOM"]) & 0x00ff_ffff_ffff_ffff
                 else:
@@ -398,33 +755,42 @@ class PtrDemangleCommand(GenericCommand):
                     return cookie
         except gdb.error:
             pass
+
+        # Before glibc 2.44, try the static RELRO fallback on architectures where GEF does not have a TCB canary offset.
+        if runtime.current_arch.get_canary_offset() is None:
+            return PtrDemangleCommand.get_cookie_from_static_relro()
         return None
 
     @parse_args
-    @only_if_gdb_running
     @exclude_specific_gdb_mode(mode=("qemu-system", "kgdb", "vmware"))
-    @exclude_specific_arch(arch=("SPARC32", "XTENSA", "CRIS"))
+    @exclude_specific_arch(arch=("XTENSA", "CRIS"))
     @require_arch_set
     def do_invoke(self, args):
         if args.source:
             s = GefUtil.get_source(runtime.current_arch.decode_cookie)
             gef_print(s)
+            gef_print()
+            s = GefUtil.get_source(runtime.current_arch.decode_cookie_legacy)
+            gef_print(s)
             return
 
-        cookie = self.get_cookie()
+        if not is_alive():
+            warn("No debugging session active")
+            return
+
+        cookie = PtrDemangleCommand.get_cookie(force_heuristic=args.force_heuristic)
         if cookie is None:
             return
         info("Cookie is {:s}".format(Color.colorify_hex(cookie, "bold")))
 
         decoded = runtime.current_arch.decode_cookie(args.value, cookie)
-        decoded = ProcessMap.lookup_address(decoded)
-        decoded_sym = Symbol.get_symbol_string(decoded.value)
-        if is_valid_addr(decoded.value):
+        if is_valid_addr(decoded):
             valid_msg = Color.colorify("valid", "bold green")
         else:
             valid_msg = Color.colorify("invalid", "bold red")
-        info("Decoded value is {!s}{:s} [{:s}]".format(decoded, decoded_sym, valid_msg))
+        info("Decoded value is {:s} [{:s}]".format(Symbol.format(decoded, show_address=True), valid_msg))
         return
+
 
 
 @register_command
@@ -440,20 +806,27 @@ class PtrMangleCommand(GenericCommand):
                        help="the value to mangle.")
     group.add_argument("--source", action="store_true",
                        help="shows the source instead of displaying mangled value.")
+    parser.add_argument("-f", "--force-heuristic", action="store_true", help="do not use symbols to detect PTR_MANGLE")
     _syntax_ = parser.format_help()
 
     @parse_args
-    @only_if_gdb_running
     @exclude_specific_gdb_mode(mode=("qemu-system", "kgdb", "vmware"))
-    @exclude_specific_arch(arch=("SPARC32", "XTENSA", "CRIS"))
+    @exclude_specific_arch(arch=("XTENSA", "CRIS"))
     @require_arch_set
     def do_invoke(self, args):
         if args.source:
             s = GefUtil.get_source(runtime.current_arch.encode_cookie)
             gef_print(s)
+            gef_print()
+            s = GefUtil.get_source(runtime.current_arch.encode_cookie_legacy)
+            gef_print(s)
             return
 
-        cookie = PtrDemangleCommand.get_cookie()
+        if not is_alive():
+            warn("No debugging session active")
+            return
+
+        cookie = PtrDemangleCommand.get_cookie(force_heuristic=args.force_heuristic)
         if cookie is None:
             return
         info("Cookie is {:s}".format(Color.colorify_hex(cookie, "bold")))
@@ -461,6 +834,7 @@ class PtrMangleCommand(GenericCommand):
         encoded = runtime.current_arch.encode_cookie(args.value, cookie)
         info("Encoded value is {:#x}".format(encoded))
         return
+
 
 
 @register_command
@@ -472,6 +846,7 @@ class SearchMangledPtrCommand(GenericCommand):
     _aliases_ = ["cookie"]
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
+    parser.add_argument("-f", "--force-heuristic", action="store_true", help="do not use symbols to detect PTR_MANGLE")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="shows the section currently being searched.")
     _syntax_ = parser.format_help()
@@ -492,20 +867,24 @@ class SearchMangledPtrCommand(GenericCommand):
         return
 
     def print_loc(self, addr, value, decoded):
-        addr_sym = Symbol.get_symbol_string(addr)
-        decoded = ProcessMap.lookup_address(decoded)
-        decoded_sym = Symbol.get_symbol_string(decoded.value)
+        addr_sym = Symbol.format(addr)
+        if addr_sym:
+            addr_sym = " " + addr_sym
+        else:
+            addr_sym = ""
 
-        if is_valid_addr(decoded.value):
+        if is_valid_addr(decoded):
             valid_msg = Color.colorify("valid", "bold green")
         else:
             valid_msg = Color.colorify("invalid", "bold red")
 
-        base_address_color = Config.get_gef_setting("theme.dereference_base_address")
+        base_address_color = Config.get("theme.dereference_base_address")
         width = AddressUtil.get_format_address_width()
         addr = Color.colorify("{:#0{:d}x}".format(addr, width), base_address_color)
 
-        gef_print("  {:s}{:s}: {:#x} (={!s}{:s}) [{:s}]".format(addr, addr_sym, value, decoded, decoded_sym, valid_msg))
+        gef_print("  {:s}{:s}: {:#x} (={:s}) [{:s}]".format(
+            addr, addr_sym, value, Symbol.format(decoded, show_address=True), valid_msg,
+        ))
         return
 
     def search_mangled_ptr(self, start_address, end_address, cookie):
@@ -522,29 +901,35 @@ class SearchMangledPtrCommand(GenericCommand):
             else:
                 chunk_size = step
 
-            try:
-                mem = read_memory(chunk_addr, chunk_size)
-            except gdb.MemoryError:
-                # cannot access memory this range. It doesn't make sense to try any more
-                break
+            mem = read_memory(chunk_addr, chunk_size, safe=True)
+            if mem is not None:
+                mems = [(chunk_addr, mem)]
+            else:
+                # part of the range may have been unmapped after the maps were read, so retry per page
+                mems = []
+                for page in range(chunk_addr, chunk_addr + chunk_size, get_pagesize()):
+                    mem = read_memory(page, min(get_pagesize(), chunk_addr + chunk_size - page), safe=True)
+                    if mem is not None:
+                        mems.append((page, mem))
 
-            for i, value in enumerate(slice_unpack(mem, runtime.current_arch.ptrsize)):
-                decoded = runtime.current_arch.decode_cookie(value, cookie)
-                if not is_valid_addr(decoded):
-                    continue
-                addr = chunk_addr + i * runtime.current_arch.ptrsize
-                locations.append((addr, value, decoded))
-            del mem
+            for mem_addr, mem in mems:
+                for i, value in enumerate(slice_unpack(mem, runtime.current_arch.ptrsize)):
+                    decoded = runtime.current_arch.decode_cookie(value, cookie)
+                    if not is_valid_addr(decoded):
+                        continue
+                    addr = mem_addr + i * runtime.current_arch.ptrsize
+                    locations.append((addr, value, decoded))
+            del mems
         return locations
 
     @parse_args
     @only_if_gdb_running
     @exclude_specific_gdb_mode(mode=("qemu-system", "kgdb", "vmware", "wine"))
-    @exclude_specific_arch(arch=("SPARC32", "XTENSA", "CRIS"))
+    @exclude_specific_arch(arch=("XTENSA", "CRIS"))
     @require_arch_set
     def do_invoke(self, args):
         # init
-        cookie = PtrDemangleCommand.get_cookie()
+        cookie = PtrDemangleCommand.get_cookie(force_heuristic=args.force_heuristic)
         if cookie is None:
             return
         info("Cookie is {:s}".format(Color.colorify_hex(cookie, "bold")))
@@ -581,6 +966,7 @@ class SearchMangledPtrCommand(GenericCommand):
         return
 
 
+
 @register_command
 class ChecksecCommand(GenericCommand):
     """Check the security properties of the current executable or passed as argument."""
@@ -590,8 +976,7 @@ class ChecksecCommand(GenericCommand):
     _aliases_ = ["cs"]
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
-    parser.add_argument("-r", "--remote", action="store_true",
-                        help="parse remote binary if download feature is available.")
+    parser.add_argument("-r", "--remote", action="store_true", help="parse remote binary if download feature is available.")
     parser.add_argument("-f", "--file", help="the file path to parse.")
     _syntax_ = parser.format_help()
 
@@ -605,7 +990,7 @@ class ChecksecCommand(GenericCommand):
         super().__init__(complete=gdb.COMPLETE_FILENAME)
         return
 
-    def check_CET_SHSTK(self, sec):
+    def check_CET_SHSTK(self, sec, runtime=True):
         # Intel CET SHSTK flags via Ehdr
         if "CET SHSTK flag" not in sec:
             # ELF is not x86_64
@@ -616,11 +1001,11 @@ class ChecksecCommand(GenericCommand):
             gef_print("{:<40s}: {:s}".format("CET SHSTK feature flag (via Ehdr)", Color.colorify("Not found", "bold red")))
 
         # gdb mode check
-        if not is_x86():
+        if not runtime or not is_x86():
             return
         if not is_alive():
             return
-        if is_rr():
+        if is_rr() or is_core_file():
             return
 
         # Intel CET SHSTK status via arch_prctl
@@ -674,7 +1059,7 @@ class ChecksecCommand(GenericCommand):
                 gef_print("{:<40s}: {:s}".format("CET SHSTK Lock status (via procfs)", msg))
         return
 
-    def check_CET_IBT(self, sec):
+    def check_CET_IBT(self, sec, runtime=True):
         # Intel CET IBT flags via Ehdr
         if "CET IBT flag" not in sec:
             # ELF is not x86_64
@@ -685,7 +1070,7 @@ class ChecksecCommand(GenericCommand):
             gef_print("{:<40s}: {:s}".format("CET IBT feature flag (via Ehdr)", Color.colorify("Not found", "bold red")))
 
         # gdb mode check
-        if not is_x86():
+        if not runtime or not is_x86():
             return
         if not is_alive():
             return
@@ -713,7 +1098,7 @@ class ChecksecCommand(GenericCommand):
             gef_print("{:<40s}: {:s}".format("CET IBT status", msg))
         return
 
-    def check_PAC(self, sec):
+    def check_PAC(self, sec, runtime=True):
         # PAC opcode
         if "PAC" not in sec:
             # ELF is not ARM64
@@ -726,7 +1111,7 @@ class ChecksecCommand(GenericCommand):
             gef_print("{:<40s}: {:s}".format("PAC opcode", Color.colorify("Not found", "bold red")))
 
         # gdb mode check
-        if not is_arm64():
+        if not runtime or not is_arm64():
             return
         if not is_alive():
             return
@@ -761,9 +1146,9 @@ class ChecksecCommand(GenericCommand):
             gef_print("{:<40s}: {:s}".format("PAC", msg))
         return
 
-    def check_MTE(self, sec):
+    def check_MTE(self, sec, runtime=True):
         # gdb mode check
-        if not is_arm64():
+        if not runtime or not is_arm64():
             return
         if not is_alive():
             return
@@ -795,10 +1180,102 @@ class ChecksecCommand(GenericCommand):
             gef_print("{:<40s}: {:s}".format("MTE", msg))
         return
 
+    def check_AARCH64_ELF(self, sec):
+        if "AArch64 BTI flag" not in sec:
+            return
+
+        properties = [
+            ("AArch64 BTI feature flag", sec["AArch64 BTI flag"]),
+            ("AArch64 PAC feature flag", sec["AArch64 PAC flag"]),
+            ("AArch64 GCS feature flag", sec["AArch64 GCS flag"]),
+            ("AArch64 BTI-PLT", sec["AArch64 BTI PLT"]),
+            ("AArch64 PAC-PLT", sec["AArch64 PAC PLT"]),
+        ]
+        for name, enabled in properties:
+            if enabled:
+                state = Color.colorify("Found", "bold green")
+            else:
+                state = Color.colorify("Not found", "bold red")
+            gef_print("{:<40s}: {:s}".format(name, state))
+
+        mte_mode = sec["AArch64 MTE mode"]
+        mte_regions = [
+            name for name, enabled in [
+                ("heap", sec["AArch64 MTE heap"]),
+                ("stack", sec["AArch64 MTE stack"]),
+                ("globals", sec["AArch64 MTE globals"]),
+            ] if enabled
+        ]
+        if mte_mode is None and not mte_regions:
+            gef_print("{:<40s}: {:s}".format("MTE ELF policy", Color.colorify("Not requested", "bold red")))
+        else:
+            modes = {0: "sync", 1: "async"}
+            mode = modes.get(mte_mode, "unspecified" if mte_mode is None else "{:#x}".format(mte_mode))
+            if mte_regions:
+                regions = ", ".join(mte_regions)
+            else:
+                regions = "none"
+            msg = Color.colorify("Requested", "bold green") + " (mode: {:s}, regions: {:s})".format(mode, regions)
+            gef_print("{:<40s}: {:s}".format("MTE ELF policy", msg))
+        return
+
+    def check_GCS(self, sec, runtime=True):
+        if "AArch64 GCS flag" not in sec:
+            return
+        if not runtime or not is_arm64():
+            return
+        if not is_alive():
+            return
+        if is_rr():
+            return
+
+        status = Checksec.get_gcs_status()
+        if status is None:
+            msg = Color.colorify("Unsupported", "bold red")
+        elif status & 1: # PR_SHADOW_STACK_ENABLE
+            features = []
+            if status & 2:
+                features.append("write")
+            if status & 4:
+                features.append("push")
+            if features:
+                additional = " ({:s})".format(", ".join(features))
+            else:
+                additional = ""
+            msg = Color.colorify("Enabled", "bold green") + additional
+        else:
+            msg = Color.colorify("Disabled", "bold red")
+        gef_print("{:<40s}: {:s}".format("GCS runtime status", msg))
+        return
+
+    def check_runtime_wx(self):
+        if not is_alive():
+            return
+
+        sections = [
+            section for section in (ProcessMap.get_process_maps() or [])
+            if section.is_writable() and section.is_executable()
+        ]
+        if not sections:
+            return
+
+        ranges = []
+        for section in sections[:4]:
+            if section.path:
+                path = " {:s}".format(section.path)
+            else:
+                path = ""
+            ranges.append("{:#x}-{:#x}{:s}".format(section.page_start, section.page_end, path))
+        if len(sections) > 4:
+            ranges.append("... +{:d} more".format(len(sections) - 4))
+        msg = Color.colorify("RWX found", "bold red") + " ({:d}: {:s})".format(len(sections), ", ".join(ranges))
+        gef_print("{:<40s}: {:s}".format("Runtime W^X (current process)", msg))
+        return
+
     def check_system_ASLR(self):
-        if is_remote_debug():
+        if is_remote_debug() or is_core_file():
             msg = Color.grayify("Unknown")
-            gef_print("{:<40s}: {:s} (remote process)".format("System-ASLR", msg))
+            gef_print("{:<40s}: {:s} (remote process or core file)".format("System-ASLR", msg))
         else:
             try:
                 system_aslr = int(open("/proc/sys/kernel/randomize_va_space").read())
@@ -817,9 +1294,9 @@ class ChecksecCommand(GenericCommand):
         return
 
     def check_gdb_ASLR(self):
-        if is_attach() or is_remote_debug():
+        if is_attach() or is_remote_debug() or is_core_file():
             msg = Color.grayify("Ignored")
-            gef_print("{:<40s}: {:s} (attached or remote process)".format("GDB ASLR setting", msg))
+            gef_print("{:<40s}: {:s} (attached, remote process or core file)".format("GDB ASLR setting", msg))
         else:
             ret = gdb.parameter("disable-randomization")
             if ret is True:
@@ -842,7 +1319,7 @@ class ChecksecCommand(GenericCommand):
             msg = Color.grayify("Unknown")
         return msg
 
-    def print_security_properties(self, filename):
+    def print_security_properties(self, filename, runtime=True):
         elf = Elf.get_elf(filename)
         if elf is None or not elf.is_valid():
             err("checksec is failed")
@@ -857,7 +1334,7 @@ class ChecksecCommand(GenericCommand):
 
         # Canary
         msg = self.get_colored_msg(sec["Canary"])
-        if sec["Canary"] is True and is_alive():
+        if sec["Canary"] is True and runtime and is_alive():
             res = CanaryCommand.gef_read_canary()
             if not res:
                 msg += " (Could not get the canary value)"
@@ -869,11 +1346,17 @@ class ChecksecCommand(GenericCommand):
         gef_print("{:<40s}: {:s}".format("NX", self.get_colored_msg(sec["NX"])))
 
         # PIE
-        if sec["PIE"]:
+        if sec["Shared object"]:
+            gef_print("{:<40s}: {:s} (shared object)".format("PIE", self.get_colored_msg(sec["PIE"])))
+        elif sec["PIE"]:
             gef_print("{:<40s}: {:s}".format("PIE", self.get_colored_msg(sec["PIE"])))
         else:
-            vaddr = min([p.p_vaddr for p in elf.phdrs if p.p_type == Elf.Phdr.PT_LOAD])
-            gef_print("{:<40s}: {:s} ({:#x})".format("PIE", self.get_colored_msg(sec["PIE"]), vaddr))
+            vaddr = min((p.p_vaddr for p in elf.phdrs if p.p_type == Elf.Phdr.PT_LOAD), default=None)
+            if vaddr is not None:
+                detail = "{:#x}".format(vaddr)
+            else:
+                detail = "N/A"
+            gef_print("{:<40s}: {:s} ({:s})".format("PIE", self.get_colored_msg(sec["PIE"]), detail))
 
         # RELRO
         if sec["Full RELRO"]:
@@ -887,10 +1370,17 @@ class ChecksecCommand(GenericCommand):
             gef_print("{:<40s}: {:s}".format("RELRO", Color.colorify("No RELRO", "bold red")))
 
         # Fortify
-        if sec["Fortify"]:
-            gef_print("{:<40s}: {:s}".format("Fortify", Color.colorify("Found", "bold green")))
+        if sec["Fortify"] is None:
+            msg = Color.grayify("Unknown")
+        elif sec["Fortify"]:
+            msg = Color.colorify("Found", "bold green")
         else:
-            gef_print("{:<40s}: {:s}".format("Fortify", Color.colorify("Not found", "bold red")))
+            msg = Color.colorify("Not found", "bold red")
+        if sec["Fortified Imports"] is not None:
+            msg += " ({:d} fortified imports, {:d} unfortified candidates; observable imports)".format(
+                sec["Fortified Imports"], sec["Unfortified Candidates"],
+            )
+        gef_print("{:<40s}: {:s}".format("Fortify", msg))
 
         gef_print(titlify("Additional information"))
 
@@ -916,12 +1406,14 @@ class ChecksecCommand(GenericCommand):
             gef_print("{:<40s}: {:s}".format("Debuginfo", Color.colorify("No debuginfo", "bold green")))
 
         # Intel CET
-        self.check_CET_SHSTK(sec)
-        self.check_CET_IBT(sec)
+        self.check_CET_SHSTK(sec, runtime=runtime)
+        self.check_CET_IBT(sec, runtime=runtime)
 
         # ARM64 PAC/MTE
-        self.check_PAC(sec)
-        self.check_MTE(sec)
+        self.check_AARCH64_ELF(sec)
+        self.check_PAC(sec, runtime=runtime)
+        self.check_MTE(sec, runtime=runtime)
+        self.check_GCS(sec, runtime=runtime)
 
         # RPATH
         if sec["RPATH"]:
@@ -939,69 +1431,54 @@ class ChecksecCommand(GenericCommand):
         if sec["Clang SafeStack"]:
             gef_print("{:<40s}: {:s}".format("Clang SafeStack", self.get_colored_msg(sec["Clang SafeStack"])))
 
+        # File and runtime W^X
+        direct = sec["W^X LOAD segments"]
+        overlaps = sec["W^X page overlap"]
+        if direct:
+            ranges = ", ".join("{:#x}-{:#x}".format(start, end) for start, end in direct)
+            msg = Color.colorify("RWX found", "bold red") + " ({:s})".format(ranges)
+            gef_print("{:<40s}: {:s}".format("File W^X LOAD segments", msg))
+
+        if overlaps:
+            ranges = ", ".join("{:#x}-{:#x}".format(start, end) for start, end in overlaps)
+            msg = Color.colorify("Found", "bold red") + " ({:s})".format(ranges)
+            gef_print("{:<40s}: {:s}".format("File W/X page overlap", msg))
+
+        if sec["Text Relocations"]:
+            gef_print("{:<40s}: {:s}".format("Text relocations", Color.colorify("Found", "bold red")))
+        if runtime:
+            self.check_runtime_wx()
+
         # ASLR
         self.check_system_ASLR()
-        self.check_gdb_ASLR()
+        if runtime:
+            self.check_gdb_ASLR()
         return
 
     @parse_args
     @exclude_specific_gdb_mode(mode=("wine", "kgdb"))
-    @require_arch_set
     def do_invoke(self, args):
         if is_qemu_system() or is_vmware():
             info("Redirect to kchecksec")
             gdb.execute("kchecksec")
             return
 
-        local_filepath = None
-        remote_filepath = None
-        tmp_filepath = None
-
-        if args.remote:
-            if not is_remote_debug():
-                err("-r option is allowed only remote debug")
+        with ContextManager.local_elf(args.file, remote=args.remote,
+                                      prefix=self._cmdline_) as (local_filepath, remote_filepath):
+            if local_filepath is None:
                 return
 
+            runtime = args.file is None and not is_core_file()
             if args.file:
-                remote_filepath = args.file # if specified, assume it is remote
-            elif gdb.current_progspace().filename:
-                f = gdb.current_progspace().filename
-                if f.startswith("target:"): # gdbserver
-                    f = f[7:]
-                remote_filepath = f
-            elif Pid.get_pid(remote=True):
-                remote_filepath = "/proc/{:d}/exe".format(Pid.get_pid(remote=True))
-            else:
-                err("File name could not be determined")
-                return
-
-            data = Path.read_remote_file(remote_filepath, as_byte=True) # qemu-user is failed here, it is ok
-            if not data:
-                err("Failed to read remote filepath")
-                return
-            tmp_fd, tmp_filepath = GefUtil.mkstemp(prefix="checksec", suffix=".elf")
-            os.fdopen(tmp_fd, "wb").write(data)
-            local_filepath = tmp_filepath
-            del data
-
-        elif args.file:
-            local_filepath = args.file
-
-        elif args.file is None:
-            if is_qemu_system():
-                err("Argument-less calls are unsupported under qemu-system")
-                return
-            local_filepath = Path.get_filepath()
-
-        if local_filepath is None:
-            err("File name could not be determined")
-            return
-
-        self.print_security_properties(local_filepath)
-
-        if tmp_filepath and os.path.exists(tmp_filepath):
-            os.unlink(tmp_filepath)
+                if args.remote:
+                    runtime = remote_filepath == Path.get_remote_filepath()
+                else:
+                    current_filepath = Path.get_filepath()
+                    if current_filepath and os.path.isfile(current_filepath) and os.path.isfile(local_filepath):
+                        runtime = os.path.samefile(local_filepath, current_filepath) and not is_core_file()
+            self.print_security_properties(local_filepath, runtime=runtime)
         return
+
 
 
 @register_command

@@ -3,6 +3,7 @@
 import abc
 import ctypes
 import enum
+import re
 import struct
 
 import gdb
@@ -16,8 +17,9 @@ from gef.core.exec import ExecAsm
 from gef.core.memory import (read_int_from_memory, read_cstring_from_memory,
                              read_memory, write_memory, is_valid_addr,
                              p32, p64, u8, u16, u32, u64)
-from gef.core.process import (is_alive, is_in_kernel, is_kvm_enabled, is_qiling,
+from gef.core.process import (is_alive, is_in_kernel, is_kvm_enabled, is_qemu_system, is_qiling,
                               is_remote_debug, is_rr)
+from gef.core.qemu import QemuMonitor
 from gef.core.registers import get_register, to_unsigned_long
 from gef.core.utils import GefUtil, rol, ror
 
@@ -87,6 +89,17 @@ class X86(Architecture):
     trap_insn = b"\xcc" # int3
     ret_insn = b"\xc3" # ret
     syscall_insn = b"\xcd\x80" # int 0x80
+
+    RE_PREFIX = re.compile(r"(?:lock|rep(?:e|ne|z|nz)?|bnd|notrack|addr(?:16|32|64)|data(?:16|32)|rex(?:\.[WRXB]+)?)$")
+
+    @staticmethod
+    def get_mnemonic_operands(insn, operands=None):
+        if operands is None:
+            operands = insn.operands
+        parts = (insn.mnemonic + " " + ",".join(operands)).split(None, 1)
+        while len(parts) == 2 and X86.RE_PREFIX.fullmatch(parts[0]):
+            parts = parts[1].split(None, 1)
+        return parts[0], parts[1] if len(parts) == 2 else ""
 
     def flag_register_to_human(self, val=None):
         if val is None:
@@ -211,6 +224,9 @@ class X86(Architecture):
             return None
         return self.get_gs()
 
+    def get_canary_offset(self):
+        return 0x14
+
     def decode_cookie(self, value, cookie):
         return ror(value, 9, 32) ^ cookie
 
@@ -299,6 +315,19 @@ class X86(Architecture):
         values = [ret["reg"][reg] for reg in regs]
         return b"".join([p32(v) for v in values])
 
+    def decode_cookie_legacy(self, value, cookie):
+        return ror(value, 9, 32) ^ cookie
+
+    def encode_cookie_legacy(self, value, cookie):
+        return rol(value ^ cookie, 9, 32)
+
+    @staticmethod
+    def is_loop(insn):
+        return insn.mnemonic in ["loop", "loope", "loopz", "loopne", "loopnz"] or (
+            len(insn.opcodes) >= 2 and insn.opcodes[-2] in [0xe0, 0xe1, 0xe2]
+            and all(byte in [0x26, 0x2e, 0x36, 0x3e, 0x64, 0x65, 0x66, 0x67, 0xf2, 0xf3]
+                    or 0x40 <= byte <= 0x4f for byte in insn.opcodes[:-2]))
+
 
 class X86_64(X86):
     """GEF representation of x86-64 architecture."""
@@ -366,6 +395,9 @@ class X86_64(X86):
         if is_in_kernel():
             return None
         return self.get_fs()
+
+    def get_canary_offset(self):
+        return 0x28
 
     def decode_cookie(self, value, cookie):
         return ror(value, 17, 64) ^ cookie
@@ -470,8 +502,14 @@ class X86_64(X86):
         values = [ret["reg"][reg] for reg in regs]
         return b"".join([p64(v) for v in values])
 
+    def decode_cookie_legacy(self, value, cookie):
+        return ror(value, 17, 64) ^ cookie
 
-class X86_16(X86):
+    def encode_cookie_legacy(self, value, cookie):
+        return rol(value ^ cookie, 17, 64)
+
+
+class X86_16(Architecture):
     """GEF representation of i8086 architecture."""
 
     arch = "X86"
@@ -480,6 +518,14 @@ class X86_16(X86):
     load_condition = [
         "I8086",
     ]
+
+    general_registers = X86.general_registers
+    special_registers = X86.special_registers
+    virtual_registers = X86.virtual_registers
+    flag_register = X86.flag_register
+    all_registers = X86.all_registers
+    alias_registers = X86.alias_registers
+    flags_table = X86.flags_table
 
     seg_extended_registers = {
         "$cs:$ip": ["$cs", "$pc"],
@@ -496,35 +542,61 @@ class X86_16(X86):
     syscall_parameters = None
 
     bit_length = 16
+    endianness = X86.endianness
+    instruction_length = X86.instruction_length
+    has_delay_slot = X86.has_delay_slot
+    has_syscall_delay_slot = X86.has_syscall_delay_slot
+    has_ret_delay_slot = X86.has_ret_delay_slot
+    stack_grow_down = X86.stack_grow_down
+    tls_supported = False
+
+    keystone_support = X86.keystone_support
+    capstone_support = X86.capstone_support
+    unicorn_support = X86.unicorn_support
+
+    nop_insn = X86.nop_insn
+    infloop_insn = X86.infloop_insn
+    trap_insn = X86.trap_insn
+    ret_insn  = X86.ret_insn
+    syscall_insn = b"\xcd\x21" # int 0x21
 
     def __init__(self):
         gdb.execute("gef config context_code.use_capstone True")
         return
 
+    flag_register_to_human = X86.flag_register_to_human
+
     def is_syscall(self, insn):
+        mnemo, operands = X86.get_mnemonic_operands(insn)
         try:
-            return insn.mnemonic == "int" and int(insn.operands[0].lstrip("$"), 0) == 0x21
+            return mnemo == "int" and int(operands.split()[0].lstrip("$"), 0) == 0x21
         except Exception:
             return False
 
+    is_call = X86.is_call
+
     def is_jump(self, insn):
-        return insn.mnemonic in ["jmp", "ljmp"] or self.is_conditional_branch(insn)
+        return X86.get_mnemonic_operands(insn)[0] in ["jmp", "ljmp"] or self.is_conditional_branch(insn)
 
     def is_ret(self, insn):
-        return insn.mnemonic in ["ret", "retf", "iret"]
+        return X86.get_mnemonic_operands(insn)[0] in ["ret", "retf", "iret"]
+
+    is_conditional_branch = X86.is_conditional_branch
+    is_branch_taken = X86.is_branch_taken
 
     def get_ra(self, insn, frame):
         ra = None
         try:
+            mnemo = X86.get_mnemonic_operands(insn)[0]
             if self.is_ret(insn):
-                if insn.mnemonic == "ret":
+                if mnemo == "ret":
                     reg = AddressUtil.dereference(runtime.current_arch.sp) & 0xffff
                     ra = runtime.current_arch.real2phys("$cs", reg)
-                elif insn.mnemonic == "retf": # ip, cs
+                elif mnemo == "retf": # ip, cs
                     reg = AddressUtil.dereference(runtime.current_arch.sp) & 0xffff
                     seg = AddressUtil.dereference(runtime.current_arch.sp + runtime.current_arch.ptrsize) & 0xffff
                     ra = runtime.current_arch.real2phys(seg, reg)
-                elif insn.mnemonic == "iret": # ip, cs, flags, sp, ss
+                elif mnemo == "iret": # ip, cs, flags, sp, ss
                     reg = AddressUtil.dereference(runtime.current_arch.sp) & 0xffff
                     seg = AddressUtil.dereference(runtime.current_arch.sp + runtime.current_arch.ptrsize) & 0xffff
                     ra = runtime.current_arch.real2phys(seg, reg)
@@ -534,17 +606,45 @@ class X86_16(X86):
             pass
         return ra
 
+    get_ith_parameter = X86.get_ith_parameter
+
     A20 = True
 
     def real2phys(self, seg, reg):
+        if is_qemu_system():
+            segments = QemuMonitor.get_x86_segments()
+        else:
+            segments = {}
         if isinstance(seg, str):
             segval = get_register(seg) & 0xffff
         else:
             segval = seg
+        protected = segments.get("protected", False)
+        if isinstance(seg, str):
+            segment = segments.get(seg.lstrip("$").upper())
+        else:
+            segment = None
         if isinstance(reg, str):
-            regval = get_register(reg) & 0xffff
+            if reg == "$sp" and segment and segment[2] & (1 << 22):
+                regval = get_register("$esp")
+            else:
+                regval = get_register(reg) & 0xffff
         else:
             regval = reg
+        if segment is not None:
+            if protected or self.A20:
+                mask = 0xffffffff
+            else:
+                mask = 0xfffff
+            return (segment[1] + regval) & mask
+        if protected:
+            table = segments.get("LDT" if segval & 4 else "GDT")
+            offset = segval & ~7
+            if table is None or offset + 7 > table[1]:
+                raise gdb.error("Cannot resolve segment selector {:#x}".format(segval))
+            descriptor = u64(read_memory(table[0] + offset, 8))
+            base = ((descriptor >> 16) & 0xffffff) | ((descriptor >> 32) & 0xff000000)
+            return (base + regval) & 0xffffffff
         if self.A20:
             return ((segval << 4) + regval) & 0x1f_ffff
         else:
@@ -557,5 +657,3 @@ class X86_16(X86):
     @property
     def sp(self):
         return self.real2phys("$ss", "$sp")
-
-

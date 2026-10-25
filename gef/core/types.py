@@ -25,7 +25,11 @@ from gef.core.memory import (
     read_int_from_memory,
     read_memory,
 )
+from gef.core.process import (ProcessMap, get_pagesize, get_pagesize_mask_high, is_64bit, is_arm32,
+                              is_arm64, is_m68k, is_ppc32, is_qiling, is_riscv32, is_x86, is_x86_32)
 from gef.core.registers import to_unsigned_long
+from gef.core.symbols import Symbol
+from gef.core.utils import GefUtil, align, align_to_ptrsize, get_libc_version
 
 
 class GenericType:
@@ -94,9 +98,6 @@ class GlibcHeap:
 
         @staticmethod
         def MALLOC_ALIGNMENT():
-            from gef.core.process import is_64bit, is_ppc32, is_riscv32, is_x86_32
-            from gef.core.utils import get_libc_version
-
             if is_64bit():
                 return 0x10
             elif (is_x86_32() or is_riscv32() or is_ppc32()) and get_libc_version() >= (2, 26):
@@ -106,8 +107,6 @@ class GlibcHeap:
 
         @staticmethod
         def MIN_SIZE():
-            from gef.core.process import is_64bit
-
             if is_64bit():
                 return 0x20
             else:
@@ -137,8 +136,6 @@ class GlibcHeap:
 
         @property
         def addrof_pagesize(self):
-            from gef.core.utils import get_libc_version
-
             if get_libc_version() >= (2, 35):
                 return self.addrof_mprotect_size + self.size_t.sizeof
             else:
@@ -146,8 +143,6 @@ class GlibcHeap:
 
         @property
         def addrof_pad(self):
-            from gef.core.utils import get_libc_version
-
             if get_libc_version() >= (2, 35):
                 return self.addrof_pagesize + self.size_t.sizeof
             else:
@@ -155,12 +150,10 @@ class GlibcHeap:
 
         @property
         def sizeof(self):
-            from gef.core.utils import get_libc_version
-
             if get_libc_version() >= (2, 35):
-                end = self.addrof_pad + (-3 * self.size_t.sizeof) & self.MALLOC_ALIGN_MASK
+                end = self.addrof_pad + ((-3 * self.size_t.sizeof) & self.MALLOC_ALIGN_MASK)
             else:
-                end = self.addrof_pad + (-6 * self.size_t.sizeof) & self.MALLOC_ALIGN_MASK
+                end = self.addrof_pad + ((-6 * self.size_t.sizeof) & self.MALLOC_ALIGN_MASK)
             return end - self.addr
 
         # struct members
@@ -182,8 +175,6 @@ class GlibcHeap:
 
         @property
         def pagesize(self):
-            from gef.core.utils import get_libc_version
-
             if get_libc_version() >= (2, 35):
                 return self.get_size_t(self.addrof_pagesize)
             else:
@@ -191,8 +182,6 @@ class GlibcHeap:
 
         @property
         def pad(self):
-            from gef.core.utils import get_libc_version
-
             if get_libc_version() >= (2, 35):
                 length = (-3 * self.size_t.sizeof) & self.MALLOC_ALIGN_MASK
             else:
@@ -225,8 +214,6 @@ class GlibcHeap:
 
         @property
         def addrof_thp_mode(self):
-            from gef.core.utils import get_libc_version
-
             if get_libc_version() >= (2, 43):
                 return self.addrof_arena_max + self.size_t.sizeof
             else:
@@ -234,8 +221,6 @@ class GlibcHeap:
 
         @property
         def addrof_thp_pagesize(self):
-            from gef.core.utils import get_libc_version
-
             if get_libc_version() >= (2, 43):
                 return self.addrof_thp_mode + self.size_t.sizeof
             elif get_libc_version() >= (2, 35):
@@ -245,8 +230,6 @@ class GlibcHeap:
 
         @property
         def addrof_hp_pagesize(self):
-            from gef.core.utils import get_libc_version
-
             if get_libc_version() >= (2, 35):
                 return self.addrof_thp_pagesize + self.size_t.sizeof
             else:
@@ -254,8 +237,6 @@ class GlibcHeap:
 
         @property
         def addrof_hp_flags(self):
-            from gef.core.utils import get_libc_version
-
             if get_libc_version() >= (2, 35):
                 return self.addrof_hp_pagesize + self.size_t.sizeof
             else:
@@ -263,8 +244,6 @@ class GlibcHeap:
 
         @property
         def addrof_n_mmaps(self):
-            from gef.core.utils import get_libc_version
-
             if get_libc_version() >= (2, 35):
                 return self.addrof_hp_flags + self.int_t.sizeof
             else:
@@ -284,17 +263,13 @@ class GlibcHeap:
 
         @property
         def addrof_pagesize(self):
-            from gef.core.utils import get_libc_version
-
             if get_libc_version() >= (2, 15):
                 return None
             else:
-                return self.addrof_max_n_mmaps + self.int_t.sizeof
+                return self.addrof_no_dyn_threshold + self.int_t.sizeof
 
         @property
         def addrof_mmapped_mem(self):
-            from gef.core.utils import align_to_ptrsize, get_libc_version
-
             if get_libc_version() >= (2, 15):
                 return align_to_ptrsize(self.addrof_no_dyn_threshold + self.int_t.sizeof)
             else:
@@ -306,17 +281,13 @@ class GlibcHeap:
 
         @property
         def addrof_max_total_mem(self):
-            from gef.core.utils import get_libc_version
-
             if get_libc_version() >= (2, 24):
                 return None
             else:
-                return self.addrof_mmapped_mem + self.size_t.sizeof
+                return self.addrof_max_mmapped_mem + self.size_t.sizeof
 
         @property
         def addrof_sbrk_base(self):
-            from gef.core.utils import get_libc_version
-
             if get_libc_version() >= (2, 24):
                 return self.addrof_max_mmapped_mem + self.size_t.sizeof
             else:
@@ -324,8 +295,6 @@ class GlibcHeap:
 
         @property
         def addrof_tcache_bins(self):
-            from gef.core.utils import get_libc_version
-
             if get_libc_version() >= (2, 26):
                 return self.addrof_sbrk_base + self.char_t.pointer().sizeof
             else:
@@ -333,8 +302,6 @@ class GlibcHeap:
 
         @property
         def addrof_tcache_max_bytes(self):
-            from gef.core.utils import get_libc_version
-
             if get_libc_version() >= (2, 26):
                 return self.addrof_tcache_bins + self.size_t.sizeof
             else:
@@ -342,8 +309,6 @@ class GlibcHeap:
 
         @property
         def addrof_tcache_count(self):
-            from gef.core.utils import get_libc_version
-
             if get_libc_version() >= (2, 26):
                 return self.addrof_tcache_max_bytes + self.size_t.sizeof
             else:
@@ -351,8 +316,6 @@ class GlibcHeap:
 
         @property
         def addrof_tcache_unsorted_limit(self):
-            from gef.core.utils import get_libc_version
-
             if get_libc_version() >= (2, 26):
                 return self.addrof_tcache_count + self.size_t.sizeof
             else:
@@ -360,8 +323,6 @@ class GlibcHeap:
 
         @property
         def sizeof(self):
-            from gef.core.utils import get_libc_version
-
             if get_libc_version() >= (2, 26):
                 end = self.addrof_tcache_unsorted_limit + self.size_t.sizeof
             else:
@@ -391,8 +352,6 @@ class GlibcHeap:
 
         @property
         def thp_pagesize(self):
-            from gef.core.utils import get_libc_version
-
             if get_libc_version() >= (2, 35):
                 return self.get_size_t(self.addrof_thp_pagesize)
             else:
@@ -400,8 +359,6 @@ class GlibcHeap:
 
         @property
         def hp_pagesize(self):
-            from gef.core.utils import get_libc_version
-
             if get_libc_version() >= (2, 35):
                 return self.get_size_t(self.addrof_hp_pagesize)
             else:
@@ -409,8 +366,6 @@ class GlibcHeap:
 
         @property
         def hp_flags(self):
-            from gef.core.utils import get_libc_version
-
             if get_libc_version() >= (2, 35):
                 return self.get_int_t(self.addrof_hp_flags)
             else:
@@ -434,8 +389,6 @@ class GlibcHeap:
 
         @property
         def pagesize(self):
-            from gef.core.utils import get_libc_version
-
             if get_libc_version() >= (2, 15):
                 return None
             else:
@@ -451,8 +404,6 @@ class GlibcHeap:
 
         @property
         def max_total_mem(self):
-            from gef.core.utils import get_libc_version
-
             if get_libc_version() >= (2, 24):
                 return None
             else:
@@ -464,8 +415,6 @@ class GlibcHeap:
 
         @property
         def tcache_bins(self):
-            from gef.core.utils import get_libc_version
-
             if get_libc_version() >= (2, 26):
                 return self.get_size_t(self.addrof_tcache_bins)
             else:
@@ -473,17 +422,13 @@ class GlibcHeap:
 
         @property
         def tcache_max_bytes(self):
-            from gef.core.utils import get_libc_version
-
             if get_libc_version() >= (2, 26):
                 return self.get_size_t(self.addrof_tcache_max_bytes)
             else:
                 return None
 
-        @property # noqa
+        @property # noqa: V106
         def tcache_count(self):
-            from gef.core.utils import get_libc_version
-
             if get_libc_version() >= (2, 26):
                 return self.get_size_t(self.addrof_tcache_count)
             else:
@@ -491,8 +436,6 @@ class GlibcHeap:
 
         @property
         def tcache_unsorted_limit(self):
-            from gef.core.utils import get_libc_version
-
             if get_libc_version() >= (2, 26):
                 return self.get_size_t(self.addrof_tcache_unsorted_limit)
             else:
@@ -501,24 +444,21 @@ class GlibcHeap:
     @staticmethod
     @Cache.cache_until_next
     def search_for_mp_():
-        """search for mp_ from main_arena, then return addr."""
         from gef.commands.process.base_address import HeapBaseCommand
-
-        main_arena_ptr = GlibcHeap.search_for_main_arena_from_tls()
-        if main_arena_ptr is None:
+        """search for mp_ from main_arena, then return addr."""
+        main_arena = GlibcHeap.search_for_main_arena_from_tls()
+        if main_arena is None:
             return None
-        main_arena = read_int_from_memory(main_arena_ptr)
 
         heap_base = HeapBaseCommand.heap_base()
         if heap_base is None:
             return None
 
         offsetof_sbrk_base = GlibcHeap.MallocPar(0).addrof_sbrk_base
-        current = main_arena - GlibcHeap.MallocPar(0).sizeof
+        current = main_arena - GlibcHeap.MallocPar(0).sizeof + offsetof_sbrk_base
         for _ in range(0, 500):
-            try:
-                x = read_int_from_memory(current)
-            except gdb.MemoryError:
+            x = read_int_from_memory(current, safe=True)
+            if x is None:
                 return None
             if x == heap_base:
                 mp_ = current - offsetof_sbrk_base
@@ -530,9 +470,6 @@ class GlibcHeap:
         """GEF representation of malloc_state."""
 
         def __init__(self, addr):
-            from gef.core.process import is_ppc32, is_riscv32, is_x86_32
-            from gef.core.utils import get_libc_version
-
             super().__init__(addr)
 
             if get_libc_version() >= (2, 43):
@@ -564,8 +501,6 @@ class GlibcHeap:
 
         @property
         def addrof_have_fastchunks(self):
-            from gef.core.utils import get_libc_version
-
             if get_libc_version() >= (2, 43):
                 return None
             elif get_libc_version() >= (2, 27):
@@ -575,8 +510,6 @@ class GlibcHeap:
 
         @property
         def addrof_fastbins(self):
-            from gef.core.utils import align, get_libc_version
-
             if get_libc_version() >= (2, 43):
                 return None
             elif get_libc_version() >= (2, 27):
@@ -587,8 +520,6 @@ class GlibcHeap:
 
         @property
         def addrof_top(self):
-            from gef.core.utils import get_libc_version
-
             if get_libc_version() >= (2, 43):
                 return self.addrof_flags + self.int_t.sizeof
             else:
@@ -612,8 +543,6 @@ class GlibcHeap:
 
         @property
         def addrof_next_free(self):
-            from gef.core.utils import get_libc_version
-
             if get_libc_version() >= (2, 19):
                 return self.addrof_next + self.size_t.sizeof
             else:
@@ -623,8 +552,6 @@ class GlibcHeap:
 
         @property
         def addrof_attached_threads(self):
-            from gef.core.utils import get_libc_version
-
             if get_libc_version() >= (2, 23):
                 return self.addrof_next_free + self.size_t.sizeof
             else:
@@ -632,8 +559,6 @@ class GlibcHeap:
 
         @property
         def addrof_system_mem(self):
-            from gef.core.utils import get_libc_version
-
             if get_libc_version() >= (2, 23):
                 return self.addrof_attached_threads + self.size_t.sizeof
             elif get_libc_version() >= (2, 19):
@@ -660,8 +585,6 @@ class GlibcHeap:
 
         @property
         def have_fastchunks(self):
-            from gef.core.utils import get_libc_version
-
             if get_libc_version() >= (2, 43):
                 return None
             elif get_libc_version() >= (2, 27):
@@ -671,8 +594,6 @@ class GlibcHeap:
 
         @property
         def fastbinsY(self):
-            from gef.core.utils import get_libc_version
-
             if get_libc_version() >= (2, 43):
                 return None
             else:
@@ -700,8 +621,6 @@ class GlibcHeap:
 
         @property
         def next_free(self):
-            from gef.core.utils import get_libc_version
-
             if get_libc_version() >= (2, 19):
                 return self.get_size_t_pointer(self.addrof_next_free)
             else:
@@ -709,8 +628,6 @@ class GlibcHeap:
 
         @property
         def attached_threads(self):
-            from gef.core.utils import get_libc_version
-
             if get_libc_version() >= (2, 23):
                 return self.get_size_t(self.addrof_attached_threads)
             else:
@@ -726,11 +643,10 @@ class GlibcHeap:
 
     @staticmethod
     @Cache.cache_until_next
-    def search_for_main_arena_from_tls():
-        """search for main arena from TLS, then return &addr."""
+    def search_for_thread_arena_from_tls():
+        from gef.commands.base import ContextManager
         from gef.commands.process.base_address import TlsCommand
-        from gef.core.process import get_pagesize, is_m68k
-
+        """search for thread_arena from TLS, then return (tls, &thread_arena, [thread_arena, *next_arenas])."""
 
         """
         [x64]
@@ -800,64 +716,83 @@ class GlibcHeap:
         0x000000499838|+0x0078|015: 0x0000000000000000
         """
 
-        orig_thread = gdb.selected_thread()
-        orig_frame = gdb.selected_frame()
-        threads = gdb.selected_inferior().threads()
-        main_thread = [th for th in threads if th.num == 1][0]
-        main_thread.switch()
-
-        tls = runtime.current_arch.get_tls()
-        if tls is None:
-            return None
-
+        threads = sorted(gdb.selected_inferior().threads(), key=lambda th: th.num)
         direction = TlsCommand.get_direction()
 
-        for i in range(1, 500):
-            addr = tls + (runtime.current_arch.ptrsize * i) * direction
-
-            if is_m68k():
-                addr += 2
-
-            if not is_valid_addr(addr):
-                break
-
-            candidate_arena_addr = read_int_from_memory(addr)
-            if not is_valid_addr(candidate_arena_addr):
+        # The main thread may have exited, so try each thread in order.
+        for thread in threads:
+            with ContextManager.selected_thread():
+                try:
+                    thread.switch()
+                except (gdb.error, RuntimeError):
+                    continue
+                tls = runtime.current_arch.get_tls()
+            if tls is None:
                 continue
 
-            candidate_arena = GlibcHeap.MallocStateStruct(candidate_arena_addr)
-            if candidate_arena.system_mem < get_pagesize():
-                continue
-            # Statically built binaries have an unaligned system_mem,
-            # so alignment should not be used to determine the validity of system_mem.
+            for i in range(1, 500):
+                addr = tls + (runtime.current_arch.ptrsize * i) * direction
 
-            top = candidate_arena.top
-            if not is_valid_addr(top):
-                continue
+                if is_m68k():
+                    addr += 2
 
-            next_addr = to_unsigned_long(candidate_arena.next)
-            while True:
-                if not is_valid_addr(next_addr):
+                if not is_valid_addr(addr):
                     break
-                if candidate_arena_addr == next_addr:
-                    orig_thread.switch() # revert thread
-                    orig_frame.select()
-                    return addr
-                next_addr = to_unsigned_long(GlibcHeap.MallocStateStruct(next_addr).next)
+
+                candidate_arena_addr = read_int_from_memory(addr)
+                if not is_valid_addr(candidate_arena_addr):
+                    continue
+
+                candidate_arena = GlibcHeap.MallocStateStruct(candidate_arena_addr)
+                arena_size = candidate_arena.sizeof
+                if not is_valid_addr(candidate_arena_addr + arena_size - 1):
+                    continue
+                if candidate_arena.system_mem < get_pagesize():
+                    continue
+                # Statically built binaries have an unaligned system_mem,
+                # so alignment should not be used to determine the validity of system_mem.
+
+                top = candidate_arena.top
+                if not is_valid_addr(top):
+                    continue
+
+                next_addr = to_unsigned_long(candidate_arena.next)
+                seen_arena = []
+                while True:
+                    if not is_valid_addr(next_addr) or not is_valid_addr(next_addr + arena_size - 1):
+                        break
+                    if candidate_arena_addr == next_addr:
+                        return tls, addr, [candidate_arena_addr] + seen_arena
+                    if next_addr in seen_arena:
+                        # broken `next` chain, give up this candidate
+                        break
+                    seen_arena.append(next_addr)
+                    next_addr = to_unsigned_long(GlibcHeap.MallocStateStruct(next_addr).next)
 
         # not found
-        orig_thread.switch() # revert thread
-        orig_frame.select()
         return None
 
     @staticmethod
-    @Cache.cache_this_session_skip_None_cache
+    @Cache.cache_until_next
+    def search_for_main_arena_from_tls():
+        """search for main arena from TLS, then return addr."""
+        ret = GlibcHeap.search_for_thread_arena_from_tls()
+        if ret is None:
+            return None
+
+        # A non-main arena is placed right after the heap_info that points back to it.
+        for arena in ret[2]:
+            heap_info = GlibcHeap.HeapInfo(arena & get_pagesize_mask_high())
+            if to_unsigned_long(heap_info.ar_ptr) != arena:
+                return arena
+        return None
+
+    @staticmethod
+    @Cache.cache_this_session(cache_None=False)
     def search_for_main_arena():
         """Search for the address of main_arena using multiple strategies and caches the result."""
-        from gef.core.process import is_arm32, is_arm64, is_x86
-        from gef.core.utils import align, get_libc_version
-
-        if is_arm64():
+        # Qiling has no TLS register on ARM64, and gdb 16+ aborts when it evaluates a TLS variable without it.
+        if is_arm64() and not is_qiling():
             # For some reason, native gdb (at least v10.1) on ARM64 has a bug where evaluating main_arena
             # destroys tcache symbols. See issues #95
             # Once you evaluate it, it will work without any problems after that.
@@ -868,40 +803,36 @@ class GlibcHeap:
                 pass
 
         # plan 1 (directly)
-        try:
-            return AddressUtil.parse_address("(void*) &main_arena")
-        except gdb.error:
-            pass
+        main_arena = Symbol.resolve_address("main_arena")
+        if main_arena is not None:
+            return main_arena
 
         # plan 2 (from __malloc_hook)
         if get_libc_version() < (2, 34):
-            try:
-                malloc_hook_addr = AddressUtil.parse_address("(void*) &__malloc_hook")
-                if is_x86():
-                    return align(malloc_hook_addr + runtime.current_arch.ptrsize, 0x20)
-                elif is_arm64():
-                    mstate_size = GlibcHeap.MallocStateStruct(0).sizeof
-                    return malloc_hook_addr - runtime.current_arch.ptrsize * 2 - mstate_size
-                elif is_arm32():
-                    mstate_size = GlibcHeap.MallocStateStruct(0).sizeof
-                    return malloc_hook_addr - runtime.current_arch.ptrsize - mstate_size
-                else:
-                    raise
-            except gdb.error:
-                pass
+            malloc_hook_addr = Symbol.resolve_address("__malloc_hook")
+            if malloc_hook_addr is not None:
+                try:
+                    if is_x86():
+                        return align(malloc_hook_addr + runtime.current_arch.ptrsize, 0x20)
+                    elif is_arm64():
+                        mstate_size = GlibcHeap.MallocStateStruct(0).sizeof
+                        return malloc_hook_addr - runtime.current_arch.ptrsize * 2 - mstate_size
+                    elif is_arm32():
+                        mstate_size = GlibcHeap.MallocStateStruct(0).sizeof
+                        return malloc_hook_addr - runtime.current_arch.ptrsize - mstate_size
+                except gdb.error:
+                    pass
 
         # plan 3 (from TLS)
-        ptr = GlibcHeap.search_for_main_arena_from_tls()
-        if ptr:
-            return read_int_from_memory(ptr)
+        main_arena = GlibcHeap.search_for_main_arena_from_tls()
+        if main_arena:
+            return main_arena
 
         raise OSError("Cannot find main_arena for {}".format(runtime.current_arch.arch))
 
     # It must be a static method because it is also used to calculate the Heapbase.
     @staticmethod
     def search_for_tcache_from_tls(arena_addr):
-        from gef.core.utils import get_libc_version
-
         if get_libc_version() < (2, 26):
             return None
         if not runtime.current_arch.tls_supported:
@@ -940,22 +871,17 @@ class GlibcHeap:
         """
 
         def get_all_tls():
-            orig_thread = gdb.selected_thread()
-            orig_frame = gdb.selected_frame()
+            from gef.commands.base import ContextManager
             threads = gdb.selected_inferior().threads()
             threads = sorted(threads, key=lambda th: th.num)
             tls_list = []
             if not threads:
                 return None
-            for thread in threads:
-                try:
-                    thread.switch()
-                except gdb.error:
-                    continue
-                tls = runtime.current_arch.get_tls()
-                tls_list.append(tls)
-            orig_thread.switch() # revert thread
-            orig_frame.select()
+            with ContextManager.threads(threads) as threads:
+                for _thread in threads:
+                    tls = runtime.current_arch.get_tls()
+                    if tls is not None:
+                        tls_list.append(tls)
             return tls_list
 
         def get_suitable_tls_addr(arena_addr):
@@ -1015,8 +941,6 @@ class GlibcHeap:
 
         @staticmethod
         def TCACHE_SMALL_BINS():
-            from gef.core.utils import get_libc_version
-
             if get_libc_version() < (2, 42):
                 return None
             else:
@@ -1024,29 +948,23 @@ class GlibcHeap:
 
         @staticmethod
         def TCACHE_LARGE_BINS():
-            from gef.core.utils import get_libc_version
-
             if get_libc_version() < (2, 42):
                 return None
             else:
                 return 12
 
         @staticmethod
-        @Cache.cache_this_session
+        @Cache.cache_this_session(until_new_objfile=True)
         def TCACHE_MAX_BINS():
-            from gef.core.utils import get_libc_version
-
             if get_libc_version() < (2, 42):
                 return 0x40
             else:
                 return GlibcHeap.GlibcArena.TCACHE_SMALL_BINS() + GlibcHeap.GlibcArena.TCACHE_LARGE_BINS()
 
         @staticmethod
-        @Cache.cache_this_session
+        @Cache.cache_this_session(until_new_objfile=True)
         def TCACHE_FILL_COUNT():
-            from gef.core.utils import get_libc_version
-
-            v = Config.get_gef_setting("heap.tcache_max_count")
+            v = Config.get("heap.tcache_max_count")
             if v != -1:
                 return v
             if get_libc_version() < (2, 43):
@@ -1062,8 +980,6 @@ class GlibcHeap:
             #   gef> call malloc(0x10)
             #   gef> bs <-- wrong result
             # This is probably a bug in GDB. The solution is to clear the GEF cache.
-            from gef.core.utils import GefUtil
-
             Cache.reset_gef_caches()
 
             # get address
@@ -1132,7 +1048,6 @@ class GlibcHeap:
         @property
         def heap_base(self):
             from gef.commands.process.base_address import HeapBaseCommand
-
             if self.is_main_arena:
                 return HeapBaseCommand.heap_base()
             else:
@@ -1148,34 +1063,31 @@ class GlibcHeap:
 
         @Cache.cache_until_next
         def addrof_tcachebins_base(self, force_heuristic=False):
-            from gef.core.utils import get_libc_version
-
             if self.heap_base is None:
                 return None
 
             def tcache_from_symbol():
+                from gef.commands.base import ContextManager
                 if force_heuristic:
+                    return None
+                if is_qiling(): # no TLS register, and gdb 16+ aborts on ARM64 when it evaluates a TLS variable
                     return None
                 # tcache is per-thread, so the address obtained by a symbol is depending on the current thread.
                 # so we get all tcaches from all threads and take the address closest to self.heap_base.
-                orig_thread = gdb.selected_thread()
-                orig_frame = gdb.selected_frame()
-                if not orig_thread: # orig_thread may be None if under winedbg
+                if not gdb.selected_thread(): # selected_thread may be None if under winedbg
                     return None
                 tcache = None
-                for thread in gdb.selected_inferior().threads():
-                    thread.switch() # change thread
-                    try:
-                        tcache_candidate = AddressUtil.parse_address("(void*) tcache")
-                        if tcache_candidate <= self.heap_base:
-                            continue
-                        if tcache is None or tcache > tcache_candidate:
-                            tcache = tcache_candidate
-                    except gdb.error:
-                        tcache_candidate = None
-                        break
-                orig_thread.switch() # revert thread
-                orig_frame.select()
+                with ContextManager.threads() as threads:
+                    for _thread in threads:
+                        try:
+                            tcache_candidate = AddressUtil.parse_address("(void*) tcache")
+                            if tcache_candidate <= self.heap_base:
+                                continue
+                            if tcache is None or tcache > tcache_candidate:
+                                tcache = tcache_candidate
+                        except gdb.error:
+                            tcache_candidate = None
+                            break
                 return tcache
 
             def tcache_from_heuristic_offset():
@@ -1312,8 +1224,6 @@ class GlibcHeap:
         def addrof_tcachebins_i_count(self, i):
             """return &tcache_perthread_struct.counts[i]
             or return &tcache_perthread_struct.num_slots[i]"""
-            from gef.core.utils import get_libc_version
-
             tcache_perthread_struct = self.tcache_perthread_struct
             if tcache_perthread_struct is None:
                 return None
@@ -1353,8 +1263,6 @@ class GlibcHeap:
 
         def tcachebins_i_count(self, i):
             """return tcache_perthread_struct.counts[i]"""
-            from gef.core.utils import get_libc_version
-
             counts_i_addr = self.addrof_tcachebins_i_count(i)
             if counts_i_addr is None:
                 return None
@@ -1370,8 +1278,6 @@ class GlibcHeap:
 
         def addrof_tcachebins_i(self, i):
             """return &tcache_perthread_struct.entries[i]"""
-            from gef.core.utils import get_libc_version
-
             tcache_perthread_struct = self.tcache_perthread_struct
             if tcache_perthread_struct is None:
                 return None
@@ -1387,56 +1293,49 @@ class GlibcHeap:
             if hasattr(self.__arena, "addrof_fastbins"):
                 fastbins_addr = self.__arena.addrof_fastbins
             else:
-                fastbins_type = [x for x in self.__arena.type.fields() if x.name == "fastbinsY"][0]
-                fastbins_addr = self.__addr + fastbins_type.bitpos // 8
+                fastbins_addr = self.__addr + GefUtil.member_offset(self.__arena.type, "fastbinsY")
             return fastbins_addr + i * runtime.current_arch.ptrsize
 
         def addrof_top(self):
             if hasattr(self.__arena, "addrof_top"):
                 top_addr = self.__arena.addrof_top
             else:
-                top_type = [x for x in self.__arena.type.fields() if x.name == "top"][0]
-                top_addr = self.__addr + top_type.bitpos // 8
+                top_addr = self.__addr + GefUtil.member_offset(self.__arena.type, "top")
             return top_addr
 
         def addrof_last_remainder(self):
             if hasattr(self.__arena, "addrof_last_remainder"):
                 last_remainder_addr = self.__arena.addrof_last_remainder
             else:
-                last_remainder_type = [x for x in self.__arena.type.fields() if x.name == "last_remainder"][0]
-                last_remainder_addr = self.__addr + last_remainder_type.bitpos // 8
+                last_remainder_addr = self.__addr + GefUtil.member_offset(self.__arena.type, "last_remainder")
             return last_remainder_addr
 
         def addrof_bins_i(self, i):
             if hasattr(self.__arena, "addrof_bins"):
                 bins_addr = self.__arena.addrof_bins
             else:
-                bins_type = [x for x in self.__arena.type.fields() if x.name == "bins"][0]
-                bins_addr = self.__addr + bins_type.bitpos // 8
+                bins_addr = self.__addr + GefUtil.member_offset(self.__arena.type, "bins")
             return bins_addr + i * runtime.current_arch.ptrsize * 2
 
         def addrof_next(self):
             if hasattr(self.__arena, "addrof_next"):
                 next_addr = self.__arena.addrof_next
             else:
-                next_type = [x for x in self.__arena.type.fields() if x.name == "next"][0]
-                next_addr = self.__addr + next_type.bitpos // 8
+                next_addr = self.__addr + GefUtil.member_offset(self.__arena.type, "next")
             return next_addr
 
         def addrof_next_free(self):
             if hasattr(self.__arena, "addrof_next_free"):
                 next_free_addr = self.__arena.addrof_next_free
             else:
-                next_free_type = [x for x in self.__arena.type.fields() if x.name == "next_free"][0]
-                next_free_addr = self.__addr + next_free_type.bitpos // 8
+                next_free_addr = self.__addr + GefUtil.member_offset(self.__arena.type, "next_free")
             return next_free_addr
 
         def addrof_system_mem(self):
             if hasattr(self.__arena, "addrof_system_mem"):
                 system_mem_addr = self.__arena.addrof_system_mem
             else:
-                system_mem_type = [x for x in self.__arena.type.fields() if x.name == "system_mem"][0]
-                system_mem_addr = self.__addr + system_mem_type.bitpos // 8
+                system_mem_addr = self.__addr + GefUtil.member_offset(self.__arena.type, "system_mem")
             return system_mem_addr
 
         def get_tcachebins_i(self, i):
@@ -1479,24 +1378,22 @@ class GlibcHeap:
 
         def __str__(self):
             """Return a formatted string representation of the arena and its key attributes."""
-            from gef.core.process import ProcessMap
-
-            arena = Color.colorify("Arena", Config.get_gef_setting("theme.heap_arena_label"))
+            arena = Color.colorify("Arena", Config.get("theme.heap_arena_label"))
             if self.heap_base is None:
                 heap_base = "uninitialized"
             else:
-                heap_base = ProcessMap.lookup_address(self.heap_base)
-            arena_addr = ProcessMap.lookup_address(self.__addr)
-            top = ProcessMap.lookup_address(self.top)
+                heap_base = ProcessMap.lookup(self.heap_base)
+            arena_addr = ProcessMap.lookup(self.__addr)
+            top = ProcessMap.lookup(self.top)
             if is_valid_addr(self.last_remainder):
-                last_remainder = ProcessMap.lookup_address(self.last_remainder)
+                last_remainder = ProcessMap.lookup(self.last_remainder)
             else:
                 last_remainder = hex(self.last_remainder)
-            next = ProcessMap.lookup_address(self.next)
+            next = ProcessMap.lookup(self.next)
             system_mem = int(self.system_mem)
             try:
                 if is_valid_addr(self.next_free):
-                    next_free = ProcessMap.lookup_address(self.next_free)
+                    next_free = ProcessMap.lookup(self.next_free)
                 else:
                     next_free = hex(self.next_free)
                 fmt = "{:s}(addr={!s}, heap_base={!s}, top={!s}, last_remainder={!s}, "
@@ -1511,8 +1408,6 @@ class GlibcHeap:
         def get_tcache_list(self):
             """Return a dictionary mapping tcache bin indices to lists of chunk addresses,
             handling loops and corruption."""
-            from gef.core.utils import get_libc_version
-
             if get_libc_version() < (2, 26):
                 return {}
 
@@ -1530,13 +1425,15 @@ class GlibcHeap:
 
                 # parse list
                 chunks = []
+                chunk_addresses = set()
                 while chunk is not None:
-                    if chunk.address in chunks:
+                    if chunk.address in chunk_addresses:
                         chunks.append(chunk.address)
                         chunks.append("Loop detected")
                         break # loop detected
 
                     chunks.append(chunk.address)
+                    chunk_addresses.add(chunk.address)
                     next_chunk = chunk.get_fwd_ptr(True)
                     if next_chunk is None:
                         chunks.append("Corrupted")
@@ -1553,17 +1450,18 @@ class GlibcHeap:
         def get_fastbins_list(self):
             """Return a dictionary of fastbin indices mapped to lists of chunk addresses,
             handling loops and corruption."""
-            from gef.core.utils import get_libc_version
-
             if get_libc_version() >= (2, 43):
                 return {}
 
             def fastbin_index(sz):
-                return (sz >> 4) - 2 if SIZE_SZ == 8 else (sz >> 3) - 2
+                if SIZE_SZ == 8:
+                    return (sz >> 4) - 2
+                return (sz >> 3) - 2
 
             SIZE_SZ = runtime.current_arch.ptrsize
+            MALLOC_ALIGN_MASK = GlibcHeap.HeapInfo.MALLOC_ALIGNMENT() - 1
             MAX_FAST_SIZE = (80 * SIZE_SZ // 4)
-            NFASTBINS = fastbin_index(MAX_FAST_SIZE) - 1
+            NFASTBINS = fastbin_index((MAX_FAST_SIZE + SIZE_SZ + MALLOC_ALIGN_MASK) & ~MALLOC_ALIGN_MASK) + 1
             chunks_all = {}
             for i in range(NFASTBINS):
                 # head check
@@ -1575,13 +1473,15 @@ class GlibcHeap:
 
                 # parse list
                 chunks = []
+                chunk_addresses = set()
                 while chunk is not None:
-                    if chunk.address in chunks:
+                    if chunk.address in chunk_addresses:
                         chunks.append(chunk.address)
                         chunks.append("Loop detected")
                         break # loop detected
 
                     chunks.append(chunk.address)
+                    chunk_addresses.add(chunk.address)
                     next_chunk = chunk.get_fwd_ptr(True)
                     if next_chunk is None:
                         chunks.append("Corrupted")
@@ -1610,18 +1510,20 @@ class GlibcHeap:
 
             corrupted = False
             chunks_bk = []
+            chunks_bk_addresses = set()
 
             # first: process backward
             while bk != head:
                 chunk = GlibcHeap.GlibcChunk(self, bk, from_base=True)
 
-                if chunk.chunk_base_address in chunks_bk:
+                if chunk.chunk_base_address in chunks_bk_addresses:
                     chunks_bk.append(chunk.chunk_base_address)
                     chunks_bk.append("Loop detected")
                     corrupted = True
                     break
 
                 chunks_bk.append(chunk.chunk_base_address)
+                chunks_bk_addresses.add(chunk.chunk_base_address)
 
                 bk = chunk.bck
                 if bk is None:
@@ -1634,15 +1536,18 @@ class GlibcHeap:
             if corrupted:
                 # second: process forward
                 chunks_fw = []
+                chunks_fw_addresses = set()
+                chunk_addresses = set(chunks)
                 while fw != head:
                     chunk = GlibcHeap.GlibcChunk(self, fw, from_base=True)
 
-                    if chunk.chunk_base_address in chunks:
+                    if chunk.chunk_base_address in chunk_addresses:
                         break # meet backward's list
-                    if chunk.chunk_base_address in chunks_fw:
+                    if chunk.chunk_base_address in chunks_fw_addresses:
                         break # loop
 
                     chunks_fw.append(chunk.chunk_base_address)
+                    chunks_fw_addresses.add(chunk.chunk_base_address)
                     fw = chunk.fwd
                     if fw is None:
                         break # corrupted
@@ -1671,37 +1576,35 @@ class GlibcHeap:
                 chunks_all[i] = self.get_bins_list(i)
             return chunks_all
 
-        def reset_cache(self):
-            """Make some caches.
-                - cached_XXX_list
-                - cached_XXX_addr_list
-                - bins_dict_for_address
-                - bins_dict_for_base_address
-            """
-            # cached_XXX_list = {bin_idx1: [chunk, chunk, ...], bin_idx2: [chunk, chunk, ...]}
-            self.cached_tcache_list = self.get_tcache_list()
-            self.cached_fastbins_list = self.get_fastbins_list()
-            self.cached_unsortedbin_list = self.get_unsortedbin_list()
-            self.cached_smallbins_list = self.get_smallbins_list()
-            self.cached_largebins_list = self.get_largebins_list()
+        @Cache.cache_until_next
+        def get_freelist_cache(self):
+            # bin_idx -> [chunk, chunk, ...]
+            tcache_lists = self.get_tcache_list()
+            fastbins_lists = self.get_fastbins_list()
+            unsortedbin_lists = self.get_unsortedbin_list()
+            smallbins_lists = self.get_smallbins_list()
+            largebins_lists = self.get_largebins_list()
 
             def int_filter(a):
                 return {x for x in a if isinstance(x, int)}
 
-            # cacheed_XXX_addr_list = {chunk, chunk, ...}
-            self.cached_tcache_addr_list = int_filter(set().union(*self.cached_tcache_list.values()))
-            self.cached_fastbins_addr_list = int_filter(set().union(*self.cached_fastbins_list.values()))
-            self.cached_unsortedbin_addr_list = int_filter(self.cached_unsortedbin_list[0])
-            self.cached_smallbins_addr_list = int_filter(set().union(*self.cached_smallbins_list.values()))
-            self.cached_largebins_addr_list = int_filter(set().union(*self.cached_largebins_list.values()))
+            # bin type -> {chunk, chunk, ...}
+            addr_lists = {
+                "tcache": int_filter(set().union(*tcache_lists.values())),
+                "fastbins": int_filter(set().union(*fastbins_lists.values())),
+                "unsortedbin": int_filter(unsortedbin_lists[0]),
+                "smallbins": int_filter(set().union(*smallbins_lists.values())),
+                "largebins": int_filter(set().union(*largebins_lists.values())),
+            }
 
             # dict[address] = ["bins info1", "bins info2", ...]
-            self.bins_dict_for_address = {}
-            for tcache_idx, tcache_list in self.cached_tcache_list.items():
-                for address in tcache_list:
+            bins_dict_for_address = {}
+            for tcache_idx, tcache_list in tcache_lists.items():
+                position_table = GefUtil.make_position_table(tcache_list)
+                for address in set(tcache_list):
                     if not isinstance(address, int):
                         continue
-                    pos = ",".join([str(i + 1) for i, x in enumerate(tcache_list) if x == address])
+                    pos = position_table[address]
                     if "size" in  GlibcHeap.get_binsize_table()["tcache"][tcache_idx]:
                         sz = GlibcHeap.get_binsize_table()["tcache"][tcache_idx]["size"]
                         m = "tcache[idx={:d},sz={:#x}][{:s}/{:d}]".format(tcache_idx, sz, pos, len(tcache_list))
@@ -1711,78 +1614,85 @@ class GlibcHeap:
                         m = "tcache[idx={:d},sz={:#x}-{:#x}][{:s}/{:d}]".format(
                             tcache_idx, sz_min, sz_max, pos, len(tcache_list),
                         )
-                    new_list = self.bins_dict_for_address.get(address, []) + [m]
-                    self.bins_dict_for_address[address] = new_list
+                    new_list = bins_dict_for_address.get(address, []) + [m]
+                    bins_dict_for_address[address] = new_list
 
-            for fastbin_idx, fastbin_list in self.cached_fastbins_list.items():
+            fastbins_table = GlibcHeap.get_binsize_table()["fastbins"]
+            for fastbin_idx, fastbin_list in fastbins_lists.items():
+                position_table = GefUtil.make_position_table(fastbin_list)
                 for address in set(fastbin_list):
                     if not isinstance(address, int):
                         continue
-                    pos = ",".join([str(i + 1) for i, x in enumerate(fastbin_list) if x == address])
-                    sz = GlibcHeap.get_binsize_table()["fastbins"][fastbin_idx]["size"]
-                    m = "fastbins[idx={:d},sz={:#x}][{:s}/{:d}]".format(fastbin_idx, sz, pos, len(fastbin_list))
-                    new_list = self.bins_dict_for_address.get(address, []) + [m]
-                    self.bins_dict_for_address[address] = new_list
+                    pos = position_table[address]
+                    if fastbin_idx in fastbins_table:
+                        sz = fastbins_table[fastbin_idx]["size"]
+                        m = "fastbins[idx={:d},sz={:#x}][{:s}/{:d}]".format(fastbin_idx, sz, pos, len(fastbin_list))
+                    else:
+                        m = "fastbins[idx={:d}][{:s}/{:d}]".format(fastbin_idx, pos, len(fastbin_list))
+                    new_list = bins_dict_for_address.get(address, []) + [m]
+                    bins_dict_for_address[address] = new_list
 
             # dict[base_address] = ["bins info1", "bins info2", ...]
-            self.bins_dict_for_base_address = {}
-            for _, unsortedbin_list in self.cached_unsortedbin_list.items():
-                for base_address in unsortedbin_list:
+            bins_dict_for_base_address = {}
+            for _, unsortedbin_list in unsortedbin_lists.items():
+                position_table = GefUtil.make_position_table(unsortedbin_list)
+                for base_address in set(unsortedbin_list):
                     if not isinstance(base_address, int):
                         continue
-                    pos = ",".join([str(i + 1) for i, x in enumerate(unsortedbin_list) if x == base_address])
+                    pos = position_table[base_address]
                     m = "unsortedbins[{:s}/{:d}]".format(pos, len(unsortedbin_list))
-                    new_list = self.bins_dict_for_base_address.get(base_address, []) + [m]
-                    self.bins_dict_for_base_address[base_address] = new_list
+                    new_list = bins_dict_for_base_address.get(base_address, []) + [m]
+                    bins_dict_for_base_address[base_address] = new_list
 
-            for smallbin_idx, smallbin_list in self.cached_smallbins_list.items():
-                for base_address in smallbin_list:
+            for smallbin_idx, smallbin_list in smallbins_lists.items():
+                position_table = GefUtil.make_position_table(smallbin_list)
+                for base_address in set(smallbin_list):
                     if not isinstance(base_address, int):
                         continue
-                    pos = ",".join([str(i + 1) for i, x in enumerate(smallbin_list) if x == base_address])
+                    pos = position_table[base_address]
                     sz = GlibcHeap.get_binsize_table()["small_bins"][smallbin_idx]["size"]
                     m = "smallbins[idx={:d},sz={:#x}][{:s}/{:d}]".format(smallbin_idx, sz, pos, len(smallbin_list))
-                    new_list = self.bins_dict_for_base_address.get(base_address, []) + [m]
-                    self.bins_dict_for_base_address[base_address] = new_list
+                    new_list = bins_dict_for_base_address.get(base_address, []) + [m]
+                    bins_dict_for_base_address[base_address] = new_list
 
-            for largebin_idx, largebin_list in self.cached_largebins_list.items():
-                for base_address in largebin_list:
+            for largebin_idx, largebin_list in largebins_lists.items():
+                position_table = GefUtil.make_position_table(largebin_list)
+                for base_address in set(largebin_list):
                     if not isinstance(base_address, int):
                         continue
-                    pos = ",".join([str(i + 1) for i, x in enumerate(largebin_list) if x == base_address])
+                    pos = position_table[base_address]
                     sz_min = GlibcHeap.get_binsize_table()["large_bins"][largebin_idx]["size_min"]
                     sz_max = GlibcHeap.get_binsize_table()["large_bins"][largebin_idx]["size_max"]
                     m = "largebins[idx={:d},sz={:#x}-{:#x}][{:s}/{:d}]".format(
                         largebin_idx, sz_min, sz_max, pos, len(largebin_list),
                     )
-                    new_list = self.bins_dict_for_base_address.get(base_address, []) + [m]
-                    self.bins_dict_for_base_address[base_address] = new_list
+                    new_list = bins_dict_for_base_address.get(base_address, []) + [m]
+                    bins_dict_for_base_address[base_address] = new_list
+            return addr_lists, bins_dict_for_address, bins_dict_for_base_address
+
+        def reset_cache(self): # noqa: V105
+            Cache.clear_cache_for(self.get_freelist_cache)
             return
 
         def is_chunk_in_tcache(self, chunk):
-            if not hasattr(self, "cached_tcache_addr_list"):
-                self.reset_cache()
-            return chunk.address in self.cached_tcache_addr_list
+            addr_lists, _, _ = self.get_freelist_cache()
+            return chunk.address in addr_lists["tcache"]
 
         def is_chunk_in_fastbins(self, chunk):
-            if not hasattr(self, "cached_fastbins_addr_list"):
-                self.reset_cache()
-            return chunk.address in self.cached_fastbins_addr_list
+            addr_lists, _, _ = self.get_freelist_cache()
+            return chunk.address in addr_lists["fastbins"]
 
         def is_chunk_in_unsortedbin(self, chunk):
-            if not hasattr(self, "cached_unsortedbin_addr_list"):
-                self.reset_cache()
-            return chunk.chunk_base_address in self.cached_unsortedbin_addr_list
+            addr_lists, _, _ = self.get_freelist_cache()
+            return chunk.chunk_base_address in addr_lists["unsortedbin"]
 
         def is_chunk_in_smallbins(self, chunk):
-            if not hasattr(self, "cached_smallbins_addr_list"):
-                self.reset_cache()
-            return chunk.chunk_base_address in self.cached_smallbins_addr_list
+            addr_lists, _, _ = self.get_freelist_cache()
+            return chunk.chunk_base_address in addr_lists["smallbins"]
 
         def is_chunk_in_largebins(self, chunk):
-            if not hasattr(self, "cached_largebins_addr_list"):
-                self.reset_cache()
-            return chunk.chunk_base_address in self.cached_largebins_addr_list
+            addr_lists, _, _ = self.get_freelist_cache()
+            return chunk.chunk_base_address in addr_lists["largebins"]
 
         def is_chunk_in_freelists(self, chunk):
             if self.is_chunk_in_tcache(chunk):
@@ -1806,15 +1716,13 @@ class GlibcHeap:
             elif isinstance(address_or_chunk, int):
                 address = address_or_chunk
                 base_address = address_or_chunk
+            else:
+                return []
 
+            _, bins_dict_for_address, bins_dict_for_base_address = self.get_freelist_cache()
             info = []
-            if not hasattr(self, "bins_dict_for_address"):
-                self.reset_cache()
-            info.extend(self.bins_dict_for_address.get(address, []))
-
-            if not hasattr(self, "bins_dict_for_base_address"):
-                self.reset_cache()
-            info.extend(self.bins_dict_for_base_address.get(base_address, []))
+            info.extend(bins_dict_for_address.get(address, []))
+            info.extend(bins_dict_for_base_address.get(base_address, []))
 
             if not skip_top:
                 if base_address == self.top:
@@ -1826,6 +1734,7 @@ class GlibcHeap:
         """Return the arena object for the given address or arena index, or None if not found."""
         if address is None or is_valid_addr(address):
             try:
+                get_libc_version() # every later step depends on it, so fail here if it is unknown
                 arena = GlibcHeap.GlibcArena(address)
                 str(arena) # check memory error
                 return arena
@@ -1841,12 +1750,8 @@ class GlibcHeap:
         if arena is None:
             return None
 
-        arenas = []
-        while arena:
-            arenas.append(arena)
-            arena = arena.get_next()
-
-        if arena_number >= len(arenas):
+        arenas = GlibcHeap.get_all_arenas()
+        if arena_number < 0 or arena_number >= len(arenas):
             err("Failed to get the arena, heap commands may not work properly")
             return None
 
@@ -1860,7 +1765,7 @@ class GlibcHeap:
     def get_all_arenas():
         arenas = []
         arena = GlibcHeap.get_main_arena()
-        while arena:
+        while arena and arena.addr not in [a.addr for a in arenas]:
             arenas.append(arena)
             arena = arena.get_next()
         return arenas
@@ -1880,10 +1785,29 @@ class GlibcHeap:
 
             self.size_addr = AddressUtil.normalize_address(self.address - self.ptrsize)
             self.prev_size_addr = self.chunk_base_address
+            self.header = None
             return
 
+        def read_header_int(self, addr, offset):
+            """Return the header word at `addr`, which is `offset` bytes from the chunk base.
+            The header fields used to be read one by one, which costs up to 7 `read_memory`
+            per chunk. Read the whole header at once instead and memoize it.
+            If the whole header is not readable (e.g. the chunk is at the end of a mapping),
+            fall back to reading the word alone, so that gdb.MemoryError is raised at
+            exactly the same place as before."""
+            if self.header is None:
+                self.header = b""
+                # If normalize_address() wrapped one of the addresses around, the fields
+                # are not contiguous and the header cannot be read at once.
+                if self.ptrsize in (4, 8) and self.size_addr == self.chunk_base_address + self.ptrsize:
+                    self.header = read_memory(self.chunk_base_address, self.ptrsize * 6, safe=True) or b""
+            if self.header:
+                unpack = GefUtil.get_unpack(self.ptrsize)
+                return unpack(self.header[offset:offset + self.ptrsize])
+            return read_int_from_memory(addr)
+
         def get_chunk_size(self):
-            return read_int_from_memory(self.size_addr) & (~0x07)
+            return self.read_header_int(self.size_addr, self.ptrsize) & (~0x07)
 
         @property
         def size(self):
@@ -1895,10 +1819,17 @@ class GlibcHeap:
                 return cursz
             if self.has_m_bit():
                 return cursz - 2 * self.ptrsize
+            # glibc maps arenas with PROT_MTE only when memory tagging is enabled
+            if is_arm64():
+                try:
+                    gdb.execute("memory-tag print-allocation-tag {:#x}".format(self.address), to_string=True)
+                    return cursz - 2 * self.ptrsize
+                except gdb.error:
+                    pass
             return cursz - self.ptrsize
 
         def get_prev_chunk_size(self):
-            return read_int_from_memory(self.prev_size_addr)
+            return self.read_header_int(self.prev_size_addr, 0)
 
         def get_next_chunk(self):
             try:
@@ -1909,15 +1840,13 @@ class GlibcHeap:
 
         # if freed functions
         def get_fwd_ptr(self, sll):
-            from gef.core.utils import get_libc_version
-
             try:
                 # Not a single-linked-list (sll) or no Safe-Linking support yet
                 if not sll or get_libc_version() < (2, 32):
-                    return read_int_from_memory(self.address)
+                    return self.read_header_int(self.address, self.ptrsize * 2)
                 # Unmask ("reveal") the Safe-Linking pointer
                 else:
-                    return read_int_from_memory(self.address) ^ (self.address >> 12)
+                    return self.read_header_int(self.address, self.ptrsize * 2) ^ (self.address >> 12)
             except gdb.MemoryError:
                 return None
 
@@ -1929,7 +1858,7 @@ class GlibcHeap:
 
         def get_bkw_ptr(self):
             try:
-                return read_int_from_memory(self.address + self.ptrsize)
+                return self.read_header_int(self.address + self.ptrsize, self.ptrsize * 3)
             except gdb.MemoryError:
                 return None
 
@@ -1940,14 +1869,14 @@ class GlibcHeap:
         bk = bck # for compat
 
         def get_fd_nextsize_ptr(self):
-            return read_int_from_memory(self.address + self.ptrsize * 2)
+            return self.read_header_int(self.address + self.ptrsize * 2, self.ptrsize * 4)
 
         @property
         def fd_nextsize(self):
             return self.get_fd_nextsize_ptr()
 
         def get_bk_nextsize_ptr(self):
-            return read_int_from_memory(self.address + self.ptrsize * 3)
+            return self.read_header_int(self.address + self.ptrsize * 3, self.ptrsize * 5)
 
         @property
         def bk_nextsize(self):
@@ -1955,13 +1884,13 @@ class GlibcHeap:
         # endif freed functions
 
         def has_p_bit(self):
-            return read_int_from_memory(self.size_addr) & 0x01
+            return self.read_header_int(self.size_addr, self.ptrsize) & 0x01
 
         def has_m_bit(self):
-            return read_int_from_memory(self.size_addr) & 0x02
+            return self.read_header_int(self.size_addr, self.ptrsize) & 0x02
 
         def has_n_bit(self):
-            return read_int_from_memory(self.size_addr) & 0x04
+            return self.read_header_int(self.size_addr, self.ptrsize) & 0x04
 
         def is_used(self):
             # Check if the current block is used by:
@@ -1971,7 +1900,9 @@ class GlibcHeap:
                 return True
             next_chunk = self.get_next_chunk()
             try:
-                return True if next_chunk.has_p_bit() else False
+                if next_chunk.has_p_bit():
+                    return True
+                return False
             except gdb.MemoryError as e:
                 # top?
                 if (next_chunk.chunk_base_address & 0xfff) == 0:
@@ -2058,37 +1989,33 @@ class GlibcHeap:
             flags = []
             if self.has_p_bit():
                 flags.append(Color.colorify(
-                    "PREV_INUSE", Config.get_gef_setting("theme.heap_chunk_flag_prev_inuse"),
+                    "PREV_INUSE", Config.get("theme.heap_chunk_flag_prev_inuse"),
                 ))
             if self.has_m_bit():
                 flags.append(Color.colorify(
-                    "IS_MMAPPED", Config.get_gef_setting("theme.heap_chunk_flag_is_mmapped"),
+                    "IS_MMAPPED", Config.get("theme.heap_chunk_flag_is_mmapped"),
                 ))
             if self.has_n_bit():
                 flags.append(Color.colorify(
-                    "NON_MAIN_ARENA", Config.get_gef_setting("theme.heap_chunk_flag_non_main_arena"),
+                    "NON_MAIN_ARENA", Config.get("theme.heap_chunk_flag_non_main_arena"),
                 ))
             return "|".join(flags)
 
         def __str__(self):
             """Return a formatted string representation of the chunk and its key attributes,
             including color and symbol information."""
-            from gef.core.process import ProcessMap
-            from gef.core.symbols import Symbol
-            from gef.core.utils import get_libc_version
-
 
             def get_sym(addr):
-                a = ProcessMap.lookup_address(addr)
-                b = Symbol.get_symbol_string(addr)
-                return a, b
+                a = ProcessMap.lookup(addr)
+                b = Symbol.format(addr)
+                return a, " " + b if b else ""
 
             def get_sym_chunk(addr):
-                a = ProcessMap.lookup_address(addr)
-                b1 = Color.colorify_hex(addr, Config.get_gef_setting("theme.heap_chunk_address_freed"))
-                b2 = Color.colorify_hex(addr, Config.get_gef_setting("theme.heap_chunk_address_used"))
-                c = Symbol.get_symbol_string(addr)
-                return a, (b1, b2), c
+                a = ProcessMap.lookup(addr)
+                b1 = Color.colorify_hex(addr, Config.get("theme.heap_chunk_address_freed"))
+                b2 = Color.colorify_hex(addr, Config.get("theme.heap_chunk_address_used"))
+                c = Symbol.format(addr)
+                return a, (b1, b2), " " + c if c else ""
 
             def get_err(addrs, sll=False):
                 for a in addrs:
@@ -2097,12 +2024,12 @@ class GlibcHeap:
                             # single link-list && 0: ok
                             continue
                         return " [{:s}]".format(Color.colorify(
-                            "Corrupted", Config.get_gef_setting("theme.heap_corrupted_msg"),
+                            "Corrupted", Config.get("theme.heap_corrupted_msg"),
                         ))
                 return ""
 
-            chunk_c = Color.colorify("Chunk", Config.get_gef_setting("theme.heap_chunk_label"))
-            size_c = Color.colorify_hex(self.get_chunk_size(), Config.get_gef_setting("theme.heap_chunk_size"))
+            chunk_c = Color.colorify("Chunk", Config.get("theme.heap_chunk_label"))
+            size_c = Color.colorify_hex(self.get_chunk_size(), Config.get("theme.heap_chunk_size"))
             base, (base_c_f, base_c_u), base_sym = get_sym_chunk(self.chunk_base_address)
             addr, (addr_c_f, addr_c_u), addr_sym = get_sym_chunk(self.address)
             flags = self.flags_as_string()
@@ -2171,20 +2098,18 @@ class GlibcHeap:
             showing both its summary and allocation state."""
             msg = []
             msg.append(str(self))
-            if self.is_used():
+            # top is not in any free list, so its fd/bk are just user data
+            if self.is_top() or self.is_used():
                 msg.append(self.str_as_alloced())
             else:
                 msg.append(self.str_as_freed())
             return "\n".join(msg)
 
     @staticmethod
-    @Cache.cache_this_session
+    @Cache.cache_this_session(until_new_objfile=True)
     def get_binsize_table():
         """Return a dictionary containing size information for tcache, fastbins, unsorted bin,
         small bins, and large bins, based on architecture and libc version."""
-        from gef.core.process import is_64bit, is_ppc32, is_riscv32, is_x86_32
-        from gef.core.utils import get_libc_version
-
         table = {
             "tcache": {},
             "fastbins": {},
@@ -2246,7 +2171,7 @@ class GlibcHeap:
 
         # fastbins
         if is_64bit():
-            for i in range(7):
+            for i in range(10):
                 size = MIN_SIZE + i * 0x10
                 table["fastbins"][i] = {"size": size}
         elif (is_x86_32() or is_riscv32() or is_ppc32()) and get_libc_version() >= (2, 26):
@@ -2256,8 +2181,10 @@ class GlibcHeap:
             table["fastbins"][2] = {"size": 0x20}
             table["fastbins"][4] = {"size": 0x30}
             table["fastbins"][6] = {"size": 0x40}
+            table["fastbins"][8] = {"size": 0x50}
+            table["fastbins"][10] = {"size": 0x60}
         else:
-            for i in range(7):
+            for i in range(10):
                 size = MIN_SIZE + i * 8
                 table["fastbins"][i] = {"size": size}
 
@@ -2266,7 +2193,7 @@ class GlibcHeap:
 
         # smallbins
         for i in range(1, 63):
-            if is_64bit() or (is_x86_32() and get_libc_version() >= (2, 26)):
+            if is_64bit() or ((is_x86_32() or is_riscv32() or is_ppc32()) and get_libc_version() >= (2, 26)):
                 size = MIN_SIZE + (i - 1) * 0x10
             else:
                 size = MIN_SIZE + (i - 1) * 0x8
@@ -2308,7 +2235,7 @@ class GlibcHeap:
             table["large_bins"][94] = {"size_min": 0xbc0, "size_max": 0xc00}
             table["large_bins"][95] = {"size_min": 0xc00, "size_max": 0xc40}
             table["large_bins"][96] = {"size_min": 0xc40, "size_max": 0xe00}
-        elif is_x86_32() and get_libc_version() >= (2, 26):
+        elif (is_x86_32() or is_riscv32() or is_ppc32()) and get_libc_version() >= (2, 26):
             table["large_bins"][63] = {"size_min": 0x3f0, "size_max": 0x400}
             table["large_bins"][64] = {"size_min": 0x400, "size_max": 0x440}
             table["large_bins"][65] = {"size_min": 0x440, "size_max": 0x480}
@@ -2412,11 +2339,11 @@ class GlibcHeap:
         return table
 
     # for convenience
-    H = HeapInfo # noqa
-    M = MallocPar # noqa
-    A = GlibcArena # noqa
-    C = GlibcChunk # noqa
+    H = HeapInfo
+    M = MallocPar
+    A = GlibcArena
+    C = GlibcChunk
 
 
 # for convenience
-GH = GlibcHeap # noqa
+GH = GlibcHeap # noqa: V107

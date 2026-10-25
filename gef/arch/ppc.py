@@ -266,10 +266,19 @@ class PPC(Architecture):
         tls = get_register("$r2")
         return adjust_offset(tls)
 
+    def get_canary_offset(self):
+        return -0x8
+
     def decode_cookie(self, value, cookie):
         return value ^ cookie
 
     def encode_cookie(self, value, cookie):
+        return value ^ cookie
+
+    def decode_cookie_legacy(self, value, cookie):
+        return value ^ cookie
+
+    def encode_cookie_legacy(self, value, cookie):
         return value ^ cookie
 
 
@@ -328,4 +337,5 @@ class PPC64(PPC):
         tls = get_register("$r13")
         return adjust_offset(tls)
 
-
+    def get_canary_offset(self):
+        return -0x10

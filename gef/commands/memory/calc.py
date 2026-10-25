@@ -11,9 +11,11 @@ import binascii
 import codecs
 import collections
 import contextlib
+import functools
 import hashlib
 import itertools
 import json
+import math
 import os
 import re
 import sys
@@ -30,6 +32,7 @@ from gef.commands.base import (
 )
 from gef.core.address import AddressUtil
 from gef.core.color import Color, err, gef_print, info, titlify, warn
+from gef.core.display import ProgressBar
 from gef.core.hash import Hash
 from gef.core.memory import hexdump, read_memory
 from gef.core.process import (
@@ -41,7 +44,7 @@ from gef.core.process import (
 from gef.core.qemu import read_physmem
 from gef.core.strings import String
 from gef.core.symbols import ModuleLoader
-from gef.core.utils import GefUtil, align_to_pagesize, slicer, xor
+from gef.core.utils import GefUtil, align, align_to_pagesize, slicer, xor
 
 
 @register_command
@@ -193,7 +196,7 @@ class HashCommand(GenericCommand):
         'The key for KMAC128 and KMAC256 is blank.',
         'The key for SipHash is "\\0" * 16.',
         'The key for HalfSipHash is "\\0" * 8.',
-        "To calculate FSB hash, you need the `gmpy2` package (uv pip install gmpy2).",
+        "To calculate FSB hash, install `gmpy2` into the Python environment used by GEF.",
     ]
     _note_ = "\n".join(_note_)
 
@@ -203,34 +206,30 @@ class HashCommand(GenericCommand):
         super().__init__(prefix=prefix, complete=complete)
         return
 
-    def get_valid_hash_funcs(self):
+    def get_hash_factories(self):
         yield "hashlib"
 
         hashlib_hashes = {
-            "MD5": "md5",
-            "SHA1": "sha1",
-            "MD5-SHA1": "md5-sha1",
-            "SHA-224": "sha224",
-            "SHA-256": "sha256",
-            "SHA-384": "sha384",
-            "SHA-512": "sha512",
-            "SHA-512/224": "sha512-224", # May not be usable depending on availability of OpenSSL
-            "SHA-512/256": "sha512-256", # May not be usable depending on availability of OpenSSL
-            "SHA3-224": "sha3-224",
-            "SHA3-256": "sha3-256",
-            "SHA3-384": "sha3-384",
-            "SHA3-512": "sha3-512",
-            "BLAKE2s": "blake2s",
-            "BLAKE2b": "blake2b",
-            "SM3": "sm3",
-            "RIPEMD-160": "ripemd160", # May not be usable depending on availability of OpenSSL
+            "MD5": ("md5", 16),
+            "SHA1": ("sha1", 20),
+            "MD5-SHA1": ("md5-sha1", 36),
+            "SHA-224": ("sha224", 28),
+            "SHA-256": ("sha256", 32),
+            "SHA-384": ("sha384", 48),
+            "SHA-512": ("sha512", 64),
+            "SHA-512/224": ("sha512-224", 28), # May not be usable depending on availability of OpenSSL
+            "SHA-512/256": ("sha512-256", 32), # May not be usable depending on availability of OpenSSL
+            "SHA3-224": ("sha3-224", 28),
+            "SHA3-256": ("sha3-256", 32),
+            "SHA3-384": ("sha3-384", 48),
+            "SHA3-512": ("sha3-512", 64),
+            "BLAKE2s": ("blake2s", 32),
+            "BLAKE2b": ("blake2b", 64),
+            "SM3": ("sm3", 32),
+            "RIPEMD-160": ("ripemd160", 20), # May not be usable depending on availability of OpenSSL
         }
-        for hname, hname_hashlib in hashlib_hashes.items():
-            try:
-                hfunc = hashlib.new(hname_hashlib)
-            except Exception:
-                continue
-            yield (hname, hfunc)
+        for hname, (hname_hashlib, digest_size) in hashlib_hashes.items():
+            yield (hname, digest_size, functools.partial(hashlib.new, hname_hashlib))
 
         class ShakeWrapper:
             def __init__(self, hname, bits):
@@ -248,512 +247,528 @@ class HashCommand(GenericCommand):
         for hname_base in ["shake-128", "shake-256"]:
             for bits in [128, 256, 512]:
                 hname = "{:s}-{:d}".format(hname_base.upper().replace("-", ""), bits)
-                try:
-                    hfunc = ShakeWrapper(hname_base, bits)
-                except Exception:
-                    continue
-                yield (hname, hfunc)
+                yield (hname, bits // 8, functools.partial(ShakeWrapper, hname_base, bits))
 
         # SHA-3 Round3 candidates
         yield "SHA3 Round3 candidates"
-        yield ("BLAKE-224", Hash.BLAKE224())
-        yield ("BLAKE-256", Hash.BLAKE256())
-        yield ("BLAKE-384", Hash.BLAKE384())
-        yield ("BLAKE-512", Hash.BLAKE512())
-        yield ("Groestl-224", Hash.Groestl224())
-        yield ("Groestl-256", Hash.Groestl256())
-        yield ("Groestl-384", Hash.Groestl384())
-        yield ("Groestl-512", Hash.Groestl512())
-        yield ("JH-224", Hash.JH224())
-        yield ("JH-256", Hash.JH256())
-        yield ("JH-384", Hash.JH384())
-        yield ("JH-512", Hash.JH512())
-        yield ("Keccak-224", Hash.Keccak224())
-        yield ("Keccak-256", Hash.Keccak256())
-        yield ("Keccak-384", Hash.Keccak384())
-        yield ("Keccak-512", Hash.Keccak512())
-        yield ("Skein256-256", Hash.Skein256(digest_bits=256))
-        yield ("Skein256-512", Hash.Skein256(digest_bits=512))
-        yield ("Skein256-1024", Hash.Skein256(digest_bits=1024))
-        yield ("Skein512-256", Hash.Skein512(digest_bits=256))
-        yield ("Skein512-512", Hash.Skein512(digest_bits=512))
-        yield ("Skein512-1024", Hash.Skein512(digest_bits=1024))
-        yield ("Skein1024-256", Hash.Skein1024(digest_bits=256))
-        yield ("Skein1024-512", Hash.Skein1024(digest_bits=512))
-        yield ("Skein1024-1024", Hash.Skein1024(digest_bits=1024))
+        yield ("BLAKE-224", 28, Hash.BLAKE224)
+        yield ("BLAKE-256", 32, Hash.BLAKE256)
+        yield ("BLAKE-384", 48, Hash.BLAKE384)
+        yield ("BLAKE-512", 64, Hash.BLAKE512)
+        yield ("Groestl-224", 28, Hash.Groestl224)
+        yield ("Groestl-256", 32, Hash.Groestl256)
+        yield ("Groestl-384", 48, Hash.Groestl384)
+        yield ("Groestl-512", 64, Hash.Groestl512)
+        yield ("JH-224", 28, Hash.JH224)
+        yield ("JH-256", 32, Hash.JH256)
+        yield ("JH-384", 48, Hash.JH384)
+        yield ("JH-512", 64, Hash.JH512)
+        yield ("Keccak-224", 28, Hash.Keccak224)
+        yield ("Keccak-256", 32, Hash.Keccak256)
+        yield ("Keccak-384", 48, Hash.Keccak384)
+        yield ("Keccak-512", 64, Hash.Keccak512)
+        yield ("Skein256-256", 32, functools.partial(Hash.Skein256, digest_bits=256))
+        yield ("Skein256-512", 64, functools.partial(Hash.Skein256, digest_bits=512))
+        yield ("Skein256-1024", 128, functools.partial(Hash.Skein256, digest_bits=1024))
+        yield ("Skein512-256", 32, functools.partial(Hash.Skein512, digest_bits=256))
+        yield ("Skein512-512", 64, functools.partial(Hash.Skein512, digest_bits=512))
+        yield ("Skein512-1024", 128, functools.partial(Hash.Skein512, digest_bits=1024))
+        yield ("Skein1024-256", 32, functools.partial(Hash.Skein1024, digest_bits=256))
+        yield ("Skein1024-512", 64, functools.partial(Hash.Skein1024, digest_bits=512))
+        yield ("Skein1024-1024", 128, functools.partial(Hash.Skein1024, digest_bits=1024))
 
         # SHA-3 Round2 candidates
         yield "SHA3 Round2 candidates"
-        yield ("BMW-224", Hash.BMW224())
-        yield ("BMW-256", Hash.BMW256())
-        yield ("BMW-384", Hash.BMW384())
-        yield ("BMW-512", Hash.BMW512())
-        yield ("CubeHash10+1/1+10-256", Hash.CubeHash(params="CubeHash10+1/1+10-256"))
-        yield ("CubeHash80+8/1+80-256", Hash.CubeHash(params="CubeHash80+8/1+80-256"))
-        yield ("CubeHash160+16/32+160-256", Hash.CubeHash(params="CubeHash160+16/32+160-256"))
-        yield ("CubeHash10+1/1+10-512", Hash.CubeHash(params="CubeHash10+1/1+10-512"))
-        yield ("CubeHash80+8/1+80-512", Hash.CubeHash(params="CubeHash80+8/1+80-512"))
-        yield ("CubeHash160+16/32+160-512", Hash.CubeHash(params="CubeHash160+16/32+160-512"))
-        yield ("ECHO-224", Hash.ECHO224())
-        yield ("ECHO-256", Hash.ECHO256())
-        yield ("ECHO-384", Hash.ECHO384())
-        yield ("ECHO-512", Hash.ECHO512())
-        yield ("Fugue-224", Hash.Fugue224())
-        yield ("Fugue-256", Hash.Fugue256())
-        yield ("Fugue-384", Hash.Fugue384())
-        yield ("Fugue-512", Hash.Fugue512())
-        yield ("Hamsi-224", Hash.Hamsi224())
-        yield ("Hamsi-256", Hash.Hamsi256())
-        yield ("Hamsi-384", Hash.Hamsi384())
-        yield ("Hamsi-512", Hash.Hamsi512())
-        yield ("Luffa-224", Hash.Luffa224())
-        yield ("Luffa-256", Hash.Luffa256())
-        yield ("Luffa-384", Hash.Luffa384())
-        yield ("Luffa-512", Hash.Luffa512())
-        yield ("Shabal-192", Hash.Shabal192())
-        yield ("Shabal-224", Hash.Shabal224())
-        yield ("Shabal-256", Hash.Shabal256())
-        yield ("Shabal-384", Hash.Shabal384())
-        yield ("Shabal-512", Hash.Shabal512())
-        yield ("SHAvite3-224", Hash.SHAvite3_224())
-        yield ("SHAvite3-256", Hash.SHAvite3_256())
-        yield ("SHAvite3-384", Hash.SHAvite3_384())
-        yield ("SHAvite3-512", Hash.SHAvite3_512())
-        yield ("SIMD-224", Hash.SIMD224())
-        yield ("SIMD-256", Hash.SIMD256())
-        yield ("SIMD-384", Hash.SIMD384())
-        yield ("SIMD-512", Hash.SIMD512())
+        yield ("BMW-224", 28, Hash.BMW224)
+        yield ("BMW-256", 32, Hash.BMW256)
+        yield ("BMW-384", 48, Hash.BMW384)
+        yield ("BMW-512", 64, Hash.BMW512)
+        yield ("CubeHash10+1/1+10-256", 32, functools.partial(Hash.CubeHash, params="CubeHash10+1/1+10-256"))
+        yield ("CubeHash80+8/1+80-256", 32, functools.partial(Hash.CubeHash, params="CubeHash80+8/1+80-256"))
+        yield ("CubeHash160+16/32+160-256", 32, functools.partial(Hash.CubeHash, params="CubeHash160+16/32+160-256"))
+        yield ("CubeHash10+1/1+10-512", 64, functools.partial(Hash.CubeHash, params="CubeHash10+1/1+10-512"))
+        yield ("CubeHash80+8/1+80-512", 64, functools.partial(Hash.CubeHash, params="CubeHash80+8/1+80-512"))
+        yield ("CubeHash160+16/32+160-512", 64, functools.partial(Hash.CubeHash, params="CubeHash160+16/32+160-512"))
+        yield ("ECHO-224", 28, Hash.ECHO224)
+        yield ("ECHO-256", 32, Hash.ECHO256)
+        yield ("ECHO-384", 48, Hash.ECHO384)
+        yield ("ECHO-512", 64, Hash.ECHO512)
+        yield ("Fugue-224", 28, Hash.Fugue224)
+        yield ("Fugue-256", 32, Hash.Fugue256)
+        yield ("Fugue-384", 48, Hash.Fugue384)
+        yield ("Fugue-512", 64, Hash.Fugue512)
+        yield ("Hamsi-224", 28, Hash.Hamsi224)
+        yield ("Hamsi-256", 32, Hash.Hamsi256)
+        yield ("Hamsi-384", 48, Hash.Hamsi384)
+        yield ("Hamsi-512", 64, Hash.Hamsi512)
+        yield ("Luffa-224", 28, Hash.Luffa224)
+        yield ("Luffa-256", 32, Hash.Luffa256)
+        yield ("Luffa-384", 48, Hash.Luffa384)
+        yield ("Luffa-512", 64, Hash.Luffa512)
+        yield ("Shabal-192", 24, Hash.Shabal192)
+        yield ("Shabal-224", 28, Hash.Shabal224)
+        yield ("Shabal-256", 32, Hash.Shabal256)
+        yield ("Shabal-384", 48, Hash.Shabal384)
+        yield ("Shabal-512", 64, Hash.Shabal512)
+        yield ("SHAvite3-224", 28, Hash.SHAvite3_224)
+        yield ("SHAvite3-256", 32, Hash.SHAvite3_256)
+        yield ("SHAvite3-384", 48, Hash.SHAvite3_384)
+        yield ("SHAvite3-512", 64, Hash.SHAvite3_512)
+        yield ("SIMD-224", 28, Hash.SIMD224)
+        yield ("SIMD-256", 32, Hash.SIMD256)
+        yield ("SIMD-384", 48, Hash.SIMD384)
+        yield ("SIMD-512", 64, Hash.SIMD512)
 
         # SHA-3 Round1 candidates
         yield "SHA3 Round1 candidates"
-        yield ("Abacus-224", Hash.Abacus224())
-        yield ("Abacus-256", Hash.Abacus256())
-        yield ("Abacus-384", Hash.Abacus384())
-        yield ("Abacus-512", Hash.Abacus512())
-        yield ("ARIRANG-224", Hash.ARIRANG224())
-        yield ("ARIRANG-256", Hash.ARIRANG256())
-        yield ("ARIRANG-384", Hash.ARIRANG384())
-        yield ("ARIRANG-512", Hash.ARIRANG512())
-        yield ("AURORA-224", Hash.AURORA224())
-        yield ("AURORA-224M", Hash.AURORA224M())
-        yield ("AURORA-256", Hash.AURORA256())
-        yield ("AURORA-256M", Hash.AURORA256M())
-        yield ("AURORA-384", Hash.AURORA384())
-        yield ("AURORA-512", Hash.AURORA512())
-        yield ("Blender-224", Hash.Blender224())
-        yield ("Blender-256", Hash.Blender256())
-        yield ("Blender-384", Hash.Blender384())
-        yield ("Blender-384Spec", Hash.Blender384Spec())
-        yield ("Blender-512", Hash.Blender512())
-        yield ("BOOLE-224", Hash.BOOLE224())
-        yield ("BOOLE-256", Hash.BOOLE256())
-        yield ("BOOLE-384", Hash.BOOLE384())
-        yield ("BOOLE-512", Hash.BOOLE512())
-        yield ("Cheetah-224", Hash.Cheetah224())
-        yield ("Cheetah-256", Hash.Cheetah256())
-        yield ("Cheetah-384", Hash.Cheetah384())
-        yield ("Cheetah-512", Hash.Cheetah512())
-        yield ("CHI-224", Hash.CHI224())
-        yield ("CHI-256", Hash.CHI256())
-        yield ("CHI-384", Hash.CHI384())
-        yield ("CHI-512", Hash.CHI512())
-        yield ("DCH-224", Hash.DCH224())
-        yield ("DCH-256", Hash.DCH256())
-        yield ("DCH-384", Hash.DCH384())
-        yield ("DCH-512", Hash.DCH512())
-        yield ("DynamicSHA-224", Hash.DynamicSHA224())
-        yield ("DynamicSHA-256", Hash.DynamicSHA256())
-        yield ("DynamicSHA-384", Hash.DynamicSHA384())
-        yield ("DynamicSHA-512", Hash.DynamicSHA512())
-        yield ("DynamicSHA2-224", Hash.DynamicSHA2_224())
-        yield ("DynamicSHA2-256", Hash.DynamicSHA2_256())
-        yield ("DynamicSHA2-384", Hash.DynamicSHA2_384())
-        yield ("DynamicSHA2-512", Hash.DynamicSHA2_512())
-        yield ("ECOH-224", Hash.ECOH224())
-        yield ("ECOH-256", Hash.ECOH256())
-        yield ("ECOH-384", Hash.ECOH384())
-        yield ("ECOH-512", Hash.ECOH512())
-        yield ("EDONR-224", Hash.EDONR224())
-        yield ("EDONR-256", Hash.EDONR256())
-        yield ("EDONR-384", Hash.EDONR384())
-        yield ("EDONR-512", Hash.EDONR512())
-        yield ("EnRUPT-224", Hash.EnRUPT224())
-        yield ("EnRUPT-256", Hash.EnRUPT256())
-        yield ("EnRUPT-384", Hash.EnRUPT384())
-        yield ("EnRUPT-512", Hash.EnRUPT512())
-        yield ("ESSENCE-224", Hash.ESSENCE224())
-        yield ("ESSENCE-256", Hash.ESSENCE256())
-        yield ("ESSENCE-384", Hash.ESSENCE384())
-        yield ("ESSENCE-512", Hash.ESSENCE512())
-        try:
-            # FSB requires a hexadecimal representation of pi.
-            # If gmpy2 is available, it can be calculated quickly,
-            # but if it is not, it will take a long time, so GEF will skip it.
-            __import__("gmpy2")
-            yield ("FSB-160", Hash.FSB160())
-            yield ("FSB-224", Hash.FSB224())
-            yield ("FSB-256", Hash.FSB256())
-            yield ("FSB-384", Hash.FSB384())
-            yield ("FSB-512", Hash.FSB512())
-        except ImportError:
-            pass
-        yield ("Khichidi1-224", Hash.Khichidi1_224())
-        yield ("Khichidi1-256", Hash.Khichidi1_256())
-        yield ("Khichidi1-384", Hash.Khichidi1_384())
-        yield ("Khichidi1-512", Hash.Khichidi1_512())
-        yield ("Lane-224", Hash.Lane224())
-        yield ("Lane-256", Hash.Lane256())
-        yield ("Lane-384", Hash.Lane384())
-        yield ("Lane-512", Hash.Lane512())
-        yield ("Lesamnta-224", Hash.Lesamnta224())
-        yield ("Lesamnta-256", Hash.Lesamnta256())
-        yield ("Lesamnta-384", Hash.Lesamnta384())
-        yield ("Lesamnta-512", Hash.Lesamnta512())
-        yield ("LUX-224", Hash.LUX224())
-        yield ("LUX-256", Hash.LUX256())
-        yield ("LUX-384", Hash.LUX384())
-        yield ("LUX-512", Hash.LUX512())
-        yield ("MCSSHA3-224", Hash.MCSSHA3_224())
-        yield ("MCSSHA3-256", Hash.MCSSHA3_256())
-        yield ("MCSSHA3-384", Hash.MCSSHA3_384())
-        yield ("MCSSHA3-512", Hash.MCSSHA3_512())
-        yield ("MD6-128", Hash.MD6_128())
-        yield ("MD6-256", Hash.MD6_256())
-        yield ("MD6-512", Hash.MD6_512())
-        yield ("MD6-128Spec", Hash.MD6_128Spec())
-        yield ("MD6-256Spec", Hash.MD6_256Spec())
-        yield ("MD6-512Spec", Hash.MD6_512Spec())
-        yield ("MeshHash-224", Hash.MeshHash224())
-        yield ("MeshHash-256", Hash.MeshHash256())
-        yield ("MeshHash-384", Hash.MeshHash384())
-        yield ("MeshHash-512", Hash.MeshHash512())
-        yield ("NaSHA-224", Hash.NaSHA224())
-        yield ("NaSHA-256", Hash.NaSHA256())
-        yield ("NaSHA-384", Hash.NaSHA384())
-        yield ("NaSHA-512", Hash.NaSHA512())
-        yield ("SANDstorm-224", Hash.SANDstorm224())
-        yield ("SANDstorm-256", Hash.SANDstorm256())
-        yield ("SANDstorm-384", Hash.SANDstorm384())
-        yield ("SANDstorm-512", Hash.SANDstorm512())
-        yield ("Sarmal-224", Hash.Sarmal224())
-        yield ("Sarmal-256", Hash.Sarmal256())
-        yield ("Sarmal-384", Hash.Sarmal384())
-        yield ("Sarmal-512", Hash.Sarmal512())
-        yield ("Sgail-224", Hash.Sgail224())
-        yield ("Sgail-256", Hash.Sgail256())
-        yield ("Sgail-384", Hash.Sgail384())
-        yield ("Sgail-512", Hash.Sgail512())
-        yield ("Sgail-768", Hash.Sgail768())
-        yield ("Sgail-1024", Hash.Sgail1024())
-        yield ("Sgail-1536", Hash.Sgail1536())
-        yield ("Sgail-2048", Hash.Sgail2048())
-        yield ("SHAMATA-224", Hash.SHAMATA224())
-        yield ("SHAMATA-256", Hash.SHAMATA256())
-        yield ("SHAMATA-384", Hash.SHAMATA384())
-        yield ("SHAMATA-512", Hash.SHAMATA512())
-        yield ("SpectralHash-128", Hash.SpectralHash128())
-        yield ("SpectralHash-160", Hash.SpectralHash160())
-        yield ("SpectralHash-192", Hash.SpectralHash192())
-        yield ("SpectralHash-224", Hash.SpectralHash224())
-        yield ("SpectralHash-256", Hash.SpectralHash256())
-        yield ("SpectralHash-288", Hash.SpectralHash288())
-        yield ("SpectralHash-320", Hash.SpectralHash320())
-        yield ("SpectralHash-352", Hash.SpectralHash352())
-        yield ("SpectralHash-384", Hash.SpectralHash384())
-        yield ("SpectralHash-416", Hash.SpectralHash416())
-        yield ("SpectralHash-448", Hash.SpectralHash448())
-        yield ("SpectralHash-480", Hash.SpectralHash480())
-        yield ("SpectralHash-512", Hash.SpectralHash512())
-        yield ("SWIFFTX-224", Hash.SWIFFTX224())
-        yield ("SWIFFTX-256", Hash.SWIFFTX256())
-        yield ("SWIFFTX-384", Hash.SWIFFTX384())
-        yield ("SWIFFTX-512", Hash.SWIFFTX512())
-        yield ("Tangle-224", Hash.Tangle224())
-        yield ("Tangle-256", Hash.Tangle256())
-        yield ("Tangle-384", Hash.Tangle384())
-        yield ("Tangle-512", Hash.Tangle512())
-        yield ("Tangle-768", Hash.Tangle768())
-        yield ("Tangle-1024", Hash.Tangle1024())
-        yield ("TIB3-224", Hash.TIB3_224())
-        yield ("TIB3-256", Hash.TIB3_256())
-        yield ("TIB3-384", Hash.TIB3_384())
-        yield ("TIB3-512", Hash.TIB3_512())
-        yield ("Twister-224", Hash.Twister224())
-        yield ("Twister-256", Hash.Twister256())
-        yield ("Twister-384", Hash.Twister384())
-        yield ("Twister-512", Hash.Twister512())
-        yield ("Vortex-224", Hash.Vortex224())
-        yield ("Vortex-256", Hash.Vortex256())
-        yield ("Vortex-384", Hash.Vortex384())
-        yield ("Vortex-512", Hash.Vortex512())
-        yield ("WaMM-192", Hash.WaMM192())
-        yield ("WaMM-224", Hash.WaMM224())
-        yield ("WaMM-256", Hash.WaMM256())
-        yield ("WaMM-384", Hash.WaMM384())
-        yield ("WaMM-512", Hash.WaMM512())
-        yield ("Waterfall-224", Hash.Waterfall224())
-        yield ("Waterfall-256", Hash.Waterfall256())
-        yield ("Waterfall-384", Hash.Waterfall384())
-        yield ("Waterfall-512", Hash.Waterfall512())
+        yield ("Abacus-224", 28, Hash.Abacus224)
+        yield ("Abacus-256", 32, Hash.Abacus256)
+        yield ("Abacus-384", 48, Hash.Abacus384)
+        yield ("Abacus-512", 64, Hash.Abacus512)
+        yield ("ARIRANG-224", 28, Hash.ARIRANG224)
+        yield ("ARIRANG-256", 32, Hash.ARIRANG256)
+        yield ("ARIRANG-384", 48, Hash.ARIRANG384)
+        yield ("ARIRANG-512", 64, Hash.ARIRANG512)
+        yield ("AURORA-224", 28, Hash.AURORA224)
+        yield ("AURORA-224M", 28, Hash.AURORA224M)
+        yield ("AURORA-256", 32, Hash.AURORA256)
+        yield ("AURORA-256M", 32, Hash.AURORA256M)
+        yield ("AURORA-384", 48, Hash.AURORA384)
+        yield ("AURORA-512", 64, Hash.AURORA512)
+        yield ("Blender-224", 28, Hash.Blender224)
+        yield ("Blender-256", 32, Hash.Blender256)
+        yield ("Blender-384", 48, Hash.Blender384)
+        yield ("Blender-384Spec", 48, Hash.Blender384Spec)
+        yield ("Blender-512", 64, Hash.Blender512)
+        yield ("BOOLE-224", 28, Hash.BOOLE224)
+        yield ("BOOLE-256", 32, Hash.BOOLE256)
+        yield ("BOOLE-384", 48, Hash.BOOLE384)
+        yield ("BOOLE-512", 64, Hash.BOOLE512)
+        yield ("Cheetah-224", 28, Hash.Cheetah224)
+        yield ("Cheetah-256", 32, Hash.Cheetah256)
+        yield ("Cheetah-384", 48, Hash.Cheetah384)
+        yield ("Cheetah-512", 64, Hash.Cheetah512)
+        yield ("CHI-224", 28, Hash.CHI224)
+        yield ("CHI-256", 32, Hash.CHI256)
+        yield ("CHI-384", 48, Hash.CHI384)
+        yield ("CHI-512", 64, Hash.CHI512)
+        yield ("DCH-224", 28, Hash.DCH224)
+        yield ("DCH-256", 32, Hash.DCH256)
+        yield ("DCH-384", 48, Hash.DCH384)
+        yield ("DCH-512", 64, Hash.DCH512)
+        yield ("DynamicSHA-224", 28, Hash.DynamicSHA224)
+        yield ("DynamicSHA-256", 32, Hash.DynamicSHA256)
+        yield ("DynamicSHA-384", 48, Hash.DynamicSHA384)
+        yield ("DynamicSHA-512", 64, Hash.DynamicSHA512)
+        yield ("DynamicSHA2-224", 28, Hash.DynamicSHA2_224)
+        yield ("DynamicSHA2-256", 32, Hash.DynamicSHA2_256)
+        yield ("DynamicSHA2-384", 48, Hash.DynamicSHA2_384)
+        yield ("DynamicSHA2-512", 64, Hash.DynamicSHA2_512)
+        yield ("ECOH-224", 28, Hash.ECOH224)
+        yield ("ECOH-256", 32, Hash.ECOH256)
+        yield ("ECOH-384", 48, Hash.ECOH384)
+        yield ("ECOH-512", 64, Hash.ECOH512)
+        yield ("EDONR-224", 28, Hash.EDONR224)
+        yield ("EDONR-256", 32, Hash.EDONR256)
+        yield ("EDONR-384", 48, Hash.EDONR384)
+        yield ("EDONR-512", 64, Hash.EDONR512)
+        yield ("EnRUPT-224", 28, Hash.EnRUPT224)
+        yield ("EnRUPT-256", 32, Hash.EnRUPT256)
+        yield ("EnRUPT-384", 48, Hash.EnRUPT384)
+        yield ("EnRUPT-512", 64, Hash.EnRUPT512)
+        yield ("ESSENCE-224", 28, Hash.ESSENCE224)
+        yield ("ESSENCE-256", 32, Hash.ESSENCE256)
+        yield ("ESSENCE-384", 48, Hash.ESSENCE384)
+        yield ("ESSENCE-512", 64, Hash.ESSENCE512)
+        yield ("FSB-160", 20, Hash.FSB160)
+        yield ("FSB-224", 28, Hash.FSB224)
+        yield ("FSB-256", 32, Hash.FSB256)
+        yield ("FSB-384", 48, Hash.FSB384)
+        yield ("FSB-512", 64, Hash.FSB512)
+        yield ("Khichidi1-224", 28, Hash.Khichidi1_224)
+        yield ("Khichidi1-256", 32, Hash.Khichidi1_256)
+        yield ("Khichidi1-384", 48, Hash.Khichidi1_384)
+        yield ("Khichidi1-512", 64, Hash.Khichidi1_512)
+        yield ("Lane-224", 28, Hash.Lane224)
+        yield ("Lane-256", 32, Hash.Lane256)
+        yield ("Lane-384", 48, Hash.Lane384)
+        yield ("Lane-512", 64, Hash.Lane512)
+        yield ("Lesamnta-224", 28, Hash.Lesamnta224)
+        yield ("Lesamnta-256", 32, Hash.Lesamnta256)
+        yield ("Lesamnta-384", 48, Hash.Lesamnta384)
+        yield ("Lesamnta-512", 64, Hash.Lesamnta512)
+        yield ("LUX-224", 28, Hash.LUX224)
+        yield ("LUX-256", 32, Hash.LUX256)
+        yield ("LUX-384", 48, Hash.LUX384)
+        yield ("LUX-512", 64, Hash.LUX512)
+        yield ("MCSSHA3-224", 28, Hash.MCSSHA3_224)
+        yield ("MCSSHA3-256", 32, Hash.MCSSHA3_256)
+        yield ("MCSSHA3-384", 48, Hash.MCSSHA3_384)
+        yield ("MCSSHA3-512", 64, Hash.MCSSHA3_512)
+        yield ("MD6-128", 16, Hash.MD6_128)
+        yield ("MD6-256", 32, Hash.MD6_256)
+        yield ("MD6-512", 64, Hash.MD6_512)
+        yield ("MD6-128Spec", 16, Hash.MD6_128Spec)
+        yield ("MD6-256Spec", 32, Hash.MD6_256Spec)
+        yield ("MD6-512Spec", 64, Hash.MD6_512Spec)
+        yield ("MeshHash-224", 28, Hash.MeshHash224)
+        yield ("MeshHash-256", 32, Hash.MeshHash256)
+        yield ("MeshHash-384", 48, Hash.MeshHash384)
+        yield ("MeshHash-512", 64, Hash.MeshHash512)
+        yield ("NaSHA-224", 28, Hash.NaSHA224)
+        yield ("NaSHA-256", 32, Hash.NaSHA256)
+        yield ("NaSHA-384", 48, Hash.NaSHA384)
+        yield ("NaSHA-512", 64, Hash.NaSHA512)
+        yield ("SANDstorm-224", 28, Hash.SANDstorm224)
+        yield ("SANDstorm-256", 32, Hash.SANDstorm256)
+        yield ("SANDstorm-384", 48, Hash.SANDstorm384)
+        yield ("SANDstorm-512", 64, Hash.SANDstorm512)
+        yield ("Sarmal-224", 28, Hash.Sarmal224)
+        yield ("Sarmal-256", 32, Hash.Sarmal256)
+        yield ("Sarmal-384", 48, Hash.Sarmal384)
+        yield ("Sarmal-512", 64, Hash.Sarmal512)
+        yield ("Sgail-224", 28, Hash.Sgail224)
+        yield ("Sgail-256", 32, Hash.Sgail256)
+        yield ("Sgail-384", 48, Hash.Sgail384)
+        yield ("Sgail-512", 64, Hash.Sgail512)
+        yield ("Sgail-768", 96, Hash.Sgail768)
+        yield ("Sgail-1024", 128, Hash.Sgail1024)
+        yield ("Sgail-1536", 192, Hash.Sgail1536)
+        yield ("Sgail-2048", 256, Hash.Sgail2048)
+        yield ("SHAMATA-224", 28, Hash.SHAMATA224)
+        yield ("SHAMATA-256", 32, Hash.SHAMATA256)
+        yield ("SHAMATA-384", 48, Hash.SHAMATA384)
+        yield ("SHAMATA-512", 64, Hash.SHAMATA512)
+        yield ("SpectralHash-128", 16, Hash.SpectralHash128)
+        yield ("SpectralHash-160", 20, Hash.SpectralHash160)
+        yield ("SpectralHash-192", 24, Hash.SpectralHash192)
+        yield ("SpectralHash-224", 28, Hash.SpectralHash224)
+        yield ("SpectralHash-256", 32, Hash.SpectralHash256)
+        yield ("SpectralHash-288", 36, Hash.SpectralHash288)
+        yield ("SpectralHash-320", 40, Hash.SpectralHash320)
+        yield ("SpectralHash-352", 44, Hash.SpectralHash352)
+        yield ("SpectralHash-384", 48, Hash.SpectralHash384)
+        yield ("SpectralHash-416", 52, Hash.SpectralHash416)
+        yield ("SpectralHash-448", 56, Hash.SpectralHash448)
+        yield ("SpectralHash-480", 60, Hash.SpectralHash480)
+        yield ("SpectralHash-512", 64, Hash.SpectralHash512)
+        yield ("SWIFFTX-224", 28, Hash.SWIFFTX224)
+        yield ("SWIFFTX-256", 32, Hash.SWIFFTX256)
+        yield ("SWIFFTX-384", 48, Hash.SWIFFTX384)
+        yield ("SWIFFTX-512", 64, Hash.SWIFFTX512)
+        yield ("Tangle-224", 28, Hash.Tangle224)
+        yield ("Tangle-256", 32, Hash.Tangle256)
+        yield ("Tangle-384", 48, Hash.Tangle384)
+        yield ("Tangle-512", 64, Hash.Tangle512)
+        yield ("Tangle-768", 96, Hash.Tangle768)
+        yield ("Tangle-1024", 128, Hash.Tangle1024)
+        yield ("TIB3-224", 28, Hash.TIB3_224)
+        yield ("TIB3-256", 32, Hash.TIB3_256)
+        yield ("TIB3-384", 48, Hash.TIB3_384)
+        yield ("TIB3-512", 64, Hash.TIB3_512)
+        yield ("Twister-224", 28, Hash.Twister224)
+        yield ("Twister-256", 32, Hash.Twister256)
+        yield ("Twister-384", 48, Hash.Twister384)
+        yield ("Twister-512", 64, Hash.Twister512)
+        yield ("Vortex-224", 28, Hash.Vortex224)
+        yield ("Vortex-256", 32, Hash.Vortex256)
+        yield ("Vortex-384", 48, Hash.Vortex384)
+        yield ("Vortex-512", 64, Hash.Vortex512)
+        yield ("WaMM-192", 24, Hash.WaMM192)
+        yield ("WaMM-224", 28, Hash.WaMM224)
+        yield ("WaMM-256", 32, Hash.WaMM256)
+        yield ("WaMM-384", 48, Hash.WaMM384)
+        yield ("WaMM-512", 64, Hash.WaMM512)
+        yield ("Waterfall-224", 28, Hash.Waterfall224)
+        yield ("Waterfall-256", 32, Hash.Waterfall256)
+        yield ("Waterfall-384", 48, Hash.Waterfall384)
+        yield ("Waterfall-512", 64, Hash.Waterfall512)
 
         # Other (relatively long)
         yield "Relatively long"
-        yield ("ACE-H-256", Hash.ACEH256())
-        yield ("Ascon-Hash", Hash.Ascon())
-        yield ("Ascon-HashA", Hash.AsconA())
-        yield ("Ascon-Xof", Hash.AsconX())
-        yield ("Ascon-XofA", Hash.AsconXA())
-        yield ("Ascon-Hash-NIST", Hash.AsconNIST())
-        yield ("Ascon-Xof-NIST", Hash.AsconXNIST())
-        yield ("Atelopus32", Hash.Atelopus32())
-        yield ("Atelopus64", Hash.Atelopus64())
-        yield ("Bash256", Hash.Bash256())
-        yield ("Bash384", Hash.Bash384())
-        yield ("Bash512", Hash.Bash512())
-        yield ("Bebb4185", Hash.Bebb4185())
-        yield ("BelT Hash", Hash.BELT())
-        yield ("BBLAKE256", Hash.BBLAKE256())
-        yield ("BBLAKE512", Hash.BBLAKE512())
-        yield ("BLAKE2sp", Hash.BLAKE2sp())
-        yield ("BLAKE2bp", Hash.BLAKE2bp())
-        yield ("BLAKE3-128", Hash.BLAKE3(digest_bits=128))
-        yield ("BLAKE3-256", Hash.BLAKE3(digest_bits=256))
-        yield ("BLAKE3-512", Hash.BLAKE3(digest_bits=512))
-        yield ("CLXHash", Hash.CLXHash())
-        yield ("Coral256", Hash.Coral256())
-        yield ("Drygascon128", Hash.Drygascon128())
-        yield ("Drygascon256", Hash.Drygascon256())
-        yield ("ED2K-Blue", Hash.ED2KBlue())
-        yield ("ED2K-Red", Hash.ED2KRed())
-        yield ("ED2K-RedBlue", Hash.ED2KRedBlue())
-        yield ("ESCH-256", Hash.ESCH256())
-        yield ("ESCH-384", Hash.ESCH384())
-        yield ("FNV1-32", Hash.FNV_32())
-        yield ("FNV1-64", Hash.FNV_64())
-        yield ("FNV1-128", Hash.FNV_128())
-        yield ("FNV1-256", Hash.FNV_256())
-        yield ("FNV1-512", Hash.FNV_512())
-        yield ("FNV1-1024", Hash.FNV_1024())
-        yield ("FNV1a-32", Hash.FNV_32(variant="fnv1a"))
-        yield ("FNV1a-64", Hash.FNV_64(variant="fnv1a"))
-        yield ("FNV1a-128", Hash.FNV_128(variant="fnv1a"))
-        yield ("FNV1a-256", Hash.FNV_256(variant="fnv1a"))
-        yield ("FNV1a-512", Hash.FNV_512(variant="fnv1a"))
-        yield ("FNV1a-1024", Hash.FNV_1024(variant="fnv1a"))
-        yield ("FNV0-32", Hash.FNV_32(variant="fnv0"))
-        yield ("FNV0-64", Hash.FNV_64(variant="fnv0"))
-        yield ("FNV0-128", Hash.FNV_128(variant="fnv0"))
-        yield ("FNV0-256", Hash.FNV_256(variant="fnv0"))
-        yield ("FNV0-512", Hash.FNV_512(variant="fnv0"))
-        yield ("FNV0-1024", Hash.FNV_1024(variant="fnv0"))
-        yield ("FNV0a-32", Hash.FNV_32(variant="fnv0a"))
-        yield ("FNV0a-64", Hash.FNV_64(variant="fnv0a"))
-        yield ("FNV0a-128", Hash.FNV_128(variant="fnv0a"))
-        yield ("FNV0a-256", Hash.FNV_256(variant="fnv0a"))
-        yield ("FNV0a-512", Hash.FNV_512(variant="fnv0a"))
-        yield ("FNV0a-1024", Hash.FNV_1024(variant="fnv0a"))
-        yield ("FORK-256", Hash.FORK256())
-        yield ("Fugue2", Hash.Fugue2())
-        yield ("Gage1h256c224r008", Hash.Gage1h256c224r008())
-        yield ("Gage1h256c224r016", Hash.Gage1h256c224r016())
-        yield ("Gage1h256c224r032", Hash.Gage1h256c224r032())
-        yield ("Gage1h256c224r064", Hash.Gage1h256c224r064())
-        yield ("Gage1h256c256r016", Hash.Gage1h256c256r016())
-        yield ("Gage1h256c256r032", Hash.Gage1h256c256r032())
-        yield ("Gage1h256c256r064", Hash.Gage1h256c256r064())
-        yield ("Gage1h256c256r128", Hash.Gage1h256c256r128())
-        yield ("Gage1h256c512r032", Hash.Gage1h256c512r032())
-        yield ("Gage1h256c512r064", Hash.Gage1h256c512r064())
-        yield ("Gimli24", Hash.Gimli24())
-        yield ("GOST", Hash.GOST()) # codespell:ignore
-        yield ("GOST94cp", Hash.GOST94cp()) # codespell:ignore
-        yield ("HAS-160", Hash.HAS160())
-        yield ("HAVAL-128,3", Hash.HAVAL(digest_bits=128, passes=3))
-        yield ("HAVAL-128,4", Hash.HAVAL(digest_bits=128, passes=4))
-        yield ("HAVAL-128,5", Hash.HAVAL(digest_bits=128, passes=5))
-        yield ("HAVAL-160,3", Hash.HAVAL(digest_bits=160, passes=3))
-        yield ("HAVAL-160,4", Hash.HAVAL(digest_bits=160, passes=4))
-        yield ("HAVAL-160,5", Hash.HAVAL(digest_bits=160, passes=5))
-        yield ("HAVAL-192,3", Hash.HAVAL(digest_bits=192, passes=3))
-        yield ("HAVAL-192,4", Hash.HAVAL(digest_bits=192, passes=4))
-        yield ("HAVAL-192,5", Hash.HAVAL(digest_bits=192, passes=5))
-        yield ("HAVAL-224,3", Hash.HAVAL(digest_bits=224, passes=3))
-        yield ("HAVAL-224,4", Hash.HAVAL(digest_bits=224, passes=4))
-        yield ("HAVAL-224,5", Hash.HAVAL(digest_bits=224, passes=5))
-        yield ("HAVAL-256,3", Hash.HAVAL(digest_bits=256, passes=3))
-        yield ("HAVAL-256,4", Hash.HAVAL(digest_bits=256, passes=4))
-        yield ("HAVAL-256,5", Hash.HAVAL(digest_bits=256, passes=5))
-        yield ("Heron256", Hash.Heron256())
-        yield ("KangarooTwelve128-128", Hash.KangarooTwelve128(digest_bits=128))
-        yield ("KangarooTwelve128-256", Hash.KangarooTwelve128(digest_bits=256))
-        yield ("KangarooTwelve128-512", Hash.KangarooTwelve128(digest_bits=512))
-        yield ("KangarooTwelve256-128", Hash.KangarooTwelve256(digest_bits=128))
-        yield ("KangarooTwelve256-256", Hash.KangarooTwelve256(digest_bits=256))
-        yield ("KangarooTwelve256-512", Hash.KangarooTwelve256(digest_bits=512))
-        yield ("KMAC128-128", Hash.KMAC128(key=b"", digest_bits=128))
-        yield ("KMAC128-256", Hash.KMAC128(key=b"", digest_bits=256))
-        yield ("KMAC128-512", Hash.KMAC128(key=b"", digest_bits=512))
-        yield ("KMAC256-128", Hash.KMAC256(key=b"", digest_bits=128))
-        yield ("KMAC256-256", Hash.KMAC256(key=b"", digest_bits=256))
-        yield ("KMAC256-512", Hash.KMAC256(key=b"", digest_bits=512))
-        yield ("Kupyna-256", Hash.Kupyna256())
-        yield ("Kupyna-384", Hash.Kupyna384())
-        yield ("Kupyna-512", Hash.Kupyna512())
-        yield ("LSH256-224", Hash.LSH256_224())
-        yield ("LSH256-256", Hash.LSH256_256())
-        yield ("LSH512-224", Hash.LSH512_224())
-        yield ("LSH512-256", Hash.LSH512_256())
-        yield ("LSH512-384", Hash.LSH512_384())
-        yield ("LSH512-512", Hash.LSH512_512())
-        yield ("MarsupilamiFourteen", Hash.MarsupilamiFourteen())
-        yield ("MD2", Hash.MD2())
-        yield ("MD4", Hash.MD4())
-        yield ("MDC-2", Hash.MDC2())
-        yield ("NTLM hash", Hash.NTLM())
-        yield ("Panama", Hash.Panama())
-        yield ("ParallelHash-128", Hash.ParallelHash128())
-        yield ("ParallelHash-256", Hash.ParallelHash256())
-        yield ("ParallelHashXOF-128", Hash.ParallelHashXOF128())
-        yield ("ParallelHashXOF-256", Hash.ParallelHashXOF256())
-        yield ("PhotonBeetle", Hash.PhotonBeetle())
-        yield ("RadioGatun-32", Hash.RadioGatun32())
-        yield ("RadioGatun-64", Hash.RadioGatun64())
-        yield ("RIPEMD-128", Hash.RIPEMD128())
-        yield ("RIPEMD-160", Hash.RIPEMD160())
-        yield ("RIPEMD-256", Hash.RIPEMD256())
-        yield ("RIPEMD-320", Hash.RIPEMD320())
-        yield ("SHA-0", Hash.SHA0())
-        yield ("SHA-512/224", Hash.SHA512_224())
-        yield ("SHA-512/256", Hash.SHA512_256())
-        yield ("Snefru-128", Hash.Snefru128())
-        yield ("Snefru-256", Hash.Snefru256())
-        yield ("Streebog-256", Hash.Streebog256())
-        yield ("Streebog-512", Hash.Streebog512())
-        yield ("TIGER-128,3", Hash.TIGER(digest_bits=128, passes=3))
-        yield ("TIGER-160,3", Hash.TIGER(digest_bits=160, passes=3))
-        yield ("TIGER-192,3", Hash.TIGER(digest_bits=192, passes=3))
-        yield ("TIGER-128,4", Hash.TIGER(digest_bits=128, passes=4))
-        yield ("TIGER-160,4", Hash.TIGER(digest_bits=160, passes=4))
-        yield ("TIGER-192,4", Hash.TIGER(digest_bits=192, passes=4))
-        yield ("TIGER2-128,3", Hash.TIGER(digest_bits=128, passes=3, version=2))
-        yield ("TIGER2-160,3", Hash.TIGER(digest_bits=160, passes=3, version=2))
-        yield ("TIGER2-192,3", Hash.TIGER(digest_bits=192, passes=3, version=2))
-        yield ("TupleHash128-128", Hash.TupleHash128(digest_bits=128))
-        yield ("TupleHash128-256", Hash.TupleHash128(digest_bits=256))
-        yield ("TupleHash128-512", Hash.TupleHash128(digest_bits=512))
-        yield ("TupleHash256-128", Hash.TupleHash256(digest_bits=128))
-        yield ("TupleHash256-256", Hash.TupleHash256(digest_bits=256))
-        yield ("TupleHash256-512", Hash.TupleHash256(digest_bits=512))
-        yield ("TurboSHAKE128-128", Hash.TurboShake128(digest_bits=128))
-        yield ("TurboSHAKE128-256", Hash.TurboShake128(digest_bits=256))
-        yield ("TurboSHAKE128-512", Hash.TurboShake128(digest_bits=512))
-        yield ("TurboSHAKE256-128", Hash.TurboShake256(digest_bits=128))
-        yield ("TurboSHAKE256-256", Hash.TurboShake256(digest_bits=256))
-        yield ("TurboSHAKE256-512", Hash.TurboShake256(digest_bits=512))
-        yield ("VSH-1024", Hash.VSH1024())
-        yield ("Whirlpool-0", Hash.Whirlpool0())
-        yield ("Whirlpool-T", Hash.WhirlpoolT())
-        yield ("Whirlpool", Hash.Whirlpool())
-        yield ("Xoodyak", Hash.Xoodyak())
+        yield ("ACE-H-256", 32, Hash.ACEH256)
+        yield ("Ascon-Hash", 32, Hash.Ascon)
+        yield ("Ascon-HashA", 32, Hash.AsconA)
+        yield ("Ascon-Xof", 128, Hash.AsconX)
+        yield ("Ascon-XofA", 128, Hash.AsconXA)
+        yield ("Ascon-Hash-NIST", 32, Hash.AsconNIST)
+        yield ("Ascon-Xof-NIST", 64, Hash.AsconXNIST)
+        yield ("Atelopus32", 32, Hash.Atelopus32)
+        yield ("Atelopus64", 64, Hash.Atelopus64)
+        yield ("Bash256", 32, Hash.Bash256)
+        yield ("Bash384", 48, Hash.Bash384)
+        yield ("Bash512", 64, Hash.Bash512)
+        yield ("Bebb4185", 32, Hash.Bebb4185)
+        yield ("BelT Hash", 32, Hash.BELT)
+        yield ("BBLAKE256", 32, Hash.BBLAKE256)
+        yield ("BBLAKE512", 64, Hash.BBLAKE512)
+        yield ("BLAKE2sp", 32, Hash.BLAKE2sp)
+        yield ("BLAKE2bp", 64, Hash.BLAKE2bp)
+        yield ("BLAKE3-128", 16, functools.partial(Hash.BLAKE3, digest_bits=128))
+        yield ("BLAKE3-256", 32, functools.partial(Hash.BLAKE3, digest_bits=256))
+        yield ("BLAKE3-512", 64, functools.partial(Hash.BLAKE3, digest_bits=512))
+        yield ("CLXHash", 32, Hash.CLXHash)
+        yield ("Coral256", 32, Hash.Coral256)
+        yield ("Drygascon128", 32, Hash.Drygascon128)
+        yield ("Drygascon256", 64, Hash.Drygascon256)
+        yield ("ED2K-Blue", 16, Hash.ED2KBlue)
+        yield ("ED2K-Red", 16, Hash.ED2KRed)
+        yield ("ED2K-RedBlue", 32, Hash.ED2KRedBlue)
+        yield ("ESCH-256", 32, Hash.ESCH256)
+        yield ("ESCH-384", 48, Hash.ESCH384)
+        yield ("FNV1-32", 4, Hash.FNV_32)
+        yield ("FNV1-64", 8, Hash.FNV_64)
+        yield ("FNV1-128", 16, Hash.FNV_128)
+        yield ("FNV1-256", 32, Hash.FNV_256)
+        yield ("FNV1-512", 64, Hash.FNV_512)
+        yield ("FNV1-1024", 128, Hash.FNV_1024)
+        yield ("FNV1a-32", 4, functools.partial(Hash.FNV_32, variant="fnv1a"))
+        yield ("FNV1a-64", 8, functools.partial(Hash.FNV_64, variant="fnv1a"))
+        yield ("FNV1a-128", 16, functools.partial(Hash.FNV_128, variant="fnv1a"))
+        yield ("FNV1a-256", 32, functools.partial(Hash.FNV_256, variant="fnv1a"))
+        yield ("FNV1a-512", 64, functools.partial(Hash.FNV_512, variant="fnv1a"))
+        yield ("FNV1a-1024", 128, functools.partial(Hash.FNV_1024, variant="fnv1a"))
+        yield ("FNV0-32", 4, functools.partial(Hash.FNV_32, variant="fnv0"))
+        yield ("FNV0-64", 8, functools.partial(Hash.FNV_64, variant="fnv0"))
+        yield ("FNV0-128", 16, functools.partial(Hash.FNV_128, variant="fnv0"))
+        yield ("FNV0-256", 32, functools.partial(Hash.FNV_256, variant="fnv0"))
+        yield ("FNV0-512", 64, functools.partial(Hash.FNV_512, variant="fnv0"))
+        yield ("FNV0-1024", 128, functools.partial(Hash.FNV_1024, variant="fnv0"))
+        yield ("FNV0a-32", 4, functools.partial(Hash.FNV_32, variant="fnv0a"))
+        yield ("FNV0a-64", 8, functools.partial(Hash.FNV_64, variant="fnv0a"))
+        yield ("FNV0a-128", 16, functools.partial(Hash.FNV_128, variant="fnv0a"))
+        yield ("FNV0a-256", 32, functools.partial(Hash.FNV_256, variant="fnv0a"))
+        yield ("FNV0a-512", 64, functools.partial(Hash.FNV_512, variant="fnv0a"))
+        yield ("FNV0a-1024", 128, functools.partial(Hash.FNV_1024, variant="fnv0a"))
+        yield ("FORK-256", 32, Hash.FORK256)
+        yield ("Fugue2", 32, Hash.Fugue2)
+        yield ("Gage1h256c224r008", 32, Hash.Gage1h256c224r008)
+        yield ("Gage1h256c224r016", 32, Hash.Gage1h256c224r016)
+        yield ("Gage1h256c224r032", 32, Hash.Gage1h256c224r032)
+        yield ("Gage1h256c224r064", 32, Hash.Gage1h256c224r064)
+        yield ("Gage1h256c256r016", 32, Hash.Gage1h256c256r016)
+        yield ("Gage1h256c256r032", 32, Hash.Gage1h256c256r032)
+        yield ("Gage1h256c256r064", 32, Hash.Gage1h256c256r064)
+        yield ("Gage1h256c256r128", 32, Hash.Gage1h256c256r128)
+        yield ("Gage1h256c512r032", 32, Hash.Gage1h256c512r032)
+        yield ("Gage1h256c512r064", 32, Hash.Gage1h256c512r064)
+        yield ("Gimli24", 32, Hash.Gimli24)
+        yield ("GOST", 32, Hash.GOST) # codespell:ignore
+        yield ("GOST94cp", 32, Hash.GOST94cp) # codespell:ignore
+        yield ("HAS-160", 20, Hash.HAS160)
+        yield ("HAVAL-128,3", 16, functools.partial(Hash.HAVAL, digest_bits=128, passes=3))
+        yield ("HAVAL-128,4", 16, functools.partial(Hash.HAVAL, digest_bits=128, passes=4))
+        yield ("HAVAL-128,5", 16, functools.partial(Hash.HAVAL, digest_bits=128, passes=5))
+        yield ("HAVAL-160,3", 20, functools.partial(Hash.HAVAL, digest_bits=160, passes=3))
+        yield ("HAVAL-160,4", 20, functools.partial(Hash.HAVAL, digest_bits=160, passes=4))
+        yield ("HAVAL-160,5", 20, functools.partial(Hash.HAVAL, digest_bits=160, passes=5))
+        yield ("HAVAL-192,3", 24, functools.partial(Hash.HAVAL, digest_bits=192, passes=3))
+        yield ("HAVAL-192,4", 24, functools.partial(Hash.HAVAL, digest_bits=192, passes=4))
+        yield ("HAVAL-192,5", 24, functools.partial(Hash.HAVAL, digest_bits=192, passes=5))
+        yield ("HAVAL-224,3", 28, functools.partial(Hash.HAVAL, digest_bits=224, passes=3))
+        yield ("HAVAL-224,4", 28, functools.partial(Hash.HAVAL, digest_bits=224, passes=4))
+        yield ("HAVAL-224,5", 28, functools.partial(Hash.HAVAL, digest_bits=224, passes=5))
+        yield ("HAVAL-256,3", 32, functools.partial(Hash.HAVAL, digest_bits=256, passes=3))
+        yield ("HAVAL-256,4", 32, functools.partial(Hash.HAVAL, digest_bits=256, passes=4))
+        yield ("HAVAL-256,5", 32, functools.partial(Hash.HAVAL, digest_bits=256, passes=5))
+        yield ("Heron256", 32, Hash.Heron256)
+        yield ("KangarooTwelve128-128", 16, functools.partial(Hash.KangarooTwelve128, digest_bits=128))
+        yield ("KangarooTwelve128-256", 32, functools.partial(Hash.KangarooTwelve128, digest_bits=256))
+        yield ("KangarooTwelve128-512", 64, functools.partial(Hash.KangarooTwelve128, digest_bits=512))
+        yield ("KangarooTwelve256-128", 16, functools.partial(Hash.KangarooTwelve256, digest_bits=128))
+        yield ("KangarooTwelve256-256", 32, functools.partial(Hash.KangarooTwelve256, digest_bits=256))
+        yield ("KangarooTwelve256-512", 64, functools.partial(Hash.KangarooTwelve256, digest_bits=512))
+        yield ("KMAC128-128", 16, functools.partial(Hash.KMAC128, key=b"", digest_bits=128))
+        yield ("KMAC128-256", 32, functools.partial(Hash.KMAC128, key=b"", digest_bits=256))
+        yield ("KMAC128-512", 64, functools.partial(Hash.KMAC128, key=b"", digest_bits=512))
+        yield ("KMAC256-128", 16, functools.partial(Hash.KMAC256, key=b"", digest_bits=128))
+        yield ("KMAC256-256", 32, functools.partial(Hash.KMAC256, key=b"", digest_bits=256))
+        yield ("KMAC256-512", 64, functools.partial(Hash.KMAC256, key=b"", digest_bits=512))
+        yield ("Kupyna-256", 32, Hash.Kupyna256)
+        yield ("Kupyna-384", 48, Hash.Kupyna384)
+        yield ("Kupyna-512", 64, Hash.Kupyna512)
+        yield ("LSH256-224", 28, Hash.LSH256_224)
+        yield ("LSH256-256", 32, Hash.LSH256_256)
+        yield ("LSH512-224", 28, Hash.LSH512_224)
+        yield ("LSH512-256", 32, Hash.LSH512_256)
+        yield ("LSH512-384", 48, Hash.LSH512_384)
+        yield ("LSH512-512", 64, Hash.LSH512_512)
+        yield ("MarsupilamiFourteen", 64, Hash.MarsupilamiFourteen)
+        yield ("MD2", 16, Hash.MD2)
+        yield ("MD4", 16, Hash.MD4)
+        yield ("MDC-2", 16, Hash.MDC2)
+        yield ("NTLM hash", 16, Hash.NTLM)
+        yield ("Panama", 32, Hash.Panama)
+        yield ("ParallelHash-128", 32, Hash.ParallelHash128)
+        yield ("ParallelHash-256", 64, Hash.ParallelHash256)
+        yield ("ParallelHashXOF-128", 32, Hash.ParallelHashXOF128)
+        yield ("ParallelHashXOF-256", 64, Hash.ParallelHashXOF256)
+        yield ("PhotonBeetle", 32, Hash.PhotonBeetle)
+        yield ("RadioGatun-32", 32, Hash.RadioGatun32)
+        yield ("RadioGatun-64", 32, Hash.RadioGatun64)
+        yield ("RIPEMD-128", 16, Hash.RIPEMD128)
+        yield ("RIPEMD-160", 20, Hash.RIPEMD160)
+        yield ("RIPEMD-256", 32, Hash.RIPEMD256)
+        yield ("RIPEMD-320", 40, Hash.RIPEMD320)
+        yield ("SHA-0", 20, Hash.SHA0)
+        yield ("SHA-512/224", 28, Hash.SHA512_224)
+        yield ("SHA-512/256", 32, Hash.SHA512_256)
+        yield ("Snefru-128", 16, Hash.Snefru128)
+        yield ("Snefru-256", 32, Hash.Snefru256)
+        yield ("Streebog-256", 32, Hash.Streebog256)
+        yield ("Streebog-512", 64, Hash.Streebog512)
+        yield ("TIGER-128,3", 16, functools.partial(Hash.TIGER, digest_bits=128, passes=3))
+        yield ("TIGER-160,3", 20, functools.partial(Hash.TIGER, digest_bits=160, passes=3))
+        yield ("TIGER-192,3", 24, functools.partial(Hash.TIGER, digest_bits=192, passes=3))
+        yield ("TIGER-128,4", 16, functools.partial(Hash.TIGER, digest_bits=128, passes=4))
+        yield ("TIGER-160,4", 20, functools.partial(Hash.TIGER, digest_bits=160, passes=4))
+        yield ("TIGER-192,4", 24, functools.partial(Hash.TIGER, digest_bits=192, passes=4))
+        yield ("TIGER2-128,3", 16, functools.partial(Hash.TIGER, digest_bits=128, passes=3, version=2))
+        yield ("TIGER2-160,3", 20, functools.partial(Hash.TIGER, digest_bits=160, passes=3, version=2))
+        yield ("TIGER2-192,3", 24, functools.partial(Hash.TIGER, digest_bits=192, passes=3, version=2))
+        yield ("TupleHash128-128", 16, functools.partial(Hash.TupleHash128, digest_bits=128))
+        yield ("TupleHash128-256", 32, functools.partial(Hash.TupleHash128, digest_bits=256))
+        yield ("TupleHash128-512", 64, functools.partial(Hash.TupleHash128, digest_bits=512))
+        yield ("TupleHash256-128", 16, functools.partial(Hash.TupleHash256, digest_bits=128))
+        yield ("TupleHash256-256", 32, functools.partial(Hash.TupleHash256, digest_bits=256))
+        yield ("TupleHash256-512", 64, functools.partial(Hash.TupleHash256, digest_bits=512))
+        yield ("TurboSHAKE128-128", 16, functools.partial(Hash.TurboShake128, digest_bits=128))
+        yield ("TurboSHAKE128-256", 32, functools.partial(Hash.TurboShake128, digest_bits=256))
+        yield ("TurboSHAKE128-512", 64, functools.partial(Hash.TurboShake128, digest_bits=512))
+        yield ("TurboSHAKE256-128", 16, functools.partial(Hash.TurboShake256, digest_bits=128))
+        yield ("TurboSHAKE256-256", 32, functools.partial(Hash.TurboShake256, digest_bits=256))
+        yield ("TurboSHAKE256-512", 64, functools.partial(Hash.TurboShake256, digest_bits=512))
+        yield ("VSH-1024", 128, Hash.VSH1024)
+        yield ("Whirlpool-0", 64, Hash.Whirlpool0)
+        yield ("Whirlpool-T", 64, Hash.WhirlpoolT)
+        yield ("Whirlpool", 64, Hash.Whirlpool)
+        yield ("Xoodyak", 32, Hash.Xoodyak)
 
         # Other (relatively short)
         yield "Relatively short"
-        yield ("Beamsplitter", Hash.Beamsplitter())
-        yield ("CityHash-32", Hash.CityHash32())
-        yield ("CityHash-64", Hash.CityHash64())
-        yield ("CityHash-128", Hash.CityHash128())
-        yield ("FarmHash-32 (fp)", Hash.FarmHash32())
-        yield ("FarmHash-64 (fp)", Hash.FarmHash64())
-        yield ("FarmHash-128 (fp)", Hash.FarmHash128())
-        yield ("FastHash-32", Hash.FastHash32())
-        yield ("FastHash-64", Hash.FastHash64())
-        yield ("Floppsy", Hash.Floppsy())
-        yield ("GxHash-32", Hash.GxHash32())
-        yield ("GxHash-64", Hash.GxHash64())
-        yield ("GxHash-128", Hash.GxHash128())
-        yield ("HalfSipHash-32_2_4", Hash.HalfSipHash32_2_4())
-        yield ("HalfSipHash-64_2_4", Hash.HalfSipHash64_2_4())
-        yield ("HalfTimeHash-64", Hash.HalfTimeHash64())
-        yield ("HalfTimeHash-128", Hash.HalfTimeHash128())
-        yield ("HalfTimeHash-256", Hash.HalfTimeHash256())
-        yield ("HalfTimeHash-512", Hash.HalfTimeHash512())
-        yield ("HighwayHash-64", Hash.HighwayHash64())
-        yield ("HighwayHash-128", Hash.HighwayHash128())
-        yield ("HighwayHash-256", Hash.HighwayHash256())
-        yield ("KomiHash", Hash.KomiHash())
-        yield ("MetroHash-64", Hash.MetroHash64())
-        yield ("MetroHash-128", Hash.MetroHash128())
-        yield ("Murmur1", Hash.MurmurHash1())
-        yield ("Murmur2", Hash.MurmurHash2())
-        yield ("Murmur2a", Hash.MurmurHash2A())
-        yield ("Murmur64a", Hash.MurmurHash64A())
-        yield ("Murmur64b", Hash.MurmurHash64B())
-        yield ("Murmur3a", Hash.MurmurHash3_x86_32())
-        yield ("Murmur3c", Hash.MurmurHash3_x86_128())
-        yield ("Murmur3f", Hash.MurmurHash3_x64_128())
-        yield ("SipHash-64_2_4", Hash.SipHash64_2_4())
-        yield ("SipHash-64_1_3", Hash.SipHash64_1_3())
-        yield ("SipHash-64_4_8", Hash.SipHash64_4_8())
-        yield ("SipHash-128_2_4", Hash.SipHash128_2_4())
-        yield ("SipHash-128_4_8", Hash.SipHash128_4_8())
-        yield ("SpookyHash-32", Hash.SpookyHash32())
-        yield ("SpookyHash-64", Hash.SpookyHash64())
-        yield ("SpookyHash-128", Hash.SpookyHash128())
-        yield ("T1HA0-32", Hash.T1HA0_32())
-        yield ("T1HA1-64", Hash.T1HA1_64())
-        yield ("T1HA2-64", Hash.T1HA2_64())
-        yield ("T1HA2-128", Hash.T1HA2_128())
-        yield ("WYHash-32", Hash.WYHash32())
-        yield ("WYHash-64", Hash.WYHash64())
-        yield ("xxHash-32", Hash.XXH32())
-        yield ("xxHash-64", Hash.XXH64())
-        yield ("xxHash3-64", Hash.XXH3_64())
-        yield ("xxHash3-128", Hash.XXH3_128())
+        yield ("Beamsplitter", 8, Hash.Beamsplitter)
+        yield ("CityHash-32", 4, Hash.CityHash32)
+        yield ("CityHash-64", 8, Hash.CityHash64)
+        yield ("CityHash-128", 16, Hash.CityHash128)
+        yield ("FarmHash-32 (fp)", 4, Hash.FarmHash32)
+        yield ("FarmHash-64 (fp)", 8, Hash.FarmHash64)
+        yield ("FarmHash-128 (fp)", 16, Hash.FarmHash128)
+        yield ("FastHash-32", 4, Hash.FastHash32)
+        yield ("FastHash-64", 8, Hash.FastHash64)
+        yield ("Floppsy", 8, Hash.Floppsy)
+        yield ("GxHash-32", 4, Hash.GxHash32)
+        yield ("GxHash-64", 8, Hash.GxHash64)
+        yield ("GxHash-128", 16, Hash.GxHash128)
+        yield ("HalfSipHash-32_2_4", 4, Hash.HalfSipHash32_2_4)
+        yield ("HalfSipHash-64_2_4", 8, Hash.HalfSipHash64_2_4)
+        yield ("HalfTimeHash-64", 8, Hash.HalfTimeHash64)
+        yield ("HalfTimeHash-128", 8, Hash.HalfTimeHash128)
+        yield ("HalfTimeHash-256", 8, Hash.HalfTimeHash256)
+        yield ("HalfTimeHash-512", 8, Hash.HalfTimeHash512)
+        yield ("HighwayHash-64", 8, Hash.HighwayHash64)
+        yield ("HighwayHash-128", 16, Hash.HighwayHash128)
+        yield ("HighwayHash-256", 32, Hash.HighwayHash256)
+        yield ("KomiHash", 8, Hash.KomiHash)
+        yield ("MetroHash-64", 8, Hash.MetroHash64)
+        yield ("MetroHash-128", 16, Hash.MetroHash128)
+        yield ("Murmur1", 4, Hash.MurmurHash1)
+        yield ("Murmur2", 4, Hash.MurmurHash2)
+        yield ("Murmur2a", 4, Hash.MurmurHash2A)
+        yield ("Murmur64a", 8, Hash.MurmurHash64A)
+        yield ("Murmur64b", 8, Hash.MurmurHash64B)
+        yield ("Murmur3a", 4, Hash.MurmurHash3_x86_32)
+        yield ("Murmur3c", 16, Hash.MurmurHash3_x86_128)
+        yield ("Murmur3f", 16, Hash.MurmurHash3_x64_128)
+        yield ("SipHash-64_2_4", 8, Hash.SipHash64_2_4)
+        yield ("SipHash-64_1_3", 8, Hash.SipHash64_1_3)
+        yield ("SipHash-64_4_8", 8, Hash.SipHash64_4_8)
+        yield ("SipHash-128_2_4", 16, Hash.SipHash128_2_4)
+        yield ("SipHash-128_4_8", 16, Hash.SipHash128_4_8)
+        yield ("SpookyHash-32", 4, Hash.SpookyHash32)
+        yield ("SpookyHash-64", 8, Hash.SpookyHash64)
+        yield ("SpookyHash-128", 16, Hash.SpookyHash128)
+        yield ("T1HA0-32", 4, Hash.T1HA0_32)
+        yield ("T1HA1-64", 8, Hash.T1HA1_64)
+        yield ("T1HA2-64", 8, Hash.T1HA2_64)
+        yield ("T1HA2-128", 16, Hash.T1HA2_128)
+        yield ("WYHash-32", 4, Hash.WYHash32)
+        yield ("WYHash-64", 8, Hash.WYHash64)
+        yield ("xxHash-32", 4, Hash.XXH32)
+        yield ("xxHash-64", 8, Hash.XXH64)
+        yield ("xxHash3-64", 8, Hash.XXH3_64)
+        yield ("xxHash3-128", 16, Hash.XXH3_128)
 
         # Checksum
         yield "Checksum"
-        yield ("RS Hash", Hash.RSHash())
-        yield ("JS Hash", Hash.JSHash())
-        yield ("PJW Hash", Hash.PJWHash())
-        yield ("ELF Hash", Hash.ELFHash())
-        yield ("BKDR Hash", Hash.BKDRHash())
-        yield ("SDBM Hash", Hash.SDBMHash())
-        yield ("DJB2", Hash.DJB2Hash())
-        yield ("DEK Hash", Hash.DEKHash())
-        yield ("AP Hash", Hash.APHash())
-        yield ("JOAAT", Hash.JOAAT())
-        yield ("Adler32", Hash.Adler())
-        yield ("SuperFastHash", Hash.SuperFastHash())
-        yield ("BuzHash", Hash.BuzHash())
-        yield ("NHash", Hash.NHash())
+        yield ("RS Hash", 4, Hash.RSHash)
+        yield ("JS Hash", 4, Hash.JSHash)
+        yield ("PJW Hash", 4, Hash.PJWHash)
+        yield ("ELF Hash", 4, Hash.ELFHash)
+        yield ("BKDR Hash", 4, Hash.BKDRHash)
+        yield ("SDBM Hash", 4, Hash.SDBMHash)
+        yield ("DJB2", 4, Hash.DJB2Hash)
+        yield ("DEK Hash", 4, Hash.DEKHash)
+        yield ("AP Hash", 4, Hash.APHash)
+        yield ("JOAAT", 4, Hash.JOAAT)
+        yield ("Adler32", 4, Hash.Adler)
+        yield ("SuperFastHash", 4, Hash.SuperFastHash)
+        yield ("BuzHash", 4, Hash.BuzHash)
+        yield ("NHash", 0, Hash.NHash)
 
         # MD5/SHA1/SHA256 n-times
         yield "MD5/SHA1/SHA256 n-times"
-        yield ("MD5 x2 (raw)", Hash.HASHxN("md5", N=2))
-        yield ("MD5 x3 (raw)", Hash.HASHxN("md5", N=3))
-        yield ("MD5 x4 (raw)", Hash.HASHxN("md5", N=4))
-        yield ("MD5 x5 (raw)", Hash.HASHxN("md5", N=5))
-        yield ("MD5 x2 (hex)", Hash.HASHxN("md5", N=2, use_hex=True))
-        yield ("MD5 x3 (hex)", Hash.HASHxN("md5", N=3, use_hex=True))
-        yield ("MD5 x4 (hex)", Hash.HASHxN("md5", N=4, use_hex=True))
-        yield ("MD5 x5 (hex)", Hash.HASHxN("md5", N=5, use_hex=True))
-        yield ("SHA1 x2 (raw)", Hash.HASHxN("sha1", N=2))
-        yield ("SHA1 x3 (raw)", Hash.HASHxN("sha1", N=3))
-        yield ("SHA1 x4 (raw)", Hash.HASHxN("sha1", N=4))
-        yield ("SHA1 x5 (raw)", Hash.HASHxN("sha1", N=5))
-        yield ("SHA1 x2 (hex)", Hash.HASHxN("sha1", N=2, use_hex=True))
-        yield ("SHA1 x3 (hex)", Hash.HASHxN("sha1", N=3, use_hex=True))
-        yield ("SHA1 x4 (hex)", Hash.HASHxN("sha1", N=4, use_hex=True))
-        yield ("SHA1 x5 (hex)", Hash.HASHxN("sha1", N=5, use_hex=True))
-        yield ("SHA-256 x2 (raw)", Hash.HASHxN("sha256", N=2))
-        yield ("SHA-256 x3 (raw)", Hash.HASHxN("sha256", N=3))
-        yield ("SHA-256 x4 (raw)", Hash.HASHxN("sha256", N=4))
-        yield ("SHA-256 x5 (raw)", Hash.HASHxN("sha256", N=5))
-        yield ("SHA-256 x2 (hex)", Hash.HASHxN("sha256", N=2, use_hex=True))
-        yield ("SHA-256 x3 (hex)", Hash.HASHxN("sha256", N=3, use_hex=True))
-        yield ("SHA-256 x4 (hex)", Hash.HASHxN("sha256", N=4, use_hex=True))
-        yield ("SHA-256 x5 (hex)", Hash.HASHxN("sha256", N=5, use_hex=True))
+        yield ("MD5 x2 (raw)", 16, functools.partial(Hash.HASHxN, "md5", N=2))
+        yield ("MD5 x3 (raw)", 16, functools.partial(Hash.HASHxN, "md5", N=3))
+        yield ("MD5 x4 (raw)", 16, functools.partial(Hash.HASHxN, "md5", N=4))
+        yield ("MD5 x5 (raw)", 16, functools.partial(Hash.HASHxN, "md5", N=5))
+        yield ("MD5 x2 (hex)", 16, functools.partial(Hash.HASHxN, "md5", N=2, use_hex=True))
+        yield ("MD5 x3 (hex)", 16, functools.partial(Hash.HASHxN, "md5", N=3, use_hex=True))
+        yield ("MD5 x4 (hex)", 16, functools.partial(Hash.HASHxN, "md5", N=4, use_hex=True))
+        yield ("MD5 x5 (hex)", 16, functools.partial(Hash.HASHxN, "md5", N=5, use_hex=True))
+        yield ("SHA1 x2 (raw)", 20, functools.partial(Hash.HASHxN, "sha1", N=2))
+        yield ("SHA1 x3 (raw)", 20, functools.partial(Hash.HASHxN, "sha1", N=3))
+        yield ("SHA1 x4 (raw)", 20, functools.partial(Hash.HASHxN, "sha1", N=4))
+        yield ("SHA1 x5 (raw)", 20, functools.partial(Hash.HASHxN, "sha1", N=5))
+        yield ("SHA1 x2 (hex)", 20, functools.partial(Hash.HASHxN, "sha1", N=2, use_hex=True))
+        yield ("SHA1 x3 (hex)", 20, functools.partial(Hash.HASHxN, "sha1", N=3, use_hex=True))
+        yield ("SHA1 x4 (hex)", 20, functools.partial(Hash.HASHxN, "sha1", N=4, use_hex=True))
+        yield ("SHA1 x5 (hex)", 20, functools.partial(Hash.HASHxN, "sha1", N=5, use_hex=True))
+        yield ("SHA-256 x2 (raw)", 32, functools.partial(Hash.HASHxN, "sha256", N=2))
+        yield ("SHA-256 x3 (raw)", 32, functools.partial(Hash.HASHxN, "sha256", N=3))
+        yield ("SHA-256 x4 (raw)", 32, functools.partial(Hash.HASHxN, "sha256", N=4))
+        yield ("SHA-256 x5 (raw)", 32, functools.partial(Hash.HASHxN, "sha256", N=5))
+        yield ("SHA-256 x2 (hex)", 32, functools.partial(Hash.HASHxN, "sha256", N=2, use_hex=True))
+        yield ("SHA-256 x3 (hex)", 32, functools.partial(Hash.HASHxN, "sha256", N=3, use_hex=True))
+        yield ("SHA-256 x4 (hex)", 32, functools.partial(Hash.HASHxN, "sha256", N=4, use_hex=True))
+        yield ("SHA-256 x5 (hex)", 32, functools.partial(Hash.HASHxN, "sha256", N=5, use_hex=True))
 
+        return None
+
+    def get_valid_hash_funcs(self, filtered=False):
+        category = None
+        for elem in self.get_hash_factories():
+            if isinstance(elem, str):
+                category = elem
+                if filtered and self.args.smart and category != "hashlib":
+                    break
+                yield elem
+                continue
+
+            hname, digest_size, factory = elem
+            if filtered and not self.should_be_displayed(hname, digest_size):
+                continue
+            if hname.startswith("FSB-"):
+                try:
+                    __import__("gmpy2")
+                except ImportError:
+                    continue
+            try:
+                hfunc = factory()
+            except Exception:
+                if category == "hashlib":
+                    continue
+                raise
+            yield (hname, hfunc)
         return None
 
     def make_line(self, hname, hfunc, h):
@@ -772,13 +787,13 @@ class HashCommand(GenericCommand):
             line = "{:26s}:[{:4d}b/{:3d}B] {:s}".format(hname, bit, byte, h)
         return line
 
-    def should_be_displayed(self, hname, hfunc):
+    def should_be_displayed(self, hname, digest_size):
         if self.args.smart >= 2:
-            if hname not in ["MD5", "SHA1", "SHA256"]:
+            if hname not in ["MD5", "SHA1", "SHA-256"]:
                 return False
 
         if self.args.length_filter is not None:
-            if self.args.length_filter != hfunc.digest_size:
+            if self.args.length_filter != digest_size:
                 return False
 
         if not self.args.filter:
@@ -1142,6 +1157,8 @@ class HashTestCommand(HashCommand, BufferingOutput):
                         help="filter by hash byte length.")
     parser.add_argument("-s", "--smart", action="store_true", help="show only failed.")
     group = parser.add_mutually_exclusive_group(required=False)
+    group.add_argument("--extended", action="store_true",
+                        help="also check split input, repeated digests and independent instances.")
     group.add_argument("-t", "--time", action="store_true",
                         help="measure the time taken to compute the hash using large bytes of data.")
     group.add_argument("-T", "--time-with-sort", action="store_true",
@@ -1467,13 +1484,14 @@ class HashTestCommand(HashCommand, BufferingOutput):
             "a7e9114eac54cc2d2014c5c976849739d66ad7f049fcd4047992f0bed1e7022e864cf12a2581254a44163b64156930632e28fca145c612d551507503734cd89c",
         # https://csrc.nist.rip/groups/ST/hash/sha-3/Round1/documents/EDON-R.zip
         "EDONR-224":
-            "8f2cf96634e6be40f2534a9ab9e5ff18070f2ecd0e2040b2d1ebda4a",
+            "e443ce8de0433647beb79df3ed5361cdce8cd2f34ea09537d370d4fa",
         "EDONR-256":
-            "42201941c0020a52cca6772d31fefddfc4db45deb64c7b7dc9e8e8f82cd7ad1e",
+            "e77a5ac00923b86c1811d42f1cb1198f43412a6d987dc98bdae11e6d91399609",
         "EDONR-384":
-            "8c2bfcee0c7224d576c8153046d684ce1152c2db137228d3dc0dbe9f14f8ce8c32d7f0e3bb19c6de864865f0a8f2f7a6",
+            "403e73a0a4afff530785564ad443f9d03d06ef1b7eed5fda9ec94606300d7379aeae4c33997f490d15723ffbf8fb16c5",
         "EDONR-512":
-            "7d7bc0c23e810d16916f392738c9f58139bea582096517672963aae6608f3945f8ab1a7c6b32823a07b71dca57694230c88a708476696e220da6ca2a6a20ad56",
+            "b986adabfa9adb1e5b152b6d64c733389082e354fde2fd9740faea6766f440ea"
+            "4391fc745bb9b11a821756944077bb30723f616645492c70fa4c614db7e9d45b",
         # https://csrc.nist.rip/groups/ST/hash/sha-3/Round1/documents/EnRUPT.zip
         "EnRUPT-224":
             "18766355483f44a5789b2ed7d1c2cff79ec56913a7a0d83c80be55f4",
@@ -2316,11 +2334,14 @@ class HashTestCommand(HashCommand, BufferingOutput):
             "fb26873649b20d04274ebc569a8b6a06a5d80fcae6025b9631ecb25bc5f22a7c",
     }
 
-    def hash_check_one(self, hname, h):
+    def hash_check_one(self, hname, h, expected=None, label=None):
         bit = len(h) * 4
         byte = bit // 8
 
-        expected = self.test_vectors.get(hname, None)
+        if expected is None:
+            expected = self.test_vectors.get(hname, None)
+        if label is not None:
+            hname = "{:s} ({:s})".format(hname, label)
         if expected is None:
             self.err_add_out("{:26s}:[{:4d}b/{:3d}B] {:s}".format(hname, bit, byte, "Not found"))
             return
@@ -2342,34 +2363,73 @@ class HashTestCommand(HashCommand, BufferingOutput):
                 self.out.append(titlify(elem))
                 continue
             hname, hfunc = elem
-            if not self.should_be_displayed(hname, hfunc):
+            if not self.should_be_displayed(hname, hfunc.digest_size):
                 continue
             hfunc.update(value)
             h = hfunc.hexdigest()
             self.hash_check_one(hname, h)
         return
 
+    def hash_test_extended(self):
+        tail = b"\x00\xffabc"
+        sources = [self.get_valid_hash_funcs() for i in range(5)]
+        self.out.append(titlify("Hash state tests"))
+        for elems in zip(*sources):
+            if isinstance(elems[0], str):
+                self.out.append(titlify(elems[0]))
+                continue
+            hname, hfunc = elems[0]
+            if not self.should_be_displayed(hname, hfunc.digest_size):
+                continue
+            split, other, expected, other_expected = [elem[1] for elem in elems[1:]]
+            size = max(129, min(getattr(hfunc, "block_size", 128), 4096) + 1)
+            value = bytes(pos % 256 for pos in range(size))
+            expected.update(value)
+            expected.update(tail)
+            expected_digest = expected.hexdigest()
+            other_expected.update(tail)
+            other_expected.update(value)
+            other_digest = other_expected.hexdigest()
+
+            hfunc.update(value)
+            digest = hfunc.hexdigest()
+            self.hash_check_one(hname, hfunc.hexdigest(), digest, "repeat digest")
+            update = split.update
+            if isinstance(split, Hash.TupleHashBase):
+                split.begin_element(len(value))
+                update = split.update_element
+            update(value[:17])
+            other.update(tail)
+            for pos in range(17, len(value), 17):
+                update(value[pos:pos + 17])
+            self.hash_check_one(hname, split.hexdigest(), digest, "split input")
+            self.hash_check_one(hname, hfunc.hexdigest(), digest, "independent state")
+            hfunc.update(tail)
+            other.update(value)
+            self.hash_check_one(hname, hfunc.hexdigest(), expected_digest, "update after digest")
+            self.hash_check_one(hname, other.hexdigest(), other_digest, "interleaved updates")
+        return
+
     def hash_test_time(self):
+        if self.args.size < 0:
+            err("Invalid size")
+            return
         value = b"A" * self.args.size
         category = None
         result = []
 
-        tqdm = GefUtil.get_tqdm()
         hash_funcs = list(self.get_valid_hash_funcs())
-        pbar = tqdm(hash_funcs, leave=False, total=len(hash_funcs))
+        pbar = ProgressBar(hash_funcs, total=len(hash_funcs))
         for i, elem in enumerate(pbar):
             if isinstance(elem, str):
                 category = elem
                 continue
 
             hname, hfunc = elem
-            if not self.should_be_displayed(hname, hfunc):
+            if not self.should_be_displayed(hname, hfunc.digest_size):
                 continue
 
-            try:
-                pbar.set_description(hname)
-            except Exception:
-                pass
+            pbar.set_description(hname)
 
             start_time_real = time.perf_counter()
             hfunc.update(value)
@@ -2406,6 +2466,7 @@ class HashTestCommand(HashCommand, BufferingOutput):
         return
 
     def disable_hash_cffi(self):
+
         def disabled_init_cffi_backend(hash_obj):
             hash_obj.USE_CFFI = False
             return
@@ -2450,11 +2511,15 @@ class HashTestCommand(HashCommand, BufferingOutput):
                     self.hash_test_time()
                 else:
                     self.hash_test()
+                    if args.extended:
+                        self.hash_test_extended()
         else:
             if args.time or args.time_with_sort:
                 self.hash_test_time()
             else:
                 self.hash_test()
+                if args.extended:
+                    self.hash_test_extended()
         self.print_output(check_terminal_size=True)
         return
 
@@ -2947,6 +3012,279 @@ class HashKnownCollisionCommand(HashCommand, BufferingOutput):
 
 
 
+class CrcEngine:
+    """Parameterized CRC calculator. This is a substitute of the `crccheck` package."""
+
+    REFLECT8 = bytes(int("{:08b}".format(i)[::-1], 2) for i in range(256))
+
+    # name, width, poly, initvalue, reflect_input, reflect_output, xor_output[, append_length]
+    PARAMETERS = [
+        ("CrcBase", 0, 0x0, 0x0, False, False, 0x0),
+        ("Crc8Base", 8, 0x7, 0x0, False, False, 0x0),
+        ("Crc16Base", 16, 0x1021, 0x0, False, False, 0x0),
+        ("Crc32Base", 32, 0x4c11db7, 0xffffffff, True, True, 0xffffffff),
+        ("Crc3Gsm", 3, 0x3, 0x0, False, False, 0x7),
+        ("Crc3Rohc", 3, 0x3, 0x7, True, True, 0x0),
+        ("Crc4G704", 4, 0x3, 0x0, True, True, 0x0),
+        ("Crc4Itu", 4, 0x3, 0x0, True, True, 0x0),
+        ("Crc4Interlaken", 4, 0x3, 0xf, False, False, 0xf),
+        ("Crc5EpcC1G2", 5, 0x9, 0x9, False, False, 0x0),
+        ("Crc5Epc", 5, 0x9, 0x9, False, False, 0x0),
+        ("Crc5G704", 5, 0x15, 0x0, True, True, 0x0),
+        ("Crc5Itu", 5, 0x15, 0x0, True, True, 0x0),
+        ("Crc5Usb", 5, 0x5, 0x1f, True, True, 0x1f),
+        ("Crc6Cdma2000A", 6, 0x27, 0x3f, False, False, 0x0),
+        ("Crc6Cdma2000B", 6, 0x7, 0x3f, False, False, 0x0),
+        ("Crc6Darc", 6, 0x19, 0x0, True, True, 0x0),
+        ("Crc6G704", 6, 0x3, 0x0, True, True, 0x0),
+        ("Crc6Itu", 6, 0x3, 0x0, True, True, 0x0),
+        ("Crc6Gsm", 6, 0x2f, 0x0, False, False, 0x3f),
+        ("Crc7Mmc", 7, 0x9, 0x0, False, False, 0x0),
+        ("Crc7", 7, 0x9, 0x0, False, False, 0x0),
+        ("Crc7Rohc", 7, 0x4f, 0x7f, True, True, 0x0),
+        ("Crc7Umts", 7, 0x45, 0x0, False, False, 0x0),
+        ("Crc8Autosar", 8, 0x2f, 0xff, False, False, 0xff),
+        ("Crc8Bluetooth", 8, 0xa7, 0x0, True, True, 0x0),
+        ("Crc8Cdma2000", 8, 0x9b, 0xff, False, False, 0x0),
+        ("Crc8Darc", 8, 0x39, 0x0, True, True, 0x0),
+        ("Crc8DvbS2", 8, 0xd5, 0x0, False, False, 0x0),
+        ("Crc8GsmA", 8, 0x1d, 0x0, False, False, 0x0),
+        ("Crc8GsmB", 8, 0x49, 0x0, False, False, 0xff),
+        ("Crc8Hitag", 8, 0x1d, 0xff, False, False, 0x0),
+        ("Crc8I4321", 8, 0x7, 0x0, False, False, 0x55),
+        ("Crc8Itu", 8, 0x7, 0x0, False, False, 0x55),
+        ("Crc8ICode", 8, 0x1d, 0xfd, False, False, 0x0),
+        ("Crc8Lte", 8, 0x9b, 0x0, False, False, 0x0),
+        ("Crc8MaximDow", 8, 0x31, 0x0, True, True, 0x0),
+        ("Crc8Maxim", 8, 0x31, 0x0, True, True, 0x0),
+        ("CrcDow", 8, 0x31, 0x0, True, True, 0x0),
+        ("Crc8MifareMad", 8, 0x1d, 0xc7, False, False, 0x0),
+        ("Crc8Nrsc5", 8, 0x31, 0xff, False, False, 0x0),
+        ("Crc8Opensafety", 8, 0x2f, 0x0, False, False, 0x0),
+        ("Crc8Rohc", 8, 0x7, 0xff, True, True, 0x0),
+        ("Crc8SaeJ1850", 8, 0x1d, 0xff, False, False, 0xff),
+        ("Crc8Smbus", 8, 0x7, 0x0, False, False, 0x0),
+        ("Crc8", 8, 0x7, 0x0, False, False, 0x0),
+        ("Crc8Tech3250", 8, 0x1d, 0xff, True, True, 0x0),
+        ("Crc8Aes", 8, 0x1d, 0xff, True, True, 0x0),
+        ("Crc8Ebu", 8, 0x1d, 0xff, True, True, 0x0),
+        ("Crc8Wcdma", 8, 0x9b, 0x0, True, True, 0x0),
+        ("Crc10Atm", 10, 0x233, 0x0, False, False, 0x0),
+        ("Crc10", 10, 0x233, 0x0, False, False, 0x0),
+        ("Crc10I610", 10, 0x233, 0x0, False, False, 0x0),
+        ("Crc10Cdma2000", 10, 0x3d9, 0x3ff, False, False, 0x0),
+        ("Crc10Gsm", 10, 0x175, 0x0, False, False, 0x3ff),
+        ("Crc11Flexray", 11, 0x385, 0x1a, False, False, 0x0),
+        ("Crc11", 11, 0x385, 0x1a, False, False, 0x0),
+        ("Crc11Umts", 11, 0x307, 0x0, False, False, 0x0),
+        ("Crc12Cdma2000", 12, 0xf13, 0xfff, False, False, 0x0),
+        ("Crc12Dect", 12, 0x80f, 0x0, False, False, 0x0),
+        ("Crc12X", 12, 0x80f, 0x0, False, False, 0x0),
+        ("Crc12Gsm", 12, 0xd31, 0x0, False, False, 0xfff),
+        ("Crc12Umts", 12, 0x80f, 0x0, False, True, 0x0),
+        ("Crc123Gpp", 12, 0x80f, 0x0, False, True, 0x0),
+        ("Crc13Bbc", 13, 0x1cf5, 0x0, False, False, 0x0),
+        ("Crc14Darc", 14, 0x805, 0x0, True, True, 0x0),
+        ("Crc14Gsm", 14, 0x202d, 0x0, False, False, 0x3fff),
+        ("Crc15Can", 15, 0x4599, 0x0, False, False, 0x0),
+        ("Crc15", 15, 0x4599, 0x0, False, False, 0x0),
+        ("Crc15Mpt1327", 15, 0x6815, 0x0, False, False, 0x1),
+        ("Crc16Arc", 16, 0x8005, 0x0, True, True, 0x0),
+        ("CrcArc", 16, 0x8005, 0x0, True, True, 0x0),
+        ("Crc16Lha", 16, 0x8005, 0x0, True, True, 0x0),
+        ("CrcIbm", 16, 0x8005, 0x0, True, True, 0x0),
+        ("Crc16Cdma2000", 16, 0xc867, 0xffff, False, False, 0x0),
+        ("Crc16Cms", 16, 0x8005, 0xffff, False, False, 0x0),
+        ("Crc16Dds110", 16, 0x8005, 0x800d, False, False, 0x0),
+        ("Crc16DectR", 16, 0x589, 0x0, False, False, 0x1),
+        ("Crc16R", 16, 0x589, 0x0, False, False, 0x1),
+        ("Crc16DectX", 16, 0x589, 0x0, False, False, 0x0),
+        ("Crc16X", 16, 0x589, 0x0, False, False, 0x0),
+        ("Crc16Dnp", 16, 0x3d65, 0x0, True, True, 0xffff),
+        ("Crc16En13757", 16, 0x3d65, 0x0, False, False, 0xffff),
+        ("Crc16Genibus", 16, 0x1021, 0xffff, False, False, 0xffff),
+        ("Crc16Darc", 16, 0x1021, 0xffff, False, False, 0xffff),
+        ("Crc16Epc", 16, 0x1021, 0xffff, False, False, 0xffff),
+        ("Crc16EpcC1G2", 16, 0x1021, 0xffff, False, False, 0xffff),
+        ("Crc16ICode", 16, 0x1021, 0xffff, False, False, 0xffff),
+        ("Crc16Gsm", 16, 0x1021, 0x0, False, False, 0xffff),
+        ("Crc16Ibm3740", 16, 0x1021, 0xffff, False, False, 0x0),
+        ("Crc16Autosar", 16, 0x1021, 0xffff, False, False, 0x0),
+        ("Crc16CcittFalse", 16, 0x1021, 0xffff, False, False, 0x0),
+        ("Crc16IbmSdlc", 16, 0x1021, 0xffff, True, True, 0xffff),
+        ("Crc16IsoHdlc", 16, 0x1021, 0xffff, True, True, 0xffff),
+        ("Crc16IsoIec144433B", 16, 0x1021, 0xffff, True, True, 0xffff),
+        ("Crc16X25", 16, 0x1021, 0xffff, True, True, 0xffff),
+        ("CrcB", 16, 0x1021, 0xffff, True, True, 0xffff),
+        ("CrcX25", 16, 0x1021, 0xffff, True, True, 0xffff),
+        ("Crc16IsoIec144433A", 16, 0x1021, 0xc6c6, True, True, 0x0),
+        ("CrcA", 16, 0x1021, 0xc6c6, True, True, 0x0),
+        ("Crc16Kermit", 16, 0x1021, 0x0, True, True, 0x0),
+        ("Crc16Ccitt", 16, 0x1021, 0x0, True, True, 0x0),
+        ("Crc16CcittTrue", 16, 0x1021, 0x0, True, True, 0x0),
+        ("Crc16V41Lsb", 16, 0x1021, 0x0, True, True, 0x0),
+        ("CrcCcitt", 16, 0x1021, 0x0, True, True, 0x0),
+        ("CrcKermit", 16, 0x1021, 0x0, True, True, 0x0),
+        ("Crc16Lj1200", 16, 0x6f63, 0x0, False, False, 0x0),
+        ("Crc16M17", 16, 0x5935, 0xffff, False, False, 0x0),
+        ("Crc16MaximDow", 16, 0x8005, 0x0, True, True, 0xffff),
+        ("Crc16Maxim", 16, 0x8005, 0x0, True, True, 0xffff),
+        ("Crc16Mcrf4Xx", 16, 0x1021, 0xffff, True, True, 0x0),
+        ("Crc16Mcrf4XX", 16, 0x1021, 0xffff, True, True, 0x0),
+        ("Crcc16Mcrf4xx", 16, 0x1021, 0xffff, True, True, 0x0),
+        ("Crc16Modbus", 16, 0x8005, 0xffff, True, True, 0x0),
+        ("CrcModbus", 16, 0x8005, 0xffff, True, True, 0x0),
+        ("Crc16Nrsc5", 16, 0x80b, 0xffff, True, True, 0x0),
+        ("Crc16OpensafetyA", 16, 0x5935, 0x0, False, False, 0x0),
+        ("Crc16OpensafetyB", 16, 0x755b, 0x0, False, False, 0x0),
+        ("Crc16Profibus", 16, 0x1dcf, 0xffff, False, False, 0xffff),
+        ("Crc16Iec611582", 16, 0x1dcf, 0xffff, False, False, 0xffff),
+        ("Crc16Riello", 16, 0x1021, 0xb2aa, True, True, 0x0),
+        ("Crc16SpiFujitsu", 16, 0x1021, 0x1d0f, False, False, 0x0),
+        ("Crc16AugCcitt", 16, 0x1021, 0x1d0f, False, False, 0x0),
+        ("Crc16T10Dif", 16, 0x8bb7, 0x0, False, False, 0x0),
+        ("Crc16Teledisk", 16, 0xa097, 0x0, False, False, 0x0),
+        ("Crc16Tms37157", 16, 0x1021, 0x89ec, True, True, 0x0),
+        ("Crc16Umts", 16, 0x8005, 0x0, False, False, 0x0),
+        ("Crc16Buypass", 16, 0x8005, 0x0, False, False, 0x0),
+        ("Crc16Verifone", 16, 0x8005, 0x0, False, False, 0x0),
+        ("Crc16Usb", 16, 0x8005, 0xffff, True, True, 0xffff),
+        ("Crc16Xmodem", 16, 0x1021, 0x0, False, False, 0x0),
+        ("Crc16Acorn", 16, 0x1021, 0x0, False, False, 0x0),
+        ("Crc16Lte", 16, 0x1021, 0x0, False, False, 0x0),
+        ("Crc16V41Msb", 16, 0x1021, 0x0, False, False, 0x0),
+        ("CrcXmodem", 16, 0x1021, 0x0, False, False, 0x0),
+        ("CrcZmodem", 16, 0x1021, 0x0, False, False, 0x0),
+        ("Crc16", 16, 0x1021, 0x0, False, False, 0x0),
+        ("Crc17CanFd", 17, 0x1685b, 0x0, False, False, 0x0),
+        ("Crc21CanFd", 21, 0x102899, 0x0, False, False, 0x0),
+        ("Crc24Ble", 24, 0x65b, 0x555555, True, True, 0x0),
+        ("Crc24FlexrayA", 24, 0x5d6dcb, 0xfedcba, False, False, 0x0),
+        ("Crc24FlexrayB", 24, 0x5d6dcb, 0xabcdef, False, False, 0x0),
+        ("Crc24Interlaken", 24, 0x328b63, 0xffffff, False, False, 0xffffff),
+        ("Crc24LteA", 24, 0x864cfb, 0x0, False, False, 0x0),
+        ("Crc24LteB", 24, 0x800063, 0x0, False, False, 0x0),
+        ("Crc24Openpgp", 24, 0x864cfb, 0xb704ce, False, False, 0x0),
+        ("Crc24", 24, 0x864cfb, 0xb704ce, False, False, 0x0),
+        ("Crc24OpenPgp", 24, 0x864cfb, 0xb704ce, False, False, 0x0),
+        ("Crc24Os9", 24, 0x800063, 0xffffff, False, False, 0xffffff),
+        ("Crc30Cdma", 30, 0x2030b9c7, 0x3fffffff, False, False, 0x3fffffff),
+        ("Crc31Philips", 31, 0x4c11db7, 0x7fffffff, False, False, 0x7fffffff),
+        ("Crc32Aixm", 32, 0x814141ab, 0x0, False, False, 0x0),
+        ("Crc32Q", 32, 0x814141ab, 0x0, False, False, 0x0),
+        ("Crc32q", 32, 0x814141ab, 0x0, False, False, 0x0),
+        ("Crc32Autosar", 32, 0xf4acfb13, 0xffffffff, True, True, 0xffffffff),
+        ("Crc32Base91D", 32, 0xa833982b, 0xffffffff, True, True, 0xffffffff),
+        ("Crc32D", 32, 0xa833982b, 0xffffffff, True, True, 0xffffffff),
+        ("Crc32d", 32, 0xa833982b, 0xffffffff, True, True, 0xffffffff),
+        ("Crc32Bzip2", 32, 0x4c11db7, 0xffffffff, False, False, 0xffffffff),
+        ("Crc32Aal5", 32, 0x4c11db7, 0xffffffff, False, False, 0xffffffff),
+        ("Crc32DectB", 32, 0x4c11db7, 0xffffffff, False, False, 0xffffffff),
+        ("Crc32B", 32, 0x4c11db7, 0xffffffff, False, False, 0xffffffff),
+        ("Crc32CdRomEdc", 32, 0x8001801b, 0x0, True, True, 0x0),
+        ("Crc32Cksum", 32, 0x4c11db7, 0x0, False, False, 0xffffffff),
+        ("CrcCksum", 32, 0x4c11db7, 0x0, False, False, 0xffffffff),
+        ("Crc32Posix", 32, 0x4c11db7, 0x0, False, False, 0xffffffff),
+        ("Crc32Iscsi", 32, 0x1edc6f41, 0xffffffff, True, True, 0xffffffff),
+        ("Crc32Base91C", 32, 0x1edc6f41, 0xffffffff, True, True, 0xffffffff),
+        ("Crc32Castagnoli", 32, 0x1edc6f41, 0xffffffff, True, True, 0xffffffff),
+        ("Crc32Interlaken", 32, 0x1edc6f41, 0xffffffff, True, True, 0xffffffff),
+        ("Crc32C", 32, 0x1edc6f41, 0xffffffff, True, True, 0xffffffff),
+        ("Crc32c", 32, 0x1edc6f41, 0xffffffff, True, True, 0xffffffff),
+        ("Crc32IsoHdlc", 32, 0x4c11db7, 0xffffffff, True, True, 0xffffffff),
+        ("Crc32", 32, 0x4c11db7, 0xffffffff, True, True, 0xffffffff),
+        ("Crc32Adccp", 32, 0x4c11db7, 0xffffffff, True, True, 0xffffffff),
+        ("Crc32V42", 32, 0x4c11db7, 0xffffffff, True, True, 0xffffffff),
+        ("Crc32Xz", 32, 0x4c11db7, 0xffffffff, True, True, 0xffffffff),
+        ("CrcPkzip", 32, 0x4c11db7, 0xffffffff, True, True, 0xffffffff),
+        ("Crc32Jamcrc", 32, 0x4c11db7, 0xffffffff, True, True, 0x0),
+        ("CrcJamcrc", 32, 0x4c11db7, 0xffffffff, True, True, 0x0),
+        ("Crc32Mef", 32, 0x741b8cd7, 0xffffffff, True, True, 0x0),
+        ("Crc32Mpeg2", 32, 0x4c11db7, 0xffffffff, False, False, 0x0),
+        ("Crc32Xfer", 32, 0xaf, 0x0, False, False, 0x0),
+        ("CrcXfer", 32, 0xaf, 0x0, False, False, 0x0),
+        ("Crc40Gsm", 40, 0x4820009, 0x0, False, False, 0xffffffffff),
+        ("Crc64Ecma182", 64, 0x42f0e1eba9ea3693, 0x0, False, False, 0x0),
+        ("Crc64", 64, 0x42f0e1eba9ea3693, 0x0, False, False, 0x0),
+        ("Crc64GoIso", 64, 0x1b, 0xffffffffffffffff, True, True, 0xffffffffffffffff),
+        ("Crc64Ms", 64, 0x259c84cba6426349, 0xffffffffffffffff, True, True, 0x0),
+        ("Crc64Nvme", 64, 0xad93d23594c93659, 0xffffffffffffffff, True, True, 0xffffffffffffffff),
+        ("Crc64Redis", 64, 0xad93d23594c935a9, 0x0, True, True, 0x0),
+        ("Crc64We", 64, 0x42f0e1eba9ea3693, 0xffffffffffffffff, False, False, 0xffffffffffffffff),
+        ("Crc64Xz", 64, 0x42f0e1eba9ea3693, 0xffffffffffffffff, True, True, 0xffffffffffffffff),
+        ("Crc64GoEcma", 64, 0x42f0e1eba9ea3693, 0xffffffffffffffff, True, True, 0xffffffffffffffff),
+        ("Crc82Darc", 82, 0x308c0111011401440411, 0x0, True, True, 0x0),
+        # CRC-32K (Koopman), which is not included in the crccheck package
+        ("Crc32K", 32, 0x741b8cd7, 0xffffffff, True, True, 0xffffffff),
+        ("Crc32Koopman", 32, 0x741b8cd7, 0xffffffff, True, True, 0xffffffff),
+        # the output of the POSIX `cksum` command, which feeds the data length to CRC-32/CKSUM after the data
+        ("Cksum", 32, 0x4c11db7, 0x0, False, False, 0xffffffff, True),
+    ]
+
+    def __init__(self, width, poly, initvalue, reflect_input, reflect_output, xor_output, append_length=False):
+        self.params = (width, poly, initvalue, reflect_input, reflect_output, xor_output, append_length)
+        self._width = width
+        self.poly = poly
+        self.initvalue = initvalue
+        self.reflect_input = reflect_input
+        self.reflect_output = reflect_output
+        self.xor_output = xor_output
+        self.append_length = append_length
+        self.value = initvalue
+        self.length = 0
+        return
+
+    def process(self, data):
+        crc = self.value
+        highbit = 1 << (self._width - 1) # ValueError is raised if width is 0
+        mask = (1 << self._width) - 1
+        poly = self.poly
+        shift = self._width - 8
+        if shift < 0:
+            # enlarge temporarily to fit 8-bit
+            diff8 = -shift
+            mask, shift, highbit = 0xff, 0, 0x80
+            crc <<= diff8
+            poly <<= diff8
+        else:
+            diff8 = 0
+        if self.reflect_input:
+            table = self.REFLECT8
+        else:
+            table = None
+        for byte in data:
+            if table:
+                byte = table[byte]
+            crc ^= byte << shift
+            for _ in range(8):
+                if crc & highbit:
+                    crc = (crc << 1) ^ poly
+                else:
+                    crc <<= 1
+            crc &= mask
+        if diff8:
+            crc >>= diff8
+        self.value = crc
+        self.length += len(data)
+        return self
+
+    def final(self):
+        crc = self.value
+        if self.append_length:
+            # in as few bytes as needed, the least significant byte first
+            length = self.length.to_bytes((self.length.bit_length() + 7) // 8, "little")
+            crc = CrcEngine(self._width, self.poly, crc, self.reflect_input, False, 0).process(length).value
+        if self.reflect_output:
+            crc = int("{:0{:d}b}".format(crc, self._width)[::-1], 2)
+        return crc ^ self.xor_output
+
+    def finalhex(self):
+        return self.final().to_bytes((self._width + 7) // 8, "big").hex()
+
+    def calchex(self, data):
+        return CrcEngine(*self.params).process(data).finalhex()
+
+
 @register_command
 class CrcCommand(GenericCommand, BufferingOutput):
     """The base command to calculate crc."""
@@ -2976,65 +3314,10 @@ class CrcCommand(GenericCommand, BufferingOutput):
         return
 
     def get_valid_crc_funcs(self):
-        import crccheck
-        for cname in crccheck.crc.__dict__:
-            if self.args.filter and not any(filt.search(cname) for filt in self.args.filter):
+        for cname, *params in CrcEngine.PARAMETERS:
+            if not GefUtil.matches_regex(cname, self.args.filter):
                 continue
-            if not cname.startswith("Crc"):
-                continue
-            if cname.startswith("Crccheck"):
-                continue
-            try:
-                cfunc = getattr(crccheck.crc, cname)()
-            except TypeError:
-                continue
-            yield (cname, cfunc)
-
-        class Crc32kWrapper:
-            def __init__(self):
-                self.buf = b""
-                return
-
-            def cfunc(self, data):
-                # CRC-32K (Koopman) polynomial:
-                # normal:   0x741B8CD7
-                # reflected 0xEB31D82E  (LSB-first bit processing)
-                poly_reflected = 0xeb31_d82e
-                init = 0xffff_ffff
-                xorout = 0xffff_ffff
-
-                crc = init & 0xffff_ffff
-                for b in data:
-                    crc ^= b
-                    for _ in range(8):
-                        if crc & 1:
-                            crc = (crc >> 1) ^ poly_reflected
-                        else:
-                            crc >>= 1
-                        crc &= 0xffff_ffff
-
-                crc ^= xorout
-                return crc & 0xffff_ffff
-
-            def process(self, value):
-                self.buf += value
-                return
-
-            def calchex(self, value):
-                crc = self.cfunc(value)
-                return "{:08x}".format(crc)
-
-            def finalhex(self):
-                crc = self.cfunc(self.buf)
-                return "{:08x}".format(crc)
-
-            def width(self):
-                return 32
-
-        for cname in ["Crc32K", "Crc32Koopman"]:
-            if self.args.filter and not any(filt.search(cname) for filt in self.args.filter):
-                continue
-            yield (cname, Crc32kWrapper())
+            yield (cname, CrcEngine(*params))
         return None
 
     def make_line(self, cname, cfunc, crc):
@@ -3095,9 +3378,8 @@ class CrcMemoryCommand(CrcCommand):
                 chunk_size = end_address - chunk_addr
             else:
                 chunk_size = step
-            try:
-                mem = read_memory(chunk_addr, chunk_size)
-            except (gdb.MemoryError, MemoryError):
+            mem = read_memory(chunk_addr, chunk_size, safe=True)
+            if mem is None:
                 err("Memory read error")
                 return False
             try:
@@ -3109,8 +3391,10 @@ class CrcMemoryCommand(CrcCommand):
 
     @parse_args
     @only_if_gdb_running
-    @ModuleLoader.load_crccheck
     def do_invoke(self, args):
+        if args.size < 0:
+            err("Invalid size")
+            return
         self.out = []
         self.out.append("Address: {:#x}".format(args.location))
         self.out.append("Size: {:#x}".format(args.size))
@@ -3157,7 +3441,8 @@ class CrcFileCommand(CrcCommand):
 
         step = 0x400 * get_pagesize()
 
-        with open(self.args.filename, "rb") as f:
+        with open(filename, "rb") as f:
+            end_pos = min(end_pos, os.fstat(f.fileno()).st_size)
             f.seek(start_pos)
             for chunk_pos in range(start_pos, end_pos, step):
                 chunk_size = min(end_pos - chunk_pos, step)
@@ -3170,23 +3455,31 @@ class CrcFileCommand(CrcCommand):
         return cfunc.finalhex()
 
     @parse_args
-    @only_if_gdb_running
-    @ModuleLoader.load_crccheck
     def do_invoke(self, args):
+        if args.start < 0 or args.size is not None and args.size < 0:
+            err("Invalid range")
+            return
         self.out = []
         if not os.path.exists(args.filename):
             err("File not found")
+            return
+        if not os.path.isfile(args.filename):
+            err("Not a regular file")
             return
         self.out.append("Path: {:s}".format(args.filename))
         self.out.append("FileSize: {:#x}".format(os.path.getsize(args.filename)))
 
         if args.size is None:
-            end_pos = args.start + os.path.getsize(args.filename)
+            end_pos = os.path.getsize(args.filename)
         else:
             end_pos = args.start + args.size
 
         for cname, cfunc in self.get_valid_crc_funcs():
-            crc = self.calc_crc(cfunc, args.filename, args.start, end_pos)
+            try:
+                crc = self.calc_crc(cfunc, args.filename, args.start, end_pos)
+            except OSError as e:
+                err("Cannot read file {:s}: {:s}".format(args.filename, str(e)))
+                return
             if crc is False:
                 return
             if crc is None:
@@ -3224,16 +3517,15 @@ class CrcValueCommand(CrcCommand):
         return
 
     @parse_args
-    @ModuleLoader.load_crccheck
     def do_invoke(self, args):
         if args.hex: # "41414141" -> b"\x41\x41\x41\x41"
             value = GefUtil.fromhex_ignore_invalid(args.value)
-            if not value:
+            if value is None:
                 return
         else:
             try:
                 value = codecs.escape_decode(args.value)[0]
-            except binascii.Error:
+            except (binascii.Error, ValueError):
                 err('Could not decode "\\xXX" encoded string')
                 return
 
@@ -3250,6 +3542,495 @@ class CrcValueCommand(CrcCommand):
 
 
 
+class BaseNCodec:
+    """The base encodings used by base-n-encode/decode, without an external module."""
+
+    UPPER = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    LOWER = "abcdefghijklmnopqrstuvwxyz"
+    DIGITS = "0123456789"
+    CHARSETS = {
+        "base1": "A",
+        "base3": "123",
+        "base10": DIGITS,
+        "base26": UPPER,
+        "base36": DIGITS + UPPER,
+        "base58-bitcoin": "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz",
+        "base58-flickr": "123456789abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ",
+        "base58-ripple": "rpshnaf39wBUDNEGHJKLM4PQRST7VWXYZ2bcdeCg65jkm8oFqi1tuvAxyz",
+        "base62": DIGITS + UPPER + LOWER,
+        "base63": DIGITS + UPPER + LOWER + "_",
+        "base67": UPPER + LOWER + DIGITS + "-_.!~",
+    }
+    POWER_CHARSETS = {
+        "base2": "01",
+        "base4": "1234",
+        "base8": "abcdefgh",
+        "base16": DIGITS + "ABCDEF",
+        "base32": UPPER + "234567",
+        "base32-crockford": DIGITS + "ABCDEFGHJKMNPQRSTVWXYZ",
+        "base32-geohash": DIGITS + "bcdefghjkmnpqrstuvwxyz",
+        "base32-hex": DIGITS + UPPER[:22],
+        "base32-z": "ybndrfg8ejkmcpqxot1uwisza345h769",
+        "base64": UPPER + LOWER + DIGITS + "+/",
+        "base64-url": UPPER + LOWER + DIGITS + "-_",
+    }
+    BASE45 = DIGITS + UPPER + " $%*+-./:"
+    BASE91 = UPPER + LOWER + DIGITS + "!#$%&()*+,./:;<=>?@[]^_`{|}~\""
+    BASE85_ASCII = "!\"#$%&'()*+,-./" + DIGITS + ":;<=>?@" + UPPER + "[\\]^_`" + LOWER[:21]
+    BASE85 = {
+        "base85": BASE85_ASCII,
+        "base85-adobe": BASE85_ASCII,
+        "base85-xbtoa": BASE85_ASCII,
+        "base85-ipv6": DIGITS + UPPER + LOWER + "!#$%&()*+-;<=>?@^_`{|}~",
+        "base85-xml": DIGITS + UPPER + LOWER[:-1] + "!#$()*+,-./:;=?@^`{|}~z_",
+        "base85-zeromq": DIGITS + LOWER + UPPER + ".-:+=^!/*?&<>()[]{}@%$#",
+    }
+    BAD122 = (0, 10, 13, 34, 38, 92)
+
+    @staticmethod
+    def as_bytes(value):
+        if isinstance(value, bytes):
+            return value
+        try:
+            return value.encode("latin-1")
+        except UnicodeEncodeError:
+            return value.encode("utf-8")
+
+    @staticmethod
+    def as_text(value):
+        if isinstance(value, str):
+            return value
+        try:
+            return value.decode("utf-8")
+        except UnicodeDecodeError:
+            return value.decode("latin-1")
+
+    @staticmethod
+    def int_to_bytes(value):
+        if value < 0:
+            raise ValueError("Negative base value")
+        size = max(1, (value.bit_length() + 7) // 8)
+        return value.to_bytes(size, "big")
+
+    @staticmethod
+    def encode_generic(data, charset):
+        value = int.from_bytes(data, "big")
+        if len(charset) == 1:
+            if value > 1024 * 1024 * 1024:
+                raise ValueError("Input exceeded size limit")
+            return (charset * value).encode("latin-1")
+        if len(charset) == 10:
+            if value:
+                result = str(value)
+            else:
+                result = ""
+        else:
+            result = ""
+            while value:
+                value, digit = divmod(value, len(charset))
+                result = charset[digit] + result
+        result = charset[0] * (len(data) - len(data.lstrip(b"\0"))) + result
+        return result.encode("latin-1")
+
+    @staticmethod
+    def decode_generic(text, charset):
+        if not text:
+            return b""
+        if len(charset) == 1:
+            text = text.replace("\r\n", "").replace("\n", "")
+            invalid = text.replace(charset, "")
+            if invalid:
+                raise ValueError("Invalid base character {!r}".format(invalid[0]))
+            return BaseNCodec.int_to_bytes(len(text))
+        if len(charset) == 10:
+            value = int(text)
+            text = text.strip()
+        else:
+            value = 0
+            text = text.replace("\r\n", "").replace("\n", "")
+            if not text:
+                return b""
+            for char in text:
+                try:
+                    digit = charset.index(char)
+                except ValueError as exc:
+                    raise ValueError("Invalid base character {!r}".format(char)) from exc
+                value = value * len(charset) + digit
+        zeros = len(text) - len(text.lstrip(charset[0]))
+        return b"\0" * zeros + (BaseNCodec.int_to_bytes(value) if value or not zeros else b"")
+
+    @staticmethod
+    def encode_power(data, charset):
+        bits_per_char = int(math.log2(len(charset)))
+        bits = "".join("{:08b}".format(value) for value in data)
+        result = ""
+        for pos in range(0, len(bits), bits_per_char):
+            chunk = bits[pos:pos + bits_per_char]
+            result += charset[int(chunk.ljust(bits_per_char, "0"), 2)]
+        quantum = bits_per_char
+        while quantum % 8:
+            quantum += bits_per_char
+        while len(result) * bits_per_char % quantum:
+            result += "="
+        return result.encode()
+
+    @staticmethod
+    def decode_power(text, charset):
+        text = re.sub(r"\s", "", text)
+        if not text:
+            return b""
+        if len(charset) == 16:
+            text = text.upper()
+        bits_per_char = int(math.log2(len(charset)))
+        padding = len(text) - len(text.rstrip("="))
+        quantum = 8 // math.gcd(bits_per_char, 8)
+        payload = text.rstrip("=")
+        if ("=" in payload or len(text) % quantum or padding >= quantum
+                or len(payload) * bits_per_char % 8 >= bits_per_char):
+            raise ValueError("Incorrect padding")
+        bits = ""
+        for char in text:
+            if char == "=":
+                bits += "0" * bits_per_char
+                continue
+            try:
+                digit = charset.index(char)
+            except ValueError as exc:
+                raise ValueError("Invalid base character {!r}".format(char)) from exc
+            bits += format(digit, "0{:d}b".format(bits_per_char))
+        if len(bits) % 8:
+            raise ValueError("Incorrect padding")
+        result = bytes(int(bits[pos:pos + 8], 2) for pos in range(0, len(bits), 8))
+        trim = math.ceil(padding * bits_per_char / 8)
+        if trim:
+            return result[:-trim]
+        return result
+
+    @staticmethod
+    def encode45(data):
+        result = ""
+        for pos in range(0, len(data), 2):
+            if pos + 1 == len(data):
+                value = data[pos]
+                result += BaseNCodec.BASE45[value % 45] + BaseNCodec.BASE45[value // 45]
+                break
+            value = data[pos] * 256 + data[pos + 1]
+            result += BaseNCodec.BASE45[value % 45]
+            result += BaseNCodec.BASE45[value // 45 % 45]
+            result += BaseNCodec.BASE45[value // (45 * 45)]
+        return result.encode()
+
+    @staticmethod
+    def decode45(text):
+        result = bytearray()
+        for pos in range(0, len(text), 3):
+            block = text[pos:pos + 3]
+            if len(block) == 1:
+                raise ValueError("Incorrect base45 length")
+            try:
+                value = sum(BaseNCodec.BASE45.index(char) * 45 ** i for i, char in enumerate(block))
+            except ValueError as exc:
+                raise ValueError("Invalid base45 character") from exc
+            if len(block) == 2:
+                if value > 255:
+                    raise ValueError("Invalid base45 value")
+                result.append(value)
+            else:
+                if value > 65535:
+                    raise ValueError("Invalid base45 value")
+                result.extend((value >> 8, value & 0xff))
+        return bytes(result)
+
+    @staticmethod
+    def update_xbtoa(values, data):
+        check_xor, check_sum, check_rot = values
+        for value in data:
+            check_xor ^= value
+            check_sum = (check_sum + value + 1) & 0xffffffff
+            check_rot = ((check_rot << 1 | check_rot >> 31) + value) & 0xffffffff
+        return check_xor, check_sum, check_rot
+
+    @staticmethod
+    def encode85(data, name):
+        if not data:
+            return b""
+        if name == "base85-zeromq" and len(data) % 4:
+            raise ValueError("Incorrect Z85 length")
+        charset = BaseNCodec.BASE85[name]
+        xbtoa = name == "base85-xbtoa"
+        checks = (0, 0, 0)
+        result = ""
+        padding = align(len(data), 4) - len(data)
+        for pos in range(0, len(data), 4):
+            block = data[pos:pos + 4]
+            if xbtoa:
+                checks = BaseNCodec.update_xbtoa(checks, block.ljust(4, b"\0"))
+            if len(block) == 4 and block == b"\0\0\0\0" and charset.endswith("stu"):
+                result += "z"
+                continue
+            if len(block) == 4 and block == b"    " and xbtoa:
+                result += "y"
+                continue
+            value = int.from_bytes(block.ljust(4, b"\0"), "big")
+            encoded = ""
+            while len(encoded) < 5:
+                value, digit = divmod(value, 85)
+                encoded = charset[digit] + encoded
+            result += encoded
+        if not xbtoa and padding:
+            result = result[:-padding]
+        if charset.endswith("stu") and result.endswith("!!!!!"):
+            result = result[:-5] + "z"
+        if name == "base85-adobe":
+            result = "<~" + result + "~>"
+        elif xbtoa:
+            check_xor, check_sum, check_rot = checks
+            body = "\n".join(result[pos:pos + 78] for pos in range(0, len(result), 78))
+            result = "xbtoa Begin\n{:s}\nxbtoa End N {:d} {:x} E {:x} S {:x} R {:x}".format(
+                body, len(data), len(data), check_xor, check_sum, check_rot,
+            )
+        return result.encode()
+
+    @staticmethod
+    def decode85(text, name):
+        if name in ("base85", "base85-adobe"):
+            text = re.sub(r"[ \t\n\r\v\f]", "", text)
+        if not text:
+            return b""
+        if name == "base85-zeromq" and len(text) % 5:
+            raise ValueError("Incorrect Z85 length")
+        charset = BaseNCodec.BASE85[name]
+        xbtoa = name == "base85-xbtoa"
+        expected = None
+        if name == "base85-adobe" and text.startswith("<~") and text.endswith("~>"):
+            text = text[2:-2]
+        elif xbtoa:
+            match = re.search(
+                r"\nxbtoa\s+[eE]nd N (\d+) ([0-9a-fA-F]+) E ([0-9a-fA-F]+) S ([0-9a-fA-F]+) R ([0-9a-fA-F]+)\s*$",
+                text,
+            )
+            if not re.match(r"^xbtoa\s+[bB]egin\n", text) or match is None:
+                raise ValueError("Bad or missing xbtoa parameters")
+            expected = match.groups()
+            text = "".join(text[:match.start()].split("\n")[1:]).replace(" ", "")
+        result = bytearray()
+        padding = 0
+        pos = 0
+        while pos < len(text):
+            if text[pos] == "z" and charset.endswith("stu"):
+                result.extend(b"\0\0\0\0")
+                pos += 1
+                continue
+            if text[pos] == "y" and xbtoa:
+                result.extend(b"    ")
+                pos += 1
+                continue
+            block = text[pos:pos + 5]
+            if len(block) < 5:
+                padding = 5 - len(block)
+            else:
+                padding = 0
+            values = []
+            for char in block:
+                try:
+                    values.append(charset.index(char))
+                except ValueError as exc:
+                    raise ValueError("Invalid base85 character {!r}".format(char)) from exc
+            if len(block) == 1 or xbtoa and padding:
+                raise ValueError("Incorrect base85 length")
+            values.extend([84] * padding)
+            value = sum(digit * 85 ** power for power, digit in enumerate(reversed(values)))
+            if value > 0xffffffff:
+                raise ValueError("Base85 value exceeds 32 bits")
+            result.extend(value.to_bytes(4, "big"))
+            pos += 5
+        if padding:
+            del result[-padding:]
+        if xbtoa:
+            data_len = int(expected[0])
+            if len(result) != align(data_len, 4):
+                raise ValueError("Incorrect xbtoa length")
+            checks = BaseNCodec.update_xbtoa((0, 0, 0), result)
+            del result[data_len:]
+            actual = (str(len(result)), format(len(result), "x")) + tuple(format(value, "x") for value in checks)
+            if tuple(value.lower() for value in expected) != actual:
+                raise ValueError("An xbtoa check value does not match")
+        return bytes(result)
+
+    @staticmethod
+    def encode91(data):
+        value = 0
+        bit_count = 0
+        result = ""
+        for byte in data:
+            value |= byte << bit_count
+            bit_count += 8
+            if bit_count > 13:
+                chunk = value & 8191
+                if chunk > 88:
+                    value >>= 13
+                    bit_count -= 13
+                else:
+                    chunk = value & 16383
+                    value >>= 14
+                    bit_count -= 14
+                result += BaseNCodec.BASE91[chunk % 91] + BaseNCodec.BASE91[chunk // 91]
+        if bit_count:
+            result += BaseNCodec.BASE91[value % 91]
+            if bit_count > 7 or value > 90:
+                result += BaseNCodec.BASE91[value // 91]
+        return result.encode()
+
+    @staticmethod
+    def decode91(text):
+        text = text.replace("\r\n", "").replace("\n", "")
+        value = 0
+        bit_count = 0
+        pending = -1
+        result = bytearray()
+        for char in text:
+            try:
+                digit = BaseNCodec.BASE91.index(char)
+            except ValueError as exc:
+                raise ValueError("Invalid base91 character {!r}".format(char)) from exc
+            if pending < 0:
+                pending = digit
+                continue
+            pending += digit * 91
+            value |= pending << bit_count
+            if pending & 8191 > 88:
+                bit_count += 13
+            else:
+                bit_count += 14
+            while bit_count > 7:
+                result.append(value & 255)
+                value >>= 8
+                bit_count -= 8
+            pending = -1
+        if pending >= 0:
+            result.append((value | pending << bit_count) & 255)
+        return bytes(result)
+
+    @staticmethod
+    def encode100(data):
+        result = bytearray()
+        for value in data:
+            result.extend((240, 159, (value + 55) // 64 + 143, (value + 55) % 64 + 128))
+        return bytes(result)
+
+    @staticmethod
+    def decode100(data):
+        data = data.replace(b"\r\n", b"").replace(b"\n", b"")
+        if len(data) % 4:
+            raise ValueError("Bad input (length should be multiple of 4)")
+        result = bytearray()
+        for pos in range(0, len(data), 4):
+            block = data[pos:pos + 4]
+            value = (block[2] - 143) * 64 + block[3] - 128 - 55
+            if block[:2] != b"\xf0\x9f" or not 128 <= block[3] < 192 or not 0 <= value < 256:
+                raise ValueError("Invalid base100 character {!r}".format(block))
+            result.append(value)
+        return bytes(result)
+
+    @staticmethod
+    def get_122_chunk(data, index, bit):
+        if index >= len(data):
+            return index, bit, None
+        available = 8 - bit
+        if available >= 7:
+            value = data[index] >> (available - 7) & 127
+            bit += 7
+        else:
+            value = (data[index] & ((1 << available) - 1)) << (7 - available)
+            index += 1
+            if index < len(data):
+                value |= data[index] >> (8 - (7 - available))
+            else:
+                value |= 0
+            bit = 7 - available
+        if bit >= 8:
+            bit -= 8
+            index += 1
+        return index, bit, value
+
+    @staticmethod
+    def encode122(data):
+        result = bytearray()
+        index = 0
+        bit = 0
+        while index < len(data):
+            index, bit, value = BaseNCodec.get_122_chunk(data, index, bit)
+            if value not in BaseNCodec.BAD122:
+                result.append(value)
+                continue
+            bad_index = BaseNCodec.BAD122.index(value)
+            index, bit, next_value = BaseNCodec.get_122_chunk(data, index, bit)
+            if next_value is None:
+                next_value = value
+                bad_index = 7
+            result.extend((194 | bad_index << 2 | int(bool(next_value & 64)), 128 | next_value & 63))
+        return bytes(result)
+
+    @staticmethod
+    def decode122(data):
+        text = BaseNCodec.as_text(data)
+        chunks = []
+        for char in text:
+            value = ord(char)
+            if value >= 128:
+                bad_index = value >> 8 & 7
+                if bad_index < len(BaseNCodec.BAD122):
+                    chunks.append(BaseNCodec.BAD122[bad_index])
+                chunks.append(value & 127)
+            else:
+                chunks.append(value)
+        bits = "".join(format(value, "07b") for value in chunks)
+        return bytes(int(bits[pos:pos + 8], 2) for pos in range(0, len(bits) - 7, 8))
+
+    @staticmethod
+    def encode(data, name):
+        data = BaseNCodec.as_bytes(data)
+        if not data:
+            return b""
+        if name in BaseNCodec.CHARSETS:
+            return BaseNCodec.encode_generic(data, BaseNCodec.CHARSETS[name])
+        if name in BaseNCodec.POWER_CHARSETS:
+            return BaseNCodec.encode_power(data, BaseNCodec.POWER_CHARSETS[name])
+        if name == "base45":
+            return BaseNCodec.encode45(data)
+        if name in BaseNCodec.BASE85:
+            return BaseNCodec.encode85(data, name)
+        if name == "base91":
+            return BaseNCodec.encode91(data)
+        if name == "base100":
+            return BaseNCodec.encode100(data)
+        if name == "base122":
+            return BaseNCodec.encode122(data)
+        raise ValueError("Unknown base encoding: {:s}".format(name))
+
+    @staticmethod
+    def decode(data, name):
+        data = BaseNCodec.as_bytes(data)
+        if not data:
+            return b""
+        if name == "base100":
+            return BaseNCodec.decode100(data)
+        if name == "base122":
+            return BaseNCodec.decode122(data)
+        text = BaseNCodec.as_text(data)
+        if name in BaseNCodec.CHARSETS:
+            return BaseNCodec.decode_generic(text, BaseNCodec.CHARSETS[name])
+        if name in BaseNCodec.POWER_CHARSETS:
+            return BaseNCodec.decode_power(text, BaseNCodec.POWER_CHARSETS[name])
+        if name == "base45":
+            return BaseNCodec.decode45(text)
+        if name in BaseNCodec.BASE85:
+            return BaseNCodec.decode85(text, name)
+        if name == "base91":
+            return BaseNCodec.decode91(text)
+        raise ValueError("Unknown base encoding: {:s}".format(name))
+
+
 @register_command
 class BaseNDecodeCommand(GenericCommand, BufferingOutput):
     """The base command to decode baseN."""
@@ -3263,6 +4044,7 @@ class BaseNDecodeCommand(GenericCommand, BufferingOutput):
     else:
         subparsers = parser.add_subparsers(title="command")
     subparsers.add_parser("memory")
+    subparsers.add_parser("file")
     subparsers.add_parser("value")
     _syntax_ = parser.format_help()
 
@@ -3275,6 +4057,8 @@ class BaseNDecodeCommand(GenericCommand, BufferingOutput):
         "base91", "base100", "base122",
     ]
 
+    _note_ = "For integer bases other than base1, each leading zero symbol represents one zero byte."
+
     def __init__(self, *args, **kwargs):
         prefix = kwargs.get("prefix", True)
         complete = kwargs.get("complete", gdb.COMPLETE_NONE)
@@ -3282,9 +4066,8 @@ class BaseNDecodeCommand(GenericCommand, BufferingOutput):
         return
 
     def get_valid_base_decode_funcs(self):
-        import codext
         for bname in self.baseN:
-            bfunc = lambda x, bname=bname: codext.decode(x, bname)
+            bfunc = lambda x, bname=bname: BaseNCodec.decode(x, bname)
             yield (bname, bfunc)
         return None
 
@@ -3321,21 +4104,82 @@ class BaseNDecodeMemoryCommand(BaseNDecodeCommand):
 
     @parse_args
     @only_if_gdb_running
-    @ModuleLoader.load_codext
     def do_invoke(self, args):
         self.out = []
         self.out.append("Address: {:#x}".format(args.location))
         self.out.append("Size: {:#x}".format(args.size))
 
-        try:
-            mem = read_memory(args.location, args.size)
-        except (gdb.MemoryError, MemoryError):
+        mem = read_memory(args.location, args.size, safe=True)
+        if mem is None:
             err("Memory read error")
             return False
 
         for bname, bfunc in self.get_valid_base_decode_funcs():
             try:
                 b = bfunc(mem)
+                self.out.append("{:17s}: {!s}".format(bname, b))
+            except ValueError:
+                self.out.append("{:17s}: ERROR".format(bname))
+        self.print_output(check_terminal_size=True)
+        return
+
+
+
+@register_command
+class BaseNDecodeFileCommand(BaseNDecodeCommand):
+    """Decode baseN from file."""
+
+    _cmdline_ = "base-n-decode file"
+    _category_ = "03-e. Memory - Calculation"
+
+    parser = argparse.ArgumentParser(prog=_cmdline_)
+    parser.add_argument("filename", metavar="FILE", help="the filepath for baseN decoding.")
+    parser.add_argument("start", metavar="START_POS", nargs="?", default=0, type=AddressUtil.parse_address,
+                        help="the start position for baseN decoding.")
+    parser.add_argument("size", metavar="SIZE", nargs="?", type=AddressUtil.parse_address,
+                        help="the size for baseN decoding.")
+    parser.add_argument("-n", "--no-pager", action="store_true", help="do not use the pager.")
+    _syntax_ = parser.format_help()
+
+    _example_ = [
+        "{0:s} /tmp/data.bin",
+        "{0:s} /tmp/data.bin 0x10 0x20",
+    ]
+    _example_ = "\n".join(_example_).format(_cmdline_)
+
+    def __init__(self):
+        super().__init__(prefix=False, complete=gdb.COMPLETE_FILENAME)
+        return
+
+    @parse_args
+    def do_invoke(self, args):
+        if args.start < 0 or (args.size is not None and args.size < 0):
+            err("Invalid range")
+            return
+        if not os.path.exists(args.filename):
+            err("File not found")
+            return
+        if not os.path.isfile(args.filename):
+            err("Not a regular file")
+            return
+        try:
+            with open(args.filename, "rb") as f:
+                file_size = os.fstat(f.fileno()).st_size
+                size = max(0, file_size - args.start)
+                if args.size is not None:
+                    size = min(size, args.size)
+                f.seek(min(args.start, file_size))
+                value = f.read(size)
+        except OSError as exc:
+            err(str(exc))
+            return
+
+        self.out = []
+        self.out.append("Path: {:s}".format(args.filename))
+        self.out.append("FileSize: {:#x}".format(file_size))
+        for bname, bfunc in self.get_valid_base_decode_funcs():
+            try:
+                b = bfunc(value)
                 self.out.append("{:17s}: {!s}".format(bname, b))
             except ValueError:
                 self.out.append("{:17s}: ERROR".format(bname))
@@ -3368,16 +4212,15 @@ class BaseNDecodeValueCommand(BaseNDecodeCommand):
         return
 
     @parse_args
-    @ModuleLoader.load_crccheck
     def do_invoke(self, args):
         if args.hex: # "41414141" -> b"\x41\x41\x41\x41"
             value = GefUtil.fromhex_ignore_invalid(args.value)
-            if not value:
+            if value is None:
                 return
         else:
             try:
                 value = codecs.escape_decode(args.value)[0]
-            except binascii.Error:
+            except (binascii.Error, ValueError):
                 err('Could not decode "\\xXX" encoded string')
                 return
 
@@ -3406,6 +4249,7 @@ class BaseNEncodeCommand(GenericCommand, BufferingOutput):
     else:
         subparsers = parser.add_subparsers(title="command")
     subparsers.add_parser("memory")
+    subparsers.add_parser("file")
     subparsers.add_parser("value")
     _syntax_ = parser.format_help()
 
@@ -3418,6 +4262,8 @@ class BaseNEncodeCommand(GenericCommand, BufferingOutput):
         "base91", "base100", "base122",
     ]
 
+    _note_ = "For integer bases other than base1, each leading zero symbol represents one zero byte."
+
     def __init__(self, *args, **kwargs):
         prefix = kwargs.get("prefix", True)
         complete = kwargs.get("complete", gdb.COMPLETE_NONE)
@@ -3425,9 +4271,8 @@ class BaseNEncodeCommand(GenericCommand, BufferingOutput):
         return
 
     def get_valid_base_encode_funcs(self):
-        import codext
         for bname in self.baseN:
-            bfunc = lambda x, bname=bname: codext.encode(x, bname)
+            bfunc = lambda x, bname=bname: BaseNCodec.encode(x, bname)
             yield (bname, bfunc)
         return None
 
@@ -3464,15 +4309,13 @@ class BaseNEncodeMemoryCommand(BaseNEncodeCommand):
 
     @parse_args
     @only_if_gdb_running
-    @ModuleLoader.load_codext
     def do_invoke(self, args):
         self.out = []
         self.out.append("Address: {:#x}".format(args.location))
         self.out.append("Size: {:#x}".format(args.size))
 
-        try:
-            mem = read_memory(args.location, args.size)
-        except (gdb.MemoryError, MemoryError):
+        mem = read_memory(args.location, args.size, safe=True)
+        if mem is None:
             err("Memory read error")
             return False
 
@@ -3482,6 +4325,72 @@ class BaseNEncodeMemoryCommand(BaseNEncodeCommand):
                 continue
             try:
                 b = bfunc(mem)
+                self.out.append("{:17s}: {!s}".format(bname, b))
+            except ValueError:
+                self.out.append("{:17s}: ERROR".format(bname))
+        self.print_output(check_terminal_size=True)
+        return
+
+
+
+@register_command
+class BaseNEncodeFileCommand(BaseNEncodeCommand):
+    """Encode baseN from file."""
+
+    _cmdline_ = "base-n-encode file"
+    _category_ = "03-e. Memory - Calculation"
+
+    parser = argparse.ArgumentParser(prog=_cmdline_)
+    parser.add_argument("filename", metavar="FILE", help="the filepath for baseN encoding.")
+    parser.add_argument("start", metavar="START_POS", nargs="?", default=0, type=AddressUtil.parse_address,
+                        help="the start position for baseN encoding.")
+    parser.add_argument("size", metavar="SIZE", nargs="?", type=AddressUtil.parse_address,
+                        help="the size for baseN encoding.")
+    parser.add_argument("-n", "--no-pager", action="store_true", help="do not use the pager.")
+    _syntax_ = parser.format_help()
+
+    _example_ = [
+        "{0:s} /tmp/data.bin",
+        "{0:s} /tmp/data.bin 0x10 0x20",
+    ]
+    _example_ = "\n".join(_example_).format(_cmdline_)
+
+    def __init__(self):
+        super().__init__(prefix=False, complete=gdb.COMPLETE_FILENAME)
+        return
+
+    @parse_args
+    def do_invoke(self, args):
+        if args.start < 0 or (args.size is not None and args.size < 0):
+            err("Invalid range")
+            return
+        if not os.path.exists(args.filename):
+            err("File not found")
+            return
+        if not os.path.isfile(args.filename):
+            err("Not a regular file")
+            return
+        try:
+            with open(args.filename, "rb") as f:
+                file_size = os.fstat(f.fileno()).st_size
+                size = max(0, file_size - args.start)
+                if args.size is not None:
+                    size = min(size, args.size)
+                f.seek(min(args.start, file_size))
+                value = f.read(size)
+        except OSError as exc:
+            err(str(exc))
+            return
+
+        self.out = []
+        self.out.append("Path: {:s}".format(args.filename))
+        self.out.append("FileSize: {:#x}".format(file_size))
+        for bname, bfunc in self.get_valid_base_encode_funcs():
+            if bname == "base1":
+                self.out.append("{:17s}: Skipped because too long".format(bname))
+                continue
+            try:
+                b = bfunc(value)
                 self.out.append("{:17s}: {!s}".format(bname, b))
             except ValueError:
                 self.out.append("{:17s}: ERROR".format(bname))
@@ -3514,16 +4423,15 @@ class BaseNEncodeValueCommand(BaseNEncodeCommand):
         return
 
     @parse_args
-    @ModuleLoader.load_crccheck
     def do_invoke(self, args):
         if args.hex: # "41414141" -> b"\x41\x41\x41\x41"
             value = GefUtil.fromhex_ignore_invalid(args.value)
-            if not value:
+            if value is None:
                 return
         else:
             try:
                 value = codecs.escape_decode(args.value)[0]
-            except binascii.Error:
+            except (binascii.Error, ValueError):
                 err('Could not decode "\\xXX" encoded string')
                 return
 
@@ -3557,6 +4465,11 @@ class MorseDecodeCommand(GenericCommand):
     subparsers.add_parser("memory")
     subparsers.add_parser("value")
     _syntax_ = parser.format_help()
+
+    _note_ = [
+        "Uses one space between letters and three spaces between words.",
+    ]
+    _note_ = "\n".join(_note_)
 
     def __init__(self, *args, **kwargs):
         prefix = kwargs.get("prefix", True)
@@ -3600,9 +4513,8 @@ class MorseDecodeMemoryCommand(MorseDecodeCommand):
         gef_print("Address: {:#x}".format(args.location))
         gef_print("Size: {:#x}".format(args.size))
 
-        try:
-            mem = read_memory(args.location, args.size)
-        except (gdb.MemoryError, MemoryError):
+        mem = read_memory(args.location, args.size, safe=True)
+        if mem is None:
             err("Memory read error")
             return False
 
@@ -3656,6 +4568,11 @@ class MorseEncodeCommand(GenericCommand):
     subparsers.add_parser("value")
     _syntax_ = parser.format_help()
 
+    _note_ = [
+        "Uses one space between letters and three spaces between words.",
+    ]
+    _note_ = "\n".join(_note_)
+
     def __init__(self, *args, **kwargs):
         prefix = kwargs.get("prefix", True)
         complete = kwargs.get("complete", gdb.COMPLETE_NONE)
@@ -3698,9 +4615,8 @@ class MorseEncodeMemoryCommand(MorseEncodeCommand):
         gef_print("Address: {:#x}".format(args.location))
         gef_print("Size: {:#x}".format(args.size))
 
-        try:
-            mem = read_memory(args.location, args.size)
-        except (gdb.MemoryError, MemoryError):
+        mem = read_memory(args.location, args.size, safe=True)
+        if mem is None:
             err("Memory read error")
             return False
 
@@ -3974,5 +4890,3 @@ class SequenceLengthCommand(GenericCommand):
             Color.colorify_hex(size, "bold"),
         ))
         return
-
-

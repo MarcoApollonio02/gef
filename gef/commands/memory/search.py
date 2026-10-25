@@ -13,6 +13,7 @@ import re
 import gdb
 
 from gef.commands.base import (
+    ContextManager,
     BufferingOutput,
     GenericCommand,
     exclude_specific_gdb_mode,
@@ -25,11 +26,13 @@ from gef.commands.base import (
 from gef.core import runtime
 from gef.core.address import Address, AddressUtil, Endian, Permission, Section
 from gef.core.color import Color, err, gef_print, info, ok, titlify
+from gef.core.display import ProgressBar
+from gef.core.kernel import AddrMap
 from gef.core.config import Config
 from gef.core.elf import Elf
 from gef.core.instruction import Disasm, get_insn
 from gef.core.memory import hexdump, is_valid_addr, read_memory
-from gef.core.pagewalk import PageMap
+from gef.core.pagewalk import KernelAddressHeuristicFinderUtil, PageMap
 from gef.core.process import (
     Path,
     ProcessMap,
@@ -47,7 +50,7 @@ from gef.core.process import (
 )
 from gef.core.qemu import read_physmem
 from gef.core.strings import String
-from gef.core.utils import GEF_TEMP_DIR, GefUtil, slice_unpack, slicer
+from gef.core.utils import GEF_TEMP_DIR, GefUtil, align, slice_unpack, slicer
 
 @register_command
 class ScanSectionCommand(GenericCommand):
@@ -189,17 +192,34 @@ class FindSyscallCommand(GenericCommand, BufferingOutput):
         return
 
     def print_loc(self, loc):
+        if not is_arm32():
+            self.print_loc_by_mode(loc)
+            return
+        mode = self.syscall_mode
+        if loc % (2 if mode == "thumb" else 4):
+            return
+        with ContextManager.gdb_parameter("arm force-mode", mode):
+            self.print_loc_by_mode(loc)
+        return
+
+    def print_loc_by_mode(self, loc):
         if is_x86():
-            show_opcodes_size = Config.get_gef_setting("context_code.show_opcodes_size_x64_x86")
+            show_opcodes_size = Config.get("context_code.show_opcodes_size_x64_x86")
         else:
-            show_opcodes_size = Config.get_gef_setting("context_code.show_opcodes_size")
+            show_opcodes_size = Config.get("context_code.show_opcodes_size")
 
         nb_lines = 1
 
         # fix loc and nb_lines
         if self.args.nb_insns_before > 0:
-             a = Disasm.gdb_get_nth_previous_instruction_address(loc, self.args.nb_insns_before)
-             if a is not None:
+            kwargs = {}
+            if is_arm32():
+                if self.syscall_mode == "thumb":
+                    kwargs["instruction_length"] = None
+                else:
+                    kwargs["instruction_length"] = 4
+            a = Disasm.gdb_get_nth_previous_instruction_address(loc, self.args.nb_insns_before, **kwargs)
+            if a is not None:
                 loc = a
                 nb_lines += self.args.nb_insns_before
 
@@ -216,9 +236,8 @@ class FindSyscallCommand(GenericCommand, BufferingOutput):
 
     def read_data(self, chunk_addr, size, end_address):
         read_size = min(size, end_address - chunk_addr)
-        try:
-            mem = read_memory(chunk_addr, read_size)
-        except (gdb.MemoryError, ValueError, OverflowError):
+        mem = read_memory(chunk_addr, read_size, safe=True)
+        if mem is None:
             # cannot access memory this range. It doesn't make sense to try any more
             self.err_add_out("skip due to memory access error")
             return None
@@ -230,8 +249,7 @@ class FindSyscallCommand(GenericCommand, BufferingOutput):
         locations = []
 
         old_mem = b""
-        tqdm = GefUtil.get_tqdm()
-        for chunk_addr in tqdm(range(start_address, end_address, step), leave=False):
+        for chunk_addr in ProgressBar(range(start_address, end_address, step)):
             # read
             mem = self.read_data(chunk_addr, step, end_address)
             if mem is None:
@@ -241,12 +259,11 @@ class FindSyscallCommand(GenericCommand, BufferingOutput):
             if old_mem and mem:
                 ofs = len(pattern) - 1
                 tmp = old_mem[-ofs:] + mem[:ofs]
-                r = tmp.find(pattern)
-                if r >= 0:
-                    locations.append(chunk_addr - ofs + r)
+                for match in re.finditer(re.escape(pattern), tmp):
+                    locations.append(chunk_addr - ofs + match.start())
 
             # normal case
-            for match in re.finditer(pattern, mem):
+            for match in re.finditer(re.escape(pattern), mem):
                 start = chunk_addr + match.start()
                 locations.append(start)
 
@@ -315,42 +332,53 @@ class FindSyscallCommand(GenericCommand, BufferingOutput):
             err("Unsupported arch")
             return
 
-        pattern = runtime.current_arch.syscall_insn
+        patterns = [(runtime.current_arch.syscall_insn, None)]
+        if is_arm32():
+            patterns = [
+                (runtime.current_arch.get_mode_insn("syscall", False), "arm"),
+                (runtime.current_arch.get_mode_insn("syscall", True), "thumb"),
+            ]
         self.out = []
+        for pattern, mode in patterns:
+            self.syscall_mode = mode
+            if Endian.is_big_endian():
+                pattern = pattern[::-1]
+            if args.section and args.size:
+                # the case `find-syscall 0x400000 0x4000`
+                try:
+                    start = int(args.section, 16)
+                    end = start + int(args.size, 16)
+                except ValueError:
+                    self.usage()
+                    return
+                self.process_by_address(pattern, start, end)
 
-        if args.section and args.size:
-            # the case `find-syscall 0x400000 0x4000`
-            try:
-                start = int(args.section, 16)
-                end = start + int(args.size, 16)
-            except ValueError:
-                self.usage()
-                return
-            self.process_by_address(pattern, start, end)
+            elif args.section and re.match(r"(0x)?[0-9a-fA-F]+-(0x)?[0-9a-fA-F]+", args.section):
+                # the case `find-syscall 0x400000-0x404000` etc.
+                try:
+                    start, end = AddressUtil.parse_string_range(args.section)
+                except ValueError:
+                    self.usage()
+                    return
+                self.process_by_address(pattern, start, end)
 
-        elif args.section and re.match(r"(0x)?[0-9a-fA-F]+-(0x)?[0-9a-fA-F]+", args.section):
-            # the case `find-syscall 0x400000-0x404000` etc.
-            try:
-                start, end = AddressUtil.parse_string_range(args.section)
-            except ValueError:
-                self.usage()
-                return
-            self.process_by_address(pattern, start, end)
+            elif args.section:
+                # search from specific section
+                if args.section in ["binary", "bin"]:
+                    section_name = Path.get_binary_map_path()
+                    if section_name is None:
+                        return
+                else:
+                    section_name = args.section
+                self.process_by_section(pattern, section_name)
 
-        elif args.section:
-            # search from specific section
-            if args.section in ["binary", "bin"]:
-                section_name = Path.get_filepath(append_proc_root_prefix=False)
             else:
-                section_name = args.section
-            self.process_by_section(pattern, section_name)
-
-        else:
-            # search whole memory
-            self.process_by_section(pattern)
+                # search whole memory
+                self.process_by_section(pattern)
 
         self.print_output(check_terminal_size=True)
         return
+
 
 
 @register_command
@@ -426,25 +454,19 @@ class SearchPatternCommand(GenericCommand):
     ]
     _note_ = "\n".join(_note_)
 
-    def is_aligned(self, addr):
-        a = self.args.aligned or 1
-        return (a <= 1) or (addr % a == 0)
-
-    def accept_match(self, start_addr, locations):
-        # alignment
-        if not self.is_aligned(start_addr):
-            return False
+    def get_acceptable_addr(self, start_addr, locations):
+        """Return the lowest address from `start_addr` that a match can start at."""
+        addr = start_addr
 
         # interval
-        if self.args.interval:
-            if locations:
-                last_loc = locations[-1]
-                if start_addr < last_loc[0] + self.args.interval:
-                    return False
-        return True
+        if self.args.interval and locations:
+            addr = max(addr, locations[-1][0] + self.args.interval)
+
+        # alignment
+        return align(addr, self.args.aligned or 1)
 
     def check_limit(self):
-        if self.args.limit:
+        if self.args.limit is not None:
             if self.args.limit <= self.found_count:
                 return True
         return False
@@ -487,10 +509,45 @@ class SearchPatternCommand(GenericCommand):
             return None
         return mem
 
+    def find_matches(self, pattern, mem, pos, base, locations):
+        # A rejected match must not consume the overlapping candidates, so the search restarts after it.
+        # For hex regex, a match must start at an even position since 2 characters make a byte.
+        regex = re.compile(pattern)
+        if self.args.hex_regex:
+            unit = 2
+        else:
+            unit = 1
+        while pos <= len(mem):
+            for match in regex.finditer(mem, pos):
+                if match.start() % unit:
+                    pos = match.start() + 1
+                    break
+                start_addr = base + match.start() // unit
+                acceptable_addr = self.get_acceptable_addr(start_addr, locations)
+                if start_addr < acceptable_addr:
+                    pos = (acceptable_addr - base) * unit
+                    break
+                yield match
+            else:
+                break
+
     def search_pattern_by_address(self, pattern, start_address, end_address):
         """Search for a pattern within a range defined by arguments."""
+        if start_address >= end_address:
+            return []
+
         if isinstance(pattern, str):
             pattern = String.str2bytes(pattern)
+
+        ofs = 0
+        if not self.args.hex_regex:
+            try:
+                pattern = codecs.escape_decode(pattern)[0]
+            except (ValueError, UnicodeDecodeError):
+                err('Could not decode "\\xXX" encoded pattern')
+                return []
+            ofs = len(pattern) - 1
+            pattern = re.escape(pattern)
 
         if self.args.hex_regex:
             step = end_address - start_address
@@ -501,8 +558,8 @@ class SearchPatternCommand(GenericCommand):
 
         locations = []
         old_mem = b""
-        tqdm = GefUtil.get_tqdm(self.args.verbose)
-        for chunk_addr in tqdm(range(start_address, end_address, step), leave=False):
+        last_end = start_address
+        for chunk_addr in ProgressBar(range(start_address, end_address, step), disable=not self.args.verbose):
             # read
             mem = self.read_data(chunk_addr, step, end_address)
             if mem is None:
@@ -513,7 +570,9 @@ class SearchPatternCommand(GenericCommand):
                 mem = mem.hex().encode()
 
             # cases where step boundaries are crossed
-            if not self.args.hex_regex and old_mem and mem:
+            # `ofs == 0` means the pattern matches only 1 byte, so it never crosses a boundary.
+            # It must be skipped, otherwise `old_mem[-0:]` would rescan the whole previous chunk.
+            if not self.args.hex_regex and old_mem and mem and ofs:
                 # Considering cases where the step size boundary is crossed,
                 # the check is performed within the range of -ofs to ofs size.
                 """
@@ -528,43 +587,46 @@ class SearchPatternCommand(GenericCommand):
                          <------->
                        -ofs     ofs
                 """
-                ofs = len(pattern) - 1
                 tmp_mem = old_mem[-ofs:] + mem[:ofs]
-                r = tmp_mem.find(pattern)
+                pos = max(last_end - (chunk_addr - ofs), 0)
+                m = next(self.find_matches(pattern, tmp_mem, pos, chunk_addr - ofs, locations), None)
+                if m:
+                    r = m.start()
+                    last_end = chunk_addr - ofs + m.end()
+                else:
+                    r = -1
                 if r >= 0:
-                    if self.accept_match(chunk_addr - ofs + r, locations):
-                        # read dump data
-                        data = (old_mem[-ofs:] + mem)[r:][:0x10]
+                    # read dump data
+                    data = (old_mem[-ofs:] + mem[:ofs + 0x10])[r:][:0x10]
 
-                        # add
-                        locations.append((chunk_addr - ofs + r, data))
-                        self.found_count += 1
+                    # add
+                    locations.append((chunk_addr - ofs + r, data))
+                    self.found_count += 1
 
-                        # loop check
-                        if self.check_limit():
-                            info("Limit reached, no more matches shown")
-                            return locations
+                    # loop check
+                    if self.check_limit():
+                        info("Limit reached, no more matches shown")
+                        return locations
                 # fall through
 
             # normal case
-            for match in re.finditer(pattern, mem):
+            if self.args.hex_regex:
+                pos = 0
+            else:
+                pos = max(last_end - chunk_addr, 0)
+            for match in self.find_matches(pattern, mem, pos, chunk_addr, locations):
                 if self.args.hex_regex:
-                    if match.start() % 2:
-                        continue
                     start_pos = match.start() // 2
                 else:
                     start_pos = match.start()
+                    last_end = chunk_addr + match.end()
                 start = chunk_addr + start_pos
-
-                # check filter
-                if not self.accept_match(start, locations):
-                    continue
 
                 # read dump data
                 if self.args.hex_regex:
-                    data = bytes.fromhex(mem.decode())[start_pos:][:0x10]
+                    data = bytes.fromhex(mem[match.start():match.start() + 0x20].decode())
                 else:
-                    data = mem[start_pos:][:0x10]
+                    data = mem[start_pos:start_pos + 0x10]
                 if len(data) < 0x10:
                     lack = self.read_data(chunk_addr + step, 0x10 - len(data), end_address)
                     if lack:
@@ -584,7 +646,10 @@ class SearchPatternCommand(GenericCommand):
         return locations
 
     def process_by_address(self, patterns, start, end):
-        extra = " (phys)" if self.args.phys else ""
+        if self.args.phys:
+            extra = " (phys)"
+        else:
+            extra = ""
         for pattern in patterns:
             if not pattern:
                 continue
@@ -599,50 +664,24 @@ class SearchPatternCommand(GenericCommand):
                 self.print_loc(found_loc)
         return
 
-    def get_process_maps_qemu_system(self):
-        res = PageMap.get_page_maps_by_pagewalk("pagewalk --quiet --no-pager --disable-color")
-        res = sorted(set(res.splitlines()))
-        res = list(filter(lambda line: line.endswith("]"), res))
-        res = list(filter(lambda line: "[+]" not in line, res))
-        res = list(filter(lambda line: "*" not in line, res))
-        for line in res:
-            if is_x86() and "ACCESSED" not in line:
-                continue
-
-            # extract
-            lines = line.split()
-            addr_start, addr_end = [int(x, 16) for x in lines[0].split("-")]
-
-            # non valid addr
-            if not is_valid_addr(addr_start):
-                continue
-
-            # parse
-            if is_x86():
-                perm = Permission.from_process_maps(lines[5][1:].lower())
-            elif is_arm32():
-                perm = line.split("/")[-1][:3]
-                perm = Permission.from_process_maps(perm.lower())
-            elif is_arm64():
-                perm = line.split("/")[-1][:3]
-                perm = Permission.from_process_maps(perm.lower())
-            yield Section(page_start=addr_start, page_end=addr_end, permission=perm)
-        return None
-
     def search_pattern_by_section(self, pattern, section_name=None):
         """Search for a pattern within selected (or whole) memory."""
         if is_qemu_system():
-            maps_generator = self.get_process_maps_qemu_system()
+            entries = AddrMap.get_maps()
+            maps_generator = (
+                entry.to_section() for entry in entries
+                if is_valid_addr(entry.vstart) and (not is_x86() or entry.accessed)
+            )
         else:
             maps_generator = ProcessMap.get_process_maps_exclude_special_regions(allow_vdso=True)
 
         for section in maps_generator:
             # user or kernel memory address filter
             if self.args.user_only:
-                if AddressUtil.is_msb_on(section.page_start):
+                if KernelAddressHeuristicFinderUtil.is_kernel_space(section.page_start):
                     continue
             if self.args.kernel_only:
-                if not AddressUtil.is_msb_on(section.page_start):
+                if not KernelAddressHeuristicFinderUtil.is_kernel_space(section.page_start):
                     continue
 
             # too big
@@ -696,7 +735,10 @@ class SearchPatternCommand(GenericCommand):
         return
 
     def process_by_section(self, patterns, section_name=None):
-        extra = " (phys)" if self.args.phys else ""
+        if self.args.phys:
+            extra = " (phys)"
+        else:
+            extra = ""
         for pattern in patterns:
             if not pattern:
                 continue
@@ -715,8 +757,20 @@ class SearchPatternCommand(GenericCommand):
         return
 
     def create_patterns(self):
+        if not self.args.pattern or self.args.pattern.lower() == "0x":
+            err("Search pattern must not be empty")
+            return None
+
         if self.args.hex_regex:
             pattern = self.args.pattern.lower().replace(" ", "")
+            if not pattern:
+                err("Search pattern must not be empty")
+                return None
+            try:
+                re.compile(String.str2bytes(pattern))
+            except re.error as e:
+                err("Invalid pattern: {!s}".format(e))
+                return None
             return (pattern,)
 
         # create normal pattern
@@ -734,14 +788,20 @@ class SearchPatternCommand(GenericCommand):
         else:
             pattern = self.args.pattern
 
-        def isascii(string):
-            val = codecs.escape_decode(string)[0]
-            return all(0x20 <= c < 0x7f for c in val)
+        try:
+            val = codecs.escape_decode(pattern)[0]
+        except (ValueError, UnicodeDecodeError):
+            err('Could not decode "\\xXX" encoded pattern')
+            return None
+
+        if not val:
+            err("Search pattern must not be empty")
+            return None
 
         # create utf16 pattern
         pattern_utf16 = None
         if not self.args.disable_utf16:
-            if isascii(pattern) and "\\" not in pattern:
+            if all(0x20 <= c < 0x7f for c in val) and "\\" not in pattern:
                 pattern_utf16 = "".join([x + "\\x00" for x in pattern])
         return (pattern, pattern_utf16)
 
@@ -771,7 +831,7 @@ class SearchPatternCommand(GenericCommand):
         if args.interval and args.interval <= 0:
             err("Invalid interval value")
             return
-        if args.limit and args.limit <= 0:
+        if args.limit is not None and args.limit <= 0:
             err("Invalid limit value")
             return
         if args.max_region_size and args.max_region_size < 0x1000:
@@ -813,7 +873,9 @@ class SearchPatternCommand(GenericCommand):
                     err("Unsupported")
                     return
                 if args.section in ["binary", "bin"]:
-                    section_name = Path.get_filepath(append_proc_root_prefix=False)
+                    section_name = Path.get_binary_map_path()
+                    if section_name is None:
+                        return
                 else:
                     section_name = args.section
                 self.process_by_section(patterns, section_name)
@@ -822,6 +884,7 @@ class SearchPatternCommand(GenericCommand):
                 # search whole memory
                 self.process_by_section(patterns)
         return
+
 
 
 @register_command

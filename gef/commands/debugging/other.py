@@ -9,6 +9,7 @@ the 01-d executor family.
 Auto-discovered by gef.bootstrap via pkgutil.walk_packages.
 """
 import argparse
+import contextlib
 import os
 import re
 import subprocess
@@ -31,15 +32,16 @@ from gef.commands.base import (
 )
 from gef.commands.debugging.context import ContextCodeCommand, ContextExtraCommand
 from gef.core import runtime
-from gef.core.address import AddressUtil, Permission
+from gef.core.address import AddressUtil, Endian, Permission
 from gef.core.cache import Cache
 from gef.core.color import Color, err, gef_print, info, ok, titlify, warn
 from gef.core.config import Config
 from gef.core.elf import Elf
-from gef.core.events import EventHandler
+from gef.core.events import EventHandler, EventHooking
 from gef.core.highlight import highlight_table, highlight_text
 from gef.core.instruction import get_insn, get_insn_next
 from gef.core.memory import (
+    read_memory,
     is_valid_addr,
     p32,
     p64,
@@ -63,11 +65,52 @@ from gef.core.symbols import ModuleLoader
 from gef.core.utils import GEF_TEMP_DIR, GefUtil
 
 
+class QemuUserStepBreakpointGroup:
+    def __init__(self):
+        self.breakpoints = []
+        return
+
+    def add(self, bp):
+        self.breakpoints.append(bp)
+        return
+
+    def delete(self):
+        for bp in self.breakpoints:
+            try:
+                if bp.is_valid():
+                    bp.delete()
+            except gdb.error as e:
+                err("Failed to remove internal breakpoint: {}".format(e))
+        self.breakpoints.clear()
+        return
+
+
 class SimpleInternalTemporaryBreakpoint(gdb.Breakpoint):
     """A simple wrapper that takes into account the bug where temporary breakpoints isn't deleted after it is hit."""
 
-    def __init__(self, loc):
+    @staticmethod
+    def get_qemu_user_step_instruction(is_next=False):
+        if is_next:
+            instruction_name = "next"
+        else:
+            instruction_name = "current"
+        try:
+            if is_next:
+                insn = get_insn_next()
+            else:
+                insn = get_insn()
+        except gdb.error as e:
+            err("Unable to decode the {} instruction: {}".format(instruction_name, e))
+            return None
+        if insn is None:
+            err("Unable to decode the {} instruction.".format(instruction_name))
+            return None
+        return insn
+
+    def __init__(self, loc, group=None):
         super().__init__("*{:#x}".format(loc), gdb.BP_BREAKPOINT, internal=True, temporary=True)
+        if group is not None:
+            group.add(self)
         return
 
     def stop(self):
@@ -76,14 +119,18 @@ class SimpleInternalTemporaryBreakpoint(gdb.Breakpoint):
 
         Cache.reset_gef_caches()
         return True
+
 
 
 class SecondBreakpoint(gdb.Breakpoint):
     """Breakpoint which sets a 2nd breakpoint, when hit."""
 
-    def __init__(self, loc, second_loc):
+    def __init__(self, loc, second_loc, group=None):
         self.second_loc = second_loc
+        self.group = group
         super().__init__("*{:#x}".format(loc), gdb.BP_BREAKPOINT, internal=True, temporary=True)
+        if group is not None:
+            group.add(self)
         return
 
     def stop(self):
@@ -91,25 +138,27 @@ class SecondBreakpoint(gdb.Breakpoint):
         self.enabled = False
 
         Cache.reset_gef_caches()
-        SimpleInternalTemporaryBreakpoint(loc=self.second_loc)
+        SimpleInternalTemporaryBreakpoint(loc=self.second_loc, group=self.group)
         return True
+
 
 
 @register_command
 class NextiForQemuUserCommand(GenericCommand):
-    """`ni` wrapper for some specific architectures (OpenRISC 1000 and CRIS)."""
+    """`ni` wrapper for specific architectures; COUNT is unsupported."""
 
     _cmdline_ = "nexti-for-qemu-user"
     _category_ = "01-c. Debugging Support - Basic Command Extension"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
-    parser.add_argument("args", metavar="ARGS", nargs="*",
-                        help="An array of arguments to pass as is to the nexti command. (default: %(default)s)")
+    parser.add_argument("count", metavar="COUNT", nargs="?",
+                        help="Unsupported. Run this command without COUNT to step once.")
     _syntax_ = parser.format_help()
 
     _note_ = [
         "Only when qemu-user with specific architecture, the `ni` command is redirected to `nexti-for-qemu-user`.",
         "This setting is done only once, when `hook_stop_handler` is called for the first time.",
+        "COUNT arguments are not supported.",
         "",
         "Target architecture:",
         "  OpenRISC 1000: branch operations don't work well, so GEF uses breakpoints to simulate.",
@@ -117,7 +166,7 @@ class NextiForQemuUserCommand(GenericCommand):
     ]
     _note_ = "\n".join(_note_)
 
-    def ni_set_bp_for_branch(self):
+    def ni_set_bp_for_branch(self, group):
         target = None
         delay_slot = False
 
@@ -127,8 +176,19 @@ class NextiForQemuUserCommand(GenericCommand):
             # gdb.selected_frame() may error for unknown reasons (often during kernel startup).
             frame = None
 
-        insn = get_insn()
-        insn_next = get_insn_next()
+        insn = SimpleInternalTemporaryBreakpoint.get_qemu_user_step_instruction()
+        if insn is None:
+            return False
+
+        # native `nexti` falls through the delay slot even if the pending branch is taken
+        if is_or1k():
+            pending = runtime.current_arch.get_pending_branch()
+            if pending is not None:
+                if not runtime.current_arch.is_call(pending):
+                    target = ContextCodeCommand.get_branch_addr(pending)
+                    if target is not None:
+                        SimpleInternalTemporaryBreakpoint(loc=target, group=group)
+                return True
 
         if insn and runtime.current_arch.is_jump(insn):
             target = ContextCodeCommand.get_branch_addr(insn)
@@ -138,67 +198,89 @@ class NextiForQemuUserCommand(GenericCommand):
             delay_slot = runtime.current_arch.has_ret_delay_slot
 
         if target is None:
-            return
+            return True
 
         # something wrong if infinity loop on CRIS architecture
         if is_cris() and target == insn.address:
-            SecondBreakpoint(loc=insn_next.address, second_loc=target)
-            return
+            insn_next = SimpleInternalTemporaryBreakpoint.get_qemu_user_step_instruction(is_next=True)
+            if insn_next is None:
+                return False
+            SecondBreakpoint(loc=insn_next.address, second_loc=target, group=group)
+            return True
 
-        SimpleInternalTemporaryBreakpoint(loc=target)
         if delay_slot:
-            SimpleInternalTemporaryBreakpoint(loc=insn_next.address)
-        return
+            insn_next = SimpleInternalTemporaryBreakpoint.get_qemu_user_step_instruction(is_next=True)
+            if insn_next is None:
+                return False
 
-    def ni_set_bp_next(self):
-        insn_next = get_insn_next()
-        SimpleInternalTemporaryBreakpoint(loc=insn_next.address)
-        return
+        SimpleInternalTemporaryBreakpoint(loc=target, group=group)
+        if delay_slot:
+            SimpleInternalTemporaryBreakpoint(loc=insn_next.address, group=group)
+        return True
+
+    def ni_set_bp_next(self, group):
+        insn_next = SimpleInternalTemporaryBreakpoint.get_qemu_user_step_instruction(is_next=True)
+        if insn_next is None:
+            return False
+        SimpleInternalTemporaryBreakpoint(loc=insn_next.address, group=group)
+        return True
 
     @parse_args
     @only_if_gdb_running
     @only_if_specific_gdb_mode(mode=("qemu-user",))
     @only_if_specific_arch(arch=("OR1K", "CRIS"))
     def do_invoke(self, args):
-        if is_cris():
-            self.ni_set_bp_for_branch()
-            self.ni_set_bp_next()
-            gdb.execute("c") # use c wrapper
+        if args.count is not None:
+            err("COUNT is not supported by `nexti-for-qemu-user`.")
             return
 
-        if is_or1k():
-            self.ni_set_bp_for_branch()
-
-        cmd = "nexti " + " ".join(args.args)
+        group = QemuUserStepBreakpointGroup()
         try:
-            gdb.execute(cmd.rstrip())
-        except gdb.error:
-            exc_type, exc_value, exc_traceback = sys.exc_info()
-            if str(exc_value).startswith("Cannot access memory at address"):
-                if is_valid_addr(runtime.current_arch.pc):
-                    gdb.execute("xuntil --from-wrapper")
+            if is_cris():
+                if not self.ni_set_bp_for_branch(group) or not self.ni_set_bp_next(group):
+                    return
+                gdb.execute("c") # use c wrapper
+                return
+
+            if is_or1k():
+                if not self.ni_set_bp_for_branch(group):
+                    return
+
+            try:
+                gdb.execute("nexti")
+            except gdb.error:
+                exc_type, exc_value, exc_traceback = sys.exc_info()
+                if str(exc_value).startswith("Cannot access memory at address"):
+                    if is_valid_addr(runtime.current_arch.pc):
+                        gdb.execute("xuntil --from-wrapper")
+                    else:
+                        err(exc_value)
                 else:
                     err(exc_value)
-            else:
-                err(exc_value)
+        except gdb.error as e:
+            err(e)
+        finally:
+            group.delete()
         return
+
 
 
 @register_command
 class StepiForQemuUserCommand(GenericCommand):
-    """`si` wrapper for some specific architectures (OpenRISC 1000 and CRIS)."""
+    """`si` wrapper for specific architectures; COUNT is unsupported."""
 
     _cmdline_ = "stepi-for-qemu-user"
     _category_ = "01-c. Debugging Support - Basic Command Extension"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
-    parser.add_argument("args", metavar="ARGS", nargs="*",
-                        help="An array of arguments to pass as is to the stepi command. (default: %(default)s)")
+    parser.add_argument("count", metavar="COUNT", nargs="?",
+                        help="Unsupported. Run this command without COUNT to step once.")
     _syntax_ = parser.format_help()
 
     _note_ = [
         "Only when qemu-user with specific architecture, the `si` command is redirected to `stepi-for-qemu-user`.",
         "This setting is done only once, when `hook_stop_handler` is called for the first time.",
+        "COUNT arguments are not supported.",
         "",
         "Target architecture:",
         "  OpenRISC 1000: branch operations don't work well, so GEF uses breakpoints to simulate.",
@@ -206,7 +288,7 @@ class StepiForQemuUserCommand(GenericCommand):
     ]
     _note_ = "\n".join(_note_)
 
-    def si_set_bp_for_branch(self):
+    def si_set_bp_for_branch(self, group):
         target = None
         delay_slot = False
 
@@ -216,8 +298,18 @@ class StepiForQemuUserCommand(GenericCommand):
             # gdb.selected_frame() may error for unknown reasons (often during kernel startup).
             frame = None
 
-        insn = get_insn()
-        insn_next = get_insn_next()
+        insn = SimpleInternalTemporaryBreakpoint.get_qemu_user_step_instruction()
+        if insn is None:
+            return False
+
+        # native `stepi` falls through the delay slot even if the pending branch is taken
+        if is_or1k():
+            pending = runtime.current_arch.get_pending_branch()
+            if pending is not None:
+                target = ContextCodeCommand.get_branch_addr(pending)
+                if target is not None:
+                    SimpleInternalTemporaryBreakpoint(loc=target, group=group)
+                return True
 
         if insn and (runtime.current_arch.is_jump(insn) or runtime.current_arch.is_call(insn)): # si also stops at `call` target
             target = ContextCodeCommand.get_branch_addr(insn)
@@ -227,50 +319,71 @@ class StepiForQemuUserCommand(GenericCommand):
             delay_slot = runtime.current_arch.has_ret_delay_slot
 
         if target is None:
-            return
+            return True
 
         # something wrong if infinity loop on CRIS architecture
         if is_cris() and target == insn.address:
-            SecondBreakpoint(loc=insn_next.address, second_loc=target)
-            return
+            insn_next = SimpleInternalTemporaryBreakpoint.get_qemu_user_step_instruction(is_next=True)
+            if insn_next is None:
+                return False
+            SecondBreakpoint(loc=insn_next.address, second_loc=target, group=group)
+            return True
 
-        SimpleInternalTemporaryBreakpoint(loc=target)
         if delay_slot:
-            SimpleInternalTemporaryBreakpoint(loc=insn_next.address)
-        return
+            insn_next = SimpleInternalTemporaryBreakpoint.get_qemu_user_step_instruction(is_next=True)
+            if insn_next is None:
+                return False
 
-    def si_set_bp_next(self):
-        insn_next = get_insn_next()
-        SimpleInternalTemporaryBreakpoint(loc=insn_next.address)
-        return
+        SimpleInternalTemporaryBreakpoint(loc=target, group=group)
+        if delay_slot:
+            SimpleInternalTemporaryBreakpoint(loc=insn_next.address, group=group)
+        return True
+
+    def si_set_bp_next(self, group):
+        insn_next = SimpleInternalTemporaryBreakpoint.get_qemu_user_step_instruction(is_next=True)
+        if insn_next is None:
+            return False
+        SimpleInternalTemporaryBreakpoint(loc=insn_next.address, group=group)
+        return True
 
     @parse_args
     @only_if_gdb_running
     @only_if_specific_gdb_mode(mode=("qemu-user",))
     @only_if_specific_arch(arch=("OR1K", "CRIS"))
     def do_invoke(self, args):
-        if is_cris():
-            self.si_set_bp_for_branch()
-            self.si_set_bp_next()
-            gdb.execute("c") # use c wrapper
+        if args.count is not None:
+            err("COUNT is not supported by `stepi-for-qemu-user`.")
             return
 
-        if is_or1k():
-            self.si_set_bp_for_branch()
-
-        cmd = "stepi " + " ".join(args.args)
+        group = QemuUserStepBreakpointGroup()
         try:
-            gdb.execute(cmd.rstrip())
-        except gdb.error:
-            exc_type, exc_value, exc_traceback = sys.exc_info()
-            if str(exc_value).startswith("Cannot access memory at address"):
-                if is_valid_addr(runtime.current_arch.pc):
-                    gdb.execute("xuntil --from-wrapper")
+            if is_cris():
+                if not self.si_set_bp_for_branch(group) or not self.si_set_bp_next(group):
+                    return
+                gdb.execute("c") # use c wrapper
+                return
+
+            if is_or1k():
+                if not self.si_set_bp_for_branch(group):
+                    return
+
+            try:
+                gdb.execute("stepi")
+            except gdb.error:
+                exc_type, exc_value, exc_traceback = sys.exc_info()
+                if str(exc_value).startswith("Cannot access memory at address"):
+                    if is_valid_addr(runtime.current_arch.pc):
+                        gdb.execute("xuntil --from-wrapper")
+                    else:
+                        err(exc_value)
                 else:
                     err(exc_value)
-            else:
-                err(exc_value)
+        except gdb.error as e:
+            err(e)
+        finally:
+            group.delete()
         return
+
 
 
 @register_command
@@ -281,76 +394,23 @@ class ContinueForQemuUserCommand(GenericCommand):
     _category_ = "01-c. Debugging Support - Basic Command Extension"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
-    parser.add_argument("args", metavar="ARGS", nargs="*",
-                        help="An array of arguments to pass as is to the continue command. (default: %(default)s)")
+    parser.add_argument("-a", dest="all_threads", action="count", default=0,
+                        help="Continue all stopped threads in non-stop mode.")
+    parser.add_argument("ignore_count", metavar="IGNORE-COUNT", nargs="?",
+                        help="Ignore the current breakpoint N-1 times.")
     _syntax_ = parser.format_help()
 
     _note_ = [
         "Only when qemu-user or pin, the `c` command is redirected to `continue-for-qemu-user`.",
         "This setting is done only once, when hook_stop_handler is called for the first time.",
         "Nested `c` command causes a problem, so in that case gef executes the original continue command instead.",
-        "Internally, SIGINT is monitored in a forked child process (default) or another thread.",
+        "Internally, SIGINT is monitored in a forked child process.",
     ]
     _note_ = "\n".join(_note_)
 
     nested = False
 
-    def __init__(self):
-        super().__init__()
-        # In the previous old implementation, Ctrl+C signal was monitored by thread. It was quite stable.
-        # However, if you use this method before libc.so is loaded, gdb will crash on non-x86 architectures.
-        # This is because the code executes gdb.execute("continue") in a non-main thread.
-        # However, signals can only be monitored in the main thread, so there was no way to avoid this.
-        # In the new implementation, Ctrl+C signal is monitored by forked child process.
-        # It seems to work well so far, but there may be cases where it doesn't work properly.
-        self.add_setting("use_fork", True, "Ctrl+C is monitored by forked process. If False, monitored by thread.")
-        return
-
-    def continue_for_qemu_thread(self):
-        import signal
-        import threading
-        thread_started = False
-        thread_finished = False
-
-        pid = Pid.get_pid()
-
-        def continue_thread():
-            nonlocal thread_started, thread_finished
-            thread_started = True
-            try:
-                gdb.execute("continue")
-            except gdb.error:
-                exc_type, exc_value, exc_traceback = sys.exc_info()
-                err(exc_value)
-            thread_finished = True
-            return
-
-        def sig_handler(_signum, _frame):
-            # do not use get_pid() in this func.
-            # get_pid() uses `maintenance packet` command internally,
-            # but it cannot be used when the non-static program is running.
-            os.kill(pid, signal.SIGTRAP)
-            return
-
-        th = threading.Thread(target=continue_thread, daemon=True)
-        th.start()
-        while thread_started is False:
-            time.sleep(0.1)
-        old = signal.signal(signal.SIGINT, sig_handler)
-        while thread_finished is False:
-            time.sleep(0.1)
-        th.join()
-        signal.signal(signal.SIGINT, old)
-        return
-
-    def pid_is_alive(self, pid):
-        try:
-            os.kill(pid, 0)
-        except OSError:
-            return False
-        return True
-
-    def continue_for_qemu_fork(self):
+    def continue_for_qemu_fork(self, command):
         import signal
 
         parent_pid = Pid.get_pid()
@@ -360,53 +420,70 @@ class ContinueForQemuUserCommand(GenericCommand):
 
             # child
             def sig_handler(_signum, _frame):
-                nonlocal signal_monitoring
-                os.kill(parent_pid, signal.SIGTRAP)
-                signal_monitoring = False
+                nonlocal signal_received
+                signal_received = True
                 return
 
-            signal_monitoring = True
-            old = signal.signal(signal.SIGINT, sig_handler)
-            while signal_monitoring:
+            signal_received = False
+            signal.signal(signal.SIGINT, sig_handler)
+            while True:
+                if signal_received:
+                    os.kill(parent_pid, signal.SIGTRAP)
                 time.sleep(0.1)
-            signal.signal(signal.SIGINT, old)
-            os._exit(0)
 
-        # parent
         try:
-            gdb.execute("continue")
+            gdb.execute(command)
         except gdb.error:
             exc_type, exc_value, exc_traceback = sys.exc_info()
             err(exc_value)
-
-        # clean up
-        try:
-            if self.pid_is_alive(child_pid):
-                os.kill(child_pid, signal.SIGKILL)
-            os.waitpid(child_pid, os.WNOHANG)
-        except (ProcessLookupError, ChildProcessError):
-            pass
+        finally:
+            try:
+                while True:
+                    try:
+                        os.kill(child_pid, signal.SIGKILL)
+                        break
+                    except InterruptedError:
+                        continue
+                    except ProcessLookupError:
+                        break
+            finally:
+                while True:
+                    try:
+                        os.waitpid(child_pid, 0)
+                        break
+                    except InterruptedError:
+                        continue
+                    except ChildProcessError:
+                        break
         return
 
     @parse_args
     @only_if_gdb_running
     @only_if_specific_gdb_mode(mode=("qemu-user", "pin"))
     def do_invoke(self, args):
+        if args.all_threads > 1 or (args.all_threads and args.ignore_count is not None):
+            err("`-a` cannot be used more than once or with an ignore count.")
+            return
+
+        command = "continue"
+        if args.all_threads:
+            command += " -a"
+        elif args.ignore_count is not None:
+            command += " " + args.ignore_count
+
         if is_qemu_user() or is_pin():
             if Pid.get_pid():
                 if not self.nested:
                     self.nested = True
-                    if Config.get_gef_setting("continue_for_qemu_user.use_fork"):
-                        self.continue_for_qemu_fork()
-                    else:
-                        self.continue_for_qemu_thread()
-                    self.nested = False
+                    try:
+                        self.continue_for_qemu_fork(command)
+                    finally:
+                        self.nested = False
                     return
 
         # fall back to original continue command
         try:
-            cmd = "continue " + " ".join(args.args)
-            gdb.execute(cmd.rstrip())
+            gdb.execute(command)
         except gdb.error:
             exc_type, exc_value, exc_traceback = sys.exc_info()
             err(exc_value)
@@ -419,6 +496,7 @@ class StepiForKGDBCommand(GenericCommand):
 
     _cmdline_ = "stepi-for-kgdb"
     _category_ = "01-c. Debugging Support - Basic Command Extension"
+    irq_mask_bit = 0x80 # DAIF.I
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     _syntax_ = parser.format_help()
@@ -426,49 +504,256 @@ class StepiForKGDBCommand(GenericCommand):
     _note_ = [
         "Only for AArch64 + kgdb.",
         "Temporarily masks IRQ before `stepi`, then restores the original state",
-        "unless the stepped instruction intentionally modified DAIF.I.",
+        "unless the stepped instruction intentionally modified DAIF.I or entered an exception.",
     ]
     _note_ = "\n".join(_note_)
+
+    @staticmethod
+    def get_exception_registers():
+        """Return readable ELR/SPSR values for detecting exception transitions."""
+        registers = {}
+        for name in ["$elr_el1", "$elr_el2", "$elr_el3", "$spsr_el1", "$spsr_el2", "$spsr_el3"]:
+            value = get_register(name)
+            if value is not None:
+                registers[name] = value
+        return registers
+
+    @staticmethod
+    def get_daif_update(instruction):
+        """Return the instruction's DAIF action and intended IRQ bit.
+        Read MSR source registers before stepping; a None IRQ bit preserves PSTATE.
+        """
+        if (instruction & 0xffff_f0df) == 0xd503_40df: # MSR DAIFSet/DAIFClr, #imm
+            immediate = (instruction >> 8) & 0xf
+            if immediate & 0x2:
+                return "write", 0 if instruction & 0x20 else 1
+            return "write", 0
+
+        if (instruction & 0xffff_ffe0) == 0xd51b_4220: # MSR DAIF, Xn
+            source_register = instruction & 0x1f
+            if source_register == 31:
+                source = 0
+            else:
+                source = get_register("$x{:d}".format(source_register))
+            if source is None:
+                raise gdb.error("Could not read the source register for `msr daif`")
+            return "write", (source >> 7) & 1
+
+        if instruction in (0xd69f_03e0, 0xd69f_0bff, 0xd69f_0fff): # ERET/ERETAA/ERETAB
+            return "preserve", None
+
+        exception_instruction = instruction & 0xffe0_001f
+        if exception_instruction in (
+            0xd400_0001, # SVC
+            0xd400_0002, # HVC
+            0xd400_0003, # SMC
+            0xd420_0000, # BRK
+            0xd440_0000, # HLT
+            0xd4a0_0001, # DCPS1
+            0xd4a0_0002, # DCPS2
+            0xd4a0_0003, # DCPS3
+        ):
+            return "preserve", None
+
+        return None, 0
+
+    @staticmethod
+    def is_branch_instruction(instruction):
+        """Identify ordinary branches for the post-step PC check.
+        Matching the saved opcode avoids disassembly and Instruction creation,
+        making it more efficient here than using runtime.current_arch.is_call. It covers
+        the calls, jumps and returns needed for this check, while is_call only
+        recognizes calls. Exception returns are handled as PSTATE transitions.
+        """
+        if (instruction & 0x7c00_0000) == 0x1400_0000: # B/BL
+            return True
+        if (instruction & 0xff00_0010) == 0x5400_0000: # B.cond
+            return True
+        if (instruction & 0x7e00_0000) in (0x3400_0000, 0x3600_0000): # CBZ/CBNZ/TBZ/TBNZ
+            return True
+        if (instruction & 0xffff_fc1f) in (0xd61f_0000, 0xd63f_0000, 0xd65f_0000): # BR/BLR/RET
+            return True
+        if instruction in (0xd65f_0bff, 0xd65f_0fff): # RETAA/RETAB
+            return True
+        return False
+
+    @staticmethod
+    def exception_state_changed(old_pc, instruction, new_pc, old_cpsr, new_cpsr, old_registers):
+        """Detect exception transitions from PC, processor mode and ELR/SPSR changes."""
+        if new_pc != old_pc + 4 and not StepiForKGDBCommand.is_branch_instruction(instruction):
+            return True
+        if (old_cpsr & 0x1f) != (new_cpsr & 0x1f):
+            return True
+
+        for name, old_value in old_registers.items():
+            new_value = get_register(name)
+            if new_value is not None and new_value != old_value:
+                return True
+        return False
+
+    @staticmethod
+    def thread_matches(thread, state):
+        """Check whether a valid thread matches the saved KGDB CPU identity."""
+        try:
+            return thread is not None and thread.is_valid() and thread.num == state["thread_num"] and thread.ptid == state["ptid"]
+        except (AttributeError, gdb.error):
+            return False
+
+    def mask_irq(self, cpsr):
+        """Try to mask IRQs, verify the write and attempt rollback on failure."""
+        try:
+            masked_cpsr = cpsr | self.irq_mask_bit
+            gdb.execute("set $cpsr = {:#x}".format(masked_cpsr), to_string=True)
+            if get_register("$cpsr") == masked_cpsr:
+                return True
+            message = "The target did not accept the temporary DAIF.I mask; `stepi` was not run"
+        except (gdb.error, KeyboardInterrupt) as e:
+            message = "Could not temporarily set DAIF.I: {}".format(e)
+        try:
+            if get_register("$cpsr") != cpsr:
+                gdb.execute("set $cpsr = {:#x}".format(cpsr), to_string=True)
+        except gdb.error:
+            pass
+        err(message)
+        return False
+
+    @staticmethod
+    @contextlib.contextmanager
+    def capture_stop(events):
+        """Capture step stop events and disconnect the temporary hook on exit."""
+        callback = events.append
+        connected = False
+        try:
+            EventHooking.gef_on_stop_hook(callback)
+            connected = True
+        except (AttributeError, gdb.error):
+            pass
+        try:
+            yield
+        finally:
+            if connected:
+                try:
+                    EventHooking.gef_on_stop_unhook(callback)
+                except (AttributeError, gdb.error):
+                    pass
+        return
+
+    def restore_irq(self, state, irq, event, step_succeeded):
+        """Apply the IRQ policy to the original CPU, preserving the selected thread."""
+        try:
+            result_thread = gdb.selected_thread()
+        except gdb.error:
+            result_thread = None
+        result_matches = self.thread_matches(result_thread, state)
+        try:
+            try:
+                thread = state["thread"]
+                source_available = thread.is_valid() and not thread.is_running()
+                if source_available and not result_matches:
+                    thread.switch()
+            except (AttributeError, gdb.error):
+                source_available = False
+            if source_available:
+                pc = get_register("$pc")
+            else:
+                pc = None
+            if source_available:
+                cpsr = get_register("$cpsr")
+            else:
+                cpsr = None
+            if pc is None or cpsr is None:
+                warn("Could not inspect the original KGDB CPU after `stepi`; its DAIF.I state was left unchanged")
+                return
+
+            signal = getattr(event, "stop_signal", None)
+            event_thread = getattr(event, "inferior_thread", None)
+            event_type = type(event).__name__
+            stop_reason = getattr(event, "details", {}).get("reason")
+            same_cpu = result_matches and (event_thread is None or self.thread_matches(event_thread, state))
+            unexpected_signal = signal not in (None, "SIGTRAP")
+            normal_stop = event is None or signal == "SIGTRAP" or (
+                signal is None and (
+                    event_type in ("SignalEvent", "BreakpointEvent")
+                    or (event_type == "StopEvent" and stop_reason in (None, "end-stepping-range"))
+                )
+            )
+            step_verified = step_succeeded and same_cpu and normal_stop
+            transitioned = self.exception_state_changed(
+                state["pc"], state["instruction"], pc, state["cpsr"], cpsr, state["exception_registers"],
+            )
+            did_not_advance = (
+                pc == state["pc"] and not transitioned
+                and (signal == "SIGINT" or not step_succeeded or event_type == "BreakpointEvent" or not same_cpu)
+            )
+            if did_not_advance:
+                irq = 0
+            elif irq is None or transitioned or unexpected_signal:
+                return
+            elif not step_verified and pc != state["pc"] and state["action"] is None:
+                if cpsr & self.irq_mask_bit:
+                    warn("Could not verify a normal single-step stop; DAIF.I was left masked")
+                return
+
+            restored_cpsr = (cpsr & ~self.irq_mask_bit) | (self.irq_mask_bit if irq else 0)
+            if restored_cpsr == cpsr:
+                return
+            try:
+                gdb.execute("set $cpsr = {:#x}".format(restored_cpsr), to_string=True)
+                verified_cpsr = get_register("$cpsr")
+                if verified_cpsr is None or (verified_cpsr & self.irq_mask_bit) != (restored_cpsr & self.irq_mask_bit):
+                    warn("The target did not confirm the restored DAIF.I value")
+            except gdb.error as e:
+                warn("Could not restore DAIF.I on the original KGDB CPU: {}".format(e))
+        finally:
+            if result_thread is not None and not result_matches:
+                try:
+                    if result_thread.is_valid():
+                        result_thread.switch()
+                except gdb.error:
+                    pass
+        return
 
     @parse_args
     @only_if_gdb_running
     @only_if_specific_gdb_mode(mode=("kgdb",))
     @only_if_specific_arch(arch=("ARM64",))
     def do_invoke(self, args):
-        old_cpsr = get_register("$cpsr")
-        try:
-            instr = read_int32_from_memory(runtime.current_arch.pc)
-        except gdb.error:
-            err("Memory read error")
+        """Step once with a temporary IRQ mask and restore it when appropriate."""
+        pc = get_register("$pc")
+        cpsr = get_register("$cpsr")
+        if pc is None or cpsr is None:
+            err("Could not read the current PC and CPSR")
             return
-
-        irq_mask_bit = 0x80 # DAIF.I
-        gdb.execute("set $cpsr = {:#x}".format(old_cpsr | irq_mask_bit), to_string=True)
-
-        try:
+        if cpsr & self.irq_mask_bit:
             gdb.execute("stepi", from_tty=True)
-        except gdb.error:
-            gdb.execute("set $cpsr = {:#x}".format(old_cpsr), to_string=True)
-            raise
-
-        if old_cpsr & irq_mask_bit:
             return
 
-        new_cpsr = get_register("$cpsr")
+        try:
+            instruction = int.from_bytes(gdb.selected_inferior().read_memory(pc, 4), "little")
+            action, irq = self.get_daif_update(instruction)
+        except gdb.error as e:
+            err("Could not prepare the KGDB step: {}".format(e))
+            return
 
-        # If the stepped instruction itself modified DAIF.I, preserve that result.
-        if (instr & 0xffff_f0ff) == 0xd503_40df: # MSR DAIFSet/DAIFClr, #imm
-            if (instr & 0x200) == 0:
-                new_cpsr &= ~irq_mask_bit
-        elif (instr & 0xffff_ffe0) == 0xd51b_4220: # MSR DAIF, Xn
-            regval = get_register("$x{:d}".format(instr & 0x1f))
-            if (regval & irq_mask_bit) == 0:
-                new_cpsr &= ~irq_mask_bit
-        else:
-            new_cpsr &= ~irq_mask_bit
+        thread = gdb.selected_thread()
+        state = {
+            "thread": thread, "thread_num": thread.num, "ptid": thread.ptid,
+            "pc": pc, "cpsr": cpsr, "instruction": instruction, "action": action,
+            "exception_registers": self.get_exception_registers(),
+        }
+        if not self.mask_irq(cpsr):
+            return
 
-        gdb.execute("set $cpsr = {:#x}".format(new_cpsr), to_string=True)
+        events = []
+        step_succeeded = False
+        try:
+            with self.capture_stop(events):
+                gdb.execute("stepi", from_tty=True)
+                step_succeeded = True
+        finally:
+            self.restore_irq(state, irq, events[-1] if events else None, step_succeeded)
         return
+
 
 
 @register_command
@@ -917,7 +1202,7 @@ class MemoryWatchCommand(GenericCommand):
     parser.add_argument("address", metavar="ADDRESS", type=AddressUtil.parse_address,
                         help="the memory address to register for display in `context memory`.")
     parser.add_argument("count", metavar="COUNT", nargs="?", type=AddressUtil.parse_address, default=0x10,
-                        help="the count of displayed units. (default: %(default)s)")
+                        help="the number of pointers, or bytes for byte/word/dword/qword. (default: %(default)s)")
     parser.add_argument("unit", nargs="?", default="pointers",
                         choices=["byte", "word", "dword", "qword", "pointers"],
                         help="the size of unit. (default: %(default)s)")
@@ -942,6 +1227,7 @@ class MemoryWatchCommand(GenericCommand):
         MemoryWatchCommand.mem_watches[args.address] = (args.count, args.unit)
         ok("Adding memwatch to {:#x}".format(args.address))
         return
+
 
 
 @register_command
@@ -1599,11 +1885,32 @@ class FormatStringBreakpoint(gdb.Breakpoint):
         self.enabled = True
         return
 
+    def read_format_string(self, addr):
+        if "wprintf" not in self.func_name and "wscanf" not in self.func_name:
+            return read_cstring_from_memory(addr) or ""
+
+        width = GefUtil.type_size("wchar_t") or 4
+        max_length = Config.get("context.nb_max_string_length")
+        data = bytearray()
+        suffix = ""
+        for index in range(max_length + 1):
+            char = read_memory(addr + index * width, width, safe=True)
+            if char is None:
+                break
+            if not any(char):
+                break
+            if index == max_length:
+                suffix = "[...]"
+                break
+            data.extend(char)
+        encoding = "utf-{:d}{:s}".format(width * 8, "le" if Endian.is_little_endian() else "be")
+        return data.decode(encoding, errors="backslashreplace") + suffix
+
     def stop(self):
         Cache.reset_gef_caches()
         msg = []
         ptr, addr = runtime.current_arch.get_ith_parameter(self.num_args)
-        addr = ProcessMap.lookup_address(addr)
+        addr = ProcessMap.lookup(addr)
 
         if not addr.valid:
             return False
@@ -1611,12 +1918,15 @@ class FormatStringBreakpoint(gdb.Breakpoint):
         if addr.section.permission.value & Permission.WRITE:
             msg.append(Color.colorify("Format string helper", "bold yellow"))
 
-            content = read_cstring_from_memory(addr.value) or ""
+            content = self.read_format_string(addr.value)
             msg.append("Possible insecure format string: {:s}('{:s}'  ->  {:#x}: '{:s}')".format(
                 self.func_name, ptr, addr.value, content,
             ))
 
-            name = addr.info.name if addr.info else addr.section.path
+            if addr.info:
+                name = addr.info.name
+            else:
+                name = addr.section.path
             msg.append("Reason: '{:s}()' with format-string arg #{:d} is in writable page {:s} ({:s})".format(
                 self.func_name, self.num_args, str(addr), name,
             ))
@@ -1624,6 +1934,7 @@ class FormatStringBreakpoint(gdb.Breakpoint):
             ContextExtraCommand.push_context_message("warn", "\n".join(msg))
             return True
         return False
+
 
 
 @register_command
@@ -1721,15 +2032,35 @@ class FormatStringSearchCommand(GenericCommand):
         "xasprintf": 0,       # char* xasprintf(const char *fmt, ...);
         "xvasprintf": 0,      # char* xvasprintf(const char *fmt, va_list ap);
     }
+    dangerous_functions.update({
+        prefix + name: num_arg
+        for name, num_arg in dangerous_functions.items() if name.endswith("scanf")
+        for prefix in ("__isoc99_", "__isoc23_")
+    })
 
     breakpoints = []
+
+    def get_function_addresses(self):
+        functions = {name: set() for name in self.dangerous_functions}
+        symbols = gdb.execute("maintenance print msymbols", to_string=True)
+        pattern = r"^\[\s*\d+\] [Tt] (0x[0-9a-f]+) (\w+) section "
+        for address, name in re.findall(pattern, symbols, re.MULTILINE):
+            if name in functions:
+                functions[name].add(int(address, 16))
+        for name, addresses in functions.items():
+            try:
+                addresses.add(AddressUtil.parse_address(name))
+            except gdb.error:
+                pass
+        return functions
 
     def remove_breakpoints(self):
         bp_count = 0
         while FormatStringSearchCommand.breakpoints:
             bp = FormatStringSearchCommand.breakpoints.pop()
-            bp.delete()
-            bp_count += 1
+            if bp.is_valid():
+                bp.delete()
+                bp_count += 1
         ok("Removed {:d} FormatStringBreakpoint".format(bp_count))
         return
 
@@ -1746,22 +2077,27 @@ class FormatStringSearchCommand(GenericCommand):
             return
 
         bp_count = 0
-        for func_name, num_arg in self.dangerous_functions.items():
-            try:
-                func_address = AddressUtil.parse_address(func_name)
-            except gdb.error:
-                continue
-            if args.verbose:
-                # The reason for the `end=""` is that when you set a breakpoint,
-                # gdb automatically outputs the following message:
-                # printf: Breakpoint 1 at 0x7ffff7c63f90: file ./stdio-common/printf.c, line 28.
-                gef_print(func_name + ": ", end="")
-            bp = FormatStringBreakpoint(func_address, func_name, num_arg, verbose=args.verbose)
-            FormatStringSearchCommand.breakpoints.append(bp)
-            bp_count += 1
+        addresses = set()
+        functions = self.get_function_addresses()
+        for func_name, func_addresses in functions.items():
+            num_arg = self.dangerous_functions[func_name]
+            for func_address in sorted(func_addresses):
+                if func_address in addresses:
+                    continue
+                if args.verbose:
+                    # The reason for the `end=""` is that when you set a breakpoint,
+                    # gdb automatically outputs the following message:
+                    # printf: Breakpoint 1 at 0x7ffff7c63f90: file ./stdio-common/printf.c, line 28.
+                    gef_print(func_name + ": ", end="")
+                bp = FormatStringBreakpoint(func_address, func_name, num_arg, verbose=args.verbose)
+                FormatStringSearchCommand.breakpoints.append(bp)
+                addresses.add(func_address)
+                bp_count += 1
 
-        ok("Enabled {:d}/{:d} FormatStringBreakpoint".format(bp_count, len(self.dangerous_functions)))
+        total = sum(max(1, len(values)) for values in functions.values())
+        ok("Enabled {:d}/{:d} FormatStringBreakpoint".format(bp_count, total))
         return
+
 
 
 @register_command
@@ -2178,4 +2514,3 @@ class AddSymbolTemporaryCommand(GenericCommand):
             err(e)
         os.unlink(sym_elf)
         return
-

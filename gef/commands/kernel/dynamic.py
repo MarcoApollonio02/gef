@@ -10,12 +10,14 @@ gef.bootstrap via pkgutil.walk_packages.
 import argparse
 import collections
 import itertools
+import os
 import re
 import struct
 
 import gdb
 
 from gef.commands.base import (
+    ContextManager,
     GenericCommand,
     only_if_gdb_running,
     only_if_in_kernel,
@@ -29,28 +31,30 @@ from gef.commands.base import (
 from gef.core import runtime
 from gef.core.address import AddressUtil
 from gef.core.cache import Cache
-from gef.core.color import Color, err, gef_print, titlify, warn
+from gef.core.color import Color, err, gef_print, info, titlify, warn
 from gef.core.config import Config
 from gef.core.instruction import Disasm
-from gef.core.kernel import Kernel
+from gef.core.kernel import Kernel, KernelPerCpu, Ksym
 from gef.core.memory import (
+    is_valid_addr,
     p16,
     p32,
     p64,
     p8,
     read_cstring_from_memory,
     read_int32_from_memory,
+    read_int8_from_memory,
     read_int_from_memory,
     read_memory,
     write_memory,
 )
 from gef.core.pagewalk import KernelAddressHeuristicFinder
-from gef.core.process import get_pagesize, get_pagesize_mask_low
+from gef.core.process import get_pagesize, get_pagesize_mask_low, is_arm32, is_arm64, is_x86_32
 from gef.core.registers import get_register
 from gef.core.strings import String
 from gef.core.symbols import Symbol
 from gef.core.syscall import Syscall
-from gef.core.utils import GefUtil, align, slice_unpack, slicer
+from gef.core.utils import GefUtil, align, slice_unpack, slicer, u2i
 
 
 class CallUsermodehelperSetupBreakpoint(gdb.Breakpoint):
@@ -87,6 +91,12 @@ class UsermodehelperTracerCommand(GenericCommand):
     parser = argparse.ArgumentParser(prog=_cmdline_)
     _syntax_ = parser.format_help()
 
+    _note_ = [
+        "Linux 6.14 removed automatic binfmt module loading for unrecognized executable formats.",
+        "Executing a file containing four 0xff bytes no longer triggers a usermode helper via that path.",
+    ]
+    _note_ = "\n".join(_note_)
+
     @parse_args
     @only_if_gdb_running
     @only_if_specific_gdb_mode(mode=("qemu-system", "vmware"))
@@ -94,13 +104,19 @@ class UsermodehelperTracerCommand(GenericCommand):
     @only_if_in_kernel
     def do_invoke(self, args):
         info("Resolving the function addresses")
-        addr = Symbol.get_ksymaddr("call_usermodehelper_setup")
+        addr = Ksym.get_addr("call_usermodehelper_setup")
         if addr is None:
             err("Could not find call_usermodehelper_setup")
             return
-        CallUsermodehelperSetupBreakpoint(addr)
-        info("Setup is complete. Try `continue`")
+        try:
+            CallUsermodehelperSetupBreakpoint(addr, self)
+            info("Setup is complete. continuing...")
+            gdb.execute("continue")
+            info("usermodehelper-tracer is complete, cleaning up...")
+        finally:
+            GefUtil.delete_breakpoints(self)
         return
+
 
 
 class ThunkBreakpoint(gdb.Breakpoint):
@@ -534,7 +550,7 @@ class KmallocTracerCommand(GenericCommand):
     parser.add_argument("-d", "--dump-chunk", action="store_true", help="dump the first 0x40 bytes of each chunk.")
     parser.add_argument("-p", "--enable-page-allocator-trace", action="store_true",
                         help="in addition to kmalloc and kfree, it also monitors __alloc_pages and __free_pages.")
-    parser.add_argument("-v", "--verbose", action="store_true", help="print meta information.")
+    parser.add_argument("--meta", action="store_true", help="display offset information.")
     _syntax_ = parser.format_help()
 
     _example_ = [
@@ -561,13 +577,16 @@ class KmallocTracerCommand(GenericCommand):
             "task_name": getattr(args, "task_name", []),
             "target_task": target_task,
         }
-        OptionInfo = collections.namedtuple("OptionInfo", dic.keys())
-        option_info = OptionInfo(*dic.values())
+        option_info = GefUtil.dict_to_namedtuple("OptionInfo", dic)
         return option_info
 
     @staticmethod
-    def clear_disabled_breakpoints(name, force=False):
-        for bp in gdb.breakpoints():
+    def clear_disabled_breakpoints(name, force=False, owner=None):
+        if owner is not None:
+            breakpoints = GefUtil.get_owned_breakpoints(owner)
+        else:
+            breakpoints = gdb.breakpoints() or ()
+        for bp in breakpoints:
             try:
                 if bp.__class__.__name__ != name:
                     continue
@@ -579,33 +598,24 @@ class KmallocTracerCommand(GenericCommand):
         return
 
     @staticmethod
-    def initialize(allocator, verbose):
-        if allocator != "SLUB":
-            # Do nothing other than SLUB.
-            return None
-
+    @Cache.cache_this_session(cache_None=False)
+    def get_extra_info():
         res = gdb.execute("slub-dump --meta", to_string=True)
 
         r = re.search(r"offsetof\((?:page|slab), slab_cache\): (0x\S+)", res)
         if not r:
-            return False
+            return None
         page_offset_slab_cache = int(r.group(1), 16)
-        if verbose:
-            info("offsetof({:s}, slab_cache): {:#x}".format(Kernel.slab_page_str(), page_offset_slab_cache))
 
         r = re.search(r"offsetof\(kmem_cache, name\): (0x\S+)", res)
         if not r:
-            return False
+            return None
         kmem_cache_offset_name = int(r.group(1), 16)
-        if verbose:
-            info("offsetof(kmem_cache, name): {:#x}".format(kmem_cache_offset_name))
 
         r = re.search(r"offsetof\(kmem_cache, size\): (0x\S+)", res)
         if not r:
-            return False
+            return None
         kmem_cache_offset_size = int(r.group(1), 16)
-        if verbose:
-            info("offsetof(kmem_cache, size): {:#x}".format(kmem_cache_offset_size))
 
         # create extra_info
         dic = {
@@ -613,20 +623,27 @@ class KmallocTracerCommand(GenericCommand):
             "kmem_cache_offset_size": kmem_cache_offset_size,
             "page_offset_slab_cache": page_offset_slab_cache,
         }
-        ExtraInfo = collections.namedtuple("ExtraInfo", dic.keys())
-        extra_info = ExtraInfo(*dic.values())
+        extra_info = GefUtil.dict_to_namedtuple("ExtraInfo", dic)
         return extra_info
 
     @staticmethod
     def get_task():
-        th_num = gdb.selected_thread().num
+        from gef.commands.kernel.basic import KernelCurrentCommand
         res = gdb.execute("kcurrent --quiet", to_string=True)
-        r = re.search(r"current \(cpu{:d}\): (0x\S+) (.*)".format(th_num - 1), res)
+        r = KernelCurrentCommand.search_selected_thread(res)
         if r:
             task = int(r.group(1), 16)
             name = r.group(2)
             return task, name
         return 0, ""
+
+    @staticmethod
+    def get_ith_parameter(i):
+        return Kernel.get_ith_parameter(i)[1]
+
+    @staticmethod
+    def get_return_address():
+        return Kernel.get_return_address()
 
     @staticmethod
     def virt2name_and_size(vaddr):
@@ -651,8 +668,7 @@ class KmallocTracerCommand(GenericCommand):
                 addr = frame.pc()
                 if not is_valid_addr(addr):
                     break
-                sym = Symbol.get_symbol_string(addr, nosymbol_string=" <NO_SYMBOL>")
-                gef_print("  {:#018x}{:s}".format(addr, sym))
+                gef_print("  " + Symbol.format(addr, missing="NO_SYMBOL", show_address=True, nocolor=True))
                 frame = frame.older()
         except gdb.error:
             return
@@ -668,7 +684,7 @@ class KmallocTracerCommand(GenericCommand):
         return
 
     @staticmethod
-    def set_bp_to_kmalloc_kfree(option_info, extra_info):
+    def get_kmalloc_kfree_syms():
         # `kmalloc` is always inlined and not exported, so its symbol cannot be identified.
         # Therefore, you must set a breakpoint in a function that is exported instead of kmalloc.
         # This can be done by checking EXPORT_SYMBOL, and a tool to automate this is dev/update-kmalloc-tracer.
@@ -787,7 +803,7 @@ class KmallocTracerCommand(GenericCommand):
         # This list may be incomplete.
         # If you know of any memory-allocating functions that may be freed with kfree, please let me know.
         # The number is the argument index of the size. -1 means index 0 is `struct kmem_cache*`.
-        kversion = Kernel.kernel_version()
+        kversion = Kernel.version()
         if kversion < "3.16":
             kmalloc_syms = [
                 ["__kmalloc", 0],
@@ -913,20 +929,32 @@ class KmallocTracerCommand(GenericCommand):
                 ["kfree", 0],
                 ["kfree_nolock", 0],
             ]
+        return kmalloc_syms, kfree_syms
+
+    @staticmethod
+    def set_bp_to_kmalloc_kfree(option_info, extra_info):
+        kmalloc_syms, kfree_syms = KmallocTracerCommand.get_kmalloc_kfree_syms()
 
         breakpoints = []
+        missing = []
         for sym, index_of_size_arg in kmalloc_syms:
-            func_addr = Symbol.get_ksymaddr(sym)
+            func_addr = Ksym.get_addr(sym)
             if func_addr:
                 gef_print(sym + ": ", end="")
                 bp = KmallocBreakpoint(func_addr, sym, index_of_size_arg, option_info, extra_info)
                 breakpoints.append(bp)
+            else:
+                missing.append(sym)
         for sym, index_of_addr_arg in kfree_syms:
-            func_addr = Symbol.get_ksymaddr(sym)
+            func_addr = Ksym.get_addr(sym)
             if func_addr:
                 gef_print(sym + ": ", end="")
                 bp = KfreeBreakpoint(func_addr, sym, index_of_addr_arg, option_info, extra_info)
                 breakpoints.append(bp)
+            else:
+                missing.append(sym)
+        if missing:
+            warn("Unresolved hooks: {:s}".format(", ".join(missing)))
         return breakpoints
 
     @staticmethod
@@ -949,7 +977,7 @@ class KmallocTracerCommand(GenericCommand):
         # This list may be incomplete.
         # If you know of any memory-allocating functions that may be freed with kfree, please let me know.
         # The number is the argument index of the order.
-        kversion = Kernel.kernel_version()
+        kversion = Kernel.version()
         if kversion < "5.13":
             alloc_pages_sym = [
                 ["__alloc_pages_nodemask", 1],
@@ -972,18 +1000,25 @@ class KmallocTracerCommand(GenericCommand):
         ]
 
         breakpoints = []
+        missing = []
         for sym, index_of_order_arg in alloc_pages_sym:
-            func_addr = Symbol.get_ksymaddr(sym)
+            func_addr = Ksym.get_addr(sym)
             if func_addr:
                 gef_print(sym + ": ", end="")
                 bp = AllocPagesBreakpoint(func_addr, sym, index_of_order_arg, option_info, extra_info)
                 breakpoints.append(bp)
+            else:
+                missing.append(sym)
         for sym, index_of_addr_arg, index_of_order_arg in free_pages_sym:
-            func_addr = Symbol.get_ksymaddr(sym)
+            func_addr = Ksym.get_addr(sym)
             if func_addr:
                 gef_print(sym + ": ", end="")
                 bp = FreePagesBreakpoint(func_addr, sym, index_of_addr_arg, index_of_order_arg, option_info, extra_info)
                 breakpoints.append(bp)
+            else:
+                missing.append(sym)
+        if missing:
+            warn("Unresolved hooks: {:s}".format(", ".join(missing)))
         return breakpoints
 
     @parse_args
@@ -995,7 +1030,10 @@ class KmallocTracerCommand(GenericCommand):
     def do_invoke(self, args):
         info("Wait for memory scan")
 
-        kversion = Kernel.kernel_version()
+        kversion = Kernel.version()
+        if kversion is None:
+            err("Could not find Linux kernel")
+            return
         if kversion < "3.0":
             err("Unsupported before v3.0")
             return
@@ -1009,15 +1047,13 @@ class KmallocTracerCommand(GenericCommand):
             # fall through
 
         # initialize
-        if not hasattr(self, "initialized"):
-            ret = KmallocTracerCommand.initialize(allocator, args.verbose)
-            if ret is False:
+        self.extra_info = None
+        if allocator == "SLUB":
+            self.extra_info = KmallocTracerCommand.get_extra_info()
+            if self.extra_info is None:
                 err("Failed to initialize")
                 return
-            self.initialized = True
-            self.extra_info = ret # allow None
-        else:
-            if args.verbose and self.extra_info:
+            if args.meta:
                 info("offsetof({:s}, slab_cache): {:#x}".format(Kernel.slab_page_str(), self.extra_info.page_offset_slab_cache))
                 info("offsetof(kmem_cache, name): {:#x}".format(self.extra_info.kmem_cache_offset_name))
                 info("offsetof(kmem_cache, size): {:#x}".format(self.extra_info.kmem_cache_offset_size))
@@ -1025,25 +1061,28 @@ class KmallocTracerCommand(GenericCommand):
         # create option_info
         option_info = KmallocTracerCommand.create_option_info(args)
 
-        # set breakpoints
-        breakpoints = KmallocTracerCommand.set_bp_to_kmalloc_kfree(option_info, self.extra_info)
-        if args.enable_page_allocator_trace:
-            breakpoints += KmallocTracerCommand.set_bp_to_alloc_free_pages(option_info, self.extra_info)
-        for bp in breakpoints:
-            bp.enabled = True
+        info("Only resolved hooks are observed; nested wrappers sharing task/CPU/interrupt state are folded")
+        info("Unknown tasks use CPU/thread and stack identity; non-local exits may leave returns unobserved")
+        try:
+            # set breakpoints
+            breakpoints = KmallocTracerCommand.set_bp_to_kmalloc_kfree(option_info, self.extra_info)
+            if args.enable_page_allocator_trace:
+                breakpoints += KmallocTracerCommand.set_bp_to_alloc_free_pages(option_info, self.extra_info)
+            if not breakpoints:
+                warn("No allocator hooks resolved; nothing will be observed")
+                return
+            for bp in breakpoints:
+                bp.enabled = True
 
-        # doit
-        info("Setup is complete. continuing...")
-        gdb.execute("continue")
+            # doit
+            info("Setup is complete. continuing...")
+            gdb.execute("continue")
 
-        # clean up
-        info("kmalloc-tracer is complete, cleaning up...")
-        for bp in breakpoints:
-            bp.delete()
-        KmallocTracerCommand.clear_disabled_breakpoints("KmallocRetBreakpoint", force=True)
-        if args.enable_page_allocator_trace:
-            KmallocTracerCommand.clear_disabled_breakpoints("AllocPagesRetBreakpoint", force=True)
+        finally:
+            info("kmalloc-tracer is complete, cleaning up...")
+            GefUtil.delete_breakpoints(option_info, report_pending=True)
         return
+
 
 
 class KmallocAllocatedBy_UserlandHardwareBreakpoint(gdb.Breakpoint):
@@ -1070,7 +1109,7 @@ class KmallocAllocatedByCommand(GenericCommand):
     parser.add_argument("-N", "--print-null", action="store_true", help="display free(NULL).")
     parser.add_argument("-t", "--backtrace", action="store_true", help="display backtrace.")
     parser.add_argument("-d", "--dump-chunk", action="store_true", help="dump the first 0x40 bytes of each chunk.")
-    parser.add_argument("-v", "--verbose", action="store_true", help="print meta information.")
+    parser.add_argument("--meta", action="store_true", help="display offset information.")
     _syntax_ = parser.format_help()
 
     _example_ = [
@@ -1088,27 +1127,48 @@ class KmallocAllocatedByCommand(GenericCommand):
     _note_ = "\n".join(_note_)
 
     def setup_syscall(self, syscall_name, args):
-        gdb.execute("set $pc-={:#x}".format(len(runtime.current_arch.syscall_insn)), to_string=True)
-        nr = self.syscall_table[syscall_name]
-        gdb.execute("set $rax={:#x}".format(nr), to_string=True)
+        entry = self.syscall_table[syscall_name]
+        if len(args) != len(entry.args_full):
+            raise gdb.GdbError("Argument count mismatch for {:s}".format(syscall_name))
+        if runtime.current_arch.pc != self.syscall_pc + 2 or runtime.current_arch.ptrsize != 8:
+            raise gdb.GdbError("Not at the expected 64-bit syscall return")
+        if read_memory(self.syscall_pc, 2) != b"\x0f\x05":
+            raise gdb.GdbError("Expected a syscall instruction before the return address")
         sp = runtime.current_arch.sp
-        for reg, arg in zip(runtime.current_arch.syscall_parameters, args):
-            if arg is None:
-                break
+        values = []
+        buffers = []
+        for arg in args:
             if isinstance(arg, str):
                 arg = String.str2bytes(arg)
             if isinstance(arg, bytes):
-                write_memory(sp, arg)
-                gdb.execute("set {:s}={:#x}".format(reg, sp), to_string=True)
-                sp = align(sp + len(arg), runtime.current_arch.ptrsize * 2)
+                buffers.append((sp, arg))
+                values.append(sp)
+                sp = align(sp + len(arg), 16)
+            elif isinstance(arg, int):
+                values.append(arg)
             else:
-                gdb.execute("set {:s}={:#x}".format(reg, arg), to_string=True)
-        self.tested_syscall.add(syscall_name)
+                raise gdb.GdbError("Invalid syscall argument")
+        if buffers and not self.scratch_start <= runtime.current_arch.sp <= sp <= self.scratch_end:
+            raise gdb.GdbError("Syscall buffers exceed the scratch mapping")
+        for address, data in buffers:
+            write_memory(address, data)
+        for reg, value in zip(runtime.current_arch.syscall_parameters, values + [0] * (6 - len(values))):
+            gdb.execute("set {:s}={:#x}".format(reg, value), to_string=True)
+        gdb.execute("set $rax={:#x}".format(entry.nr), to_string=True)
+        gdb.execute("set $pc={:#x}".format(self.syscall_pc), to_string=True)
         return
+
+    def continue_syscall(self, syscall_name):
+        gdb.execute("continue")
+        if (not self.hwbp.matched or runtime.current_arch.pc != self.syscall_pc + 2
+                or runtime.current_arch.sp != self.scratch_start):
+            raise gdb.GdbError("Syscall interrupted before returning to the test process")
+        self.tested_syscall.add(syscall_name)
+        return get_register(runtime.current_arch.return_register)
 
     def dump_untested_syscall(self):
         valid_syscall = []
-        for line in self.syscall_table_view_ret.splitlines():
+        for line in self.ksyscalls_ret.splitlines():
             tag, _, valid, name, *__ = Color.remove_color(line).split()
             if tag != "x86_64":
                 continue
@@ -1121,7 +1181,7 @@ class KmallocAllocatedByCommand(GenericCommand):
         untested_syscall = []
         skipped_syscall = []
         # sort by index and translate from set to list
-        for name, _nr in self.syscall_table.items():
+        for name in self.syscall_table:
             if name not in valid_syscall:
                 invalid_syscall.append(name)
             elif name in self.tested_syscall:
@@ -1147,10 +1207,7 @@ class KmallocAllocatedByCommand(GenericCommand):
         return
 
     def test_syscall(self, breakpoints):
-
-        def u2i(x):
-            x = struct.pack("<Q", x & 0xffff_ffff_ffff_ffff)
-            return struct.unpack("<q", x)[0]
+        test_dir = "/tmp/gef-kmalloc-{:s}".format(os.urandom(8).hex())
 
         def gen_testcase():
             # It is implemented with a generator because
@@ -1164,8 +1221,8 @@ class KmallocAllocatedByCommand(GenericCommand):
             msg = p64(1) + b"A" * msgsize
             if u2i(ret_history[-1]) >= 0:
                 msqid = ret_history[-1]
-                yield ("msgsnd(msqid, &msg, msgsize, 0)", "msgsnd", [msqid, msg, msgsize, 0])
-                yield ("msgrcv(msqid, &msg, msgsize, 0, 0)", "msgrcv", [msqid, msg, msgsize, 0, 0])
+                yield ("msgsnd(msqid, &msg, msgsize, IPC_NOWAIT)", "msgsnd", [msqid, msg, msgsize, 0o4000])
+                yield ("msgrcv(msqid, &msg, msgsize, 0, IPC_NOWAIT)", "msgrcv", [msqid, msg, msgsize, 0, 0o4000])
                 yield ("msgctl(msqid, IPC_RMID, 0)", "msgctl", [msqid, 0, 0])
 
             yield "shmget -> shmat -> shmdt -> shmctl"
@@ -1186,21 +1243,22 @@ class KmallocAllocatedByCommand(GenericCommand):
                 sembuf += p16(0) # sem_flg
                 yield ("semop(semid, &sembuf, 1)", "semop", [semid, sembuf, 1])
                 self.skipped_syscall.add("semtimedop")
-                yield ("semctl(semid, 0, IPC_RMID)", "semctl", [semid, 0, 0])
+                yield ("semctl(semid, 0, IPC_RMID)", "semctl", [semid, 0, 0, 0])
 
             yield "mq_open -> mq_timedsend -> mq_timedreceive -> mq_notify -> mq_getsetattr -> mq_unlink -> close"
-            MQ_NAME = "mq_test\0"
-            attr = p64(0o4000) # mq_flags: O_NONBLOCK
+            MQ_NAME = "gef_mq_{:x}\0".format(runtime.current_arch.sp)
+            attr = p64(0)      # mq_flags
             attr += p64(10)    # mq_maxmsg
             attr += p64(0x100) # mq_msgsize
             attr += p64(0)     # mq_curmsgs
             attr += p64(0) * 4 # __reserved[4]
             yield (
-                'fd = mq_open("mq_test", O_RDWR|O_CREAT, 0700, &attr)',
-                "mq_open", [MQ_NAME, 0o2 | 0o100, 0o700, attr],
+                'fd = mq_open(name, O_RDWR|O_CREAT|O_EXCL|O_NONBLOCK, 0700, &attr)',
+                "mq_open", [MQ_NAME, 0o2 | 0o100 | 0o200 | 0o4000, 0o700, attr],
             )
             if u2i(ret_history[-1]) >= 0:
                 fd = ret_history[-1]
+                yield ("mq_unlink(name)", "mq_unlink", [MQ_NAME])
                 msg = "A" * 0x100
                 yield ("mq_timedsend(fd, &msg, sizeof(msg), 0, NULL)", "mq_timedsend", [fd, msg, len(msg), 0, 0])
                 buf = "\0" * 0x100
@@ -1211,12 +1269,10 @@ class KmallocAllocatedByCommand(GenericCommand):
                     "mq_timedreceive(fd, &buf, sizeof(buf), &prio, &timeout)",
                     "mq_timedreceive", [fd, buf, len(buf), prio, timeout],
                 )
-                sigevent = p32(0)   # sigev_notify: SIGEV_SIGNAL
+                sigevent = p64(0)   # sigev_value
                 sigevent += p32(10) # sigev_signo: SIGUSR1
-                sigevent += p64(0)  # sigev_value
-                sigevent += p64(0)  # sigev_notify_function
-                sigevent += p64(0)  # sigev_notify_attributes
-                sigevent += p64(0)  # sigev_notify_thread_id
+                sigevent += p32(1)  # sigev_notify: SIGEV_NONE
+                sigevent += b"\0" * 48
                 yield ("mq_notify(fd, &sigevent)", "mq_notify", [fd, sigevent])
                 attr = p64(0)      # mq_flags
                 attr += p64(0)     # mq_maxmsg
@@ -1224,7 +1280,6 @@ class KmallocAllocatedByCommand(GenericCommand):
                 attr += p64(0)     # mq_curmsgs
                 attr += p64(0) * 4 # __reserved[4]
                 yield ("mq_getsetattr(fd, NULL, &attr)", "mq_getsetattr", [fd, 0, attr])
-                yield ('mq_unlink("mq_test")', "mq_unlink", [MQ_NAME])
                 yield ("close(fd)", "close", [fd])
 
             yield "signalfd4 -> close"
@@ -1372,7 +1427,7 @@ class KmallocAllocatedByCommand(GenericCommand):
                 addr = ret_history[-1]
                 yield ("mprotect(addr, 0x1000, R--)", "mprotect", [addr, size, 1])
                 size2 = size * 2
-                yield ("addr2 = mremap(addr, 0x1000, 0x2000, MREMAP_MAYMOVE)", "mremap", [addr, size, size2, 1])
+                yield ("addr2 = mremap(addr, 0x1000, 0x2000, MREMAP_MAYMOVE)", "mremap", [addr, size, size2, 1, 0])
                 if u2i(ret_history[-1]) >= 0:
                     addr2 = ret_history[-1]
                     yield ("msync(addr2, 0x2000, MS_SYNC)", "msync", [addr2, size2, 4])
@@ -1395,8 +1450,8 @@ class KmallocAllocatedByCommand(GenericCommand):
                 status = p64(0)
                 yield ("move_pages(0, 1, &pages, NULL, &status, 0)", "move_pages", [0, 1, pages, 0, status, 0])
                 maxnode = 8
-                old_nodes = "\x02"
-                new_nodes = "\x01"
+                old_nodes = p64(2)
+                new_nodes = p64(1)
                 yield (
                     "migrate_pages(0, 8, old_nodes, new_nodes)",
                     "migrate_pages", [0, maxnode, old_nodes, new_nodes],
@@ -1439,32 +1494,33 @@ class KmallocAllocatedByCommand(GenericCommand):
 
             yield "prctl -> arch_prctl -> set_tid_address"
             buf = p32(0)
-            yield ("prctl(PR_GET_PDEATHSIG, &buf)", "prctl", [2, buf])
-            yield ("prctl(PR_GET_DUMPABLE)", "prctl", [3])
-            yield ("prctl(PR_GET_KEEPCAPS)", "prctl", [7])
-            yield ("prctl(PR_GET_TIMING)", "prctl", [13])
+            yield ("prctl(PR_GET_PDEATHSIG, &buf)", "prctl", [2, buf, 0, 0, 0])
+            yield ("prctl(PR_GET_DUMPABLE)", "prctl", [3, 0, 0, 0, 0])
+            yield ("prctl(PR_GET_KEEPCAPS)", "prctl", [7, 0, 0, 0, 0])
+            yield ("prctl(PR_GET_TIMING)", "prctl", [13, 0, 0, 0, 0])
             buf = "\0" * 16
-            yield ("prctl(PR_GET_NAME, &buf)", "prctl", [16, buf])
-            yield ("prctl(PR_GET_SECCOMP)", "prctl", [21])
-            yield ("prctl(PR_CAPBSET_READ, CAP_CHOWN)", "prctl", [23, 0])
+            yield ("prctl(PR_GET_NAME, &buf)", "prctl", [16, buf, 0, 0, 0])
+            yield ("prctl(PR_GET_SECCOMP)", "prctl", [21, 0, 0, 0, 0])
+            yield ("prctl(PR_CAPBSET_READ, CAP_CHOWN)", "prctl", [23, 0, 0, 0, 0])
             buf = p32(0)
-            yield ("prctl(PR_GET_TSC, &buf)", "prctl", [25, buf])
-            yield ("prctl(PR_GET_SECUREBITS)", "prctl", [27])
-            yield ("prctl(PR_GET_TIMERSLACK)", "prctl", [30])
-            yield ("prctl(PR_TASK_PERF_EVENTS_DISABLE)", "prctl", [31])
+            yield ("prctl(PR_GET_TSC, &buf)", "prctl", [25, buf, 0, 0, 0])
+            yield ("prctl(PR_GET_SECUREBITS)", "prctl", [27, 0, 0, 0, 0])
+            yield ("prctl(PR_GET_TIMERSLACK)", "prctl", [30, 0, 0, 0, 0])
+            yield ("prctl(PR_TASK_PERF_EVENTS_DISABLE)", "prctl", [31, 0, 0, 0, 0])
             yield ("prctl(PR_MCE_KILL_GET, 0, 0, 0, 0)", "prctl", [34, 0, 0, 0, 0])
             buf = p32(0)
-            yield ("prctl(PR_GET_CHILD_SUBREAPER, &buf)", "prctl", [37, buf])
+            yield ("prctl(PR_GET_CHILD_SUBREAPER, &buf)", "prctl", [37, buf, 0, 0, 0])
             yield ("prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0)", "prctl", [39, 0, 0, 0, 0])
-            yield ("prctl(PR_GET_TID_ADDRESS)", "prctl", [40, buf])
+            yield ("prctl(PR_GET_TID_ADDRESS, &buf)", "prctl", [40, p64(0), 0, 0, 0])
             yield ("prctl(PR_GET_THP_DISABLE, 0, 0, 0, 0)", "prctl", [42, 0, 0, 0, 0])
-            yield ("arch_prctl(ARCH_GET_CPUID)", "arch_prctl", [0x1011])
+            yield ("arch_prctl(ARCH_GET_CPUID)", "arch_prctl", [0x1011, 0])
             buf = p64(0)
-            yield ("arch_prctl(ARCH_GET_GS, &buf)", "arch_prctl", [0x1001, buf])
+            yield ("arch_prctl(ARCH_GET_GS, &buf)", "arch_prctl", [0x1004, buf])
             buf = p64(0)
             yield ("arch_prctl(ARCH_GET_FS, &buf)", "arch_prctl", [0x1003, buf])
-            fsbase = ret_history[-1]
-            yield ("set_tid_address(fsbase)", "set_tid_address", [fsbase])
+            if u2i(ret_history[-1]) == 0:
+                fsbase = read_int_from_memory(runtime.current_arch.sp)
+                yield ("set_tid_address(fsbase)", "set_tid_address", [fsbase])
 
             yield "futex"
             uaddr = p64(0)
@@ -1525,6 +1581,7 @@ class KmallocAllocatedByCommand(GenericCommand):
             buf += p64(0) # errcnt
             buf += p64(0) # stbcnt
             buf += p64(0) # tai
+            buf = buf.ljust(208, b"\0")
             yield ("adjtimex(&buf)", "adjtimex", [buf])
             self.skipped_syscall.add("clock_adjtime")
 
@@ -1541,14 +1598,14 @@ class KmallocAllocatedByCommand(GenericCommand):
 
             yield "getrandom"
             buf = "\0" * 0x100
-            yield ("getrandom(&buf, sizeof(buf), 0)", "getrandom", [buf, len(buf), 0])
+            yield ("getrandom(&buf, sizeof(buf), GRND_NONBLOCK)", "getrandom", [buf, len(buf), 1])
 
             yield "getrlimit -> setrlimit"
             rlim = p64(0)  # rlim_cur
             rlim += p64(0) # rlim_max
-            yield ("getrlimit(RLIMIT_STACK, &rlim, sizeof(rlim))", "getrlimit", [3, rlim, len(rlim)])
+            yield ("getrlimit(RLIMIT_STACK, &rlim)", "getrlimit", [3, rlim])
             rlim = read_memory(runtime.current_arch.sp, 16)
-            yield ("setrlimit(RLIMIT_STACK, &rlim, sizeof(rlim))", "setrlimit", [3, rlim, len(rlim)])
+            yield ("setrlimit(RLIMIT_STACK, &rlim)", "setrlimit", [3, rlim])
             self.skipped_syscall.add("prlimit64")
 
             yield "sched_yield"
@@ -1644,7 +1701,12 @@ class KmallocAllocatedByCommand(GenericCommand):
             buf += p64(0)     # totalswap
             buf += p64(0)     # freeswap
             buf += p16(0)     # procs
-            buf += p8(0) * 22 # padding
+            buf += p16(0)    # pad
+            buf += p32(0)    # padding
+            buf += p64(0)    # totalhigh
+            buf += p64(0)    # freehigh
+            buf += p32(0)    # mem_unit
+            buf += p32(0)    # padding
             yield ("sysinfo(&buf)", "sysinfo", [buf])
 
             yield "sysfs"
@@ -1663,7 +1725,7 @@ class KmallocAllocatedByCommand(GenericCommand):
             sigsetsize = 8
             yield ("rt_sigprocmask(0, NULL, &oldset, sigsetsize)", "rt_sigprocmask", [0, 0, oldset, sigsetsize])
             set_ = "\0" * 0x100
-            yield ("rt_sigpending(&set)", "rt_sigpending", [set_])
+            yield ("rt_sigpending(&set, sigsetsize)", "rt_sigpending", [set_, sigsetsize])
 
             yield "getpid -> getppid -> getsid -> gettid -> getpgid -> setpgid -> getpgrp -> kcmp"
             yield ("pid = getpid()", "getpid", [])
@@ -1714,7 +1776,7 @@ class KmallocAllocatedByCommand(GenericCommand):
             yield ("rt_sigaction(SIGALRM, &act, &oldact, sigsetsize)", "rt_sigaction", [14, act, oldact, sigsetsize])
             yield ("alarm(1000)", "alarm", [1000])
             yield ("kill(pid, SIGALRM)", "kill", [pid, 14])
-            yield ("tkill(tid, SIGALRM)", "kill", [tid, 14])
+            yield ("tkill(tid, SIGALRM)", "tkill", [tid, 14])
             self.skipped_syscall.add("tgkill")
             self.skipped_syscall.add("rt_sigqueueinfo")
             self.skipped_syscall.add("rt_tgsigqueueinfo")
@@ -1731,6 +1793,7 @@ class KmallocAllocatedByCommand(GenericCommand):
             info += p32(0) # si_band
             timeout = p64(0)  # tv_sec
             timeout += p64(0) # tv_nsec
+            info = info.ljust(128, b"\0")
             sigsetsize = 8
             yield (
                 "rt_sigtimedwait(&set, &info, &timeout, sigsetsize)",
@@ -1754,16 +1817,25 @@ class KmallocAllocatedByCommand(GenericCommand):
             datap = p32(0)  # effective
             datap += p32(0) # permitted
             datap += p32(0) # inheritable
+            datap += p32(0) * 3
             yield ("capget(&hdrp, &datap)", "capget", [hdrp, datap])
-            datap = read_memory(runtime.current_arch.sp + 0x10, 4 * 3)
+            datap = read_memory(runtime.current_arch.sp + 0x10, 4 * 6)
             yield ("capset(&hdrp, &datap)", "capset", [hdrp, datap])
 
             yield "umask"
             yield ("umask(022)", "umask", [0o022])
 
+            yield "mkdir"
+            yield ('mkdir("{:s}", 0700)'.format(test_dir), "mkdir", [test_dir + "\0", 0o700])
+            if u2i(ret_history[-1]) < 0:
+                raise gdb.GdbError("Could not create the private syscall test directory")
+
             yield "open -> fallocate -> write -> fdatasync -> fsync -> syncfs -> fadvise64 -> close"
-            TMP_XXX = "/tmp/xxx\0"
-            yield ('fd = open("/tmp/xxx", 0_WRONLY|O_CREAT, 0666)', "open", [TMP_XXX, 0o1 | 0o100, 0o666])
+            TMP_XXX = test_dir + "/xxx\0"
+            yield ('fd = open("/tmp/xxx", O_WRONLY|O_CREAT|O_EXCL, 0666)', "open", [TMP_XXX, 0o1 | 0o100 | 0o200, 0o666])
+            if u2i(ret_history[-1]) < 0:
+                yield ('rmdir("{:s}")'.format(test_dir), "rmdir", [test_dir + "\0"])
+                raise gdb.GdbError("Could not create the private syscall test file")
             self.skipped_syscall.add("creat")
             self.skipped_syscall.add("openat")
             self.skipped_syscall.add("openat2")
@@ -1785,7 +1857,7 @@ class KmallocAllocatedByCommand(GenericCommand):
                 yield ("close(fd)", "close", [fd])
 
             yield "open -> flock -> lseek -> readahead -> poll -> read -> dup -> close_range"
-            yield ('fd = open("/tmp/xxx", 0_RDONLY)', "open", [TMP_XXX, 0o0])
+            yield ('fd = open("/tmp/xxx", 0_RDONLY)', "open", [TMP_XXX, 0o0, 0])
             if u2i(ret_history[-1]) >= 0:
                 fd = ret_history[-1]
                 yield ("flock(fd, LOCK_SH|LOCK_NB)", "flock", [fd, 1 | 4])
@@ -1807,10 +1879,14 @@ class KmallocAllocatedByCommand(GenericCommand):
                 self.skipped_syscall.add("dup2")
                 self.skipped_syscall.add("dup3")
                 fd2 = ret_history[-1]
-                yield ("close_range(fd, fd2, 0)", "close_range", [fd, fd2, 0])
+                if u2i(fd2) >= 0:
+                    yield ("close_range(fd2, fd2, 0)", "close_range", [fd2, fd2, 0])
+                    if u2i(ret_history[-1]) < 0:
+                        yield ("close(fd2)", "close", [fd2])
+                yield ("close(fd)", "close", [fd])
 
             yield "open -> mmap -> remap_file_pages -> munmap -> close"
-            yield ('fd = open("/tmp/xxx", 0_RDONLY)', "open", [TMP_XXX, 0o0])
+            yield ('fd = open("/tmp/xxx", 0_RDONLY)', "open", [TMP_XXX, 0o0, 0])
             if u2i(ret_history[-1]) >= 0:
                 fd = ret_history[-1]
                 size = get_pagesize()
@@ -1833,8 +1909,8 @@ class KmallocAllocatedByCommand(GenericCommand):
             self.skipped_syscall.add("lchown")
             self.skipped_syscall.add("fchownat")
 
-            yield "open -> pipe -> sendfile -> splice -> select -> vmsplice -> close_range -> close"
-            yield ('fd = open("/tmp/xxx", 0_RDONLY)', "open", [TMP_XXX, 0o0])
+            yield "open -> pipe -> sendfile -> splice -> select -> vmsplice -> close"
+            yield ('fd = open("/tmp/xxx", 0_RDONLY)', "open", [TMP_XXX, 0o0, 0])
             if u2i(ret_history[-1]) >= 0:
                 fd = ret_history[-1]
                 pipefd_array = p32(0) * 2 # pipefd[2]
@@ -1852,38 +1928,48 @@ class KmallocAllocatedByCommand(GenericCommand):
                     readfds = slicer("".join([str(x) for x in readfds]), 64)
                     readfds = b"".join([p64(int(x[::-1], 2)) for x in readfds])
                     nfds = pipefd0 + 1
-                    yield ("select(nfds, readfds, NULL, NULL, NULL)", "select", [nfds, readfds, 0, 0, 0])
+                    yield ("select(nfds, readfds, NULL, NULL, &timeout)", "select", [nfds, readfds, 0, 0, p64(0) * 2])
                     self.skipped_syscall.add("pselect6")
                     iov = p64(runtime.current_arch.sp + 0x10) # iov_base
-                    iov += p64(0x100)                 # iov_len
-                    yield ("vmsplice(pipefd[0], &iov, 1, 0)", "vmsplice", [pipefd0, iov, 1, 0])
-                    yield ("close_range(pipefd[0], pipefd[1], 0)", "close_range", [pipefd0, pipefd1, 0])
+                    iov += p64(4)                 # iov_len
+                    yield ("vmsplice(pipefd[0], &iov, 1, SPLICE_F_NONBLOCK)", "vmsplice", [pipefd0, iov + b"\0" * 4, 1, 2])
+                    yield ("close(pipefd[0])", "close", [pipefd0])
+                    yield ("close(pipefd[1])", "close", [pipefd1])
                 yield ("close(fd)", "close", [fd])
 
-            yield "pipe -> pipe -> tee -> close_range"
+            yield "pipe -> pipe -> tee -> close"
             pipefd_array = p32(0) * 2 # pipefd[2]
             yield ("pipe(&pipefd[])", "pipe", [pipefd_array])
-            pipefd0 = read_int32_from_memory(runtime.current_arch.sp)
-            _pipefd1 = read_int32_from_memory(runtime.current_arch.sp + 4)
-            yield ("pipe(&pipefd[])", "pipe", [pipefd_array])
-            _pipefd2 = read_int32_from_memory(runtime.current_arch.sp)
-            pipefd3 = read_int32_from_memory(runtime.current_arch.sp + 4)
-            yield ("tee(pipefd[0], pipefd[3], 0", "tee", [pipefd0, pipefd3])
-            yield ("close_range(pipefd[0], pipefd[3], 0)", "close_range", [pipefd0, pipefd3, 0])
+            if u2i(ret_history[-1]) >= 0:
+                pipefd0 = read_int32_from_memory(runtime.current_arch.sp)
+                pipefd1 = read_int32_from_memory(runtime.current_arch.sp + 4)
+                yield ("pipe(&pipefd[])", "pipe", [pipefd_array])
+                if u2i(ret_history[-1]) >= 0:
+                    pipefd2 = read_int32_from_memory(runtime.current_arch.sp)
+                    pipefd3 = read_int32_from_memory(runtime.current_arch.sp + 4)
+                    yield ('write(pipefd[1], "AAAA", 4)', "write", [pipefd1, b"AAAA", 4])
+                    yield ("tee(pipefd[0], pipefd[3], 4, SPLICE_F_NONBLOCK)", "tee", [pipefd0, pipefd3, 4, 2])
+                    yield ("close(pipefd[2])", "close", [pipefd2])
+                    yield ("close(pipefd[3])", "close", [pipefd3])
+                yield ("close(pipefd[0])", "close", [pipefd0])
+                yield ("close(pipefd[1])", "close", [pipefd1])
 
             yield "mknod -> unlink"
-            TMP_PIPE = "/tmp/pipe\0"
+            TMP_PIPE = test_dir + "/pipe\0"
             yield ('mknod("/tmp/pipe", S_IFIFO|0644, 0)', "mknod", [TMP_PIPE, 0o10000 | 0o644, 0])
             self.skipped_syscall.add("mknodat")
             if u2i(ret_history[-1]) >= 0:
                 yield ('unlink("/tmp/pipe")', "unlink", [TMP_PIPE])
 
             yield "open -> sync_file_range -> copy_file_range -> close -> unlink -> close"
-            TMP_XXX2 = "/tmp/xxx2\0"
-            yield ('fd_in = open("/tmp/xxx", 0_RDONLY)', "open", [TMP_XXX, 0o0])
+            TMP_XXX2 = test_dir + "/xxx2\0"
+            yield ('fd_in = open("/tmp/xxx", 0_RDONLY)', "open", [TMP_XXX, 0o0, 0])
             if u2i(ret_history[-1]) >= 0:
                 fd_in = ret_history[-1]
-                yield ('fd_out = open("/tmp/xxx2", 0_WRONLY|O_CREAT, 0666)', "open", [TMP_XXX2, 0o1 | 0o100, 0o666])
+                yield (
+                    'fd_out = open("/tmp/xxx2", O_WRONLY|O_CREAT|O_EXCL, 0666)',
+                    "open", [TMP_XXX2, 0o1 | 0o100 | 0o200, 0o666],
+                )
                 if u2i(ret_history[-1]) >= 0:
                     fd_out = ret_history[-1]
                     yield (
@@ -1960,6 +2046,7 @@ class KmallocAllocatedByCommand(GenericCommand):
                 statxbuf += p64(0) # stx_mnt_id
                 statxbuf += p32(0) # stx_dio_mem_align
                 statxbuf += p32(0) # stx_dio_offset_align
+                statxbuf = statxbuf.ljust(256, b"\0")
                 yield ('statx(0, "/tmp/xxx", 0, 0, &statxbuf)', "statx", [0, TMP_XXX, 0, 0, statxbuf])
                 yield ('truncate("/tmp/xxx", 10)', "truncate", [TMP_XXX, 10])
                 self.skipped_syscall.add("ftruncate")
@@ -1992,7 +2079,7 @@ class KmallocAllocatedByCommand(GenericCommand):
                     self.skipped_syscall.add("fremovexattr")
 
             yield "link -> unlink"
-            TMP_XXX3 = "/tmp/xxx3\0"
+            TMP_XXX3 = test_dir + "/xxx3\0"
             yield ('link("/tmp/xxx", "/tmp/xxx3")', "link", [TMP_XXX, TMP_XXX3])
             self.skipped_syscall.add("linkat")
             if u2i(ret_history[-1]) >= 0:
@@ -2000,20 +2087,22 @@ class KmallocAllocatedByCommand(GenericCommand):
                 self.skipped_syscall.add("unlinkat")
 
             yield "symlink -> readlink -> rename -> unlink"
-            TMP_XXX4 = "/tmp/xxx4\0"
+            TMP_XXX4 = test_dir + "/xxx4\0"
             yield ('symlink("/tmp/xxx", "/tmp/xxx4")', "symlink", [TMP_XXX, TMP_XXX4])
             self.skipped_syscall.add("symlinkat")
             if u2i(ret_history[-1]) >= 0:
                 buf = "\0" * 0x100
                 yield ('readlink("/tmp/xxx4", &buf, sizeof(buf))', "readlink", [TMP_XXX4, buf, len(buf)])
                 self.skipped_syscall.add("readlinkat")
-                TMP_XXX5 = "/tmp/xxx5\0"
+                TMP_XXX5 = test_dir + "/xxx5\0"
                 yield ('rename("/tmp/xxx4", "/tmp/xxx5")', "rename", [TMP_XXX4, TMP_XXX5])
                 self.skipped_syscall.add("renameat")
                 self.skipped_syscall.add("renameat2")
                 if u2i(ret_history[-1]) >= 0:
                     yield ('unlink("/tmp/xxx5")', "unlink", [TMP_XXX5])
                     self.skipped_syscall.add("unlinkat")
+                else:
+                    yield ('unlink("/tmp/xxx4")', "unlink", [TMP_XXX4])
 
             yield "inotify_init1 -> inotify_add_watch -> inotify_rm_watch -> close"
             yield ("fd = inotify_init1(0)", "inotify_init1", [0])
@@ -2030,7 +2119,7 @@ class KmallocAllocatedByCommand(GenericCommand):
                 yield ("close(fd)", "close", [fd])
 
             yield "open -> io_setup -> io_submit -> io_getevents -> close -> io_destroy"
-            yield ('fd = open("/tmp/xxx", 0_RDONLY)', "open", [TMP_XXX, 0o0])
+            yield ('fd = open("/tmp/xxx", 0_RDONLY)', "open", [TMP_XXX, 0o0, 0])
             if u2i(ret_history[-1]) >= 0:
                 fd = ret_history[-1]
                 ctx_idp = p64(0)
@@ -2063,8 +2152,8 @@ class KmallocAllocatedByCommand(GenericCommand):
                     "io_getevents(ctx_id, 1, 1, &events, &timeout)",
                     "io_getevents", [ctx_id, 1, 1, events, timeout],
                 )
-                self.tested_syscall.add("io_pgetevents")
-                yield ("clode(fd)", "close", [fd])
+                self.skipped_syscall.add("io_pgetevents")
+                yield ("close(fd)", "close", [fd])
                 yield ("io_destroy(ctx_id)", "io_destroy", [ctx_id])
 
             yield "io_uring_setup -> mmap -> io_uring_enter -> io_uring_register -> munmap"
@@ -2094,31 +2183,32 @@ class KmallocAllocatedByCommand(GenericCommand):
             params += p32(0) * 3 # cq_off.resv[3]
             yield ("ring_fd = io_uring_setup(1, &params)", "io_uring_setup", [1, params])
             params = slice_unpack(read_memory(runtime.current_arch.sp, len(params)), 4)
-            if u2i(ret_history[-1]) >= 0 and params[5] & 1: # IORING_FEAT_SINGLE_MMAP (available linux v5.4~)
+            if u2i(ret_history[-1]) >= 0:
                 ring_fd = ret_history[-1]
-                sring_sz = params[16] + params[0] * 4    # sq_off.array + sq_entries * sizeof(uint)
-                cring_sz = params[25] + params[1] * 0x10 # cq_off.cqes + cq_entries * sizeof(struct io_uring_cqe)
-                sring_sz = max(sring_sz, cring_sz)
-                yield (
-                    "mmap(0, sring_sz, RW-, MAP_SHARED|MAP_POPULATE, ring_fd, IORING_OFF_SQ_RING)",
-                    "mmap", [0, sring_sz, 3, 0x1 | 0x8000, ring_fd, 0],
-                )
-                if u2i(ret_history[-1]) >= 0:
-                    sq_ptr = ret_history[-1]
+                if params[5] & 1: # IORING_FEAT_SINGLE_MMAP
+                    sring_sz = params[16] + params[0] * 4    # sq_off.array + sq_entries * sizeof(uint)
+                    cring_sz = params[25] + params[1] * 0x10 # cq_off.cqes + cq_entries * sizeof(struct io_uring_cqe)
+                    sring_sz = max(sring_sz, cring_sz)
                     yield (
-                        "io_uring_enter(ring_fd, 0, 0, 0, NULL, 8)",
-                        "io_uring_enter", [ring_fd, 0, 0, 0, 0, 8],
+                        "mmap(0, sring_sz, RW-, MAP_SHARED|MAP_POPULATE, ring_fd, IORING_OFF_SQ_RING)",
+                        "mmap", [0, sring_sz, 3, 0x1 | 0x8000, ring_fd, 0],
                     )
-                    arg = p32(0)
-                    yield (
-                        "io_uring_register(ring_fd, IORING_REGISTER_FILES, &arg, 1)",
-                        "io_uring_register", [ring_fd, 2, arg, 1],
-                    )
-                    yield (
-                        "io_uring_register(ring_fd, IORING_UNREGISTER_FILES, NULL, 0)",
-                        "io_uring_register", [ring_fd, 3, 0, 0],
-                    )
-                    yield ("munmap(sq_ptr, sring_sz)", "munmap", [sq_ptr, sring_sz])
+                    if u2i(ret_history[-1]) >= 0:
+                        sq_ptr = ret_history[-1]
+                        yield (
+                            "io_uring_enter(ring_fd, 0, 0, 0, NULL, 8)",
+                            "io_uring_enter", [ring_fd, 0, 0, 0, 0, 8],
+                        )
+                        arg = p32(0)
+                        yield (
+                            "io_uring_register(ring_fd, IORING_REGISTER_FILES, &arg, 1)",
+                            "io_uring_register", [ring_fd, 2, arg, 1],
+                        )
+                        yield (
+                            "io_uring_register(ring_fd, IORING_UNREGISTER_FILES, NULL, 0)",
+                            "io_uring_register", [ring_fd, 3, 0, 0],
+                        )
+                        yield ("munmap(sq_ptr, sring_sz)", "munmap", [sq_ptr, sring_sz])
                 yield ("close(ring_fd)", "close", [ring_fd])
 
             yield "unshare"
@@ -2136,9 +2226,9 @@ class KmallocAllocatedByCommand(GenericCommand):
             yield ('unlink("/tmp/xxx")', "unlink", [TMP_XXX])
 
             yield "mkdir -> open_tree -> close -> chdir -> rmdir"
-            TMP_YYY = "/tmp/yyy\0"
+            TMP_YYY = test_dir + "/yyy\0"
             yield ('mkdir("/tmp/yyy", 0777)', "mkdir", [TMP_YYY, 0o777])
-            self.tested_syscall.add("mkdirat")
+            self.skipped_syscall.add("mkdirat")
             if u2i(ret_history[-1]) >= 0:
                 yield ('fd = open_tree(-1, "/tmp/yyy", 0)', "open_tree", [-1, TMP_YYY, 0])
                 if u2i(ret_history[-1]) >= 0:
@@ -2146,8 +2236,13 @@ class KmallocAllocatedByCommand(GenericCommand):
                     yield ("close(fd)", "close", [fd])
                 yield ('chdir("/tmp/yyy")', "chdir", [TMP_YYY])
                 self.skipped_syscall.add("fchdir")
-                yield ('chdir("..")', "chdir", ["..\0"])
+                if u2i(ret_history[-1]) >= 0:
+                    yield ('chdir("..")', "chdir", ["..\0"])
                 yield ('rmdir("/tmp/yyy")', "rmdir", [TMP_YYY])
+
+            yield "chdir -> rmdir"
+            yield ('chdir("/")', "chdir", ["/\0"])
+            yield ('rmdir("{:s}")'.format(test_dir), "rmdir", [test_dir + "\0"])
 
             yield "statfs"
             buf = p64(0)      # f_type
@@ -2167,14 +2262,14 @@ class KmallocAllocatedByCommand(GenericCommand):
             self.skipped_syscall.add("ustat")
 
             yield "open -> getdents -> fcntl -> close"
-            yield ('fd = open("/", 0_RDONLY)', "open", ["/\0", 0])
+            yield ('fd = open("/", 0_RDONLY)', "open", ["/\0", 0, 0])
             if u2i(ret_history[-1]) >= 0:
                 fd = ret_history[-1]
                 buf = "\0" * 0x200
                 yield ("getdents(fd, &buf, sizeof(buf))", "getdents", [fd, buf, len(buf)])
                 self.skipped_syscall.add("getdents64")
-                yield ("fcntl(fd, F_GETFD)", "fcntl", [fd, 1])
-                yield ("fcntl(fd, F_GETFL)", "fcntl", [fd, 3])
+                yield ("fcntl(fd, F_GETFD)", "fcntl", [fd, 1, 0])
+                yield ("fcntl(fd, F_GETFL)", "fcntl", [fd, 3, 0])
                 flock = "\0" * 0x200
                 yield ("fcntl(fd, F_GETLK, &flock)", "fcntl", [fd, 5, flock])
                 yield ("fcntl(fd, F_OFD_GETLK, &flock)", "fcntl", [fd, 36, flock])
@@ -2182,6 +2277,8 @@ class KmallocAllocatedByCommand(GenericCommand):
 
             yield "invalid socket -> close"
             yield ("socket(22, SOCK_STREAM, 0)", "socket", [22, 1, 0])
+            if u2i(ret_history[-1]) >= 0:
+                yield ("close(fd)", "close", [ret_history[-1]])
 
             yield "socket AF_INET/TCP -> bind -> listen -> setsockopt -> getsockopt -> close"
             yield ("fd = socket(AF_INET, SOCK_STREAM, 0)", "socket", [2, 1, 0])
@@ -2224,7 +2321,7 @@ class KmallocAllocatedByCommand(GenericCommand):
 
             yield "socketpair AF_UNIX -> sendto -> recvfrom -> sendmsg -> recvmsg -> shutdown -> close"
             sv_array = p32(0) * 2 # sv[2]
-            yield ("socketpair(AF_UNIX, SOCK_STREAM, 0, &sv[])", "socketpair", [1, 1, 0, sv_array])
+            yield ("socketpair(AF_UNIX, SOCK_STREAM|SOCK_NONBLOCK, 0, &sv[])", "socketpair", [1, 1 | 0o4000, 0, sv_array])
             if u2i(ret_history[-1]) >= 0:
                 sv0 = read_int32_from_memory(runtime.current_arch.sp)
                 sv1 = read_int32_from_memory(runtime.current_arch.sp + 4)
@@ -2245,7 +2342,7 @@ class KmallocAllocatedByCommand(GenericCommand):
                 msg += b"AAAA"                     # data
                 yield ("sendmsg(sv[0], &msg, 0)", "sendmsg", [sv0, msg, 0])
                 self.skipped_syscall.add("sendmmsg")
-                yield ("recvmsg(sv[1], &msg, 0)", "sendmsg", [sv1, msg, 0])
+                yield ("recvmsg(sv[1], &msg, 0)", "recvmsg", [sv1, msg, 0])
                 self.skipped_syscall.add("recvmmsg")
                 yield ("shutdown(sv[0], SHUT_RDWR)", "shutdown", [sv0, 2])
                 yield ("close(sv[0])", "close", [sv0])
@@ -2268,7 +2365,7 @@ class KmallocAllocatedByCommand(GenericCommand):
                    "request_key", [user, tkey, callout_info, 0xffff_fffe])
             if u2i(ret_history[-1]) >= 0:
                 key_serial = ret_history[-1]
-                yield ("keyctl(KEYCTL_REVOKE, key_serial)", "keyctl", [3, key_serial])
+                yield ("keyctl(KEYCTL_REVOKE, key_serial)", "keyctl", [3, key_serial, 0, 0, 0])
 
             yield "invalid add_key"
             tkey = "A" * 0x100
@@ -2276,13 +2373,13 @@ class KmallocAllocatedByCommand(GenericCommand):
                    "add_key", [user, tkey, 0, 0, 0xffff_fffe])
 
             yield "open /dev/ptmx -> close"
-            yield ('fd = open("/dev/ptmx", O_RDWR|O_NOCTTY)', "open", ["/dev/ptmx\0", 0o2 | 0o400])
+            yield ('fd = open("/dev/ptmx", O_RDWR|O_NOCTTY)', "open", ["/dev/ptmx\0", 0o2 | 0o400, 0])
             if u2i(ret_history[-1]) >= 0:
                 fd = ret_history[-1]
                 yield ("close(fd)", "close", [fd])
 
             yield "open /proc/self/stat -> close"
-            yield ('fd = open("/proc/self/stat", O_RDONLY)', "open", ["/proc/self/stat\0", 0])
+            yield ('fd = open("/proc/self/stat", O_RDONLY)', "open", ["/proc/self/stat\0", 0, 0])
             if u2i(ret_history[-1]) >= 0:
                 fd = ret_history[-1]
                 yield ("close(fd)", "close", [fd])
@@ -2359,14 +2456,13 @@ class KmallocAllocatedByCommand(GenericCommand):
                 continue
 
             desc, syscall_name, args = testcase
+            if test_dir not in desc:
+                desc = desc.replace("/tmp/", test_dir + "/")
             gef_print(titlify("{:s};".format(desc)))
             self.setup_syscall(syscall_name, args)
             for bp in breakpoints:
                 bp.enabled = True
-            gdb.execute("continue")
-
-            # here, stop at hw breakpoint
-            ret = get_register(runtime.current_arch.return_register)
+            ret = self.continue_syscall(syscall_name)
             gef_print("ret: {:#x}".format(ret))
             if u2i(ret) < 0:
                 gef_print(Color.colorify("WARNING: r < 0", "bold red underline"))
@@ -2377,20 +2473,14 @@ class KmallocAllocatedByCommand(GenericCommand):
                 bp.enabled = False
 
         self.dump_untested_syscall()
-
-        self.setup_syscall("exit", [0])
         return
 
-    def cleanup(self, hwbp, breakpoints):
-        # clean up
-        from gef.commands.debugging.context import ContextCommand
-        hwbp.delete()
-        for bp in breakpoints:
-            bp.delete()
-        KmallocTracerCommand.clear_disabled_breakpoints("KmallocRetBreakpoint", force=True)
-        ContextCommand.unhide_context()
-        info("Exiting `sleep` process... (Please issue Ctrl+C)")
-        gdb.execute("continue")
+    def cleanup(self, hwbp, option_info):
+        for bp in gdb.breakpoints() or ():
+            if bp != hwbp and getattr(bp, "option", None) is not option_info:
+                continue
+            if bp.is_valid():
+                bp.delete()
         return
 
     @parse_args
@@ -2401,10 +2491,12 @@ class KmallocAllocatedByCommand(GenericCommand):
     @only_if_kvm_disabled
     @only_if_smp_disabled
     def do_invoke(self, args):
-        from gef.commands.debugging.context import ContextCommand
         info("Wait for memory scan")
 
-        kversion = Kernel.kernel_version()
+        kversion = Kernel.version()
+        if kversion is None:
+            err("Could not find Linux kernel")
+            return
         if kversion < "3.0":
             err("Unsupported before v3.0")
             return
@@ -2418,15 +2510,13 @@ class KmallocAllocatedByCommand(GenericCommand):
             # fall through
 
         # initialize
-        if not hasattr(self, "initialized"):
-            ret = KmallocTracerCommand.initialize(allocator, args.verbose)
-            if ret is False:
+        self.extra_info = None
+        if allocator == "SLUB":
+            self.extra_info = KmallocTracerCommand.get_extra_info()
+            if self.extra_info is None:
                 err("Failed to initialize")
                 return
-            self.initialized = True
-            self.extra_info = ret # allow None
-        else:
-            if args.verbose and self.extra_info:
+            if args.meta:
                 info("offsetof({:s}, slab_cache): {:#x}".format(Kernel.slab_page_str(), self.extra_info.page_offset_slab_cache))
                 info("offsetof(kmem_cache, name): {:#x}".format(self.extra_info.kmem_cache_offset_name))
                 info("offsetof(kmem_cache, size): {:#x}".format(self.extra_info.kmem_cache_offset_size))
@@ -2436,8 +2526,8 @@ class KmallocAllocatedByCommand(GenericCommand):
         if syscall_table is None:
             err("Could not find the syscall table")
             return
-        self.syscall_table = {e.name: n for n, e in syscall_table.nr_table.items() if n < 0x1000}
-        self.syscall_table_view_ret = gdb.execute("syscall-table-view --no-pager --quiet", to_string=True)
+        self.syscall_table = {e.name: e for n, e in syscall_table.nr_table.items() if n < 0x1000}
+        self.ksyscalls_ret = gdb.execute("ksyscalls --no-pager --quiet", to_string=True)
 
         # get task
         res = gdb.execute("ktask --print-regs --no-pager --quiet --filter sleep", to_string=True)
@@ -2470,32 +2560,42 @@ class KmallocAllocatedByCommand(GenericCommand):
             rip_of_sleep, rsp_of_sleep,
         ))
 
-        # set a hw breakpoints
-        hwbp = KmallocAllocatedBy_UserlandHardwareBreakpoint(rip_of_sleep)
+        hwbp = None
+        with ContextManager.hidden_context():
+            try:
+                hwbp = KmallocAllocatedBy_UserlandHardwareBreakpoint(rip_of_sleep, target_task)
+                self.hwbp = hwbp
+                breakpoints = KmallocTracerCommand.set_bp_to_kmalloc_kfree(option_info, self.extra_info)
+                info("Setup is complete. continuing...")
+                gdb.execute("continue")
 
-        # set kmalloc breakpoints (but disabled)
-        breakpoints = KmallocTracerCommand.set_bp_to_kmalloc_kfree(option_info, self.extra_info)
+                if not hwbp.matched or runtime.current_arch.pc != rip_of_sleep:
+                    raise gdb.GdbError("Not stopped at the expected sleep syscall return")
+                if get_register("$cs") & 3 != 3 or runtime.current_arch.ptrsize != 8:
+                    raise gdb.GdbError("Expected a 64-bit userspace syscall return")
+                self.syscall_pc = rip_of_sleep - 2
+                self.scratch_start = runtime.current_arch.sp
+                self.scratch_end = runtime.current_arch.sp
+                self.tested_syscall = set()
+                self.setup_syscall("mmap", [0, 0x10000, 3, 0x8022, -1, 0])
+                scratch = self.continue_syscall("mmap")
+                if u2i(scratch) < 0:
+                    raise gdb.GdbError("Could not allocate syscall scratch memory")
+                self.scratch_start = scratch + 0x8000
+                self.scratch_end = scratch + 0x10000
+                gdb.execute("set $rsp={:#x}".format(self.scratch_start), to_string=True)
+                gdb.execute("set $rip={:#x}".format(rip_of_sleep), to_string=True)
+                hwbp.sp = self.scratch_start
 
-        # wait to stop at userland `sleep` process
-        ContextCommand.hide_context()
-        info("Setup is complete. continuing...")
+                self.test_syscall(breakpoints)
+                info("Syscall test is complete, cleaning up...")
+                self.setup_syscall("exit", [0])
+            finally:
+                self.cleanup(hwbp, option_info)
+        info("Exiting `sleep` process... (Please issue Ctrl+C)")
         gdb.execute("continue")
-
-        # here, stop in userland `sleep` process
-        if runtime.current_arch.sp != rsp_of_sleep:
-            err("Stack pointer is different from expected. Unable to continue")
-            self.cleanup(hwbp, breakpoints)
-            return
-        # rsp align
-        gdb.execute("set $rsp = {:#x}".format(rsp_of_sleep & ~0xf))
-        # For some reason, setting rsp can break rip. Here's a workaround for that.
-        gdb.execute("set $rip = {:#x}".format(rip_of_sleep))
-
-        # do test
-        self.test_syscall(breakpoints)
-        info("Syscall test is complete, cleaning up...")
-        self.cleanup(hwbp, breakpoints)
         return
+
 
 
 class KtraceBreakpoint(gdb.Breakpoint):
@@ -2610,46 +2710,25 @@ class KtraceRetBreakpoint(gdb.FinishBreakpoint):
 
 @register_command
 class KernelTraceCommand(GenericCommand):
-    """Trace kernel functions and arguments."""
+    """Trace arguments and returns of the specified kernel functions."""
 
     _cmdline_ = "ktrace"
     _category_ = "06-i. Qemu-system/KGDB Cooperation - Linux Dynamic Inspection"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
-    parser.add_argument("--task-name", action="append", default=[],
-                        help="task name (from `ktask`) for filtering.")
-    parser.add_argument("--task-addr", action="append", type=AddressUtil.parse_address, default=[],
-                        help="task address for filtering.")
-    parser.add_argument("-f", "--filter", action="append", type=re.compile, default=[],
-                        help="function include filter (REGEXP).")
-    parser.add_argument("-e", "--exclude", action="append", type=re.compile, default=[],
-                        help="function exclude filter (REGEXP).")
-    parser.add_argument("-c", "--commit", action="store_true", help="actually perform ktrace.")
-    parser.add_argument("-q", "--quiet", action="store_true", help="skip tqdm and displaying function name.")
+    parser.add_argument("function", metavar="FUNCTION", nargs="+", help="exact kernel function names.")
+    parser.add_argument("--asmlinkage", action="store_true", help="use the i386 stack ABI for selected functions.")
     _syntax_ = parser.format_help()
 
+    _example_ = "{0:s} commit_creds prepare_kernel_cred".format(_cmdline_)
+
     _note_ = [
-        "If you set breakpoints in some commonly called functions, it became too slow to be useful.",
-        "Use filtering options to reduce the number of functions targeted by breakpoints as much as possible.",
+        "All definitions of each exact function name are included; duplicate addresses are skipped.",
+        "Arguments are six guessed machine words; function prototypes and pt_regs syscall arguments are not decoded.",
+        "Tracing continues until interrupted or stopped by another breakpoint; tracing breakpoints are then removed.",
+        "Tail calls and non-local exits may have no observed return.",
     ]
     _note_ = "\n".join(_note_)
-
-    finish_breakpoints = []
-
-    def is_valid_addr(self, addr):
-        page_start = addr & get_pagesize_mask_low()
-
-        if page_start in self.addr_range_ok_cache:
-            return True
-        if page_start in self.addr_range_ng_cache:
-            return False
-
-        if is_valid_addr(addr):
-            self.addr_range_ok_cache.append(page_start)
-            return True
-        else:
-            self.addr_range_ng_cache.append(page_start)
-            return False
 
     @parse_args
     @only_if_gdb_running
@@ -2658,81 +2737,1047 @@ class KernelTraceCommand(GenericCommand):
     @only_if_in_kernel
     @only_if_kvm_disabled
     def do_invoke(self, args):
-        info("Wait for memory scan")
-
-        # check if text base is available
-        text_base = Symbol.get_ksymaddr("_stext")
-        if text_base is None:
-            err("Failed to get kernel base (_stext)")
+        ret = Ksym.get_kallsyms()
+        if ret is None:
+            err("Could not resolve kernel symbols")
             return
-
-        self.addr_range_ok_cache = []
-        self.addr_range_ng_cache = []
-
-        # list target functions
-        res = gdb.execute("ksymaddr-remote --quiet --no-pager --type t", to_string=True)
-        target_functions = []
-        tqdm = GefUtil.get_tqdm(not args.quiet)
-        for line in tqdm(res.splitlines(), leave=False):
-            func_addr, _, func_name = line.split()
-            func_addr = int(func_addr, 16)
-
-            # user specified filtering
-            if args.filter and not any(filt.search(func_name) for filt in args.filter):
-                continue
-            if args.exclude and any(filt.search(func_name) for filt in args.exclude):
-                continue
-
-            # lower address is percpu-relative.
-            if func_addr < text_base:
-                continue
-
-            # The function with `init` attribute may no longer exist.
-            if not self.is_valid_addr(func_addr):
-                continue
-
-            target_functions.append([func_addr, func_name])
-
-        # check num of breakpoints
-        info("Num of breakpoint targets: {:d}".format(len(target_functions)))
-        if len(target_functions) > 1000:
-            err("Too many breakpoints cause this to not work properly (>1000)")
-            return
-
-        if len(target_functions) > 100:
-            warn("Too many breakpoints may cause this to not work properly (>100)")
-
-        # debug print
-        if not args.quiet:
-            for func_addr, func_name in target_functions:
-                info("{:#x} {:s}".format(func_addr, func_name))
-
-        # not commit
-        if not args.commit:
-            warn('This dry run mode skips executing; add "--commit" to proceed')
-            return
-
-        # set break points
-        info("Set breakpoints in all functions that match the specified criteria")
-        breakpoints = []
-        for func_addr, func_name in target_functions:
-            bp = KtraceBreakpoint(func_addr, func_name, args.task_name, args.task_addr)
-            breakpoints.append(bp)
-
-        # Locking a thread can have disadvantages: such as making it impossible to enter commands
-        # from the guest's terminal. Therefore, we decided not to disable it.
-
-        # doit
-        info("Setup is complete (set {:d} braekpoints). continuing...".format(len(breakpoints)))
-        gdb.execute("continue")
-
-        # clean up
-        info("ktrace is complete, cleaning up...")
-        for bp in breakpoints:
-            bp.delete()
-        while KernelTraceCommand.finish_breakpoints:
-            bp = KernelTraceCommand.finish_breakpoints.pop()
-            if bp.is_valid():
-                bp.delete()
+        requested = set(args.function)
+        functions = collections.defaultdict(list)
+        for addr, name, typ in ret[0]:
+            if name in requested and typ.lower() in ("t", "w"):
+                functions[name].append(addr)
+        targets = {}
+        for name in dict.fromkeys(args.function):
+            if not functions[name]:
+                err("Could not find kernel function: {:s}".format(name))
+                return
+            for addr in functions[name]:
+                targets.setdefault(addr, name)
+        self.call_ids = itertools.count(1)
+        if is_x86_32():
+            info("Argument ABI: {:s}".format("asmlinkage (stack)" if args.asmlinkage else "regparm=3"))
+        try:
+            for addr, name in targets.items():
+                gef_print(name + ": ", end="")
+                KtraceBreakpoint(addr, name, self, args.asmlinkage)
+            info("Setup is complete (set {:d} breakpoints). continuing...".format(len(targets)))
+            gdb.execute("continue")
+            info("ktrace is complete, cleaning up...")
+        finally:
+            GefUtil.delete_breakpoints(self, report_pending=True)
         return
 
+
+
+class KuafWatchAllocBreakpoint(gdb.Breakpoint):
+    """Create a breakpoint at an allocator entry for kuaf-watch."""
+
+    def __init__(self, loc, sym, watcher):
+        super().__init__("*{:#x}".format(loc), gdb.BP_BREAKPOINT, internal=False)
+        self.sym = sym
+        self.watcher = watcher
+        self.enabled = False
+        return
+
+    def stop(self):
+        Cache.reset_gef_caches()
+        # Capture the caller and execution context before the function can schedule.
+        try:
+            ret_addr = KmallocTracerCommand.get_return_address()
+        except gdb.error:
+            return False
+        KuafWatchAllocRetBreakpoint(ret_addr, self.sym, ret_addr, self.watcher)
+        return False
+
+
+
+class KuafWatchAllocRetBreakpoint(gdb.Breakpoint):
+    """Create a breakpoint at an allocator return for kuaf-watch."""
+
+    def __init__(self, loc, sym, caller_pc, watcher):
+        super().__init__("*{:#x}".format(loc), gdb.BP_BREAKPOINT, internal=True)
+        self.sym = sym
+        self.caller_pc = caller_pc
+        self.watcher = watcher
+        task_addr, task_name = KmallocTracerCommand.get_task()
+        self.call_context = Kernel.get_call_context(task_addr)
+        KmallocTracerCommand.clear_disabled_breakpoints("KuafWatchAllocRetBreakpoint", owner=self.watcher)
+        return
+
+    def stop(self):
+        Cache.reset_gef_caches()
+        task_addr, task_name = KmallocTracerCommand.get_task()
+        if self.call_context != Kernel.get_call_context(task_addr, at_return=True):
+            return False
+        allocated = AddressUtil.parse_address(runtime.current_arch.return_register)
+        self.enabled = False
+        return self.watcher.handle_alloc(allocated, self.sym, self.caller_pc)
+
+
+
+class KuafWatchFreeBreakpoint(gdb.Breakpoint):
+    """Create a breakpoint at kfree for kuaf-watch."""
+
+    def __init__(self, loc, sym, index_of_addr_arg, watcher):
+        super().__init__("*{:#x}".format(loc), gdb.BP_BREAKPOINT, internal=False)
+        self.sym = sym
+        self.index_of_addr_arg = index_of_addr_arg
+        self.watcher = watcher
+        self.enabled = False
+        return
+
+    def stop(self):
+        Cache.reset_gef_caches()
+        to_free = KmallocTracerCommand.get_ith_parameter(self.index_of_addr_arg)
+        if to_free == 0:
+            return False
+        caller_pc = KmallocTracerCommand.get_return_address()
+        return self.watcher.handle_free(to_free, self.sym, caller_pc)
+
+
+
+class KuafWatchBulkFreeBreakpoint(gdb.Breakpoint):
+    """Create a breakpoint at kmem_cache_free_bulk for kuaf-watch."""
+
+    def __init__(self, loc, sym, watcher):
+        super().__init__("*{:#x}".format(loc), gdb.BP_BREAKPOINT, internal=False)
+        self.sym = sym
+        self.watcher = watcher
+        self.enabled = False
+        return
+
+    def stop(self):
+        Cache.reset_gef_caches()
+        size = KmallocTracerCommand.get_ith_parameter(1)
+        objects = KmallocTracerCommand.get_ith_parameter(2)
+        if size == 0 or objects == 0:
+            return False
+
+        caller_pc = KmallocTracerCommand.get_return_address()
+        stop = False
+        ptrsize = runtime.current_arch.ptrsize
+        try:
+            # Keep remote reads bounded while still handling every object in the batch.
+            for index in range(0, size, 256):
+                count = min(size - index, 256)
+                data = read_memory(objects + index * ptrsize, count * ptrsize)
+                for to_free in slice_unpack(data, ptrsize):
+                    if to_free == 0:
+                        continue
+                    # In object mode avoid the comparatively expensive slab lookup for
+                    # unrelated entries. Cache mode intentionally resolves every entry.
+                    if self.watcher.cache_name is None and to_free not in self.watcher.watched:
+                        continue
+                    stop |= self.watcher.handle_free(to_free, self.sym, caller_pc)
+        except (gdb.error, OverflowError, ValueError):
+            pass
+        return stop
+
+
+
+@register_command
+class KuafWatchCommand(GenericCommand):
+    """Track the alloc/free/reuse lifecycle of a slab object (or an entire cache) for UAF analysis."""
+
+    _cmdline_ = "kuaf-watch"
+    _category_ = "06-i. Qemu-system/KGDB Cooperation - Linux Dynamic Inspection"
+
+    parser = argparse.ArgumentParser(prog=_cmdline_)
+    parser.add_argument("address", metavar="ADDRESS", nargs="*", type=AddressUtil.parse_address,
+                        help="the slab object address(es) (or interior pointer) to watch.")
+    parser.add_argument("-c", "--cache", help="follow an entire slab cache by name instead of specific objects.")
+    parser.add_argument("-s", "--stop-on-reuse", action="store_true", help="stop at the first reuse (re-allocation) event.")
+    parser.add_argument("-t", "--backtrace", action="store_true", help="display a backtrace for each event.")
+    _syntax_ = parser.format_help()
+
+    _example_ = [
+        "{0:s} 0xffff888012345600                     # watch one object's alloc/free/reuse",
+        "{0:s} 0xffff888012345600 0xffff888012345700  # watch several objects at once",
+        "{0:s} --cache kmalloc-256                    # watch every object of a cache",
+        "{0:s} 0xffff888012345600 -s                  # break at the first reuse",
+    ]
+    _example_ = "\n".join(_example_).format(_cmdline_)
+
+    _note_ = [
+        "Disable `-enable-kvm` option for qemu-system (#PF may occur).",
+        "Append `tsc=unstable` option for kernel cmdline.",
+        "This is a higher-level view built on the same allocator breakpoints as kmalloc-tracer.",
+        "In --cache mode the slab cache of every alloc/free is resolved, which is slower than single-object mode.",
+        "This command requires CONFIG_RANDSTRUCT=n.",
+    ]
+    _note_ = "\n".join(_note_)
+
+    def resolve_offsets(self):
+        self.offset_pid = None
+        ret = gdb.execute("ktask --no-pager --meta", to_string=True)
+        r = re.search(r"offsetof\(task_struct, pid\): (0x\S+)", ret)
+        if r:
+            self.offset_pid = int(r.group(1), 16)
+        return
+
+    def get_task_info(self):
+        cpu = KernelPerCpu.get_cpu_index(gdb.selected_thread())
+        task_addr, comm = KmallocTracerCommand.get_task()
+        pid = None
+        if task_addr and self.offset_pid is not None:
+            pid = read_int32_from_memory(task_addr + self.offset_pid)
+        return task_addr, comm, pid, cpu
+
+    def lookup_cache(self, addr):
+        ret = KmallocTracerCommand.virt2name_and_size(addr)
+        if ret:
+            return ret[0]
+        return None
+
+    def resolve_object(self, addr):
+        """Resolve (object_base, cache_name, object_size, state) for a slab address, or None."""
+        out = Color.remove_color(gdb.execute("slab-contains {:#x}".format(addr), to_string=True))
+        m = re.search(r"^name: (\S+)\s+object_size: (\S+)", out, re.M)
+        if not m:
+            return None
+        name, object_size = m.group(1), int(m.group(2), 0)
+        m = re.search(r"^object_base: (0x\S+)", out, re.M)
+        if not m:
+            return None
+        base = int(m.group(1), 16)
+        m = re.search(r"^status: (freed|in-use)", out, re.M)
+        state = None
+        if m:
+            if m.group(1) == "freed":
+                state = "freed"
+            else:
+                state = "allocated"
+        return base, name, object_size, state
+
+    def emit_event(self, tag, addr, cache, caller_pc, api):
+        _task_addr, _comm, pid, cpu = self.get_task_info()
+        caller = Symbol.format(caller_pc, bracket="", missing="?" if caller_pc is None else "{:#x}".format(caller_pc))
+        if tag == "FREE":
+            theme = "theme.heap_chunk_address_freed"
+        else:
+            theme = "theme.heap_chunk_address_used"
+        addr_s = Color.colorify_hex(addr, Config.get(theme))
+        cache_s = Color.colorify(cache or "?", Config.get("theme.heap_chunk_label"))
+        gef_print("[{:5s}] {:s}  cache={:s}".format(tag, addr_s, cache_s))
+        if pid is None:
+            pid_s = "?"
+        else:
+            pid_s = "{:d}".format(pid)
+        gef_print("        caller={:s}  pid={:s} cpu={:s}  api={:s}".format(
+            caller, pid_s, "?" if cpu is None else str(cpu), api,
+        ))
+        if self.backtrace:
+            KmallocTracerCommand.print_backtrace(True)
+        return
+
+    def handle_alloc(self, allocated, sym, caller_pc):
+        if self.cache_name is None:
+            if allocated not in self.watched:
+                return False
+            cache = self.lookup_cache(allocated) or self.watched[allocated]
+        else:
+            cache = self.lookup_cache(allocated)
+            if cache != self.cache_name:
+                return False
+        reuse = allocated in self.freed_slots
+        self.freed_slots.discard(allocated)
+        self.emit_event("ALLOC", allocated, cache, caller_pc, sym)
+        return self.stop_on_reuse and reuse
+
+    def handle_free(self, to_free, sym, caller_pc):
+        if self.cache_name is None:
+            if to_free not in self.watched:
+                return False
+            cache = self.watched[to_free]
+        else:
+            cache = self.lookup_cache(to_free)
+            if cache != self.cache_name:
+                return False
+        self.freed_slots.add(to_free)
+        self.emit_event("FREE", to_free, cache, caller_pc, sym)
+        return False
+
+    @parse_args
+    @only_if_gdb_running
+    @only_if_specific_gdb_mode(mode=("qemu-system",))
+    @only_if_specific_arch(arch=("x86_32", "x86_64", "ARM32", "ARM64"))
+    @only_if_in_kernel
+    @only_if_kvm_disabled
+    def do_invoke(self, args):
+        if args.cache is None and not args.address:
+            err("Specify an ADDRESS or --cache CACHE")
+            return
+
+        kversion = Kernel.version()
+        if kversion is None:
+            err("Could not find Linux kernel")
+            return
+        if kversion < "3.0":
+            err("Unsupported before v3.0")
+            return
+
+        allocator = Kernel.get_slab_type()
+        if allocator not in ["SLUB", "SLUB_TINY", "SLAB"]:
+            err("Unsupported: SLOB, Unknown allocator")
+            return
+
+        info("Wait for memory scan")
+        self.resolve_offsets()
+        self.stop_on_reuse = args.stop_on_reuse
+        self.backtrace = args.backtrace
+        self.watched = {}
+        self.freed_slots = set()
+
+        if args.cache is not None:
+            self.cache_name = args.cache
+            info("Watching cache: {:s}".format(Color.colorify(self.cache_name, Config.get("theme.heap_chunk_label"))))
+        else:
+            self.cache_name = None
+            for address in args.address:
+                resolved = self.resolve_object(address)
+                if resolved is None:
+                    err("{:#x} is not a slab object".format(address))
+                    continue
+                base, cache, object_size, state = resolved
+                if base in self.watched:
+                    # several interior pointers can designate the same object
+                    continue
+                self.watched[base] = cache
+                if state == "freed":
+                    self.freed_slots.add(base)
+                gef_print("[{:5s}] {:s}  cache={:s}  object_size={:#x}  state={:s}".format(
+                    "WATCH",
+                    Color.colorify_hex(base, Config.get("theme.heap_chunk_address_used")),
+                    Color.colorify(cache, Config.get("theme.heap_chunk_label")),
+                    object_size, state or "unknown",
+                ))
+            if not self.watched:
+                err("No slab object to watch")
+                return
+
+        try:
+            # set breakpoints (reuse kmalloc-tracer's allocator symbol tables)
+            kmalloc_syms, kfree_syms = KmallocTracerCommand.get_kmalloc_kfree_syms()
+            # Dedicated caches (task_struct, cred, filp, ...) - the usual UAF targets - are
+            # released with kmem_cache_free, not kfree, so track it as well (ptr is arg 1).
+            kfree_syms = kfree_syms + [["kmem_cache_free", 1]]
+            breakpoints = []
+            for sym, _index_of_size_arg in kmalloc_syms:
+                func_addr = Ksym.get_addr(sym)
+                if func_addr:
+                    gef_print(sym + ": ", end="")
+                    breakpoints.append(KuafWatchAllocBreakpoint(func_addr, sym, self))
+            for sym, index_of_addr_arg in kfree_syms:
+                func_addr = Ksym.get_addr(sym)
+                if func_addr:
+                    gef_print(sym + ": ", end="")
+                    breakpoints.append(KuafWatchFreeBreakpoint(func_addr, sym, index_of_addr_arg, self))
+            bulk_free_sym = "kmem_cache_free_bulk"
+            func_addr = Ksym.get_addr(bulk_free_sym)
+            if func_addr:
+                gef_print(bulk_free_sym + ": ", end="")
+                breakpoints.append(KuafWatchBulkFreeBreakpoint(func_addr, bulk_free_sym, self))
+            if not breakpoints:
+                warn("No allocator hooks resolved; nothing will be observed")
+                return
+            for bp in breakpoints:
+                bp.enabled = True
+
+            info("Setup is complete. continuing...")
+            gdb.execute("continue")
+
+        finally:
+            info("kuaf-watch is complete, cleaning up...")
+            GefUtil.delete_breakpoints(self, report_pending=True)
+        return
+
+
+
+class KpageWatchAllocBreakpoint(gdb.Breakpoint):
+    """Create a breakpoint at the page allocator entry for kpage-watch."""
+
+    def __init__(self, loc, sym, index_of_order_arg, watcher):
+        super().__init__("*{:#x}".format(loc), gdb.BP_BREAKPOINT, internal=False)
+        self.sym = sym
+        self.index_of_order_arg = index_of_order_arg
+        self.watcher = watcher
+        self.enabled = False
+        return
+
+    def stop(self):
+        Cache.reset_gef_caches()
+        task_addr, task_name = KmallocTracerCommand.get_task()
+        # the bulk allocator falls back to this one; its return records the page instead
+        names = ["KpageWatchAllocRetBreakpoint", "KpageWatchAllocBulkRetBreakpoint"]
+        if GefUtil.is_nested_call(self.watcher, names, task_addr):
+            return False
+        order = KmallocTracerCommand.get_ith_parameter(self.index_of_order_arg)
+        caller_pc = KmallocTracerCommand.get_return_address()
+        KpageWatchAllocRetBreakpoint(caller_pc, self.sym, order, caller_pc, task_addr, self.watcher)
+        return False
+
+
+
+class KpageWatchAllocRetBreakpoint(gdb.Breakpoint):
+    """Create a breakpoint at the page allocator return for kpage-watch."""
+
+    def __init__(self, loc, sym, order, caller_pc, task_addr, watcher):
+        super().__init__("*{:#x}".format(loc), gdb.BP_BREAKPOINT, internal=True)
+        self.sym = sym
+        self.order = order
+        self.caller_pc = caller_pc
+        self.task_addr = task_addr
+        self.watcher = watcher
+        self.call_context = Kernel.get_call_context(task_addr)
+        self.interrupt_context = Kernel.get_interrupt_context()
+        KmallocTracerCommand.clear_disabled_breakpoints("KpageWatchAllocRetBreakpoint", owner=self.watcher)
+        return
+
+    def stop(self):
+        Cache.reset_gef_caches()
+        task_addr, task_name = KmallocTracerCommand.get_task()
+        if self.call_context != Kernel.get_call_context(task_addr, at_return=True):
+            return False
+        self.enabled = False
+        page = AddressUtil.parse_address(runtime.current_arch.return_register)
+        return self.watcher.record("alloc", self.sym, page, order=self.order, caller_pc=self.caller_pc)
+
+
+
+class KpageWatchAllocBulkBreakpoint(gdb.Breakpoint):
+    """Create a breakpoint at the bulk page allocator entry for kpage-watch."""
+
+    def __init__(self, loc, sym, has_page_list, watcher):
+        super().__init__("*{:#x}".format(loc), gdb.BP_BREAKPOINT, internal=False)
+        self.sym = sym
+        self.has_page_list = has_page_list
+        self.watcher = watcher
+        self.enabled = False
+        return
+
+    def stop(self):
+        Cache.reset_gef_caches()
+        task_addr, task_name = KmallocTracerCommand.get_task()
+        # (gfp, preferred_nid, nodemask, int nr_pages, struct list_head *page_list (~v6.13), struct page **page_array)
+        nr_pages = u2i(KmallocTracerCommand.get_ith_parameter(3), 32)
+        if self.has_page_list:
+            page_list = KmallocTracerCommand.get_ith_parameter(4)
+        else:
+            page_list = 0
+        page_array = KmallocTracerCommand.get_ith_parameter(5 if self.has_page_list else 4)
+        pages_at_entry = self.watcher.watched_pages_in_bulk(page_list, page_array, nr_pages)
+        caller_pc = KmallocTracerCommand.get_return_address()
+        KpageWatchAllocBulkRetBreakpoint(caller_pc, self.sym, page_list, page_array, nr_pages, pages_at_entry, caller_pc,
+                                         task_addr, self.watcher)
+        return False
+
+
+
+class KpageWatchAllocBulkRetBreakpoint(gdb.Breakpoint):
+    """Create a breakpoint at the bulk page allocator return for kpage-watch."""
+
+    def __init__(self, loc, sym, page_list, page_array, nr_pages, pages_at_entry, caller_pc, task_addr, watcher):
+        super().__init__("*{:#x}".format(loc), gdb.BP_BREAKPOINT, internal=True)
+        self.sym = sym
+        self.page_list = page_list
+        self.page_array = page_array
+        self.nr_pages = nr_pages
+        self.pages_at_entry = pages_at_entry
+        self.caller_pc = caller_pc
+        self.task_addr = task_addr
+        self.watcher = watcher
+        self.call_context = Kernel.get_call_context(task_addr)
+        self.interrupt_context = Kernel.get_interrupt_context()
+        KmallocTracerCommand.clear_disabled_breakpoints("KpageWatchAllocBulkRetBreakpoint", owner=self.watcher)
+        return
+
+    def stop(self):
+        Cache.reset_gef_caches()
+        task_addr, task_name = KmallocTracerCommand.get_task()
+        if self.call_context != Kernel.get_call_context(task_addr, at_return=True):
+            return False
+        self.enabled = False
+        stop = False
+        # the pages that were already there at the entry are not allocated by this call
+        for page in self.watcher.watched_pages_in_bulk(self.page_list, self.page_array, self.nr_pages):
+            if page not in self.pages_at_entry:
+                stop |= self.watcher.record("alloc", self.sym, page, order=0, caller_pc=self.caller_pc)
+        return stop
+
+
+
+class KpageWatchFreeBreakpoint(gdb.Breakpoint):
+    """Create a breakpoint at the buddy free entry for kpage-watch."""
+
+    def __init__(self, loc, sym, index_of_page_arg, index_of_order_arg, watcher):
+        super().__init__("*{:#x}".format(loc), gdb.BP_BREAKPOINT, internal=False)
+        self.sym = sym
+        self.index_of_page_arg = index_of_page_arg
+        self.index_of_order_arg = index_of_order_arg
+        self.watcher = watcher
+        self.enabled = False
+        return
+
+    def stop(self):
+        Cache.reset_gef_caches()
+        page = KmallocTracerCommand.get_ith_parameter(self.index_of_page_arg)
+        order = 0
+        if self.index_of_order_arg is not None:
+            order = KmallocTracerCommand.get_ith_parameter(self.index_of_order_arg)
+        caller_pc = KmallocTracerCommand.get_return_address()
+        return self.watcher.record("free", self.sym, page, order=order, caller_pc=caller_pc)
+
+
+
+class KpageWatchBatchFreeBreakpoint(gdb.Breakpoint):
+    """Create a breakpoint at the batched free path (folio_batch or page list) for kpage-watch.
+    These paths return order-0 pages straight to the pcp lists without going through
+    free_frozen_pages/__free_pages, so a page freed here would otherwise be missed."""
+
+    def __init__(self, loc, sym, mode, watcher):
+        super().__init__("*{:#x}".format(loc), gdb.BP_BREAKPOINT, internal=False)
+        self.sym = sym
+        self.mode = mode
+        self.watcher = watcher
+        self.enabled = False
+        return
+
+    def stop(self):
+        Cache.reset_gef_caches()
+        arg0 = KmallocTracerCommand.get_ith_parameter(0)
+        caller_pc = KmallocTracerCommand.get_return_address()
+        stop = False
+        try:
+            if self.mode == "folio_batch":
+                # struct folio_batch { u8 nr; u8 i; bool drained; struct folio *folios[PAGEVEC_SIZE]; }
+                nr = read_int8_from_memory(arg0)
+                for i in range(min(nr, 31)):
+                    folio = read_int_from_memory(arg0 + runtime.current_arch.ptrsize + runtime.current_arch.ptrsize * i)
+                    # a large folio (e.g. THP) is freed here as well
+                    order = self.watcher.folio_order(folio)
+                    stop |= self.watcher.record("free", self.sym, folio, order=order, caller_pc=caller_pc)
+            else:
+                # a list_head of pages linked by page->lru; a watched page matches when a node
+                # falls inside its struct page (no need to know offsetof(page, lru)).
+                for page in self.watcher.watched_pages_in_list(arg0):
+                    stop |= self.watcher.record("free", self.sym, page, order=0, caller_pc=caller_pc)
+        except gdb.error:
+            pass
+        return stop
+
+
+
+class KpageWatchSlabBreakpoint(gdb.Breakpoint):
+    """Create a breakpoint at allocate_slab entry for kpage-watch."""
+
+    def __init__(self, loc, sym, page_kind, watcher):
+        super().__init__("*{:#x}".format(loc), gdb.BP_BREAKPOINT, internal=False)
+        self.sym = sym
+        self.page_kind = page_kind
+        self.watcher = watcher
+        self.enabled = False
+        return
+
+    def stop(self):
+        Cache.reset_gef_caches()
+        task_addr, task_name = KmallocTracerCommand.get_task()
+        if GefUtil.is_nested_call(self.watcher, ["KpageWatchSlabRetBreakpoint"], task_addr):
+            return False
+        kmem_cache = KmallocTracerCommand.get_ith_parameter(0)
+        caller_pc = KmallocTracerCommand.get_return_address()
+        KpageWatchSlabRetBreakpoint(caller_pc, self.sym, self.page_kind, kmem_cache, caller_pc, task_addr, self.watcher)
+        return False
+
+
+
+class KpageWatchSlabRetBreakpoint(gdb.Breakpoint):
+    """Create a breakpoint at allocate_slab return for kpage-watch."""
+
+    def __init__(self, loc, sym, page_kind, kmem_cache, caller_pc, task_addr, watcher):
+        super().__init__("*{:#x}".format(loc), gdb.BP_BREAKPOINT, internal=True)
+        self.sym = sym
+        self.page_kind = page_kind
+        self.kmem_cache = kmem_cache
+        self.caller_pc = caller_pc
+        self.task_addr = task_addr
+        self.watcher = watcher
+        self.call_context = Kernel.get_call_context(task_addr)
+        self.interrupt_context = Kernel.get_interrupt_context()
+        KmallocTracerCommand.clear_disabled_breakpoints("KpageWatchSlabRetBreakpoint", owner=self.watcher)
+        return
+
+    def stop(self):
+        Cache.reset_gef_caches()
+        task_addr, task_name = KmallocTracerCommand.get_task()
+        if self.call_context != Kernel.get_call_context(task_addr, at_return=True):
+            return False
+        self.enabled = False
+        page = self.watcher.slab_page(AddressUtil.parse_address(runtime.current_arch.return_register), self.page_kind)
+        return self.watcher.record("slab_assign", self.sym, page, caller_pc=self.caller_pc, kmem_cache=self.kmem_cache)
+
+
+
+class KpageWatchSlabFreeBreakpoint(gdb.Breakpoint):
+    """Create a breakpoint at __free_slab entry for kpage-watch."""
+
+    def __init__(self, loc, sym, page_kind, watcher):
+        super().__init__("*{:#x}".format(loc), gdb.BP_BREAKPOINT, internal=False)
+        self.sym = sym
+        self.page_kind = page_kind
+        self.watcher = watcher
+        self.enabled = False
+        return
+
+    def stop(self):
+        Cache.reset_gef_caches()
+        kmem_cache = KmallocTracerCommand.get_ith_parameter(0)
+        page = self.watcher.slab_page(KmallocTracerCommand.get_ith_parameter(1), self.page_kind)
+        caller_pc = KmallocTracerCommand.get_return_address()
+        return self.watcher.record("slab_free", self.sym, page, caller_pc=caller_pc, kmem_cache=kmem_cache)
+
+
+
+@register_command
+class KpageWatchCommand(GenericCommand):
+    """Track the alloc/free/slab lifecycle of a physical page (PFN) for cross-cache analysis."""
+
+    _cmdline_ = "kpage-watch"
+    _category_ = "06-i. Qemu-system/KGDB Cooperation - Linux Dynamic Inspection"
+
+    parser = argparse.ArgumentParser(prog=_cmdline_)
+    parser.add_argument("address", metavar="ADDRESS", nargs="*", type=AddressUtil.parse_address,
+                        help="the virtual address(es) whose backing page is watched.")
+    parser.add_argument("-p", "--page", action="append", default=[], type=AddressUtil.parse_address,
+                        help="watch by `struct page` address instead of a virtual address (can be repeated).")
+    parser.add_argument("--pfn", action="append", default=[], type=AddressUtil.parse_address,
+                        help="watch by page frame number (PFN) (can be repeated).")
+    parser.add_argument("-s", "--stop-on-reuse", action="store_true",
+                        help="stop at the first reuse (a re-allocation after a free).")
+    parser.add_argument("-t", "--backtrace", action="store_true", help="display a backtrace for each event.")
+    _syntax_ = parser.format_help()
+
+    _example_ = [
+        "{0:s} 0xffff888012345600                           # watch the page backing this virtual address",
+        "{0:s} 0xffff888012345600 0xffff888012346000        # watch several pages at once",
+        "{0:s} -p 0xffffea000048d140 -p 0xffffea000048d180  # watch by struct page address",
+        "{0:s} --pfn 0x12345 --pfn 0x12346                  # watch by PFN",
+        "{0:s} 0xffff888012345600 -s                        # stop at the first reuse",
+    ]
+    _example_ = "\n".join(_example_).format(_cmdline_)
+
+    _note_ = [
+        "Disable `-enable-kvm` option for qemu-system (#PF may occur).",
+        "Append `tsc=unstable` option for kernel cmdline.",
+        "ADDRESS, --page and --pfn can be mixed; each resolves to one watched PFN.",
+        "This records events touching the watched PFNs, so the page-allocator/SLUB/page-table boundary is visible.",
+        "Only events reached while continuing are recorded; the history before the command started is not.",
+        "On SLAB the slab-assign hook may be missing (its helpers are inlined); page alloc/free and slab-release are still shown.",
+        "This command requires CONFIG_RANDSTRUCT=n.",
+    ]
+    _note_ = "\n".join(_note_)
+
+    def resolve_offsets(self):
+        self.name_offset = None
+        allocator = Kernel.get_slab_type()
+        command = {"SLUB": "slub-dump", "SLUB_TINY": "slub-tiny-dump", "SLAB": "slab-dump"}.get(allocator)
+        if command is None:
+            return
+        ret = Color.remove_color(gdb.execute("{:s} --meta --no-pager".format(command), to_string=True))
+        r = re.search(r"offsetof\(kmem_cache, name\): (0x\S+)", ret)
+        if r:
+            self.name_offset = int(r.group(1), 16)
+        return
+
+    def get_task_info(self):
+        thread = gdb.selected_thread()
+        cpu = KernelPerCpu.get_cpu_index(thread)
+        task_addr, comm = KmallocTracerCommand.get_task()
+        return task_addr, comm, cpu
+
+    def pfn_of(self, page):
+        if not is_valid_addr(page):
+            return None
+        phys = Kernel.page2phys(page)
+        if phys is None:
+            return None
+        return phys >> self.page_shift
+
+    def cache_name(self, kmem_cache):
+        if self.name_offset is None or not kmem_cache:
+            return None
+        try:
+            name_ptr = read_int_from_memory(kmem_cache + self.name_offset)
+            return read_cstring_from_memory(name_ptr)
+        except gdb.error:
+            return None
+
+    def slab_page(self, value, page_kind):
+        # SLAB before v3.13 passes page_address(page), and its slab_destroy() takes the slab descriptor
+        if page_kind == "virt":
+            if value:
+                return Kernel.virt2page(value)
+            return None
+        if page_kind == "slab_desc":
+            # struct slab { struct list_head list; unsigned long colouroff; void *s_mem; ... }
+            colouroff = read_int_from_memory(value + runtime.current_arch.ptrsize * 2)
+            s_mem = read_int_from_memory(value + runtime.current_arch.ptrsize * 3)
+            return Kernel.virt2page(s_mem - colouroff)
+        return value
+
+    def slab_matched_pfns(self, page):
+        # sibling command module: lazy import per layering rule 1
+        from gef.commands.kernel.page import PageInfoCommand
+        base_pfn = self.pfn_of(page)
+        if base_pfn is None:
+            return []
+        # a slab may be a compound page: compare the head PFN of both sides.
+        head = PageInfoCommand.get_head_page(page)
+        if head is None:
+            head_pfn = base_pfn
+        else:
+            head_pfn = self.pfn_of(head)
+        matched = []
+        for pfn, (target_page, _virt) in self.watched.items():
+            # a multi-page slab of SLAB before v3.13 is not compound: use the block seen when it was allocated
+            if pfn == base_pfn or self.blocks.get(pfn) == page:
+                matched.append(pfn)
+                continue
+            target_head = PageInfoCommand.get_head_page(target_page)
+            if target_head is not None and self.pfn_of(target_head) == head_pfn:
+                matched.append(pfn)
+        return matched
+
+    def watched_pages_in_list(self, list_head):
+        # walk a list_head of page->lru nodes; a watched page matches when a node lands
+        # inside its struct page, so offsetof(page, lru) never has to be known.
+        if not is_valid_addr(list_head):
+            return []
+        found = []
+        node = read_int_from_memory(list_head)
+        for _ in range(4096):
+            if node == list_head or not is_valid_addr(node):
+                break
+            for target_page, _virt in self.watched.values():
+                if target_page <= node < target_page + self.sizeof_struct_page:
+                    found.append(target_page)
+            node = read_int_from_memory(node)
+        return found
+
+    def watched_pages_in_bulk(self, page_list, page_array, nr_pages):
+        # the bulk allocator links order-0 pages to page_list, or fills the empty slots of page_array
+        if page_list:
+            return self.watched_pages_in_list(page_list)
+        if not is_valid_addr(page_array) or nr_pages <= 0:
+            return []
+        targets = [target_page for target_page, _virt in self.watched.values()]
+        pages = []
+        for index in range(0, nr_pages, 4096):
+            count = min(nr_pages - index, 4096)
+            data = read_memory(page_array + index * runtime.current_arch.ptrsize, count * runtime.current_arch.ptrsize)
+            pages.extend(page for page in slice_unpack(data, runtime.current_arch.ptrsize) if page in targets)
+        return pages
+
+    def folio_order(self, folio):
+        # sibling command module: lazy import per layering rule 1
+        from gef.commands.kernel.page import PageInfoCommand
+        # folio_order(): a large folio keeps its order in the low byte of _flags_1 (the flags of page[1])
+        if not PageInfoCommand.has_flag(read_int_from_memory(folio), "PG_head"):
+            return 0
+        return read_int_from_memory(folio + self.sizeof_struct_page) & 0xff
+
+    def direct_map_virt(self, page, phys):
+        # the same resolution as buddy-dump: physmap + phys, or page2virt when it falls outside the direct map
+        consts = KernelAddressHeuristicFinder.consts()
+        page_offset = KernelAddressHeuristicFinder.get_PAGE_OFFSET()
+        if is_arm64():
+            physmap = consts.physmap_base
+        elif is_arm32():
+            phys_offset = consts.PHYS_OFFSET
+            if page_offset is None or phys_offset is None:
+                physmap = None
+            else:
+                physmap = page_offset - phys_offset
+        else:
+            physmap = page_offset
+        if physmap is not None:
+            # check the range before normalizing, or a 32-bit PA of 4 GiB or more wraps into the direct map
+            virt = physmap + phys
+            page_offset_end = KernelAddressHeuristicFinder.get_PAGE_OFFSET_END()
+            if page_offset is None or page_offset_end is None:
+                return AddressUtil.normalize_address(virt)
+            if page_offset <= virt < page_offset_end:
+                return virt
+        return Kernel.page2virt(page)
+
+    def emit_event(self, tag, pfn, api, page, order, cache, caller_pc):
+        task_addr, comm, cpu = self.get_task_info()
+        caller = Symbol.format(caller_pc, bracket="", missing="?" if caller_pc is None else "{:#x}".format(caller_pc))
+        if tag == "FREE":
+            theme = "theme.heap_chunk_address_freed"
+        else:
+            theme = "theme.heap_chunk_address_used"
+        target_page, virt = self.watched[pfn]
+        if virt is None:
+            virt_s = "-"
+        else:
+            virt_s = Color.colorify_hex(virt, Config.get("theme.heap_page_address"))
+        page_s = Color.colorify_hex(target_page, Config.get(theme))
+        detail = "pfn={:#x} page={:s} virt={:s}".format(pfn, page_s, virt_s)
+        if page != target_page:
+            # the event is about the block whose head is `page` (e.g. a higher order allocation)
+            detail += " head={:#x}".format(page)
+        if order is not None:
+            detail += " order={:d}".format(order)
+        if cache:
+            detail += "  cache={:s}".format(Color.colorify(cache, Config.get("theme.heap_chunk_label")))
+        gef_print("[{:6s}] {:s}".format(tag, detail))
+        gef_print("         via {:s}  caller={:s}  comm={:s} cpu={:s}".format(
+            api, caller, comm, "?" if cpu is None else str(cpu),
+        ))
+        if self.backtrace:
+            KmallocTracerCommand.print_backtrace(True)
+        return
+
+    def record(self, kind, api, page, order=None, caller_pc=None, kmem_cache=None):
+        if kind in ("alloc", "free"):
+            base_pfn = self.pfn_of(page)
+            if base_pfn is None:
+                return False
+            # order comes from a register; ignore an out-of-range read so span stays sane.
+            if order is None or order < 0 or order > 20:
+                order = 0
+            span = 1 << order
+            matched = [pfn for pfn in self.watched if base_pfn <= pfn < base_pfn + span]
+            # another block at the same page ends the one remembered for a watched page
+            self.blocks = {pfn: block for pfn, block in self.blocks.items() if block != page}
+        else:
+            order = None
+            matched = self.slab_matched_pfns(page)
+        if not matched:
+            return False
+
+        cache = self.cache_name(kmem_cache)
+        tag = {"alloc": "ALLOC", "free": "FREE", "slab_assign": "SLAB", "slab_free": "UNSLAB"}[kind]
+        reuse = False
+        for pfn in matched:
+            if kind in ("alloc", "slab_assign") and pfn in self.freed:
+                reuse = True
+            self.emit_event(tag, pfn, api, page, order, cache, caller_pc)
+            if kind in ("free", "slab_free"):
+                self.freed.add(pfn)
+            else:
+                self.freed.discard(pfn)
+            if kind == "alloc":
+                self.blocks[pfn] = page
+            elif kind == "free":
+                self.blocks.pop(pfn, None)
+        return self.stop_on_reuse and reuse
+
+    def build_alloc_syms(self, kversion):
+        if kversion < "5.13":
+            return [["__alloc_pages_nodemask", 1]]
+        elif kversion < "6.10":
+            return [["__alloc_pages", 1]]
+        elif kversion < "6.14":
+            return [["__alloc_pages_noprof", 1]]
+        else:
+            # v6.15+: the nolock allocator (e.g. for BPF) takes pages from the freelists by itself.
+            # alloc_pages_nolock_noprof() of v6.18+ calls alloc_frozen_pages_nolock_noprof().
+            syms = [["__alloc_frozen_pages_noprof", 1]]
+            sym, func_addr = self.first_resolvable(["alloc_frozen_pages_nolock_noprof", "alloc_pages_nolock_noprof",
+                                                    "try_alloc_pages_noprof"])
+            if sym:
+                # (gfp_flags, nid, order) or (nid, order)
+                syms.append([sym, 2 if sym == "alloc_frozen_pages_nolock_noprof" else 1])
+            return syms
+
+    def build_bulk_alloc_syms(self, kversion):
+        # order-0 pages allocated in bulk (e.g. vmalloc, page_pool) are taken from the pcp lists by itself.
+        # [sym, whether page_list comes before page_array]
+        if kversion >= "6.14":
+            return ["alloc_pages_bulk_noprof", False]
+        elif kversion >= "6.10":
+            return ["alloc_pages_bulk_noprof", True]
+        elif kversion >= "5.13":
+            return ["__alloc_pages_bulk", True]
+        else:
+            return [None, None]
+
+    def build_free_syms(self, kversion):
+        # Hook the functions reached only after the refcount dropped to zero (not __free_pages,
+        # which also runs for a put that does not free). [sym, index of page, index of order or None]
+        if kversion >= "6.14":
+            # v6.15+: __free_pages -> ___free_pages -> __free_frozen_pages, skipping free_frozen_pages.
+            sym, func_addr = self.first_resolvable(["__free_frozen_pages", "free_frozen_pages"])
+            if sym:
+                return [[sym, 0, 1]]
+            return []
+        elif kversion >= "6.10":
+            return [["free_unref_page", 0, 1]]
+        elif kversion >= "5.14":
+            return [["free_unref_page", 0, 1], ["__free_pages_ok", 0, 1]]
+        elif kversion >= "4.15":
+            return [["free_unref_page", 0, None], ["__free_pages_ok", 0, 1]]
+        else:
+            return [["free_hot_cold_page", 0, None], ["__free_pages_ok", 0, 1]]
+
+    def build_batch_free_syms(self, kversion):
+        # order-0 pages freed in bulk skip the functions above and go straight to the pcp lists.
+        # Before v4.15 free_hot_cold_page_list calls free_hot_cold_page per page, so it needs no hook.
+        if kversion >= "6.9":
+            return ["free_unref_folios", "folio_batch"]
+        elif kversion >= "4.15":
+            return ["free_unref_page_list", "list"]
+        else:
+            return [None, None]
+
+    def build_slab_syms(self, allocator, kversion):
+        # The function that hands a fresh page to a cache, and the one that gives it back,
+        # as ordered candidates (the caller hooks the first that resolves). SLAB uses different
+        # symbols than SLUB, and its inner helpers are often inlined, so an outer one is tried too.
+        # {sym: how the page is passed (see slab_page)}
+        if allocator == "SLAB":
+            if kversion < "3.13":
+                return {"kmem_getpages": "virt"}, {"kmem_freepages": "virt", "slab_destroy": "slab_desc"}
+            return {"kmem_getpages": "page", "cache_grow_begin": "page"}, {"kmem_freepages": "page", "slab_destroy": "page"}
+        return {"allocate_slab": "page"}, {"__free_slab": "page"}
+
+    @staticmethod
+    def first_resolvable(syms):
+        for sym in syms:
+            func_addr = Ksym.get_addr(sym)
+            if func_addr:
+                return sym, func_addr
+        return None, None
+
+    @parse_args
+    @only_if_gdb_running
+    @only_if_specific_gdb_mode(mode=("qemu-system",))
+    @only_if_specific_arch(arch=("x86_32", "x86_64", "ARM32", "ARM64"))
+    @only_if_in_kernel
+    @only_if_kvm_disabled
+    def do_invoke(self, args):
+        if not args.pfn and not args.page and not args.address:
+            err("Specify an ADDRESS, --page PAGE or --pfn PFN")
+            return
+
+        kversion = Kernel.version()
+        if kversion is None:
+            err("Could not find Linux kernel")
+            return
+        if kversion < "3.0":
+            err("Unsupported before v3.0")
+            return
+
+        allocator = Kernel.get_slab_type()
+        if allocator == "Unknown":
+            err("Unsupported: Unknown allocator")
+            return
+
+        info("Wait for memory scan")
+
+        consts = KernelAddressHeuristicFinder.consts()
+        if consts is None or consts.PAGE_SHIFT is None:
+            err("Failed to resolve kernel constants")
+            return
+        self.page_shift = consts.PAGE_SHIFT
+
+        # resolve the watched PFNs and their struct pages
+        pfns = list(args.pfn)
+        for page in args.page:
+            phys = Kernel.page2phys(page)
+            if phys is None:
+                err("{:#x} is not a valid struct page".format(page))
+                continue
+            pfns.append(phys >> self.page_shift)
+        for address in args.address:
+            page = Kernel.virt2page(address)
+            if page is not None:
+                phys = Kernel.page2phys(page)
+            else:
+                phys = None
+            if phys is None:
+                err("Could not resolve the page of {:#x}".format(address))
+                continue
+            pfns.append(phys >> self.page_shift)
+
+        self.watched = {}
+        for pfn in pfns:
+            if pfn in self.watched:
+                continue
+            target_page = Kernel.phys2page(pfn << self.page_shift)
+            if target_page is None:
+                err("Could not resolve the struct page of pfn {:#x}".format(pfn))
+                continue
+            virt = self.direct_map_virt(target_page, pfn << self.page_shift)
+            self.watched[pfn] = (target_page, virt)
+            gef_print("[WATCH ] pfn={:#x} page={:#x} virt={:s} phys={:#x}".format(
+                pfn,
+                target_page,
+                "-" if virt is None else Color.colorify_hex(virt, Config.get("theme.heap_page_address")),
+                pfn << self.page_shift,
+            ))
+        if not self.watched:
+            err("No page to watch")
+            return
+
+        self.resolve_offsets()
+        self.sizeof_struct_page = consts.sizeof_struct_page or (runtime.current_arch.ptrsize * 8)
+        self.stop_on_reuse = args.stop_on_reuse
+        self.backtrace = args.backtrace
+        self.freed = set()
+        self.blocks = {}
+
+        if self.name_offset is None:
+            warn("Slab cache names are unavailable (offset not resolved); slab events show no cache")
+
+        # set breakpoints
+        breakpoints = []
+        try:
+            for sym, index_of_order_arg in self.build_alloc_syms(kversion):
+                func_addr = Ksym.get_addr(sym)
+                if func_addr:
+                    gef_print(sym + ": ", end="")
+                    breakpoints.append(KpageWatchAllocBreakpoint(func_addr, sym, index_of_order_arg, self))
+            bulk_sym, has_page_list = self.build_bulk_alloc_syms(kversion)
+            if bulk_sym:
+                func_addr = Ksym.get_addr(bulk_sym)
+            else:
+                func_addr = None
+            if func_addr:
+                gef_print(bulk_sym + ": ", end="")
+                breakpoints.append(KpageWatchAllocBulkBreakpoint(func_addr, bulk_sym, has_page_list, self))
+            for sym, index_of_page_arg, index_of_order_arg in self.build_free_syms(kversion):
+                func_addr = Ksym.get_addr(sym)
+                if func_addr:
+                    gef_print(sym + ": ", end="")
+                    breakpoints.append(KpageWatchFreeBreakpoint(func_addr, sym, index_of_page_arg, index_of_order_arg, self))
+            slab_assign_syms, slab_free_syms = self.build_slab_syms(allocator, kversion)
+            sym, func_addr = self.first_resolvable(slab_assign_syms)
+            if func_addr:
+                gef_print(sym + ": ", end="")
+                breakpoints.append(KpageWatchSlabBreakpoint(func_addr, sym, slab_assign_syms[sym], self))
+            sym, func_addr = self.first_resolvable(slab_free_syms)
+            if func_addr:
+                gef_print(sym + ": ", end="")
+                breakpoints.append(KpageWatchSlabFreeBreakpoint(func_addr, sym, slab_free_syms[sym], self))
+            batch_sym, batch_mode = self.build_batch_free_syms(kversion)
+            if batch_sym:
+                func_addr = Ksym.get_addr(batch_sym)
+            else:
+                func_addr = None
+            if func_addr:
+                gef_print(batch_sym + ": ", end="")
+                breakpoints.append(KpageWatchBatchFreeBreakpoint(func_addr, batch_sym, batch_mode, self))
+            if not breakpoints:
+                warn("No page hooks resolved; nothing will be observed")
+                return
+            for bp in breakpoints:
+                bp.enabled = True
+
+            info("Setup is complete. continuing...")
+            gdb.execute("continue")
+            info("kpage-watch is complete, cleaning up...")
+        finally:
+            GefUtil.delete_breakpoints(self, report_pending=True)
+        return

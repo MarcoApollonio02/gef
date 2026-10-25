@@ -54,6 +54,8 @@ def update_gef(argv):
 class Gef:
     """A collection of utility functions that are related to GEF start up."""
 
+    missing_commands = runtime.missing_commands
+
     @staticmethod
     def list_current_commands():
         command_list = []
@@ -352,12 +354,7 @@ class Gef:
         gdb.execute("save gdb-index {:s}".format(GEF_TEMP_DIR)) # don't use {!r}
 
         # gdb events configuration
-        EventHooking.gef_on_continue_hook(EventHandler.continue_handler)
-        EventHooking.gef_on_stop_hook(EventHandler.hook_stop_handler)
-        EventHooking.gef_on_new_hook(EventHandler.new_objfile_handler)
-        EventHooking.gef_on_exit_hook(EventHandler.exit_handler)
-        EventHooking.gef_on_memchanged_hook(EventHandler.memchanged_handler)
-        EventHooking.gef_on_regchanged_hook(EventHandler.regchanged_handler)
+        EventHandler.connect()
 
         if gdb.current_progspace().filename is not None:
             # if here, we are sourcing gef from a gdb session already attached

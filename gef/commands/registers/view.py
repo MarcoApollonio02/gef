@@ -6,6 +6,7 @@ Auto-discovered by gef.bootstrap via pkgutil.walk_packages.
 """
 
 import argparse
+import math
 import ctypes
 import re
 import struct
@@ -26,6 +27,7 @@ from gef.commands.base import (
 )
 from gef.core import runtime
 from gef.core.bitinfo import BitInfo
+from gef.core.address import Endian
 from gef.core.color import Color, err, gef_print, info, titlify, warn
 from gef.core.exec import ExecAsm
 from gef.core.memory import p32, p64
@@ -371,32 +373,27 @@ class FpuCommand(GenericCommand):
                         help="also display bit information of fpu control registers.")
     _syntax_ = parser.format_help()
 
-    def f2u(self, a):
-        u = lambda a: struct.unpack("<I", a)[0]
-        pf = lambda a: struct.pack("<f", a)
-        return u(pf(a))
-
-    def u2f(self, a):
-        p = lambda a: struct.pack("<I", a & 0xffff_ffff)
-        uf = lambda a: struct.unpack("<f", a)[0]
-        return uf(p(a))
-
-    def d2u(self, a):
-        uQ = lambda a: struct.unpack("<Q", a)[0]
-        pd = lambda a: struct.pack("<d", a)
-        return uQ(pd(a))
-
-    def u2d(self, a):
-        pQ = lambda a: struct.pack("<Q", a & 0xffff_ffff_ffff_ffff)
-        ud = lambda a: struct.unpack("<d", a)[0]
-        return ud(pQ(a))
-
-    def d2u80(self, a):
-        value = ctypes.c_longdouble(a)
-        BYTES = ctypes.POINTER(ctypes.c_byte * 10)
-        ptr = ctypes.cast(ctypes.addressof(value), BYTES)
-        x = ["{:02x}".format(int(x) & 0xff) for x in ptr[0][::-1]]
-        return int("".join(x), 16)
+    def get_arm_value(self, regname):
+        try:
+            value = gdb.parse_and_eval(regname)
+            if value.type.code == gdb.TYPE_CODE_VOID:
+                return None
+            if is_arm32() and regname.startswith("$q"):
+                index = int(regname[2:]) * 2
+                low = self.get_arm_value("$d{:d}".format(index))
+                high = self.get_arm_value("$d{:d}".format(index + 1))
+                if low is not None and high is not None:
+                    return (high << 64) | low
+                return None
+            if hasattr(value, "bytes"):
+                return int.from_bytes(value.bytes, "little" if Endian.is_little_endian() else "big")
+            if value.type.code == gdb.TYPE_CODE_UNION:
+                if is_arm64():
+                    return int(value["u"])
+                return int(value["u64"])
+            return int(value.format_string(format="x"), 16)
+        except (gdb.error, ValueError):
+            return None
 
     def print_fpu_arm(self):
         red = lambda x: Color.colorify("{:4s}".format(x), "bold red") # need padding
@@ -416,25 +413,18 @@ class FpuCommand(GenericCommand):
             regname1 = "$s{:d}".format(i)
             regname2 = "$d{:d}".format(i)
             regname3 = "$q{:d}".format(i)
-            if is_32bit():
-                reg1 = self.f2u(float(gdb.execute("p {}".format(regname1), to_string=True).split()[2]))
-                reg2 = int(gdb.execute("p {}.u64".format(regname2), to_string=True).split()[2], 16)
-                try:
-                    reg3h = int(gdb.execute("p {}.u64[0]".format(regname3), to_string=True).split()[2], 16)
-                    reg3l = int(gdb.execute("p {}.u64[1]".format(regname3), to_string=True).split()[2], 16)
-                    reg3 = (reg3h << 64) + reg3l
-                except Exception:
-                    reg3 = None
-            else:
-                reg1 = int(gdb.execute("p {}.u".format(regname1), to_string=True).split()[2], 16)
-                reg2 = int(gdb.execute("p {}.u".format(regname2), to_string=True).split()[2], 16)
-                try:
-                    reg3 = int(gdb.execute("p {}.u".format(regname3), to_string=True).split()[2], 16)
-                except Exception:
-                    reg3 = None
+            reg1 = self.get_arm_value(regname1)
+            reg2 = self.get_arm_value(regname2)
+            reg3 = self.get_arm_value(regname3)
 
-            fmt1 = "{:s}: {:15s} {:<#10x}".format(red(regname1), "{:<+.8e}".format(self.u2f(reg1)), reg1)
-            fmt2 = "{:s}: {:28s} {:<#18x}".format(red(regname2), "{:<+.20e}".format(self.u2d(reg2)), reg2)
+            if reg1 is None:
+                fmt1 = "{:s}: {:s}".format(red(regname1), "Access denied")
+            else:
+                fmt1 = "{:s}: {:15s} {:<#10x}".format(red(regname1), "{:<+.8e}".format(GefUtil.u2f(reg1)), reg1)
+            if reg2 is None:
+                fmt2 = "{:s}: {:s}".format(red(regname2), "Access denied")
+            else:
+                fmt2 = "{:s}: {:28s} {:<#18x}".format(red(regname2), "{:<+.20e}".format(GefUtil.u2d(reg2)), reg2)
             if reg3 is None:
                 fmt3 = "{:s}: {:s}".format(red(regname3), "Access denied")
             else:
@@ -453,32 +443,43 @@ class FpuCommand(GenericCommand):
         gef_print(GefUtil.make_legend(fmt.format(*legend)))
 
         fstat = get_register("$fstat")
+        if fstat is None:
+            err("Could not read x87 status register")
+            return
         top_of_stack = (fstat >> 11) & 0b111
         regs = ["mm{:d}".format(i) for i in range(8)]
         regs = regs[top_of_stack:] + regs[:top_of_stack] # need rotate. because mmx0 != st(0)
 
         for i in range(8):
             regname = "$st{:d}".format(i)
-            result = gdb.execute("info registers {}".format(regname), to_string=True)
-            if "invalid" in result:
-                r = re.findall(r"\(raw (0x[0-9a-f]+)\)", result)
-                u80 = int(r[0], 16)
-                u64 = 0xfff8_0000_0000_0000 # nan
-                u32 = 0xffc0_0000 # nan
-                gef_print("{:4s}({:3s}) : {:<27s}\t{:<#24x} {:<#18x} {:<#10x}".format(
-                    red(regname), regs[i], "<invalid>", u80, u64, u32,
-                ))
-            else:
-                reg = float(result.split()[1])
-                u80 = self.d2u80(reg)
-                u64 = self.d2u(reg)
-                u32 = self.f2u(reg)
-                gef_print("{:4s}({:3s}) : {:<+.20e}\t{:<#24x} {:<#18x} {:<#10x}".format(
-                    red(regname), regs[i], reg, u80, u64, u32,
-                ))
-        info('XWORD: Real register value; Used at "fstp xword ptr [rax]".')
-        info('QWORD: Used at "fst/fstp qword ptr [rax]".')
-        info('DWORD: Used at "fst/fstp dword ptr [rax]".')
+            try:
+                result = gdb.execute("info registers {}".format(regname), to_string=True)
+                raw = re.search(r"\(raw (0x[0-9a-fA-F]+)\)", result)
+                if raw is None:
+                    gef_print("{:4s}({:3s}) : <unavailable>".format(red(regname), regs[i]))
+                    continue
+                u80 = int(raw.group(1), 16)
+                value = result.split(None, 1)[1].split("(raw", 1)[0].strip()
+                if "invalid" in value:
+                    u64, u32 = "<invalid>", "<invalid>"
+                else:
+                    reg = float(gdb.parse_and_eval(regname))
+                    if math.isinf(reg) and (u80 >> 64) & 0x7fff != 0x7fff:
+                        u64, u32 = "<overflow>", "<overflow>"
+                    else:
+                        u64 = "{:#x}".format(GefUtil.d2u(reg))
+                        try:
+                            u32 = "{:#x}".format(GefUtil.f2u(reg))
+                        except OverflowError:
+                            u32 = "<overflow>"
+            except gdb.error:
+                gef_print("{:4s}({:3s}) : <unavailable>".format(red(regname), regs[i]))
+                continue
+            gef_print("{:4s}({:3s}) : {:<27s}\t{:<#24x} {:<18s} {:<10s}".format(
+                red(regname), regs[i], value, u80, u64, u32,
+            ))
+        info("XWORD: Raw 80-bit register value.")
+        info("QWORD/DWORD: Converted to float64/float32 with round-to-nearest; overflow is marked.")
         return
 
     def print_fpu_arm_other(self):
@@ -712,6 +713,7 @@ class FpuCommand(GenericCommand):
         return
 
 
+
 @register_command
 class CpuidCommand(GenericCommand, BufferingOutput):
     """Get cpuid result."""
@@ -733,13 +735,16 @@ class CpuidCommand(GenericCommand, BufferingOutput):
     ]
     _note_ = "\n".join(_note_)
 
-    def execute_cpuid(self, num, subnum=0):
+    @staticmethod
+    def execute_cpuid(num, subnum=0):
         codes = [b"\x0f\xa2"] # cpuid
         if is_x86_64():
             regs = {"$rax": num, "$rcx": subnum}
         else:
             regs = {"$eax": num, "$ecx": subnum}
-        ret = ExecAsm(codes, regs=regs).exec_code()
+        ret = ExecAsm(codes, regs=regs).exec_code(check_complete=True)
+        if ret is None:
+            raise gdb.error("Failed to execute CPUID")
 
         if is_x86_64():
             eax = ret["reg"]["$rax"] & 0xffff_ffff
@@ -1246,7 +1251,7 @@ class CpuidCommand(GenericCommand, BufferingOutput):
             o(c(eax, 12, 1,           "EAX    12: Reenlightenment controls"))
             o(c(eax, 13, 0x7_ffff,    "EAX 31-13: Reserved"))
             o(c(edx,  0, 0xf,         "EDX  3- 0: Reserved"))
-            o(c(eax,  4, 1,           "EDX     4: Hypercall input params via XMM registers"))
+            o(c(edx,  4, 1,           "EDX     4: Hypercall input params via XMM registers"))
             o(c(edx,  5, 0x3ff,       "EDX 14- 5: Reserved"))
             o(c(edx, 15, 1,           "EDX    15: Hypercall output via XMM registers"))
             o(c(edx, 16, 1,           "EDX    16: Reserved"))
@@ -1376,7 +1381,7 @@ class CpuidCommand(GenericCommand, BufferingOutput):
             o(c(edx, 12, 1,           "EDX    12: Core power reporting"))
             o(c(edx, 13, 1,           "EDX    13: Connected standby"))
             o(c(edx, 14, 1,           "EDX    14: RAPL (Running Average Power Limit)"))
-            o(c(edx, 15, 0x1_ffff,    "EAX 31-15: Reserved"))
+            o(c(edx, 15, 0x1_ffff,    "EDX 31-15: Reserved"))
         elif id == 0x8000_0008:
             o("eax: Extended Address Length Information")
             o(c(eax,  0, 0xff,        "EAX  7- 0: Physical address length"))
@@ -1493,26 +1498,23 @@ class CpuidCommand(GenericCommand, BufferingOutput):
             o(c(edx, 11, 1,           "EDX    11: PHE_EN (Padlock Hash Engine ENabled)"))
             o(c(edx, 12, 1,           "EDX    12: PMM (Padlock Montgomery Multiplier available)"))
             o(c(edx, 13, 1,           "EDX    13: PMM_EN (Padlock Montgomery Multiplier ENabled)"))
-            o(c(edx, 14, 0x3_ffff,    "EAX 31-14: Reserved"))
+            o(c(edx, 14, 0x3_ffff,    "EDX 31-14: Reserved"))
         return
 
-    @parse_args
-    @only_if_gdb_running
-    @exclude_specific_gdb_mode(mode=("rr", "kgdb"))
-    @only_if_specific_arch(arch=("x86_32", "x86_64"))
-    @only_if_kvm_disabled
-    def do_invoke(self, args):
-        self.out = []
-
+    def dump_cpuid(self):
         # Basic Information
         eax, _, _, _ = self.execute_cpuid(0)
         valid_max_cpuid = min(eax, 0x20)
 
         for id in range(valid_max_cpuid + 1):
             if id == 4:
-                for subid in range(3):
+                for subid in range(64):
                     eax, ebx, ecx, edx = self.execute_cpuid(id, subid)
+                    if (eax & 0x1f) == 0:
+                        break
                     self.make_out(id, subid, eax, ebx, ecx, edx)
+                else:
+                    self.warn_add_out("Cache enumeration is incomplete: subleaf limit reached (64)")
             elif id == 7:
                 eax, _, _, _ = self.execute_cpuid(id, 0)
                 for subid in range(eax + 1):
@@ -1555,9 +1557,22 @@ class CpuidCommand(GenericCommand, BufferingOutput):
         for id in range(0xc000_0000, valid_max_cpuid + 1):
             eax, ebx, ecx, edx = self.execute_cpuid(id)
             self.make_out(id, None, eax, ebx, ecx, edx)
+        return
 
+    @parse_args
+    @only_if_gdb_running
+    @exclude_specific_gdb_mode(mode=("rr", "kgdb"))
+    @only_if_specific_arch(arch=("x86_32", "x86_64"))
+    @only_if_kvm_disabled
+    def do_invoke(self, args):
+        self.out = []
+        try:
+            self.dump_cpuid()
+        except gdb.error as e:
+            self.err_add_out("{}".format(e))
         self.print_output()
         return
+
 
 
 @register_command

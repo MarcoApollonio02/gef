@@ -16,6 +16,7 @@ import gdb
 
 from gef.commands.base import (
     BufferingOutput,
+    ContextManager,
     GenericCommand,
     exclude_specific_arch,
     exclude_specific_gdb_mode,
@@ -33,6 +34,7 @@ from gef.core.cache import Cache
 from gef.core.color import Color, err, gef_print, info, titlify, warn
 from gef.core.config import Config
 from gef.core.elf import Elf
+from gef.core.exec import ExecAsm, ExecSyscall
 from gef.core.memory import (
     hexdump,
     is_valid_addr,
@@ -41,8 +43,11 @@ from gef.core.memory import (
     read_int32_from_memory,
     read_int64_from_memory,
     read_int8_from_memory,
+    p32,
+    p64,
     read_int_from_memory,
     read_memory,
+    u32,
 )
 from gef.core.process import (
     Path,
@@ -59,6 +64,9 @@ from gef.core.process import (
     is_nios2,
     is_ppc32,
     is_ppc64,
+    get_pagesize,
+    is_alive,
+    is_core_file,
     is_qemu_system,
     is_remote_debug,
     is_riscv32,
@@ -67,72 +75,768 @@ from gef.core.process import (
     is_sparc32,
     is_sparc32plus,
     is_sparc64,
+    is_x86_32,
     is_x86_64,
     is_xtensa,
 )
 from gef.core.symbols import Symbol
+from gef.core.syscall import Syscall
 from gef.core.types import GlibcHeap
-from gef.core.utils import GefUtil, byteswap, get_libc_version
+from gef.core.utils import (GefUtil, align, align_to_pagesize, byteswap, get_libc_version, slice_unpack,
+                            u2i)
+
+@register_command
+class CppVtableCommand(GenericCommand, BufferingOutput):
+    """Dump C++ virtual tables and RTTI from an object or base subobject."""
+
+    _cmdline_ = "cpp-vtable"
+    _category_ = "02-e. Process Information - Complex Structure Information"
+
+    parser = argparse.ArgumentParser(prog=_cmdline_)
+    parser.add_argument("address", metavar="ADDRESS", type=AddressUtil.parse_address,
+                        help="the address of a C++ object or polymorphic base subobject.")
+    parser.add_argument("-c", "--count", type=int, default=64,
+                        help="maximum number of virtual function entries per table. (default: 64)")
+    parser.add_argument("-n", "--no-pager", action="store_true", help="do not use the pager.")
+    _syntax_ = parser.format_help()
+
+    _example_ = [
+        "{0:s} 0x55555556b2a0",
+        "{0:s} '&object'",
+        "{0:s} '(Base2 *)&object' -c 8",
+    ]
+    _example_ = "\n".join(_example_).format(_cmdline_)
+
+    _note_ = [
+        "Uses the Itanium C++ ABI with pointer-sized virtual function entries (Linux GCC/Clang).",
+        "No debug information is required; RTTI is decoded from target memory.",
+        "Stripped functions are shown by address; class names are recovered from RTTI.",
+        "Relative vtables and function descriptors are unsupported.",
+        "RTTI supplies inheritance and secondary tables, including virtual base offsets.",
+        "Without RTTI, only the specified subobject's table is displayed.",
+        "Function enumeration stops at non-code entries or --count; the ABI stores no table length.",
+    ]
+    _note_ = "\n".join(_note_)
+
+    def read_vtable(self, address):
+        vptr = read_int_from_memory(address)
+        if not vptr or vptr % self.ptrsize:
+            raise ValueError("Invalid vptr")
+        offset_to_top = read_int_from_memory(vptr - 2 * self.ptrsize, signed=True)
+        rtti = read_int_from_memory(vptr - self.ptrsize)
+        return {"vptr": vptr, "rtti": rtti, "offset_to_top": offset_to_top, "top": address + offset_to_top}
+
+    def read_typeinfo(self, address):
+        if address in self.typeinfos:
+            return self.typeinfos[address]
+        vptr = read_int_from_memory(address)
+        nameptr = read_int_from_memory(address + self.ptrsize)
+        if nameptr:
+            name = read_cstring_from_memory(nameptr, max_length=0x1000, safe=True)
+        else:
+            name = None
+        if not vptr or not name or name.endswith("[...]"):
+            raise ValueError("Invalid RTTI at {:#x}".format(address))
+
+        location = Symbol.lookup_gdb(vptr)
+        if location:
+            kind_name = location[0]
+        else:
+            kind_name = ""
+        kinds = ("__class_type_info", "__si_class_type_info", "__vmi_class_type_info")
+        if not any(kind in kind_name for kind in kinds):
+            meta = read_int_from_memory(vptr - self.ptrsize, safe=True)
+            if meta:
+                meta_nameptr = read_int_from_memory(meta + self.ptrsize, safe=True)
+            else:
+                meta_nameptr = None
+            if meta_nameptr:
+                kind_name = read_cstring_from_memory(meta_nameptr, max_length=0x100, safe=True)
+            else:
+                kind_name = ""
+        kind = next((kind for kind in kinds if kind in (kind_name or "")), None)
+        if kind is None:
+            raise ValueError("Unsupported RTTI at {:#x}".format(address))
+
+        if self.cppfilt:
+            try:
+                result = GefUtil.gef_execute_external([self.cppfilt, "_ZTS" + name.lstrip("*")]).strip()
+                if result.startswith("typeinfo name for "):
+                    name = result[len("typeinfo name for "):]
+            except (OSError, subprocess.CalledProcessError):
+                pass
+
+        bases = []
+        flags = 0
+        if kind == "__si_class_type_info":
+            bases.append((read_int_from_memory(address + 2 * self.ptrsize), 0, 2))
+        elif kind == "__vmi_class_type_info":
+            flags = read_int32_from_memory(address + 2 * self.ptrsize)
+            count = read_int32_from_memory(address + 2 * self.ptrsize + 4)
+            if count > 256:
+                raise ValueError("Too many RTTI bases at {:#x}".format(address))
+            for i in range(count):
+                entry = address + 2 * self.ptrsize + 8 + i * 2 * self.ptrsize
+                base = read_int_from_memory(entry)
+                offset_flags = read_int_from_memory(entry + self.ptrsize, signed=True)
+                bases.append((base, offset_flags >> 8, offset_flags & 0xff))
+
+        result = {"name": name, "kind": kind, "flags": flags, "bases": bases}
+        self.typeinfos[address] = result
+        return result
+
+    def dump_inheritance(self, rtti, address, root, tables, seen, depth=0, attributes="", prefix="", last=True):
+        if depth >= 32 or len(seen) >= 256:
+            self.warn_add_out("Inheritance traversal limit reached")
+            return
+        try:
+            record = self.read_typeinfo(rtti)
+        except (gdb.error, ValueError, OverflowError) as exception:
+            self.warn_add_out("Failed to read base RTTI: {!s}".format(exception))
+            return
+
+        flags = []
+        if record["flags"] & 1:
+            flags.append("repeated bases")
+        if record["flags"] & 2:
+            flags.append("diamond")
+        details = ", ".join(filter(None, (attributes, ", ".join(flags))))
+        if depth:
+            tree = prefix + ("\u2514\u2500\u2500 " if last else "\u251c\u2500\u2500 ")
+        else:
+            tree = ""
+        self.out.append("  {!s} {:s}{:s} (offset {:+d}){:s}".format(
+            ProcessMap.lookup(address), tree, record["name"], address - root["top"],
+            " [" + details + "]" if details else "",
+        ))
+        key = (rtti, address)
+        if key in seen:
+            return
+        seen.add(key)
+
+        try:
+            table = self.read_vtable(address)
+            if table["rtti"] == root["rtti"] and table["top"] == root["top"]:
+                tables[address] = table
+        except (gdb.error, ValueError, OverflowError):
+            pass
+
+        if depth:
+            if last:
+                prefix += "    "
+            else:
+                prefix += "\u2502   "
+        for i, (base, offset, flags) in enumerate(record["bases"]):
+            if flags & 2:
+                attributes = "public"
+            else:
+                attributes = "non-public"
+            if flags & 1:
+                attributes += ", virtual"
+                vptr = read_int_from_memory(address, safe=True)
+                if vptr:
+                    displacement = read_int_from_memory(vptr + offset, safe=True, signed=True)
+                else:
+                    displacement = None
+                if displacement is None:
+                    self.warn_add_out("Failed to read virtual base offset at {:#x}".format(address))
+                    continue
+                base_address = address + displacement
+            else:
+                base_address = address + offset
+            self.dump_inheritance(base, base_address, root, tables, seen, depth + 1, attributes,
+                                  prefix, i == len(record["bases"]) - 1)
+        return
+
+    def is_function(self, address):
+        if not address:
+            return False
+        if is_arm32():
+            address &= ~1
+        return ProcessMap.lookup(address).is_in_text_segment()
+
+    def dump_functions(self, table, count):
+        table_symbol = Symbol.lookup_gdb(table["vptr"])
+        for i in range(count):
+            slot = table["vptr"] + i * self.ptrsize
+            slot_symbol = Symbol.lookup_gdb(slot)
+            if table_symbol and slot_symbol and slot_symbol[0] != table_symbol[0]:
+                break
+            function = read_int_from_memory(slot, safe=True)
+            if function is None:
+                self.warn_add_out("Unreadable vtable entry at {:#x}".format(slot))
+                break
+            if function == 0:
+                next_entry = read_int_from_memory(slot + self.ptrsize, safe=True)
+                if next_entry and not self.is_function(next_entry):
+                    try:
+                        self.read_typeinfo(next_entry)
+                    except (gdb.error, ValueError, OverflowError):
+                        pass
+                    else:
+                        break
+            if function and not self.is_function(function):
+                break
+            symbol = Symbol.format(function, missing="NO_SYMBOL", show_address=True)
+            self.out.append("{:10s} {:s}".format("[{:d}]".format(i), symbol))
+        else:
+            self.warn_add_out("Function entry limit reached; use --count to adjust it")
+        return
+
+    @parse_args
+    @only_if_gdb_running
+    @exclude_specific_gdb_mode(mode=("qemu-system", "kgdb", "vmware", "wine"))
+    @require_arch_set
+    @only_if_specific_arch(arch=("x86_32", "x86_64", "ARM32", "ARM64", "MIPS32", "MIPS64", "MIPSN32", "RISCV32", "RISCV64"))
+    def do_invoke(self, args):
+        if args.count <= 0:
+            err("--count must be positive")
+            return
+
+        self.ptrsize = AddressUtil.get_memory_alignment()
+        self.typeinfos = {}
+        self.out = []
+        try:
+            self.cppfilt = GefUtil.which(Config.get_gef_setting("gef.cppfilt_command"))
+        except FileNotFoundError:
+            self.cppfilt = None
+
+        try:
+            table = self.read_vtable(args.address)
+            if table["rtti"]:
+                rtti = self.read_typeinfo(table["rtti"])
+            else:
+                rtti = None
+            if rtti is None:
+                symbol = Symbol.lookup_gdb(table["vptr"] - self.ptrsize)
+                if not (symbol and symbol[0].startswith(("vtable for ", "_ZTV"))) and not any(
+                    self.is_function(read_int_from_memory(table["vptr"] + i * self.ptrsize, safe=True))
+                    for i in range(3)
+                ):
+                    raise ValueError("No virtual function pointer found")
+        except (gdb.error, ValueError, OverflowError) as exception:
+            err("Failed to read C++ object at {:#x}: {!s}".format(args.address, exception))
+            return
+
+        self.out.append("{:10s} {!s}".format("Object:", ProcessMap.lookup(args.address)))
+        self.out.append("{:10s} {!s}".format("Top:", ProcessMap.lookup(table["top"])))
+        tables = {args.address: table}
+        if rtti:
+            self.out.append("{:10s} {:s}".format("Type:", rtti["name"]))
+            self.out.append("")
+            self.out.append("Inheritance:")
+            self.dump_inheritance(table["rtti"], table["top"], table, tables, set())
+        else:
+            self.warn_add_out("RTTI is unavailable; inheritance and secondary tables cannot be resolved")
+
+        for address, entry in tables.items():
+            self.out.append("")
+            self.out.append("{:10s} {!s} (offset {:+d})".format("Subobject:", ProcessMap.lookup(address), address - table["top"]))
+            self.out.append("{:10s} {:s}".format("vptr:", Symbol.format(entry["vptr"], show_address=True)))
+            self.out.append("{:10s} {:s}".format("RTTI:", Symbol.format(entry["rtti"], show_address=True)))
+            self.out.append("offset-to-top: {:d}".format(entry["offset_to_top"]))
+            self.dump_functions(entry, args.count)
+
+        self.print_output(check_terminal_size=True)
+        return
+
 
 @register_command
 class IouringDumpCommand(GenericCommand, BufferingOutput):
-    """Dump the iouring area (x64 only)."""
+    """Dump the userland io_uring rings."""
 
     _cmdline_ = "iouring-dump"
     _category_ = "02-e. Process Information - Complex Structure Information"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
+    parser.add_argument("-r", "--rings", type=AddressUtil.parse_address,
+                        help="the address of the rings set up with IORING_SETUP_NO_MMAP (p->cq_off.user_addr).")
+    parser.add_argument("-s", "--sqes", type=AddressUtil.parse_address,
+                        help="the address of the SQEs set up with IORING_SETUP_NO_MMAP (p->sq_off.user_addr).")
+    parser.add_argument("--no-scan", action="store_true",
+                        help="do not search writable memory for the rings set up with IORING_SETUP_NO_MMAP.")
     parser.add_argument("-n", "--no-pager", action="store_true", help="do not use the pager.")
     _syntax_ = parser.format_help()
 
-    def read(self, addr, size):
-        block_size = 128
-        dynamic_read = runtime.current_arch.read128
+    _example_ = [
+        "{0:s}                                      # dump mmapped rings and search IORING_SETUP_NO_MMAP rings",
+        "{0:s} -r 0x7ffff7fb2000 -s 0x7ffff7fb1000  # dump IORING_SETUP_NO_MMAP rings at the specified address",
+    ]
+    _example_ = "\n".join(_example_).format(_cmdline_)
 
-        out = b""
-        pos = 0
-        while pos < size:
-            out += dynamic_read(addr + pos)
-            pos += block_size
-        return out[:size]
+    _note_ = [
+        "The layout of the rings is recognized from their metadata, not from the kernel version.",
+        "  Linux v5.1-v5.3: IORING_OFF_SQ_RING and IORING_OFF_CQ_RING map struct io_sq_ring and struct io_cq_ring.",
+        "  Linux v5.4-    : both offsets map the same struct io_rings (IORING_FEAT_SINGLE_MMAP).",
+        "Linux v5.1-v6.9 (except some later v6.1.y/v6.6.y) maps the rings with remap_pfn_range(), so gdb cannot read them.",
+        "Then, on x86/ARM/AArch64, they are copied to a temporary mapping in the inferior if the mapping is readable.",
+        "The rings set up with IORING_SETUP_NO_MMAP (Linux v6.5-) are in user memory, not in an io_uring mapping.",
+        "They are searched in writable memory. Their SQEs are guessed from the liburing layout, or specify --sqes.",
+    ]
+    _note_ = "\n".join(_note_)
+
+    IORING_OFF_SQ_RING = 0x0000_0000
+    IORING_OFF_CQ_RING = 0x0800_0000
+    IORING_OFF_SQES = 0x1000_0000
+    IORING_MAP_OFF_PARAM_REGION = 0x2000_0000
+    IORING_MAP_OFF_ZCRX_REGION = 0x3000_0000
+    IORING_OFF_PBUF_RING = 0x8000_0000
+    IORING_OFF_MMAP_MASK = 0xf800_0000
+    IORING_OFF_ID_SHIFT = 16 # IORING_OFF_PBUF_SHIFT, IORING_OFF_ZCRX_SHIFT
+
+    IORING_MAX_ENTRIES = 0x8000
+    IORING_MAX_CQ_ENTRIES = 0x10000
+
+    # the alignment of struct io_uring {head, tail}; 4 means unaligned (!CONFIG_SMP, or recent kernels)
+    CACHELINE_SIZES = (4, 64, 128, 32, 256, 16)
+    SMP_CACHE_BYTES = (64, 128, 32, 256, 16)
+
+    MAX_SCAN_SIZE = 0x400_0000
+    SCAN_CHUNK_SIZE = 0x10_0000
+
+    def read_mappings(self, entries):
+        result = {}
+        pending = []
+        for entry in entries:
+            try:
+                result[entry.page_start] = read_memory(entry.page_start, entry.size)
+            except (gdb.error, OverflowError):
+                if entry.is_readable():
+                    pending.append(entry)
+
+        # ptrace cannot read VM_PFNMAP, so copy them in the inferior.
+        # Never do it for an unreadable mapping; the inferior would receive SIGSEGV.
+        if pending and self.get_copy_codes(pending) and not is_core_file():
+            data = self.read_by_inferior(pending)
+            if data is not None:
+                pos = 0
+                for entry in pending:
+                    result[entry.page_start] = data[pos:pos + entry.size]
+                    pos += entry.size
+        return result
+
+    def get_copy_codes(self, entries):
+        """Return the code which copies the entries to the address in the returned register, one after another."""
+
+        def arm64_mov_imm(rd, value):
+            # movz xd, #imm16; movk xd, #imm16, lsl #16; ...
+            codes = []
+            for hw in range(4):
+                if hw == 0:
+                    base = 0xd280_0000
+                else:
+                    base = 0xf280_0000
+                codes.append(struct.pack("<I", base | hw << 21 | (value >> hw * 16 & 0xffff) << 5 | rd))
+            return codes
+
+        def arm32_mov_imm(rd, value, thumb):
+            # movw rd, #imm16; movt rd, #imm16
+            codes = []
+            for arm_base, thumb_base, imm in [(0xe300_0000, 0xf240, value & 0xffff), (0xe340_0000, 0xf2c0, value >> 16)]:
+                if thumb:
+                    codes.append(struct.pack("<HH", thumb_base | (imm >> 11 & 1) << 10 | imm >> 12, (imm >> 8 & 7) << 12 | rd << 8 | imm & 0xff))
+                else:
+                    codes.append(struct.pack("<I", arm_base | (imm >> 12) << 16 | rd << 12 | imm & 0xfff))
+            return codes
+
+        if Endian.is_big_endian():
+            return None
+        codes = []
+        if is_x86_64():
+            codes += [b"\xfc"] # cld
+            for entry in entries:
+                codes += [b"\x48\xbe" + p64(entry.page_start)] # mov rsi, imm64
+                codes += [b"\x48\xb9" + p64(entry.size)] # mov rcx, imm64
+                codes += [b"\xf3\xa4"] # rep movsb
+            return codes, "$rdi"
+        if is_x86_32():
+            codes += [b"\xfc"] # cld
+            for entry in entries:
+                codes += [b"\xbe" + p32(entry.page_start)] # mov esi, imm32
+                codes += [b"\xb9" + p32(entry.size)] # mov ecx, imm32
+                codes += [b"\xf3\xa4"] # rep movsb
+            return codes, "$edi"
+        if is_arm64():
+            for entry in entries:
+                codes += arm64_mov_imm(1, entry.page_start)
+                codes += arm64_mov_imm(2, entry.size)
+                codes += [b"\x23\x84\x40\xf8"] # ldr x3, [x1], #8
+                codes += [b"\x03\x84\x00\xf8"] # str x3, [x0], #8
+                codes += [b"\x42\x20\x00\xf1"] # subs x2, x2, #8
+                codes += [b"\xa1\xff\xff\x54"] # b.ne <ldr>
+            return codes, "$x0"
+        if is_arm32():
+            thumb = runtime.current_arch.is_thumb()
+            for entry in entries:
+                codes += arm32_mov_imm(1, entry.page_start, thumb)
+                codes += arm32_mov_imm(2, entry.size, thumb)
+                if thumb:
+                    codes += [b"\x51\xf8\x04\x3b"] # ldr.w r3, [r1], #4
+                    codes += [b"\x40\xf8\x04\x3b"] # str.w r3, [r0], #4
+                    codes += [b"\x04\x3a"] # subs r2, #4
+                    codes += [b"\xf9\xd1"] # bne.n <ldr.w>
+                else:
+                    codes += [b"\x04\x30\x91\xe4"] # ldr r3, [r1], #4
+                    codes += [b"\x04\x30\x80\xe4"] # str r3, [r0], #4
+                    codes += [b"\x04\x20\x52\xe2"] # subs r2, r2, #4
+                    codes += [b"\xfb\xff\xff\x1a"] # bne <ldr>
+            return codes, "$r0"
+        return None
+
+    def read_by_inferior(self, entries):
+        """Copy the mappings to a temporary mapping in the inferior, then read it."""
+        size = sum(entry.size for entry in entries)
+        syscall_table = Syscall.get_syscall_table()
+        if is_x86_64() or is_arm64():
+            mmap_name = "mmap"
+        else:
+            mmap_name = "mmap2"
+        mmap_args = [0, size, 0x3, 0x22, (1 << runtime.current_arch.ptrsize * 8) - 1, 0] # RW, MAP_PRIVATE|MAP_ANONYMOUS, fd=-1
+        ret = ExecSyscall(syscall_table.name_table[mmap_name].nr, mmap_args).exec_code()
+        tmp = ret["reg"][runtime.current_arch.return_register]
+        if -0x1000 < u2i(tmp, runtime.current_arch.ptrsize * 8) < 0:
+            return None
+
+        try:
+            # Each ExecAsm is slow on a slow remote link, so copy all mappings at once.
+            codes, dst = self.get_copy_codes(entries)
+            # A loop and `rep movsb` need a breakpoint, since stepi executes one iteration; do not resume other threads.
+            with ContextManager.gdb_parameter("scheduler-locking", "on"):
+                ret = ExecAsm(codes, regs={dst: tmp}, step=len(codes), use_bp=True).exec_code()
+
+            data = None
+            if ret["reg"][dst] == tmp + size:
+                try:
+                    data = read_memory(tmp, size)
+                except (gdb.error, OverflowError):
+                    pass
+            return data
+        finally:
+            if is_alive():
+                try:
+                    ExecSyscall(syscall_table.name_table["munmap"].nr, [tmp, size]).exec_code()
+                except gdb.error as exception:
+                    warn("Failed to unmap temporary io_uring memory: {!s}".format(exception))
+
+    def is_valid_ring(self, head, tail, mask, entries, max_entries):
+        if entries == 0 or entries & (entries - 1) or entries > max_entries:
+            return False
+        if mask + 1 != entries:
+            return False
+        return (tail - head) & 0xffff_ffff <= entries
+
+    def parse_rings(self, data, offset=0):
+        """Recognize struct io_rings (Linux v5.4-)."""
+        fmt = Endian.endian_str() + "6I"
+        for cacheline in self.CACHELINE_SIZES:
+            pos = offset + cacheline * 4
+            if len(data) < pos + 0x18:
+                continue
+            sq_mask, cq_mask, sq_entries, cq_entries, dropped, flags = struct.unpack_from(fmt, data, pos)
+            if sq_mask + 1 != sq_entries or cq_mask + 1 != cq_entries or cq_entries < sq_entries:
+                continue
+            heads = [offset + cacheline * i for i in range(4)]
+            sq_head, sq_tail, cq_head, cq_tail = [u32(data[x:x + 4]) for x in heads]
+            if not self.is_valid_ring(sq_head, sq_tail, sq_mask, sq_entries, self.IORING_MAX_ENTRIES):
+                continue
+            if not self.is_valid_ring(cq_head, cq_tail, cq_mask, cq_entries, self.IORING_MAX_CQ_ENTRIES):
+                continue
+            return {
+                "name": "struct io_rings", "cacheline": cacheline,
+                "sq_entries": sq_entries, "cq_entries": cq_entries, "sq_tail": sq_tail,
+                "lines": [
+                    "sq: head={:#x}, tail={:#x}, ring_mask={:#x}, ring_entries={:d}, dropped={:#x}, flags={:#x}".format(
+                        sq_head, sq_tail, sq_mask, sq_entries, dropped, flags,
+                    ),
+                    "cq: head={:#x}, tail={:#x}, ring_mask={:#x}, ring_entries={:d}".format(
+                        cq_head, cq_tail, cq_mask, cq_entries,
+                    ),
+                ],
+            }
+        return None
+
+    def parse_split_ring(self, data, is_sq):
+        """Recognize struct io_sq_ring or struct io_cq_ring (Linux v5.1-v5.3)."""
+        for cacheline in self.CACHELINE_SIZES:
+            pos = cacheline * 2
+            if len(data) < pos + 0x10:
+                continue
+            head, tail = u32(data[:4]), u32(data[cacheline:cacheline + 4])
+            mask, entries, count, flags = slice_unpack(data[pos:pos + 0x10], 4)
+            if is_sq:
+                if not self.is_valid_ring(head, tail, mask, entries, self.IORING_MAX_ENTRIES):
+                    continue
+                line = "sq: head={:#x}, tail={:#x}, ring_mask={:#x}, ring_entries={:d}, dropped={:#x}, flags={:#x}"
+                return {"name": "struct io_sq_ring", "lines": [line.format(head, tail, mask, entries, count, flags)]}
+            else:
+                if not self.is_valid_ring(head, tail, mask, entries, self.IORING_MAX_CQ_ENTRIES):
+                    continue
+                line = "cq: head={:#x}, tail={:#x}, ring_mask={:#x}, ring_entries={:d}, overflow={:#x}"
+                return {"name": "struct io_cq_ring", "lines": [line.format(head, tail, mask, entries, count)]}
+        return None
+
+    def sq_array_offset(self, layout, cqe32, cacheline):
+        # rings_size() in the kernel doubles the whole struct io_rings, not only cqes[], for IORING_SETUP_CQE32
+        size = align(layout["cacheline"] * 4 + 0x20, cacheline) + layout["cq_entries"] * 0x10
+        return align(size * 2 if cqe32 else size, cacheline)
+
+    def rings_size(self, layout):
+        # the cache line size is unknown, so assume the largest one
+        size = self.sq_array_offset(layout, True, 0x100) + layout["sq_entries"] * 4
+        return align_to_pagesize(size)
+
+    def find_sq_array(self, data, layout):
+        """IORING_SETUP_CQE32 leaves no trace in the rings, but liburing fills sq_array with 0, 1, 2, ...,
+        so its position tells the size of CQE."""
+        n = layout["sq_entries"]
+        if n < 2:
+            return None, None
+        identity = struct.pack("{:s}{:d}I".format(Endian.endian_str(), n), *range(n))
+        for cqe32 in [False, True]:
+            for cacheline in self.SMP_CACHE_BYTES:
+                pos = self.sq_array_offset(layout, cqe32, cacheline)
+                if data[pos:pos + n * 4] == identity:
+                    return pos, 0x20 if cqe32 else 0x10
+        return None, None
+
+    def guess_sqes(self, maps, rings, layout):
+        """liburing puts the SQEs just before the rings in the same memory, so validate it by the contents."""
+        from gef.commands.kernel.advanced import KernelIoUringCommand
+        entry = self.find_map(maps, rings)
+        if entry is None or layout["sq_tail"] == 0:
+            return None, None
+        for sqe_size in [0x40, 0x80]: # IORING_SETUP_SQE128
+            size = align_to_pagesize(layout["sq_entries"] * sqe_size)
+            addr = rings - size
+            if addr < entry.page_start:
+                continue
+            data = self.read_user(maps, addr, size)
+            if not data or not any(data):
+                continue
+            sqes = [data[i:i + sqe_size] for i in range(0, layout["sq_entries"] * sqe_size, sqe_size)]
+            if all(sqe[0] < len(KernelIoUringCommand.OPCODES) and sqe[1] < 0x80 for sqe in sqes): # opcode, IOSQE_*
+                return addr, size
+        return None, None
+
+    def dump(self, title, addr, data, lines=()):
+        from gef.commands.memory.view import HexdumpCommand
+        if data is None:
+            self.out.append(titlify("{:s}: {:#x}".format(title, addr)))
+            self.out.append(Color.redify("Failed to read memory"))
+            return
+        self.out.append(titlify("{:s}: {:#x}-{:#x}".format(title, addr, addr + len(data))))
+        self.out.extend(lines)
+        hex_data = hexdump(data, base=addr, unit=runtime.current_arch.ptrsize)
+        hex_data_merged = HexdumpCommand.merge_lines(hex_data.splitlines(), nb_skip_merge=0x10)
+        self.out.extend(hex_data_merged)
+        return
+
+    def dump_mapping(self, entry, data):
+        base = entry.offset & self.IORING_OFF_MMAP_MASK
+        delta = entry.offset & ~self.IORING_OFF_MMAP_MASK
+        if base in [self.IORING_OFF_PBUF_RING, self.IORING_MAP_OFF_ZCRX_REGION]:
+            ident = delta >> self.IORING_OFF_ID_SHIFT
+            delta &= (1 << self.IORING_OFF_ID_SHIFT) - 1
+
+        lines = []
+        if base in [self.IORING_OFF_SQ_RING, self.IORING_OFF_CQ_RING]:
+            is_sq = base == self.IORING_OFF_SQ_RING
+            layout = None
+            if data is not None and delta == 0:
+                layout = self.parse_rings(data) or self.parse_split_ring(data, is_sq)
+            if layout:
+                name = layout["name"]
+                lines = layout["lines"]
+            else:
+                if is_sq:
+                    name = "SQ ring"
+                else:
+                    name = "CQ ring"
+            if is_sq:
+                name += " (IORING_OFF_SQ_RING"
+            else:
+                name += " (IORING_OFF_CQ_RING"
+            if not layout and delta == 0:
+                name += ", unknown layout"
+                lines = ["struct {:s} on Linux v5.1-v5.3, struct io_rings on Linux v5.4-".format(
+                    "io_sq_ring" if is_sq else "io_cq_ring",
+                )]
+        elif base == self.IORING_OFF_SQES:
+            name = "struct io_uring_sqe[] (IORING_OFF_SQES"
+        elif base == self.IORING_OFF_PBUF_RING:
+            name = "struct io_uring_buf_ring (IORING_OFF_PBUF_RING, bgid={:d}".format(ident)
+        elif base == self.IORING_MAP_OFF_PARAM_REGION:
+            name = "parameter region (IORING_MAP_OFF_PARAM_REGION"
+        elif base == self.IORING_MAP_OFF_ZCRX_REGION:
+            name = "zero-copy receive region (IORING_MAP_OFF_ZCRX_REGION, id={:d}".format(ident)
+        else:
+            name = "unknown io_uring mapping (offset {:#x}".format(entry.offset)
+            delta = 0
+        if delta:
+            name += ", continued from +{:#x}".format(delta)
+        name += ")"
+
+        if data is None and not entry.is_readable():
+            self.out.append(titlify("{:s}: {:#x}".format(name, entry.page_start)))
+            self.out.append(Color.redify("Unreadable mapping (permission: {!s})".format(entry.permission)))
+            return
+        self.dump(name, entry.page_start, data, lines)
+        return
+
+    def find_map(self, maps, addr):
+        for entry in maps:
+            if entry.page_start <= addr < entry.page_end:
+                return entry
+        return None
+
+    def read_user(self, maps, addr, size):
+        entry = self.find_map(maps, addr)
+        if entry:
+            size = min(size, entry.page_end - addr)
+        try:
+            return read_memory(addr, size)
+        except (gdb.error, OverflowError):
+            return None
+
+    def scan_rings(self, maps):
+        found = []
+        skipped = 0
+        page_size = get_pagesize()
+        for entry in maps:
+            if not entry.is_readable() or not entry.is_writable():
+                continue
+            if entry.path == "anon_inode:[io_uring]":
+                continue
+            if entry.size > self.MAX_SCAN_SIZE:
+                skipped += 1
+                continue
+            for chunk in range(entry.page_start, entry.page_end, self.SCAN_CHUNK_SIZE):
+                try:
+                    data = read_memory(chunk, min(self.SCAN_CHUNK_SIZE, entry.page_end - chunk))
+                except (gdb.error, OverflowError):
+                    continue
+                for pos in range(0, len(data), page_size):
+                    layout = self.parse_rings(data, pos)
+                    if layout:
+                        found.append((chunk + pos, layout))
+        return found, skipped
+
+    def get_iouring_fds(self):
+        if is_remote_debug():
+            return []
+        pid = Pid.get_pid()
+        if not pid:
+            return []
+        path = "/proc/{:d}/fd".format(pid)
+        try:
+            items = os.listdir(path)
+        except OSError:
+            return []
+        fds = []
+        for fname in items:
+            try:
+                content = os.readlink(os.path.join(path, fname))
+            except (FileNotFoundError, OSError):
+                continue # closed by another running thread
+            if content == "anon_inode:[io_uring]":
+                fds.append(int(fname))
+        return sorted(fds)
+
+    def dump_no_mmap(self, maps, rings, sqes, how):
+        page_size = get_pagesize()
+        layout = None
+        if rings is not None:
+            data = self.read_user(maps, rings, page_size)
+            if data is not None:
+                layout = self.parse_rings(data)
+            if layout:
+                data = self.read_user(maps, rings, self.rings_size(layout))
+                lines = list(layout["lines"])
+                pos, cqe_size = self.find_sq_array(data or b"", layout)
+                if pos is None:
+                    lines.append("sq_array: not found, so the size of CQE (16 or 32 bytes) is unknown")
+                else:
+                    data = data[:align(pos + layout["sq_entries"] * 4, page_size)]
+                    lines.append("sq_array: +{:#x}, so the size of CQE is {:d} bytes".format(pos, cqe_size))
+                self.dump("struct io_rings (IORING_SETUP_NO_MMAP, {:s})".format(how), rings, data, lines)
+            else:
+                self.dump("unknown (struct io_rings is not recognized)", rings, data)
+
+        if sqes is None and layout:
+            sqes, size = self.guess_sqes(maps, rings, layout)
+            if sqes is None:
+                self.out.append("struct io_uring_sqe[]: not found; try `{:s} --rings {:#x} --sqes ADDRESS`".format(
+                    self._cmdline_, rings,
+                ))
+                return
+            name = "struct io_uring_sqe[] (IORING_SETUP_NO_MMAP, guessed)"
+            lines = ["liburing puts the SQEs just before the rings"]
+        elif sqes is not None and layout:
+            candidates = [align(layout["sq_entries"] * x, page_size) for x in [0x40, 0x80]]
+            if rings - sqes in candidates:
+                size = rings - sqes
+            else:
+                size = candidates[0]
+            name = "struct io_uring_sqe[] (IORING_SETUP_NO_MMAP, specified)"
+            lines = []
+        elif sqes is not None:
+            size = page_size
+            name = "struct io_uring_sqe[] (IORING_SETUP_NO_MMAP, specified)"
+            lines = ["the number of entries is unknown without --rings, so dump the first page only"]
+        else:
+            return
+        self.dump(name, sqes, self.read_user(maps, sqes, size), lines)
+        return
 
     @parse_args
     @only_if_gdb_running
     @exclude_specific_gdb_mode(mode=("qemu-system", "kgdb", "vmware", "rr", "wine"))
-    @only_if_specific_arch(arch=("x86_64",))
+    @require_arch_set
     def do_invoke(self, args):
-        from gef.commands.memory.view import HexdumpCommand
         # get map entry
         maps = ProcessMap.get_process_maps()
         if maps is None:
             err("Failed to get maps")
             return
 
-        # get anon_inode:[io_uring]
-        iouring_entries = []
-        for entry in maps:
-            if entry.path == "anon_inode:[io_uring]":
-                iouring_entries.append(entry)
-
-        # dump
         self.out = []
-        for entry in iouring_entries:
-            if entry.offset in [0, 0x0800_0000]: # IORING_OFF_SQ_RING ,IORING_OFF_CQ_RING
-                self.out.append(titlify("struct io_rings: {:#x}".format(entry.page_start)))
-            elif entry.offset == 0x1000_0000: # IORING_OFF_SQES
-                self.out.append(titlify("struct io_uring_sqe: {:#x}".format(entry.page_start)))
 
-            data = self.read(entry.page_start, entry.size)
-            hex_data = hexdump(data, base=entry.page_start, unit=runtime.current_arch.ptrsize)
-            hex_data_merged = HexdumpCommand.merge_lines(hex_data.splitlines(), nb_skip_merge=0x10)
-            self.out.extend(hex_data_merged)
+        # dump the specified IORING_SETUP_NO_MMAP rings
+        if args.rings is not None or args.sqes is not None:
+            self.dump_no_mmap(maps, args.rings, args.sqes, "specified")
+            self.print_output(check_terminal_size=True)
+            return
+
+        # dump anon_inode:[io_uring]
+        entries = [entry for entry in maps if entry.path == "anon_inode:[io_uring]"]
+        data = self.read_mappings(entries)
+        nr_rings = 0
+        for entry in entries:
+            self.dump_mapping(entry, data.get(entry.page_start))
+            if entry.offset == self.IORING_OFF_SQ_RING:
+                nr_rings += 1
+
+        # search IORING_SETUP_NO_MMAP rings
+        skipped = 0
+        if not args.no_scan:
+            found, skipped = self.scan_rings(maps)
+            for addr, _ in found:
+                self.dump_no_mmap(maps, addr, None, "found by scan")
+            nr_rings += len(found)
 
         # print
+        fds = self.get_iouring_fds()
         if not self.out:
             err("Could not find io_uring region")
-            return
-        self.print_output(check_terminal_size=True)
+        else:
+            self.print_output(check_terminal_size=True)
+        if len(fds) > nr_rings:
+            fds = ", ".join(str(fd) for fd in fds)
+            info("io_uring fd ({:s}) is opened, but some rings are not found".format(fds))
+            if skipped:
+                info("{:d} large regions were not searched; try `{:s} --rings ADDRESS`".format(skipped, self._cmdline_))
         return
+
 
 
 @register_command
@@ -2349,6 +3053,163 @@ class DwarfExceptionHandlerInfoCommand(GenericCommand, BufferingOutput):
 
 
 @register_command
+class UnwindInfoCommand(GenericCommand):
+    """Show the effective DWARF unwind rules at the current or specified PC."""
+
+    _cmdline_ = "unwind-info"
+    _category_ = "02-e. Process Information - Complex Structure Information"
+
+    parser = argparse.ArgumentParser(prog=_cmdline_)
+    parser.add_argument("location", metavar="PC", nargs="?", type=AddressUtil.parse_address,
+                        help="the program counter to inspect. (default: current_arch.pc)")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="decode the selected CIE and FDE.")
+    _syntax_ = parser.format_help()
+
+    _example_ = [
+        "{0:s}",
+        "{0:s} $pc",
+        "{0:s} -v $pc",
+        "{0:s} 0x55555555529a",
+    ]
+    _example_ = "\n".join(_example_).format(_cmdline_)
+
+    def find_handler(self, pc):
+        section = ProcessMap.process_lookup_address(pc)
+        if section is None:
+            return None, None
+
+        mapped_path = section.path.replace(" (deleted)", "")
+        if mapped_path.startswith("target:"):
+            mapped_path = mapped_path[len("target:"):]
+        candidates = []
+
+        try:
+            solib_path = gdb.solib_name(pc)
+        except (AttributeError, gdb.error):
+            solib_path = None
+        if solib_path:
+            candidates.append(solib_path)
+
+        mapped_name = os.path.basename(mapped_path)
+        for objfile in gdb.objfiles():
+            objfile_path = objfile.filename
+            if objfile_path and os.path.basename(objfile_path) == mapped_name:
+                candidates.append(objfile_path)
+
+        main_path = Path.get_filepath()
+        if main_path and os.path.basename(main_path) == mapped_name:
+            candidates.append(main_path)
+        remote = is_remote_debug()
+        if not remote and mapped_path.startswith("/"):
+            proc_path = Path.append_proc_root(mapped_path)
+            if proc_path:
+                candidates.append(proc_path)
+        candidates.append(mapped_path)
+        maps = [item for item in ProcessMap.get_process_maps() if item.path == section.path] or [section]
+        mapped_base = min(item.page_start - item.offset for item in maps)
+
+        elf = None
+        seen = set()
+        for filepath in candidates:
+            if not filepath or filepath in seen or not os.access(filepath, os.R_OK):
+                continue
+            seen.add(filepath)
+            candidate = Elf.get_elf(filepath)
+            if not candidate or not candidate.is_valid() or not candidate.get_shdr(".eh_frame"):
+                continue
+            if remote:
+                loads = [phdr for phdr in candidate.phdrs if phdr.p_type == Elf.Phdr.PT_LOAD]
+                if not loads:
+                    continue
+                linked_base = min(phdr.p_vaddr - phdr.p_offset for phdr in loads)
+                note = candidate.get_shdr(".note.gnu.build-id")
+                check_section = note or candidate.get_shdr(".eh_frame")
+                try:
+                    actual = read_memory(mapped_base + check_section.sh_addr - linked_base, check_section.sh_size)
+                except gdb.error:
+                    continue
+                if actual != candidate.read_shdr(".note.gnu.build-id" if note else ".eh_frame"):
+                    continue
+            elf = candidate
+            break
+
+        if elf is None:
+            candidate = Elf.get_elf(mapped_base)
+            if candidate and candidate.is_valid() and candidate.get_shdr(".eh_frame"):
+                elf = candidate
+        if elf is None:
+            return None, None
+
+        load_segments = [
+            phdr for phdr in elf.phdrs
+            if phdr.p_type == Elf.Phdr.PT_LOAD
+        ]
+        if not load_segments:
+            return None, None
+        linked_base = min(phdr.p_vaddr - phdr.p_offset for phdr in load_segments)
+        return DwarfExceptionHandler(elf), mapped_base - linked_base
+
+    @parse_args
+    @only_if_gdb_running
+    @exclude_specific_gdb_mode(mode=("qemu-system", "kgdb", "vmware"))
+    @require_arch_set
+    def do_invoke(self, args):
+        if args.location is None:
+            pc = runtime.current_arch.pc
+        else:
+            pc = args.location
+        handler, load_bias = self.find_handler(pc)
+        if handler is None:
+            err("Could not read .eh_frame for the mapping containing {:#x}".format(pc))
+            return
+
+        try:
+            unwind = handler.unwind_info(pc, load_bias)
+        except (IndexError, KeyError, ValueError) as exception:
+            err("Failed to evaluate unwind information: {!s}".format(exception))
+            return
+        if unwind is None:
+            err("No FDE covers {:#x}".format(pc))
+            return
+
+        cie = unwind["cie"]
+        fde = unwind["fde"]
+        state = unwind["state"]
+        registers = state["registers"]
+        return_register = cie["return_register"]
+        fde_start = fde["pc_begin"] + load_bias
+        fde_end = fde["pc_end"] + load_bias
+
+        lines = [
+            ("CIE", "{:#x}".format(cie["address"] + load_bias)),
+            ("FDE", "{:#x} [{:#x}-{:#x})".format(fde["address"] + load_bias, fde_start, fde_end)),
+            ("PC", Symbol.format(pc, show_address=True)),
+            ("CFA", handler.format_cfa_rule(state["cfa"])),
+            ("RA", handler.format_register_rule(registers.get(return_register, ("undefined",)))),
+        ]
+        for reg in sorted(registers):
+            if reg == return_register:
+                continue
+            regname = handler.get_register_name(reg)
+            if regname == "???":
+                regname = "r{:d}".format(reg)
+            lines.append((regname, handler.format_register_rule(registers[reg])))
+        if state["ra_state"]:
+            lines.append(("RA state", "negated/signed"))
+
+        width = max(len(label) for label, value in lines)
+        for label, value in lines:
+            gef_print("{0:<{1:d}s} : {2:s}".format(label, width, value))
+        if args.verbose:
+            details = handler.format_frame_records(cie["offset"], fde["offset"])
+            if details:
+                gef_print("")
+                gef_print("\n".join(details))
+        return
+
+
+@register_command
 class LinkMapCommand(GenericCommand, BufferingOutput):
     """Dump useful members of link_map with iterating."""
 
@@ -2659,6 +3520,10 @@ class DynamicCommand(GenericCommand, BufferingOutput):
             0x70000001: "DT_AARCH64_BTI_PLT",
             0x70000003: "DT_AARCH64_PAC_PLT",
             0x70000005: "DT_AARCH64_VARIANT_PCS",
+            0x70000009: "DT_AARCH64_MEMTAG_MODE",
+            0x7000000b: "DT_AARCH64_MEMTAG_HEAP",
+            0x7000000c: "DT_AARCH64_MEMTAG_STACK",
+            0x7000000d: "DT_AARCH64_MEMTAG_GLOBALS",
         },
         "alpha": {
             0x70000000: "DT_ALPHA_PLTRO",
@@ -2743,19 +3608,16 @@ class DynamicCommand(GenericCommand, BufferingOutput):
     }
 
     @staticmethod
-    def get_ARCH_SPECIFIC_DT_TABLE():
+    def get_DT_THISPROCNUM():
         # default value
         DT_THISPROCNUM = 0
-        ARCH_SPECIFIC_DT_TABLE = {}
 
         # Considering glibc 2.20 and later
         if is_arm64():
             if get_libc_version() >= (2, 33):
                 DT_THISPROCNUM = 6
-                ARCH_SPECIFIC_DT_TABLE = DynamicCommand.ARCH_SPECIFIC_DT_TABLE["arm64"]
         elif is_alpha():
             DT_THISPROCNUM = 1
-            ARCH_SPECIFIC_DT_TABLE = DynamicCommand.ARCH_SPECIFIC_DT_TABLE["alpha"]
         elif is_mips32() or is_mips64() or is_mipsn32():
             if get_libc_version() >= (2, 31):
                 DT_THISPROCNUM = 0x37
@@ -2763,47 +3625,74 @@ class DynamicCommand(GenericCommand, BufferingOutput):
                 DT_THISPROCNUM = 0x36
             else:
                 DT_THISPROCNUM = 0x35
-            ARCH_SPECIFIC_DT_TABLE = DynamicCommand.ARCH_SPECIFIC_DT_TABLE["mips"] # 2.20~
-        elif is_nios2():
-            # DT_THISPROCNUM is not changed
-            ARCH_SPECIFIC_DT_TABLE = DynamicCommand.ARCH_SPECIFIC_DT_TABLE["nios2"]
         elif is_ppc32():
             if get_libc_version() >= (2, 22):
                 DT_THISPROCNUM = 2
             else:
                 DT_THISPROCNUM = 1
-            ARCH_SPECIFIC_DT_TABLE = DynamicCommand.ARCH_SPECIFIC_DT_TABLE["ppc32"]
         elif is_ppc64():
             DT_THISPROCNUM = 4
-            ARCH_SPECIFIC_DT_TABLE = DynamicCommand.ARCH_SPECIFIC_DT_TABLE["ppc64"]
-        elif is_riscv32() or is_riscv64():
-            if get_libc_version() >= (2, 36):
-                # DT_THISPROCNUM is not changed
-                ARCH_SPECIFIC_DT_TABLE = DynamicCommand.ARCH_SPECIFIC_DT_TABLE["riscv"]
         elif is_sparc32() or is_sparc32plus() or is_sparc64():
             DT_THISPROCNUM = 2
-            ARCH_SPECIFIC_DT_TABLE = DynamicCommand.ARCH_SPECIFIC_DT_TABLE["sparc"]
         elif is_x86_64():
             if get_libc_version() >= (2, 39):
                 DT_THISPROCNUM = 4
-                ARCH_SPECIFIC_DT_TABLE = DynamicCommand.ARCH_SPECIFIC_DT_TABLE["x86-64"]
-        elif is_xtensa():
-            # DT_THISPROCNUM is not changed
-            ARCH_SPECIFIC_DT_TABLE = DynamicCommand.ARCH_SPECIFIC_DT_TABLE["xtensa"]
-        return DT_THISPROCNUM, ARCH_SPECIFIC_DT_TABLE
+        return DT_THISPROCNUM
 
     @staticmethod
     @Cache.cache_this_session
     def get_DT_TABLE():
-        _, ARCH_SPECIFIC_DT_TABLE = DynamicCommand.get_ARCH_SPECIFIC_DT_TABLE()
-        return DynamicCommand.DT_TABLE | ARCH_SPECIFIC_DT_TABLE
+        ARCH_SPECIFIC_DT_TABLE = {}
+        if is_arm64():
+            ARCH_SPECIFIC_DT_TABLE = DynamicCommand.ARCH_SPECIFIC_DT_TABLE["arm64"]
+        elif is_alpha():
+            ARCH_SPECIFIC_DT_TABLE = DynamicCommand.ARCH_SPECIFIC_DT_TABLE["alpha"]
+        elif is_mips32() or is_mips64() or is_mipsn32():
+            ARCH_SPECIFIC_DT_TABLE = DynamicCommand.ARCH_SPECIFIC_DT_TABLE["mips"]
+        elif is_nios2():
+            ARCH_SPECIFIC_DT_TABLE = DynamicCommand.ARCH_SPECIFIC_DT_TABLE["nios2"]
+        elif is_ppc32():
+            ARCH_SPECIFIC_DT_TABLE = DynamicCommand.ARCH_SPECIFIC_DT_TABLE["ppc32"]
+        elif is_ppc64():
+            ARCH_SPECIFIC_DT_TABLE = DynamicCommand.ARCH_SPECIFIC_DT_TABLE["ppc64"]
+        elif is_riscv32() or is_riscv64():
+            ARCH_SPECIFIC_DT_TABLE = DynamicCommand.ARCH_SPECIFIC_DT_TABLE["riscv"]
+        elif is_sparc32() or is_sparc32plus() or is_sparc64():
+            ARCH_SPECIFIC_DT_TABLE = DynamicCommand.ARCH_SPECIFIC_DT_TABLE["sparc"]
+        elif is_x86_64():
+            ARCH_SPECIFIC_DT_TABLE = DynamicCommand.ARCH_SPECIFIC_DT_TABLE["x86-64"]
+        elif is_xtensa():
+            ARCH_SPECIFIC_DT_TABLE = DynamicCommand.ARCH_SPECIFIC_DT_TABLE["xtensa"]
+        return {**DynamicCommand.DT_TABLE, **ARCH_SPECIFIC_DT_TABLE}
 
     def __init__(self):
         super().__init__(complete=gdb.COMPLETE_FILENAME)
         return
 
-    def dump_dynamic(self, dynamic, remain_size):
-        base_address_color = Config.get_gef_setting("theme.dereference_base_address")
+    @staticmethod
+    def iter_dynamic(dynamic, size=None, raw=False):
+        current = dynamic.value
+        if dynamic.section:
+            end = dynamic.section.page_end
+        else:
+            end = AddressUtil.get_vmem_end()
+        if size is not None:
+            end = min(AddressUtil.get_vmem_end(), current + size)
+        while current + runtime.current_arch.ptrsize * 2 <= end:
+            try:
+                tag = read_int_from_memory(current)
+                val = read_int_from_memory(current + runtime.current_arch.ptrsize)
+            except gdb.MemoryError:
+                err("Memory read error at {:#x}".format(current))
+                break
+            yield current, tag, val
+            if tag == 0 and not raw: # DT_NULL
+                break
+            current += runtime.current_arch.ptrsize * 2
+        return
+
+    def dump_dynamic(self, dynamic, remain_size, raw=None):
+        base_address_color = Config.get("theme.dereference_base_address")
 
         if dynamic is None:
             info("Could not find _DYNAMIC")
@@ -2817,29 +3706,16 @@ class DynamicCommand(GenericCommand, BufferingOutput):
 
         DT_TABLE = DynamicCommand.get_DT_TABLE()
 
-        current = dynamic.value
-        while True:
-            addr = current
-            tag = read_int_from_memory(current)
-            current += runtime.current_arch.ptrsize
-            val = read_int_from_memory(current)
-            current += runtime.current_arch.ptrsize
-
-            if remain_size is None:
-                if tag not in DT_TABLE:
-                    break
-            else:
-                remain_size -= runtime.current_arch.ptrsize * 2
-
-            val = ProcessMap.lookup_address(val)
+        if raw is None:
+            raw = remain_size is not None
+        for addr, tag, val in self.iter_dynamic(dynamic, remain_size, raw):
+            val = ProcessMap.lookup(val)
             tag_description = DT_TABLE.get(tag, "Unknown")
             colored_addr = Color.colorify("{:#0{:d}x}".format(addr, width), base_address_color)
             self.out.append("{:s}: {:#0{:d}x} {!s}  |  {:s}".format(
                 colored_addr, tag, width, val, tag_description,
             ))
 
-            if remain_size is not None and remain_size <= 0:
-                break
         return
 
     @staticmethod
@@ -2847,9 +3723,10 @@ class DynamicCommand(GenericCommand, BufferingOutput):
         if not filename_or_addr:
             # fast path
             try:
-                dynamic = AddressUtil.parse_address("(void*) &_DYNAMIC")
-                dynamic = ProcessMap.lookup_address(dynamic)
-                return dynamic
+                dynamic = Symbol.resolve_address("_DYNAMIC")
+                # patchelf may leave _DYNAMIC pointing to a clobbered old .dynamic section.
+                if dynamic is not None and read_memory(dynamic, 4) != b"\x5a\x5a\x5a\x5a":
+                    return ProcessMap.lookup(dynamic)
             except gdb.error:
                 pass
 
@@ -2918,9 +3795,9 @@ class DynamicCommand(GenericCommand, BufferingOutput):
             else:
                 dynamic = phdr.p_vaddr
 
-        dynamic = ProcessMap.lookup_address(dynamic)
+        dynamic = ProcessMap.lookup(dynamic)
         if not silent:
-            info("_DNYAMIC: {!s} [{!s}]".format(dynamic, dynamic.section.permission))
+            info("_DYNAMIC: {!s} [{!s}]".format(dynamic, dynamic.section.permission))
         return dynamic
 
     @parse_args
@@ -2928,8 +3805,9 @@ class DynamicCommand(GenericCommand, BufferingOutput):
     @exclude_specific_gdb_mode(mode=("qemu-system", "kgdb", "vmware", "wine"))
     @require_arch_set
     def do_invoke(self, args):
-        if args.dynamic_address:
-            dynamic = ProcessMap.lookup_address(args.dynamic_address)
+        dynamic_size = args.dynamic_size
+        if args.dynamic_address is not None:
+            dynamic = ProcessMap.lookup(args.dynamic_address)
         else:
             try:
                 dynamic = self.get_dynamic(args.elf_address or args.filename)
@@ -2937,15 +3815,23 @@ class DynamicCommand(GenericCommand, BufferingOutput):
                 err("Failed to get _DYNAMIC")
                 return
 
+            if dynamic_size is None:
+                try:
+                    elf = Elf.get_elf(args.elf_address or args.filename)
+                    dynamic_size = elf.get_phdr(Elf.Phdr.PT_DYNAMIC).p_memsz
+                except Exception:
+                    dynamic_size = None
+
         self.out = []
         try:
-            self.dump_dynamic(dynamic, args.dynamic_size)
+            self.dump_dynamic(dynamic, dynamic_size, raw=args.dynamic_size is not None)
         except Exception:
             err("Failed to parse _DYNAMIC")
             return
 
         self.print_output(check_terminal_size=True)
         return
+
 
 
 @register_command
@@ -4651,3 +5537,2467 @@ class GotAllCommand(GenericCommand, BufferingOutput):
 
         self.print_output(check_terminal_size=True)
         return
+
+
+class DwarfExceptionHandler:
+    """Parse the DWARF exception handler sections (.eh_frame_hdr, .eh_frame and .gcc_except_table)."""
+
+    def __init__(self, elf):
+        self.elf = elf
+        if elf.e_endianness == Elf.LITTLE_ENDIAN:
+            self.endian = "little"
+        else:
+            self.endian = "big"
+        if elf.e_class == Elf.ELF_32_BITS:
+            self.ptr_size = 4
+        else:
+            self.ptr_size = 8
+        phdr = elf.get_phdr(Elf.Phdr.PT_LOAD)
+        if phdr:
+            self.load_base = phdr.p_vaddr
+        else:
+            self.load_base = 0
+        self.lsda_info = {} # {LSDA offset from load_base: function start offset from load_base}
+        return
+
+    class ErrorEntry:
+        def __init__(self, *args):
+            self.tag = "error"
+            assert len(args) == 2
+            self.msg1 = args[0]
+            self.msg2 = args[1]
+            return
+
+        def __str__(self):
+            msg = "[!] {!s}\n{!s}".format(self.msg1, self.msg2)
+            return msg
+
+    class SeparatorEntry:
+        def __init__(self, *args):
+            self.tag = "separator"
+            assert 2 <= len(args) <= 3
+            self.pos = args[0]
+            self.name = args[1]
+            if len(args) == 3 and args[2] is not None:
+                self.extra = args[2]
+            else:
+                self.extra = ""
+            return
+
+        def __str__(self):
+            if self.extra:
+                extra_s = "  |  {:s}".format(self.extra)
+            else:
+                extra_s = ""
+            msg = "[{:#06x}] {:4s}{:s}".format(self.pos, self.name, extra_s)
+            msg = titlify(msg, color="red", msg_color="red")
+            return msg
+
+    class DataEntry:
+        def __init__(self, *args):
+            self.tag = "data"
+            assert 3 <= len(args) <= 5
+            self.pos = args[0]
+            self.raw_data = args[1]
+            self.name = args[2]
+            if len(args) >= 4 and args[3] is not None:
+                self.value = args[3]
+            else:
+                self.value = ""
+            if len(args) == 5 and args[4] is not None:
+                self.extra = args[4]
+            else:
+                self.extra = ""
+            return
+
+        def __str__(self):
+            pos_s = "[{:#08x}|+{:#06x}]".format(self.sec.offset + self.pos, self.pos)
+
+            if self.raw_data is None:
+                raw_data_s = ""
+            elif isinstance(self.raw_data, int):
+                raw_data_s = "{:02x}".format(self.raw_data)
+            elif isinstance(self.raw_data, bytes):
+                raw_data_s = " ".join(["{:02x}".format(x) for x in self.raw_data])
+            else:
+                raise TypeError("unsupported raw_data type: {!s}".format(type(self.raw_data)))
+
+            if isinstance(self.value, str):
+                value_s = self.value
+            elif isinstance(self.value, int):
+                value_s = "{:#018x}".format(self.value)
+            elif isinstance(self.value, list):
+                value_s = " ".join(["{:#018x}".format(x) for x in self.value])
+            else:
+                raise TypeError("unsupported value type: {!s}".format(type(self.value)))
+
+            if self.extra:
+                extra_s = "  |  {:s}".format(self.extra)
+            else:
+                extra_s = ""
+
+            if self.value is not None:
+                msg = "{:s} {:<23s} {:<30s}: {:<18s}{:s}".format(
+                    pos_s, raw_data_s, self.name, value_s, extra_s,
+                )
+            else:
+                msg = "{:s} {:<23s} {:<50s}{:s}".format(
+                    pos_s, raw_data_s, self.name, extra_s,
+                )
+            return msg
+
+        def add_sec(self, sec):
+            self.sec = sec
+            return
+
+    def format_entry(self, sec, entries, with_hexdump=False):
+        out = []
+        out.append(titlify(sec.name))
+
+        # hexdump
+        if with_hexdump:
+            out.append(hexdump(sec.data, show_symbol=False, base=sec.offset))
+
+        # print details
+        fmt = "[{:<8}|+{:<6}] {:<23s} {:<30s}: {:<18s}  |  {:s}"
+        legend = ["FileOff", "Offset", "Raw bytes", "Name", "Value", "Extra Information"]
+        out.append(GefUtil.make_legend(fmt.format(*legend)))
+
+        # print each entries
+        for entry in entries:
+            if entry.tag == "data":
+                entry.add_sec(sec)
+            out.append(str(entry))
+        return out
+
+    def get_uleb128(self, data, pos):
+        acc = 0
+        i = 0
+        while True:
+            if i == 10:
+                return pos, 0xffff_ffff_ffff_ffff
+            pos, b = self.read_1ubyte(data, pos)
+            acc |= (b & 0x7f) << (i * 7)
+            if (b & 0x80) == 0:
+                return pos, acc
+            i += 1
+
+    def get_sleb128(self, data, pos):
+        orig_pos = pos
+        pos, acc = self.get_uleb128(data, pos)
+        length = pos - orig_pos
+        sleb_sign_mask = 1 << (length * 7 - 1)
+        if (acc & sleb_sign_mask) == 0:
+            return pos, acc
+        else:
+            return pos, acc - (sleb_sign_mask << 1)
+
+    def read_nbyte(self, data, pos, size, signed=False):
+        if pos + size > len(data):
+            raise IndexError("read out of range: {:#x}".format(pos + size))
+        acc = int.from_bytes(data[pos:pos + size], self.endian, signed=signed)
+        return pos + size, acc
+
+    def read_1ubyte(self, data, pos):
+        return self.read_nbyte(data, pos, 1)
+
+    def read_1sbyte(self, data, pos):
+        return self.read_nbyte(data, pos, 1, signed=True)
+
+    def read_2ubyte(self, data, pos):
+        return self.read_nbyte(data, pos, 2)
+
+    def read_2sbyte(self, data, pos):
+        return self.read_nbyte(data, pos, 2, signed=True)
+
+    def read_4ubyte(self, data, pos):
+        return self.read_nbyte(data, pos, 4)
+
+    def read_4sbyte(self, data, pos):
+        return self.read_nbyte(data, pos, 4, signed=True)
+
+    def read_8ubyte(self, data, pos):
+        return self.read_nbyte(data, pos, 8)
+
+    def read_8sbyte(self, data, pos):
+        return self.read_nbyte(data, pos, 8, signed=True)
+
+    # FDE data encoding
+    DW_EH_PE_ptr      = 0x00
+    DW_EH_PE_uleb128  = 0x01
+    DW_EH_PE_udata2   = 0x02
+    DW_EH_PE_udata4   = 0x03
+    DW_EH_PE_udata8   = 0x04
+    DW_EH_PE_signed   = 0x08 # noqa: F841
+    DW_EH_PE_sleb128  = 0x09
+    DW_EH_PE_sdata2   = 0x0a
+    DW_EH_PE_sdata4   = 0x0b
+    DW_EH_PE_sdata8   = 0x0c
+    # FDE flags
+    DW_EH_PE_absptr   = 0x00
+    DW_EH_PE_pcrel    = 0x10
+    DW_EH_PE_textrel  = 0x20
+    DW_EH_PE_datarel  = 0x30
+    DW_EH_PE_funcrel  = 0x40
+    DW_EH_PE_aligned  = 0x50
+    DW_EH_PE_indirect = 0x80
+    DW_EH_PE_omit     = 0xff
+
+    def read_encoded(self, encoding, data, pos):
+        if (encoding & 0xf) == self.DW_EH_PE_ptr:
+            pos, res = self.read_nbyte(data, pos, self.ptr_size)
+        elif (encoding & 0xf) == self.DW_EH_PE_uleb128:
+            pos, res = self.get_uleb128(data, pos)
+        elif (encoding & 0xf) == self.DW_EH_PE_sleb128:
+            pos, res = self.get_sleb128(data, pos)
+        elif (encoding & 0xf) == self.DW_EH_PE_udata2:
+            pos, res = self.read_2ubyte(data, pos)
+        elif (encoding & 0xf) == self.DW_EH_PE_udata4:
+            pos, res = self.read_4ubyte(data, pos)
+        elif (encoding & 0xf) == self.DW_EH_PE_udata8:
+            pos, res = self.read_8ubyte(data, pos)
+        elif (encoding & 0xf) == self.DW_EH_PE_sdata2:
+            pos, res = self.read_2sbyte(data, pos)
+        elif (encoding & 0xf) == self.DW_EH_PE_sdata4:
+            pos, res = self.read_4sbyte(data, pos)
+        elif (encoding & 0xf) == self.DW_EH_PE_sdata8:
+            pos, res = self.read_8sbyte(data, pos)
+        else:
+            raise ValueError("read_encoded: unsupported encoding: {:#x}".format(encoding))
+        return pos, res
+
+    def get_encoding_str(self, fde_encoding):
+        if fde_encoding == self.DW_EH_PE_omit:
+            return "omit"
+        s = []
+        if (fde_encoding & 0xf) == self.DW_EH_PE_ptr:
+            s.append("ptr")
+        elif (fde_encoding & 0xf) == self.DW_EH_PE_uleb128:
+            s.append("uleb128")
+        elif (fde_encoding & 0xf) == self.DW_EH_PE_sleb128:
+            s.append("sleb128")
+        elif (fde_encoding & 0xf) == self.DW_EH_PE_udata2:
+            s.append("udata2")
+        elif (fde_encoding & 0xf) == self.DW_EH_PE_sdata2:
+            s.append("sdata2")
+        elif (fde_encoding & 0xf) == self.DW_EH_PE_udata4:
+            s.append("udata4")
+        elif (fde_encoding & 0xf) == self.DW_EH_PE_sdata4:
+            s.append("sdata4")
+        elif (fde_encoding & 0xf) == self.DW_EH_PE_udata8:
+            s.append("udata8")
+        elif (fde_encoding & 0xf) == self.DW_EH_PE_sdata8:
+            s.append("sdata8")
+        if (fde_encoding & 0x70) == self.DW_EH_PE_absptr:
+            s.append("absptr")
+        elif (fde_encoding & 0x70) == self.DW_EH_PE_pcrel:
+            s.append("pcrel")
+        elif (fde_encoding & 0x70) == self.DW_EH_PE_textrel:
+            s.append("textrel")
+        elif (fde_encoding & 0x70) == self.DW_EH_PE_datarel:
+            s.append("datarel")
+        elif (fde_encoding & 0x70) == self.DW_EH_PE_funcrel:
+            s.append("funcrel")
+        elif (fde_encoding & 0x70) == self.DW_EH_PE_aligned:
+            s.append("aligned")
+        if (fde_encoding & 0x80) == self.DW_EH_PE_indirect:
+            s.append("indirect")
+        return ",".join(s)
+
+    def encoded_ptr_size(self, encoding, ptr_size):
+        if (encoding & 0xf) == self.DW_EH_PE_ptr:
+            return ptr_size
+        elif (encoding & 0xf) in [self.DW_EH_PE_udata2, self.DW_EH_PE_sdata2]:
+            return 2
+        elif (encoding & 0xf) in [self.DW_EH_PE_udata4, self.DW_EH_PE_sdata4]:
+            return 4
+        elif (encoding & 0xf) in [self.DW_EH_PE_udata8, self.DW_EH_PE_sdata8]:
+            return 8
+        elif encoding == self.DW_EH_PE_omit:
+            return 0
+        err("Unsupported pointer encoding: {:#x}, assuming pointer size of {:d}".format(
+            encoding, ptr_size,
+        ))
+        return 0
+
+    def format_vma(self, offset):
+        if self.elf.is_pie():
+            return "$codebase+{:#x}".format(self.load_base + offset)
+        return "{:#x}".format(self.load_base + offset)
+
+    def section_offset(self, section_name):
+        shdr = self.elf.get_shdr(section_name)
+        return shdr.sh_addr - self.load_base
+
+    def encoded_offset(self, encoding, value, pos_off, data_off=None, func_off=None):
+        # returns the offset from load_base, or None if it cannot be resolved statically
+        application = encoding & 0x70
+        if application == self.DW_EH_PE_absptr:
+            if value == 0:
+                return None
+            offset = value - self.load_base
+        elif application == self.DW_EH_PE_pcrel:
+            offset = pos_off + value
+        elif application == self.DW_EH_PE_datarel and data_off is not None:
+            offset = data_off + value
+        elif application == self.DW_EH_PE_funcrel and func_off is not None:
+            offset = func_off + value
+        else:
+            return None
+        return offset & ((1 << (self.ptr_size * 8)) - 1)
+
+    def parse_eh_frame_hdr(self, eh_frame_hdr):
+        data = eh_frame_hdr.data
+        sec_off = self.section_offset(".eh_frame_hdr")
+
+        entries = []
+        pos = 0
+
+        try:
+            new_pos, version = self.read_1ubyte(data, pos)
+            entries.append(self.DataEntry(pos, data[pos:new_pos], "version", version))
+            pos = new_pos
+
+            new_pos, eh_frame_ptr_enc = self.read_1ubyte(data, pos)
+            encoding_str = self.get_encoding_str(eh_frame_ptr_enc)
+            entries.append(self.DataEntry(
+                pos, data[pos:new_pos], "eh_frame_ptr_enc", eh_frame_ptr_enc,
+                "encoding: {:s}".format(encoding_str),
+            ))
+            pos = new_pos
+
+            new_pos, fde_count_enc = self.read_1ubyte(data, pos)
+            encoding_str = self.get_encoding_str(fde_count_enc)
+            entries.append(self.DataEntry(
+                pos, data[pos:new_pos], "fde_count_enc", fde_count_enc,
+                "encoding: {:s}".format(encoding_str),
+            ))
+            pos = new_pos
+
+            new_pos, table_enc = self.read_1ubyte(data, pos)
+            encoding_str = self.get_encoding_str(table_enc)
+            entries.append(self.DataEntry(
+                pos, data[pos:new_pos], "table_enc", table_enc,
+                "encoding: {:s}".format(encoding_str),
+            ))
+            pos = new_pos
+
+            eh_frame_off = None
+            if eh_frame_ptr_enc != self.DW_EH_PE_omit:
+                new_pos, eh_frame_ptr = self.read_encoded(eh_frame_ptr_enc, data, pos)
+                eh_frame_off = self.encoded_offset(eh_frame_ptr_enc, eh_frame_ptr, sec_off + pos, data_off=sec_off)
+                if eh_frame_off is None:
+                    entries.append(self.DataEntry(
+                        pos, data[pos:new_pos], "eh_frame_ptr", eh_frame_ptr,
+                    ))
+                else:
+                    if (eh_frame_ptr_enc & 0x70) == self.DW_EH_PE_pcrel:
+                        eh_frame_ptr = eh_frame_off
+                    extra_s = "vma: {:s}".format(self.format_vma(eh_frame_off))
+                    entries.append(self.DataEntry(
+                        pos, data[pos:new_pos], "eh_frame_ptr", eh_frame_ptr, extra_s,
+                    ))
+                pos = new_pos
+
+            fde_count = 0
+            if fde_count_enc != self.DW_EH_PE_omit:
+                new_pos, fde_count = self.read_encoded(fde_count_enc, data, pos)
+                entries.append(self.DataEntry(pos, data[pos:new_pos], "fde_count", fde_count))
+                pos = new_pos
+
+            table_cnt = 0
+            if table_enc != self.DW_EH_PE_omit:
+                while table_cnt < fde_count and data[pos:]:
+                    entries.append(self.SeparatorEntry(pos, "Table[{:4d}]".format(table_cnt)))
+
+                    new_pos, initial_loc = self.read_encoded(table_enc, data, pos)
+                    initial_offset = self.encoded_offset(table_enc, initial_loc, sec_off + pos, data_off=sec_off)
+                    if initial_offset is None:
+                        entries.append(self.DataEntry(pos, data[pos:new_pos], "initial_loc", initial_loc))
+                    else:
+                        extra_s = "vma: {:s}".format(self.format_vma(initial_offset))
+                        entries.append(self.DataEntry(
+                            pos, data[pos:new_pos], "initial_loc", initial_offset, extra_s,
+                        ))
+                    pos = new_pos
+
+                    new_pos, fde_ptr = self.read_encoded(table_enc, data, pos)
+                    fde_offset = self.encoded_offset(table_enc, fde_ptr, sec_off + pos, data_off=sec_off)
+                    if fde_offset is None:
+                        entries.append(self.DataEntry(pos, data[pos:new_pos], "fde", fde_ptr))
+                    else:
+                        if eh_frame_off is not None:
+                            fde_ptr = fde_offset - eh_frame_off
+                        extra_s = "vma: {:s}".format(self.format_vma(fde_offset))
+                        entries.append(self.DataEntry(
+                            pos, data[pos:new_pos], "fde", fde_ptr, extra_s,
+                        ))
+                    pos = new_pos
+
+                    table_cnt += 1
+        except (IndexError, ValueError):
+            _exc_type, exc_value, _exc_traceback = sys.exc_info()
+            entries.append(self.ErrorEntry("Parse Error", exc_value))
+        return entries
+
+    def parse_eh_frame(self, eh_frame):
+        data = eh_frame.data
+        sec_off = self.section_offset(".eh_frame")
+
+        cies = []
+        entries = []
+        pos = 0
+
+        try:
+            while data[pos:]:
+                offset = pos
+                tmp_entries = []
+
+                # parse length
+                new_pos, unit_length = self.read_4ubyte(data, pos)
+                length = 4 # default
+                tmp_entries.append(self.DataEntry(
+                    pos, data[pos:new_pos], "length", unit_length,
+                ))
+                pos = new_pos
+                if unit_length == 0xffff_ffff:
+                    new_pos, unit_length = self.read_8ubyte(data, pos)
+                    length = 8
+                    tmp_entries.append(self.DataEntry(
+                        pos, data[pos:new_pos], "extended_length", unit_length,
+                    ))
+                    pos = new_pos
+                if unit_length == 0:
+                    entries.append(self.SeparatorEntry(offset, "Zero terminator"))
+                    entries += tmp_entries
+                    tmp_entries = []
+                    continue
+
+                ptr_size = self.ptr_size
+                start = pos # use later
+                cie_end = pos + unit_length
+
+                # parse cie_id / cie_pointer
+                if length == 4:
+                    new_pos, cie_id = self.read_4ubyte(data, pos)
+                else:
+                    new_pos, cie_id = self.read_8ubyte(data, pos)
+                if cie_id == 0:
+                    tmp_entries.append(self.DataEntry(
+                        pos, data[pos:new_pos], "cie_id", cie_id, "type: CIE",
+                    ))
+                else:
+                    extra_s = "type: FDE, Associated_CIE: {:#x}(={:#x}-{:#x})".format(
+                        start - cie_id, start, cie_id,
+                    )
+                    tmp_entries.append(
+                        self.DataEntry(pos, data[pos:new_pos], "cie_pointer", cie_id, extra_s,
+                    ))
+                pos = new_pos
+
+                version = 2
+                fde_encoding = 0
+                lsda_encoding = 0
+                initial_location = 0
+                vma_base = 0
+
+                if cie_id == 0:  # CIE parsing
+                    entries.append(self.SeparatorEntry(offset, "CIE"))
+                    entries += tmp_entries
+                    tmp_entries = []
+
+                    # parse version
+                    new_pos, version = self.read_1ubyte(data, pos)
+                    entries.append(self.DataEntry(pos, data[pos:new_pos], "version", version))
+                    pos = new_pos
+
+                    # parse augmentation string
+                    orig_pos = pos
+                    augmentation = ""
+                    while data[pos]:
+                        augmentation += chr(data[pos])
+                        pos += 1
+                    pos += 1 # skip NUL
+                    entries.append(self.DataEntry(
+                        orig_pos, data[orig_pos:pos],
+                        "augmentation_string", '"{:s}"'.format(augmentation),
+                    ))
+
+                    if augmentation == "eh":
+                        new_pos, adjust = self.read_nbyte(data, pos, self.ptr_size)
+                        entries.append(self.DataEntry(pos, data[pos:new_pos], "eh_data", adjust))
+                        pos = new_pos
+
+                    # parse ptr_size, segment_size
+                    segment_size = 0
+                    if version >= 4:
+                        new_pos, ptr_size = self.read_1ubyte(data, pos)
+                        entries.append(self.DataEntry(pos, data[pos:new_pos], "ptr_size", ptr_size))
+                        pos = new_pos
+                        new_pos, segment_size = self.read_1ubyte(data, pos)
+                        entries.append(self.DataEntry(pos, data[pos:new_pos], "segment_size", segment_size))
+                        pos = new_pos
+
+                    # parse code/data alignment factor
+                    new_pos, code_alignment_factor = self.get_uleb128(data, pos)
+                    entries.append(self.DataEntry(
+                        pos, data[pos:new_pos], "code_alignment_factor", code_alignment_factor,
+                    ))
+                    pos = new_pos
+                    new_pos, data_alignment_factor = self.get_sleb128(data, pos)
+                    entries.append(self.DataEntry(
+                        pos, data[pos:new_pos], "data_alignment_factor", data_alignment_factor,
+                    ))
+                    pos = new_pos
+
+                    if version == 1:
+                        new_pos, return_address_register = self.read_1ubyte(data, pos)
+                        ra_reg_name = self.get_register_name(return_address_register)
+                        extra_s = "Reg: {:s}".format(ra_reg_name)
+                        entries.append(self.DataEntry(
+                            pos, data[pos:new_pos],
+                            "return_address_register", return_address_register, extra_s,
+                        ))
+                        pos = new_pos
+                    else:
+                        new_pos, return_address_register = self.get_uleb128(data, pos)
+                        ra_reg_name = self.get_register_name(return_address_register)
+                        extra_s = "Reg: {:s}".format(ra_reg_name)
+                        entries.append(self.DataEntry(
+                            pos, data[pos:new_pos],
+                            "return_address_register", return_address_register, extra_s,
+                        ))
+                        pos = new_pos
+
+                    if augmentation.startswith("z"):
+                        new_pos, augmentation_len = self.get_uleb128(data, pos)
+                        entries.append(self.DataEntry(
+                            pos, data[pos:new_pos], "augmentation_len", augmentation_len,
+                        ))
+                        pos = new_pos
+
+                        aug_end = pos + augmentation_len
+                        for cp in augmentation[1:]:
+                            if cp == "R":
+                                new_pos, fde_encoding = self.read_1ubyte(data, pos)
+                                encoding_str = self.get_encoding_str(fde_encoding)
+                                extra_s = "FDE address encoding: {:s}".format(encoding_str)
+                                entries.append(self.DataEntry(
+                                    pos, data[pos:new_pos], "augmentation_data(R)", fde_encoding, extra_s,
+                                ))
+                                pos = new_pos
+                            elif cp == "L":
+                                new_pos, lsda_encoding = self.read_1ubyte(data, pos)
+                                encoding_str = self.get_encoding_str(lsda_encoding)
+                                extra_s = "LSDA pointer encoding: {:s}".format(encoding_str)
+                                entries.append(self.DataEntry(
+                                    pos, data[pos:new_pos], "augmentation_data(L)", lsda_encoding, extra_s,
+                                ))
+                                pos = new_pos
+                            elif cp == "P":
+                                new_pos, p_encoding = self.read_1ubyte(data, pos)
+                                encoding_str = self.get_encoding_str(p_encoding)
+                                extra_s = "Personality pointer encoding: {:s}".format(encoding_str)
+                                entries.append(self.DataEntry(
+                                    pos, data[pos:new_pos], "augmentation_data(P)", p_encoding, extra_s,
+                                ))
+                                pos = new_pos
+                                new_pos, p_addr = self.read_encoded(p_encoding, data, pos)
+                                p_off = self.encoded_offset(p_encoding, p_addr, sec_off + pos)
+                                if p_off is None:
+                                    extra_s = "Personality pointer address"
+                                else:
+                                    if (p_encoding & 0x70) == self.DW_EH_PE_pcrel:
+                                        p_addr = p_off
+                                    extra_s = "Personality pointer address: {:s}".format(self.format_vma(p_off))
+                                entries.append(self.DataEntry(
+                                    pos, data[pos:new_pos], "augmentation_data(P)", p_addr, extra_s,
+                                ))
+                                pos = new_pos
+                            elif cp in ["S", "B", "G"]: # no data
+                                pass
+                            else: # unknown
+                                break
+                        if pos < aug_end:
+                            entries.append(self.DataEntry(pos, data[pos:aug_end], "?"))
+                        pos = aug_end
+
+                    cie = {}
+                    cie["cie_offset"] = offset
+                    cie["version"] = version
+                    cie["augmentation"] = augmentation
+                    cie["fde_encoding"] = fde_encoding
+                    cie["lsda_encoding"] = lsda_encoding
+                    cie["address_size"] = ptr_size
+                    cie["code_alignment_factor"] = code_alignment_factor
+                    cie["data_alignment_factor"] = data_alignment_factor
+                    cie = GefUtil.dict_to_namedtuple("Cie", cie)
+                    cies.append(cie)
+
+                else: # FDE parsing
+                    cie = [x for x in cies if start - cie_id == x.cie_offset][0]
+                    version = cie.version
+
+                    entries.append(self.SeparatorEntry(offset, "FDE"))
+                    entries += tmp_entries # unit_length, cie_pointer
+                    tmp_entries = []
+
+                    ptr_mask = (1 << (self.ptr_size * 8)) - 1
+
+                    # parse pc_begin
+                    new_pos, initial_location = self.read_encoded(cie.fde_encoding, data, pos)
+                    func_off = self.encoded_offset(cie.fde_encoding, initial_location, sec_off + pos)
+                    if func_off is None:
+                        func_off = (initial_location - self.load_base) & ptr_mask
+                        entries.append(self.DataEntry(
+                            pos, data[pos:new_pos], "pc_begin", initial_location,
+                        ))
+                    else:
+                        if (cie.fde_encoding & 0x70) == self.DW_EH_PE_pcrel:
+                            initial_location = func_off
+                        extra_s = "pc_begin vma: {:s}".format(self.format_vma(func_off))
+                        entries.append(self.DataEntry(
+                            pos, data[pos:new_pos], "pc_begin", initial_location, extra_s,
+                        ))
+                    vma_base = self.load_base + func_off
+                    pos = new_pos
+
+                    # parse pc_range
+                    new_pos, pc_range = self.read_encoded(cie.fde_encoding & 0x0f, data, pos)
+                    end_off = (func_off + pc_range) & ptr_mask
+                    extra_s = "pc_end vma: {:s}".format(self.format_vma(end_off))
+                    entries.append(self.DataEntry(
+                        pos, data[pos:new_pos], "pc_range", pc_range, extra_s,
+                    ))
+                    pos = new_pos
+
+                    # parse augmentation
+                    if cie.augmentation.startswith("z"):
+                        new_pos, augmentation_len = self.get_uleb128(data, pos)
+                        entries.append(self.DataEntry(
+                            pos, data[pos:new_pos], "augmentation_len", augmentation_len,
+                        ))
+                        pos = new_pos
+
+                        aug_end = pos + augmentation_len
+                        if augmentation_len:
+                            for cp in cie.augmentation[1:]:
+                                if cp == "L":
+                                    new_pos, lsda_pointer = self.read_encoded(cie.lsda_encoding, data, pos)
+                                    lsda_off = self.encoded_offset(
+                                        cie.lsda_encoding, lsda_pointer, sec_off + pos, func_off=func_off,
+                                    )
+                                    if lsda_off is None:
+                                        entries.append(self.DataEntry(
+                                            pos, data[pos:new_pos],
+                                            "augmentation_data(L)", lsda_pointer, "LSDA pointer",
+                                        ))
+                                    else:
+                                        if (cie.lsda_encoding & 0x70) == self.DW_EH_PE_pcrel:
+                                            lsda_pointer = lsda_off
+                                        extra_s = "LSDA pointer vma: {:s}".format(self.format_vma(lsda_off))
+                                        entries.append(self.DataEntry(
+                                            pos, data[pos:new_pos],
+                                            "augmentation_data(L)", lsda_pointer, extra_s,
+                                        ))
+                                        self.lsda_info[lsda_off] = func_off
+                                    pos = new_pos
+                            if pos < aug_end:
+                                entries.append(self.DataEntry(pos, data[pos:aug_end], "?"))
+                            pos = aug_end
+
+                # common
+                entries += self.parse_cfa_program(data, pos, cie_end, vma_base, version, cie, sec_off)
+                pos = cie_end
+        except (IndexError, ValueError):
+            _exc_type, exc_value, _exc_traceback = sys.exc_info()
+            entries.append(self.ErrorEntry("Parse Error", exc_value))
+        return entries
+
+    DW_CFA_advance_loc                  = 0x40
+    DW_CFA_offset                       = 0x80
+    DW_CFA_restore                      = 0xc0
+    DW_CFA_nop                          = 0x00
+    DW_CFA_set_loc                      = 0x01
+    DW_CFA_advance_loc1                 = 0x02
+    DW_CFA_advance_loc2                 = 0x03
+    DW_CFA_advance_loc4                 = 0x04
+    DW_CFA_offset_extended              = 0x05
+    DW_CFA_restore_extended             = 0x06
+    DW_CFA_undefined                    = 0x07
+    DW_CFA_same_value                   = 0x08
+    DW_CFA_register                     = 0x09
+    DW_CFA_remember_state               = 0x0a
+    DW_CFA_restore_state                = 0x0b
+    DW_CFA_def_cfa                      = 0x0c
+    DW_CFA_def_cfa_register             = 0x0d
+    DW_CFA_def_cfa_offset               = 0x0e
+    DW_CFA_def_cfa_expression           = 0x0f
+    DW_CFA_expression                   = 0x10
+    DW_CFA_offset_extended_sf           = 0x11
+    DW_CFA_def_cfa_sf                   = 0x12
+    DW_CFA_def_cfa_offset_sf            = 0x13
+    DW_CFA_val_offset                   = 0x14
+    DW_CFA_val_offset_sf                = 0x15
+    DW_CFA_val_expression               = 0x16
+    DW_CFA_low_user                     = 0x1c # noqa: F841
+    DW_CFA_MIPS_advance_loc8            = 0x1d
+    DW_CFA_GNU_window_save              = 0x2d # dup
+    DW_CFA_AARCH64_negate_ra_state      = 0x2d # noqa: F841
+    DW_CFA_GNU_args_size                = 0x2e
+    DW_CFA_GNU_negative_offset_extended = 0x2f # noqa: F841
+    DW_CFA_high_user                    = 0x3f # noqa: F841
+
+    def get_register_name(self, reg):
+        if self.elf.e_machine == Elf.EM_X86_64:
+            REG_LIST = [
+                "rax", "rdx", "rcx", "rbx", "rsi", "rdi", "rbp", "rsp",
+                "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
+                "rip", "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6",
+                "xmm7", "xmm8", "xmm9", "xmm10", "xmm11", "xmm12", "xmm13", "xmm14",
+                "xmm15", "st0", "st1", "st2", "st3", "st4", "st5", "st6", "st7",
+                "mm0", "mm1", "mm2", "mm3", "mm4", "mm5", "mm6", "mm7",
+                "rflags", "es", "cs", "ss", "ds", "fs", "gs", "???",
+                "???", "fs.base", "gs.base", "???", "???", "tr", "ldtr", "mxcsr",
+                "fcw", "fsw",
+            ]
+        elif self.elf.e_machine == Elf.EM_386:
+            REG_LIST = [
+                "eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi",
+                "eip", "eflags", "trapno", "st0", "st1", "st2", "st3", "st4",
+                "st5", "st6", "st7", "???", "???", "xmm0", "xmm1", "xmm2",
+                "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "mm0", "mm1", "mm2",
+                "mm3", "mm4", "mm5", "mm6", "mm7", "fctrl", "fstat", "mxcsr",
+                "es", "cs", "ss", "ds", "fs", "gs",
+            ]
+        elif self.elf.e_machine == Elf.EM_ARM:
+            REG_LIST = [
+                "r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7",
+                "r8", "r9", "r10", "r11", "r12", "sp", "lr", "pc",
+                "f0", "f1", "f2", "f3", "f4", "f5", "f6", "f7",
+            ] + ["???"] * 40 + [
+                "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7",
+                "s8", "s9", "s10", "s11", "s12", "s13", "s14", "s15",
+                "s16", "s17", "s18", "s19", "s20", "s21", "s22", "s23",
+                "s24", "s25", "s26", "s27", "s28", "s29", "s30", "s31",
+                "f0", "f1", "f2", "f3", "f4", "f5", "f6", "f7",
+                "wcgr0", "wcgr1", "wcgr2", "wcgr3", "wcgr4", "wcgr5", "wcgr6", "wcgr7",
+                "wr0", "wr1", "wr2", "wr3", "wr4", "wr5", "wr6", "wr7",
+                "wr8", "wr9", "wr10", "wr11", "wr12", "wr13", "wr14", "wr15",
+                "spsr", "spsr_fiq", "spsr_irq", "spsr_abt", "spsr_und", "spsr_svc",
+            ] + ["???"] * 10 + [
+                "r8_usr", "r9_usr", "r10_usr", "r11_usr", "r12_usr", "r13_usr", "r14_usr", "r8_fiq",
+                "r9_fiq", "r10_fiq", "r11_fiq", "r12_fiq", "r13_fiq", "r14_fiq", "r13_irq", "r14_irq",
+                "r13_abt", "r14_abt", "r13_und", "r14_und", "r13_svc", "r14_svc",
+            ] + ["???"] * 26 + [
+                "wc0", "wc1", "wc2", "wc3", "wc4", "wc5", "wc6", "wc7",
+            ] + ["???"] * 56 + ["d{:d}".format(i) for i in range(32)]
+        elif self.elf.e_machine == Elf.EM_AARCH64:
+            REG_LIST = [
+                "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7",
+                "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
+                "x16", "x17", "x18", "x19", "x20", "x21", "x22", "x23",
+                "x24", "x25", "x26", "x27", "x28", "x29", "x30", "sp",
+                "???", "elr",
+            ] + ["???"] * 30 + [
+                "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
+                "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15",
+                "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23",
+                "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31",
+            ]
+        elif self.elf.e_machine == Elf.EM_RISCV:
+            REG_LIST = [
+                "zero", "ra", "sp", "gp", "tp", "t0", "t1", "t2",
+                "fp", "s1", "a0", "a1", "a2", "a3", "a4", "a5",
+                "a6", "a7", "s2", "s3", "s4", "s5", "s6", "s7",
+                "s8", "s9", "s10", "s11", "t3", "t4", "t5", "t6",
+                "ft0", "ft1", "ft2", "ft3", "ft4", "ft5", "ft6", "ft7",
+                "fs0", "fs1", "fa0", "fa1", "fa2", "fa3", "fa4", "fa5",
+                "fa6", "fa7", "fs2", "fs3", "fs4", "fs5", "fs6", "fs7",
+                "fs8", "fs9", "fs10", "fs11", "ft8", "ft9", "ft10", "ft11",
+            ] + ["???"] * 32 + ["v{:d}".format(i) for i in range(32)]
+        elif self.elf.e_machine == Elf.EM_MIPS:
+            if self.elf.e_class == Elf.ELF_64_BITS or self.elf.e_flags & 0x20: # EF_MIPS_ABI2 (n32)
+                REG_LIST = [
+                    "zero", "at", "v0", "v1", "a0", "a1", "a2", "a3",
+                    "a4", "a5", "a6", "a7", "t0", "t1", "t2", "t3",
+                ]
+            else:
+                REG_LIST = [
+                    "zero", "at", "v0", "v1", "a0", "a1", "a2", "a3",
+                    "t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7",
+                ]
+            REG_LIST += [
+                "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7",
+                "t8", "t9", "k0", "k1", "gp", "sp", "fp", "ra",
+            ] + ["f{:d}".format(i) for i in range(32)] + ["hi", "lo"]
+        elif self.elf.e_machine in [Elf.EM_PPC, Elf.EM_PPC64]:
+            # GCC uses its own numbering in .eh_frame
+            REG_LIST = ["r{:d}".format(i) for i in range(32)] + ["f{:d}".format(i) for i in range(32)] + [
+                "???", "lr", "ctr", "vscr", "cr0", "cr1", "cr2", "cr3", "cr4", "cr5", "cr6", "cr7", "xer",
+            ] + ["v{:d}".format(i) for i in range(32)] + ["vrsave"]
+        elif self.elf.e_machine == Elf.EM_S390:
+            REG_LIST = ["r{:d}".format(i) for i in range(16)] + [
+                "f0", "f2", "f4", "f6", "f1", "f3", "f5", "f7",
+                "f8", "f10", "f12", "f14", "f9", "f11", "f13", "f15",
+            ] + ["cr{:d}".format(i) for i in range(16)] + ["a{:d}".format(i) for i in range(16)] + [
+                "pswm", "pswa", "???", "???",
+                "v16", "v18", "v20", "v22", "v17", "v19", "v21", "v23",
+                "v24", "v26", "v28", "v30", "v25", "v27", "v29", "v31",
+            ]
+        elif self.elf.e_machine == Elf.EM_LOONGARCH:
+            REG_LIST = [
+                "zero", "ra", "tp", "sp", "a0", "a1", "a2", "a3",
+                "a4", "a5", "a6", "a7", "t0", "t1", "t2", "t3",
+                "t4", "t5", "t6", "t7", "t8", "r21", "fp", "s0",
+                "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8",
+                "fa0", "fa1", "fa2", "fa3", "fa4", "fa5", "fa6", "fa7",
+            ] + ["ft{:d}".format(i) for i in range(16)] + ["fs{:d}".format(i) for i in range(8)]
+        elif self.elf.e_machine in [Elf.EM_SPARC, Elf.EM_SPARC32PLUS, Elf.EM_SPARCV9]:
+            REG_LIST = [
+                "g0", "g1", "g2", "g3", "g4", "g5", "g6", "g7",
+                "o0", "o1", "o2", "o3", "o4", "o5", "sp", "o7",
+                "l0", "l1", "l2", "l3", "l4", "l5", "l6", "l7",
+                "i0", "i1", "i2", "i3", "i4", "i5", "fp", "i7",
+            ] + ["f{:d}".format(i) for i in range(32)]
+        else:
+            # other arch is unimplemented
+            return "r{:d}".format(reg)
+
+        if reg < len(REG_LIST):
+            return REG_LIST[reg]
+        return "???"
+
+    def parse_cfa_program(self, data, pos, pos_end, vma_base, version, cie, sec_off):
+        encoding = cie.fde_encoding
+        ptr_size = cie.address_size
+        code_align = cie.code_alignment_factor
+        data_align = cie.data_alignment_factor
+        pc = vma_base
+        indent = " " * 4
+
+        entries = []
+        entries.append(self.DataEntry(pos, None, "program"))
+        try:
+            while pos < pos_end:
+                new_pos, opcode = self.read_1ubyte(data, pos)
+
+                if opcode < self.DW_CFA_advance_loc:
+                    if opcode == self.DW_CFA_nop:
+                        entries.append(self.DataEntry(pos, data[pos:new_pos], indent + "nop"))
+                    elif opcode == self.DW_CFA_set_loc:
+                        new_pos, op1 = self.read_encoded(encoding, data, new_pos)
+                        func_off = vma_base - self.load_base
+                        loc_off = self.encoded_offset(encoding, op1, sec_off + pos + 1, func_off=func_off)
+                        if loc_off is None:
+                            pc = op1
+                        else:
+                            pc = self.load_base + loc_off
+                        entries.append(self.DataEntry(
+                            pos, data[pos:new_pos],
+                            indent + "set_loc {:#x} to {:#x}".format(op1, pc),
+                        ))
+                    elif opcode == self.DW_CFA_advance_loc1:
+                        op1 = data[new_pos]
+                        new_pos += 1
+                        pc += op1 * code_align
+                        entries.append(self.DataEntry(
+                            pos, data[pos:new_pos],
+                            indent + "advance_loc1 {:#x} to {:#x}".format(op1, pc),
+                        ))
+                    elif opcode == self.DW_CFA_advance_loc2:
+                        new_pos, op1 = self.read_2ubyte(data, new_pos)
+                        pc += op1 * code_align
+                        entries.append(self.DataEntry(
+                            pos, data[pos:new_pos],
+                            indent + "advance_loc2 {:#x} to {:#x}".format(op1, pc),
+                        ))
+                    elif opcode == self.DW_CFA_advance_loc4:
+                        new_pos, op1 = self.read_4ubyte(data, new_pos)
+                        pc += op1 * code_align
+                        entries.append(self.DataEntry(
+                            pos, data[pos:new_pos],
+                            indent + "advance_loc4 {:#x} to {:#x}".format(op1, pc),
+                        ))
+                    elif opcode == self.DW_CFA_offset_extended:
+                        new_pos, op1 = self.get_uleb128(data, new_pos)
+                        new_pos, op2 = self.get_uleb128(data, new_pos)
+                        regname = self.get_register_name(op1)
+                        off = op2 * data_align
+                        entries.append(self.DataEntry(
+                            pos, data[pos:new_pos],
+                            indent + "offset_extended r{:d} ({:s}) at cfa{:+#x}".format(op1, regname, off),
+                        ))
+                    elif opcode == self.DW_CFA_restore_extended:
+                        new_pos, op1 = self.get_uleb128(data, new_pos)
+                        regname = self.get_register_name(op1)
+                        entries.append(self.DataEntry(
+                            pos, data[pos:new_pos],
+                            indent + "restore_extended r{:d} ({:s})".format(op1, regname),
+                        ))
+                    elif opcode == self.DW_CFA_undefined:
+                        new_pos, op1 = self.get_uleb128(data, new_pos)
+                        regname = self.get_register_name(op1)
+                        entries.append(self.DataEntry(
+                            pos, data[pos:new_pos],
+                            indent + "undefined r{:d} ({:s})".format(op1, regname),
+                        ))
+                    elif opcode == self.DW_CFA_same_value:
+                        new_pos, op1 = self.get_uleb128(data, new_pos)
+                        regname = self.get_register_name(op1)
+                        entries.append(self.DataEntry(
+                            pos, data[pos:new_pos],
+                            indent + "same_value r{:d} ({:s})".format(op1, regname),
+                        ))
+                    elif opcode == self.DW_CFA_register:
+                        new_pos, op1 = self.get_uleb128(data, new_pos)
+                        new_pos, op2 = self.get_uleb128(data, new_pos)
+                        regname1 = self.get_register_name(op1)
+                        regname2 = self.get_register_name(op2)
+                        entries.append(self.DataEntry(
+                            pos, data[pos:new_pos],
+                            indent + "register r{:d} ({:s}) in r{:d} ({:s})".format(op1, regname1, op2, regname2),
+                        ))
+                    elif opcode == self.DW_CFA_remember_state:
+                        entries.append(self.DataEntry(pos, data[pos:new_pos], indent + "remember_state"))
+                    elif opcode == self.DW_CFA_restore_state:
+                        entries.append(self.DataEntry(pos, data[pos:new_pos], indent + "restore_state"))
+                    elif opcode == self.DW_CFA_def_cfa:
+                        new_pos, op1 = self.get_uleb128(data, new_pos)
+                        new_pos, op2 = self.get_uleb128(data, new_pos)
+                        regname = self.get_register_name(op1)
+                        entries.append(self.DataEntry(
+                            pos, data[pos:new_pos],
+                            indent + "def_cfa r{:d} ({:s}) at offset {:#x}".format(op1, regname, op2),
+                        ))
+                    elif opcode == self.DW_CFA_def_cfa_register:
+                        new_pos, op1 = self.get_uleb128(data, new_pos)
+                        regname = self.get_register_name(op1)
+                        entries.append(self.DataEntry(
+                            pos, data[pos:new_pos],
+                            indent + "def_cfa_register r{:d} ({:s})".format(op1, regname),
+                        ))
+                    elif opcode == self.DW_CFA_def_cfa_offset:
+                        new_pos, op1 = self.get_uleb128(data, new_pos)
+                        entries.append(self.DataEntry(
+                            pos, data[pos:new_pos],
+                            indent + "def_cfa_offset {:#x}".format(op1),
+                        ))
+                    elif opcode == self.DW_CFA_def_cfa_expression:
+                        new_pos, op1 = self.get_uleb128(data, new_pos)
+                        entries.append(self.DataEntry(
+                            pos, data[pos:new_pos],
+                            indent + "def_cfa_expression {:#x}".format(op1),
+                        ))
+                        entries += self.parse_ops(version, ptr_size, op1, data, new_pos)
+                        new_pos += op1
+                    elif opcode == self.DW_CFA_expression:
+                        new_pos, op1 = self.get_uleb128(data, new_pos)
+                        new_pos, op2 = self.get_uleb128(data, new_pos)
+                        regname = self.get_register_name(op1)
+                        entries.append(self.DataEntry(
+                            pos, data[pos:new_pos],
+                            indent + "expression r{:d} ({:s})".format(op1, regname),
+                        ))
+                        entries += self.parse_ops(version, ptr_size, op2, data, new_pos)
+                        new_pos += op2
+                    elif opcode == self.DW_CFA_offset_extended_sf:
+                        new_pos, op1 = self.get_uleb128(data, new_pos)
+                        new_pos, op2 = self.get_sleb128(data, new_pos)
+                        regname = self.get_register_name(op1)
+                        off = op2 * data_align
+                        entries.append(self.DataEntry(
+                            pos, data[pos:new_pos],
+                            indent + "offset_extended_sf r{:d} ({:s}) at cfa{:+#x}".format(op1, regname, off),
+                        ))
+                    elif opcode == self.DW_CFA_def_cfa_sf:
+                        new_pos, op1 = self.get_uleb128(data, new_pos)
+                        new_pos, op2 = self.get_sleb128(data, new_pos)
+                        regname = self.get_register_name(op1)
+                        off = op2 * data_align
+                        entries.append(self.DataEntry(
+                            pos, data[pos:new_pos],
+                            indent + "def_cfa_sf r{:d} ({:s}) at offset {:#x}".format(op1, regname, off),
+                        ))
+                    elif opcode == self.DW_CFA_def_cfa_offset_sf:
+                        new_pos, op1 = self.get_sleb128(data, new_pos)
+                        entries.append(self.DataEntry(
+                            pos, data[pos:new_pos],
+                            indent + "def_cfa_offset_sf {:#x}".format(op1 * data_align),
+                        ))
+                    elif opcode == self.DW_CFA_val_offset:
+                        new_pos, op1 = self.get_uleb128(data, new_pos)
+                        new_pos, op2 = self.get_uleb128(data, new_pos)
+                        off = op2 * data_align
+                        entries.append(self.DataEntry(
+                            pos, data[pos:new_pos],
+                            indent + "val_offset {:#x} at offset {:#x}".format(op1, off),
+                        ))
+                    elif opcode == self.DW_CFA_val_offset_sf:
+                        new_pos, op1 = self.get_uleb128(data, new_pos)
+                        new_pos, op2 = self.get_sleb128(data, new_pos)
+                        off = op2 * data_align
+                        entries.append(self.DataEntry(
+                            pos, data[pos:new_pos],
+                            indent + "val_offset_sf {:#x} at offset {:#x}".format(op1, off),
+                        ))
+                    elif opcode == self.DW_CFA_val_expression:
+                        new_pos, op1 = self.get_uleb128(data, new_pos)
+                        new_pos, op2 = self.get_uleb128(data, new_pos)
+                        regname = self.get_register_name(op1)
+                        entries.append(self.DataEntry(
+                            pos, data[pos:new_pos],
+                            indent + "val_expression r{:d} ({:s})".format(op1, regname),
+                        ))
+                        entries += self.parse_ops(version, ptr_size, op2, data, new_pos)
+                        new_pos += op2
+                    elif opcode == self.DW_CFA_MIPS_advance_loc8:
+                        new_pos, op1 = self.read_8ubyte(data, new_pos)
+                        pc += op1 * code_align
+                        entries.append(self.DataEntry(
+                            pos, data[pos:new_pos],
+                            indent + "MIPS_advance_loc8 {:#x} to {:#x}".format(op1, pc),
+                        ))
+                    elif opcode == self.DW_CFA_GNU_window_save:
+                        if self.elf.e_machine == Elf.EM_AARCH64:
+                            entries.append(self.DataEntry(
+                                pos, data[pos:new_pos],
+                                indent + "AARCH64_negate_ra_state",
+                            ))
+                        else:
+                            entries.append(self.DataEntry(
+                                pos, data[pos:new_pos],
+                                indent + "GNU_window_save",
+                            ))
+                    elif opcode == self.DW_CFA_GNU_args_size:
+                        new_pos, op1 = self.get_uleb128(data, new_pos)
+                        entries.append(self.DataEntry(
+                            pos, data[pos:new_pos],
+                            indent + "args_size {:#x}".format(op1),
+                        ))
+                    else:
+                        entries.append(self.DataEntry(
+                            pos, data[pos:new_pos],
+                            indent + "??? {:#x}".format(opcode),
+                        ))
+                elif opcode < self.DW_CFA_offset:
+                    op1 = opcode & 0x3f
+                    pc += op1 * code_align
+                    entries.append(self.DataEntry(
+                        pos, data[pos:new_pos],
+                        indent + "advance_loc {:d} to {:#x}".format(op1, pc),
+                    ))
+                elif opcode < self.DW_CFA_restore:
+                    op1 = opcode & 0x3f
+                    new_pos, op2 = self.get_uleb128(data, new_pos)
+                    regname = self.get_register_name(op1)
+                    off = op2 * data_align
+                    entries.append(self.DataEntry(
+                        pos, data[pos:new_pos],
+                        indent + "offset r{:d} ({:s}) at cfa{:+#x}".format(op1, regname, off),
+                    ))
+                else:
+                    op1 = opcode & 0x3f
+                    regname = self.get_register_name(op1)
+                    entries.append(self.DataEntry(
+                        pos, data[pos:new_pos],
+                        indent + "restore r{:d} ({:s})".format(op1, regname),
+                    ))
+                pos = new_pos
+        except (IndexError, ValueError):
+            _exc_type, exc_value, _exc_traceback = sys.exc_info()
+            entries.append(self.ErrorEntry("Parse Error", exc_value))
+        return entries
+
+    def read_frame_records(self):
+        """Return structured CIE/FDE records from .eh_frame.
+        The regular parser above deliberately produces display entries.  Unwind row
+        evaluation needs the same fields plus the original CFA bytecode boundaries,
+        so keep that representation separate from the dump output.
+        """
+        section = self.read_section(".eh_frame", quiet=True)
+        if section is None:
+            return None, {}, []
+
+        data = section.data
+        sec_off = self.section_offset(".eh_frame")
+        cies = {}
+        fdes = []
+        pos = 0
+
+        while pos < len(data):
+            record_offset = pos
+            pos, unit_length = self.read_4ubyte(data, pos)
+            id_size = 4
+            if unit_length == 0xffff_ffff:
+                pos, unit_length = self.read_8ubyte(data, pos)
+                id_size = 8
+            if unit_length == 0:
+                break
+
+            id_pos = pos
+            record_end = pos + unit_length
+            if record_end > len(data):
+                raise ValueError("truncated .eh_frame record at {:#x}".format(record_offset))
+            pos, cie_id = self.read_nbyte(data, pos, id_size)
+
+            if cie_id == 0:
+                pos, version = self.read_1ubyte(data, pos)
+                augmentation_start = pos
+                while pos < record_end and data[pos]:
+                    pos += 1
+                if pos >= record_end:
+                    raise ValueError("unterminated CIE augmentation at {:#x}".format(record_offset))
+                augmentation = data[augmentation_start:pos].decode("ascii", errors="replace")
+                pos += 1
+
+                if augmentation == "eh":
+                    pos = self.read_nbyte(data, pos, self.ptr_size)[0]
+                address_size = self.ptr_size
+                if version >= 4:
+                    pos, address_size = self.read_1ubyte(data, pos)
+                    pos, segment_size = self.read_1ubyte(data, pos)
+                    if segment_size:
+                        raise ValueError("segmented CIE addresses are unsupported")
+
+                pos, code_align = self.get_uleb128(data, pos)
+                pos, data_align = self.get_sleb128(data, pos)
+                if version == 1:
+                    pos, return_register = self.read_1ubyte(data, pos)
+                else:
+                    pos, return_register = self.get_uleb128(data, pos)
+
+                fde_encoding = self.DW_EH_PE_absptr
+                if augmentation.startswith("z"):
+                    pos, augmentation_len = self.get_uleb128(data, pos)
+                    augmentation_end = pos + augmentation_len
+                    if augmentation_end > record_end:
+                        raise ValueError("truncated CIE augmentation data at {:#x}".format(record_offset))
+                    for cp in augmentation[1:]:
+                        if pos >= augmentation_end:
+                            break
+                        if cp == "R":
+                            pos, fde_encoding = self.read_1ubyte(data, pos)
+                        elif cp == "L":
+                            pos, lsda_encoding = self.read_1ubyte(data, pos)
+                        elif cp == "P":
+                            pos, personality_encoding = self.read_1ubyte(data, pos)
+                            pos = self.read_encoded(personality_encoding, data, pos)[0]
+                        elif cp in ("S", "B", "G"):
+                            continue
+                        else:
+                            break
+                    pos = augmentation_end
+
+                cies[record_offset] = {
+                    "offset": record_offset,
+                    "address": self.load_base + sec_off + record_offset,
+                    "version": version,
+                    "augmentation": augmentation,
+                    "address_size": address_size,
+                    "code_align": code_align,
+                    "data_align": data_align,
+                    "return_register": return_register,
+                    "fde_encoding": fde_encoding,
+                    "program_start": pos,
+                    "program_end": record_end,
+                }
+            else:
+                cie_offset = id_pos - cie_id
+                if cie_offset not in cies:
+                    raise ValueError("FDE at {:#x} references unknown CIE {:#x}".format(
+                        record_offset, cie_offset,
+                    ))
+                cie = cies[cie_offset]
+                encoding = cie["fde_encoding"]
+                encoded_pos = pos
+                pos, initial_location = self.read_encoded(encoding, data, pos)
+                func_off = self.encoded_offset(encoding, initial_location, sec_off + encoded_pos)
+                if func_off is None:
+                    pc_begin = initial_location
+                else:
+                    pc_begin = self.load_base + func_off
+                pos, pc_range = self.read_encoded(encoding & 0x0f, data, pos)
+
+                if cie["augmentation"].startswith("z"):
+                    pos, augmentation_len = self.get_uleb128(data, pos)
+                    pos += augmentation_len
+                    if pos > record_end:
+                        raise ValueError("truncated FDE augmentation data at {:#x}".format(record_offset))
+
+                fdes.append({
+                    "offset": record_offset,
+                    "address": self.load_base + sec_off + record_offset,
+                    "cie": cie,
+                    "pc_begin": pc_begin,
+                    "pc_end": pc_begin + pc_range,
+                    "program_start": pos,
+                    "program_end": record_end,
+                    "section_offset": sec_off,
+                })
+            pos = record_end
+
+        return section, cies, fdes
+
+    def run_cfa_program(self, data, start, end, cie, initial_pc, target_pc, state, initial_rules):
+        """Apply one CFA program to `state`, stopping at the row for target_pc."""
+        pos = start
+        pc = initial_pc
+        stack = []
+        registers = state["registers"]
+        encoding = cie["fde_encoding"]
+        code_align = cie["code_align"]
+        data_align = cie["data_align"]
+
+        while pos < end:
+            opcode_pos = pos
+            pos, opcode = self.read_1ubyte(data, pos)
+            primary = opcode & 0xc0
+
+            if primary == self.DW_CFA_advance_loc:
+                next_pc = pc + (opcode & 0x3f) * code_align
+                if target_pc is not None and target_pc < next_pc:
+                    break
+                pc = next_pc
+                continue
+            if primary == self.DW_CFA_offset:
+                reg = opcode & 0x3f
+                pos, operand = self.get_uleb128(data, pos)
+                registers[reg] = ("offset", operand * data_align)
+                continue
+            if primary == self.DW_CFA_restore:
+                reg = opcode & 0x3f
+                registers[reg] = initial_rules.get(reg, ("undefined",))
+                continue
+
+            if opcode == self.DW_CFA_nop:
+                continue
+            if opcode == self.DW_CFA_set_loc:
+                operand_pos = pos
+                pos, operand = self.read_encoded(encoding, data, pos)
+                func_off = initial_pc - self.load_base
+                loc_off = self.encoded_offset(
+                    encoding, operand, self.section_offset(".eh_frame") + operand_pos,
+                    func_off=func_off,
+                )
+                if loc_off is None:
+                    next_pc = operand
+                else:
+                    next_pc = self.load_base + loc_off
+                if target_pc is not None and target_pc < next_pc:
+                    break
+                pc = next_pc
+            elif opcode in (self.DW_CFA_advance_loc1, self.DW_CFA_advance_loc2,
+                             self.DW_CFA_advance_loc4, self.DW_CFA_MIPS_advance_loc8):
+                readers = {
+                    self.DW_CFA_advance_loc1: self.read_1ubyte,
+                    self.DW_CFA_advance_loc2: self.read_2ubyte,
+                    self.DW_CFA_advance_loc4: self.read_4ubyte,
+                    self.DW_CFA_MIPS_advance_loc8: self.read_8ubyte,
+                }
+                pos, operand = readers[opcode](data, pos)
+                next_pc = pc + operand * code_align
+                if target_pc is not None and target_pc < next_pc:
+                    break
+                pc = next_pc
+            elif opcode in (self.DW_CFA_offset_extended, self.DW_CFA_val_offset):
+                pos, reg = self.get_uleb128(data, pos)
+                pos, operand = self.get_uleb128(data, pos)
+                if opcode == self.DW_CFA_offset_extended:
+                    kind = "offset"
+                else:
+                    kind = "val_offset"
+                registers[reg] = (kind, operand * data_align)
+            elif opcode in (self.DW_CFA_offset_extended_sf, self.DW_CFA_val_offset_sf):
+                pos, reg = self.get_uleb128(data, pos)
+                pos, operand = self.get_sleb128(data, pos)
+                if opcode == self.DW_CFA_offset_extended_sf:
+                    kind = "offset"
+                else:
+                    kind = "val_offset"
+                registers[reg] = (kind, operand * data_align)
+            elif opcode in (self.DW_CFA_restore_extended, self.DW_CFA_undefined,
+                             self.DW_CFA_same_value):
+                pos, reg = self.get_uleb128(data, pos)
+                if opcode == self.DW_CFA_restore_extended:
+                    registers[reg] = initial_rules.get(reg, ("undefined",))
+                elif opcode == self.DW_CFA_undefined:
+                    registers[reg] = ("undefined",)
+                else:
+                    registers[reg] = ("same_value",)
+            elif opcode == self.DW_CFA_register:
+                pos, reg = self.get_uleb128(data, pos)
+                pos, source_reg = self.get_uleb128(data, pos)
+                registers[reg] = ("register", source_reg)
+            elif opcode == self.DW_CFA_remember_state:
+                stack.append((state["cfa"], dict(registers), state["ra_state"]))
+            elif opcode == self.DW_CFA_restore_state:
+                if not stack:
+                    raise ValueError("DW_CFA_restore_state without a saved state")
+                state["cfa"], saved_registers, state["ra_state"] = stack.pop()
+                registers.clear()
+                registers.update(saved_registers)
+            elif opcode in (self.DW_CFA_def_cfa, self.DW_CFA_def_cfa_sf):
+                pos, reg = self.get_uleb128(data, pos)
+                if opcode == self.DW_CFA_def_cfa:
+                    pos, offset = self.get_uleb128(data, pos)
+                else:
+                    pos, offset = self.get_sleb128(data, pos)
+                    offset *= data_align
+                state["cfa"] = ("register", reg, offset)
+            elif opcode == self.DW_CFA_def_cfa_register:
+                pos, reg = self.get_uleb128(data, pos)
+                if state["cfa"] is None:
+                    state["cfa"] = ("register", reg, 0)
+                elif state["cfa"][0] != "register":
+                    raise ValueError("DW_CFA_def_cfa_register without a register CFA")
+                state["cfa"] = ("register", reg, state["cfa"][2])
+            elif opcode in (self.DW_CFA_def_cfa_offset, self.DW_CFA_def_cfa_offset_sf):
+                if opcode == self.DW_CFA_def_cfa_offset:
+                    pos, offset = self.get_uleb128(data, pos)
+                else:
+                    pos, offset = self.get_sleb128(data, pos)
+                    offset *= data_align
+                if state["cfa"] is None or state["cfa"][0] != "register":
+                    raise ValueError("DW_CFA_def_cfa_offset without a register CFA")
+                state["cfa"] = ("register", state["cfa"][1], offset)
+            elif opcode == self.DW_CFA_def_cfa_expression:
+                pos, length = self.get_uleb128(data, pos)
+                state["cfa"] = ("expression", data[pos:pos + length], cie["version"], cie["address_size"])
+                pos += length
+            elif opcode in (self.DW_CFA_expression, self.DW_CFA_val_expression):
+                pos, reg = self.get_uleb128(data, pos)
+                pos, length = self.get_uleb128(data, pos)
+                if opcode == self.DW_CFA_expression:
+                    kind = "expression"
+                else:
+                    kind = "val_expression"
+                registers[reg] = (kind, data[pos:pos + length], cie["version"], cie["address_size"])
+                pos += length
+            elif opcode == self.DW_CFA_GNU_args_size:
+                pos = self.get_uleb128(data, pos)[0]
+            elif opcode == self.DW_CFA_GNU_negative_offset_extended:
+                pos, reg = self.get_uleb128(data, pos)
+                pos, operand = self.get_uleb128(data, pos)
+                registers[reg] = ("offset", -operand * data_align)
+            elif opcode == self.DW_CFA_GNU_window_save:
+                if self.elf.e_machine == Elf.EM_AARCH64:
+                    state["ra_state"] = not state["ra_state"]
+                else:
+                    for reg in range(16, 32):
+                        registers[reg] = ("offset", (reg - 16) * self.ptr_size)
+            else:
+                raise ValueError("unsupported CFA opcode {:#x} at .eh_frame+{:#x}".format(
+                    opcode, opcode_pos,
+                ))
+
+            if pos > end:
+                raise ValueError("CFA instruction extends past its record")
+        return state
+
+    def unwind_info(self, runtime_pc, load_bias=0):
+        """Evaluate and return the unwind row covering runtime_pc."""
+        section, cies, fdes = self.read_frame_records()
+        if section is None:
+            return None
+
+        linked_pc = runtime_pc - load_bias
+        matches = [fde for fde in fdes if fde["pc_begin"] <= linked_pc < fde["pc_end"]]
+        if not matches:
+            return None
+        fde = min(matches, key=lambda item: item["pc_end"] - item["pc_begin"])
+        cie = fde["cie"]
+
+        state = {"cfa": None, "registers": {}, "ra_state": False}
+        self.run_cfa_program(
+            section.data, cie["program_start"], cie["program_end"], cie,
+            fde["pc_begin"], None, state, {},
+        )
+        initial_rules = dict(state["registers"])
+        self.run_cfa_program(
+            section.data, fde["program_start"], fde["program_end"], cie,
+            fde["pc_begin"], linked_pc, state, initial_rules,
+        )
+        return {
+            "cie": cie,
+            "fde": fde,
+            "load_bias": load_bias,
+            "pc": runtime_pc,
+            "state": state,
+        }
+
+    def format_expression(self, expression, version, address_size):
+        entries = self.parse_ops(version, address_size, len(expression), expression, 0)
+        parts = []
+        for entry in entries:
+            if entry.tag == "error":
+                parts.append(str(entry).replace("\n", ": "))
+                continue
+            name = entry.name.strip()
+            name = re.sub(r"^\[0x[0-9a-f]+\]\s+", "", name)
+            if entry.extra:
+                name += " ({:s})".format(entry.extra)
+            parts.append(name)
+        return "; ".join(parts)
+
+    def format_cfa_rule(self, rule):
+        if rule is None:
+            return "undefined"
+        if rule[0] == "register":
+            regname = self.get_register_name(rule[1])
+            if rule[2] == 0:
+                return regname
+            if rule[2] > 0:
+                sign = "+"
+            else:
+                sign = "-"
+            return "{:s} {:s} {:#x}".format(regname, sign, abs(rule[2]))
+        expression = self.format_expression(rule[1], rule[2], rule[3])
+        return "expression({:s})".format(expression)
+
+    def format_register_rule(self, rule):
+        kind = rule[0]
+        if kind == "offset":
+            return "[CFA{:+#x}]".format(rule[1])
+        if kind == "val_offset":
+            return "CFA{:+#x}".format(rule[1])
+        if kind == "register":
+            return self.get_register_name(rule[1])
+        if kind in ("expression", "val_expression"):
+            expression = self.format_expression(rule[1], rule[2], rule[3])
+            if kind == "expression":
+                prefix = "memory at "
+            else:
+                prefix = ""
+            return "{:s}expression({:s})".format(prefix, expression)
+        return kind
+
+    def format_frame_records(self, cie_offset, fde_offset):
+        """Format only the selected CIE/FDE using the regular dump decoder."""
+        section = self.read_section(".eh_frame", quiet=True)
+        if section is None:
+            return []
+
+        selected = []
+        wanted = {cie_offset: "CIE", fde_offset: "FDE"}
+        keep = False
+        for entry in self.parse_eh_frame(section):
+            if entry.tag == "separator" and entry.name in ("CIE", "FDE", "Zero terminator"):
+                keep = entry.pos in wanted and wanted[entry.pos] == entry.name
+            if keep:
+                selected.append(entry)
+        if not selected:
+            return []
+        return self.format_entry(section, selected)
+
+    DW_OP_addr                 = 0x03  # Constant address
+    DW_OP_deref                = 0x06  #
+    DW_OP_const1u              = 0x08  # Unsigned 1-byte constant
+    DW_OP_const1s              = 0x09  # Signed 1-byte constant
+    DW_OP_const2u              = 0x0a  # Unsigned 2-byte constant
+    DW_OP_const2s              = 0x0b  # Signed 2-byte constant
+    DW_OP_const4u              = 0x0c  # Unsigned 4-byte constant
+    DW_OP_const4s              = 0x0d  # Signed 4-byte constant
+    DW_OP_const8u              = 0x0e  # Unsigned 8-byte constant
+    DW_OP_const8s              = 0x0f  # Signed 8-byte constant
+    DW_OP_constu               = 0x10  # Unsigned LEB128 constant
+    DW_OP_consts               = 0x11  # Signed LEB128 constant
+    DW_OP_dup                  = 0x12  #
+    DW_OP_drop                 = 0x13  #
+    DW_OP_over                 = 0x14  #
+    DW_OP_pick                 = 0x15  # 1-byte stack index
+    DW_OP_swap                 = 0x16  #
+    DW_OP_rot                  = 0x17  #
+    DW_OP_xderef               = 0x18  #
+    DW_OP_abs                  = 0x19  #
+    DW_OP_and                  = 0x1a  #
+    DW_OP_div                  = 0x1b  #
+    DW_OP_minus                = 0x1c  #
+    DW_OP_mod                  = 0x1d  #
+    DW_OP_mul                  = 0x1e  #
+    DW_OP_neg                  = 0x1f  #
+    DW_OP_not                  = 0x20  #
+    DW_OP_or                   = 0x21  #
+    DW_OP_plus                 = 0x22  #
+    DW_OP_plus_uconst          = 0x23  # Unsigned LEB128 addend
+    DW_OP_shl                  = 0x24  #
+    DW_OP_shr                  = 0x25  #
+    DW_OP_shra                 = 0x26  #
+    DW_OP_xor                  = 0x27  #
+    DW_OP_bra                  = 0x28  # Signed 2-byte constant
+    DW_OP_eq                   = 0x29  #
+    DW_OP_ge                   = 0x2a  #
+    DW_OP_gt                   = 0x2b  #
+    DW_OP_le                   = 0x2c  #
+    DW_OP_lt                   = 0x2d  #
+    DW_OP_ne                   = 0x2e  #
+    DW_OP_skip                 = 0x2f  # Signed 2-byte constant
+    DW_OP_lit0                 = 0x30  # Literal 0
+    DW_OP_lit1                 = 0x31  # Literal 1
+    DW_OP_lit2                 = 0x32  # Literal 2
+    DW_OP_lit3                 = 0x33  # Literal 3
+    DW_OP_lit4                 = 0x34  # Literal 4
+    DW_OP_lit5                 = 0x35  # Literal 5
+    DW_OP_lit6                 = 0x36  # Literal 6
+    DW_OP_lit7                 = 0x37  # Literal 7
+    DW_OP_lit8                 = 0x38  # Literal 8
+    DW_OP_lit9                 = 0x39  # Literal 9
+    DW_OP_lit10                = 0x3a  # Literal 10
+    DW_OP_lit11                = 0x3b  # Literal 11
+    DW_OP_lit12                = 0x3c  # Literal 12
+    DW_OP_lit13                = 0x3d  # Literal 13
+    DW_OP_lit14                = 0x3e  # Literal 14
+    DW_OP_lit15                = 0x3f  # Literal 15
+    DW_OP_lit16                = 0x40  # Literal 16
+    DW_OP_lit17                = 0x41  # Literal 17
+    DW_OP_lit18                = 0x42  # Literal 18
+    DW_OP_lit19                = 0x43  # Literal 19
+    DW_OP_lit20                = 0x44  # Literal 20
+    DW_OP_lit21                = 0x45  # Literal 21
+    DW_OP_lit22                = 0x46  # Literal 22
+    DW_OP_lit23                = 0x47  # Literal 23
+    DW_OP_lit24                = 0x48  # Literal 24
+    DW_OP_lit25                = 0x49  # Literal 25
+    DW_OP_lit26                = 0x4a  # Literal 26
+    DW_OP_lit27                = 0x4b  # Literal 27
+    DW_OP_lit28                = 0x4c  # Literal 28
+    DW_OP_lit29                = 0x4d  # Literal 29
+    DW_OP_lit30                = 0x4e  # Literal 30
+    DW_OP_lit31                = 0x4f  # Literal 31
+    DW_OP_reg0                 = 0x50  # Register 0
+    DW_OP_reg1                 = 0x51  # Register 1
+    DW_OP_reg2                 = 0x52  # Register 2
+    DW_OP_reg3                 = 0x53  # Register 3
+    DW_OP_reg4                 = 0x54  # Register 4
+    DW_OP_reg5                 = 0x55  # Register 5
+    DW_OP_reg6                 = 0x56  # Register 6
+    DW_OP_reg7                 = 0x57  # Register 7
+    DW_OP_reg8                 = 0x58  # Register 8
+    DW_OP_reg9                 = 0x59  # Register 9
+    DW_OP_reg10                = 0x5a  # Register 10
+    DW_OP_reg11                = 0x5b  # Register 11
+    DW_OP_reg12                = 0x5c  # Register 12
+    DW_OP_reg13                = 0x5d  # Register 13
+    DW_OP_reg14                = 0x5e  # Register 14
+    DW_OP_reg15                = 0x5f  # Register 15
+    DW_OP_reg16                = 0x60  # Register 16
+    DW_OP_reg17                = 0x61  # Register 17
+    DW_OP_reg18                = 0x62  # Register 18
+    DW_OP_reg19                = 0x63  # Register 19
+    DW_OP_reg20                = 0x64  # Register 20
+    DW_OP_reg21                = 0x65  # Register 21
+    DW_OP_reg22                = 0x66  # Register 22
+    DW_OP_reg23                = 0x67  # Register 24
+    DW_OP_reg24                = 0x68  # Register 24
+    DW_OP_reg25                = 0x69  # Register 25
+    DW_OP_reg26                = 0x6a  # Register 26
+    DW_OP_reg27                = 0x6b  # Register 27
+    DW_OP_reg28                = 0x6c  # Register 28
+    DW_OP_reg29                = 0x6d  # Register 29
+    DW_OP_reg30                = 0x6e  # Register 30
+    DW_OP_reg31                = 0x6f  # Register 31
+    DW_OP_breg0                = 0x70  # Base register 0
+    DW_OP_breg1                = 0x71  # Base register 1
+    DW_OP_breg2                = 0x72  # Base register 2
+    DW_OP_breg3                = 0x73  # Base register 3
+    DW_OP_breg4                = 0x74  # Base register 4
+    DW_OP_breg5                = 0x75  # Base register 5
+    DW_OP_breg6                = 0x76  # Base register 6
+    DW_OP_breg7                = 0x77  # Base register 7
+    DW_OP_breg8                = 0x78  # Base register 8
+    DW_OP_breg9                = 0x79  # Base register 9
+    DW_OP_breg10               = 0x7a  # Base register 10
+    DW_OP_breg11               = 0x7b  # Base register 11
+    DW_OP_breg12               = 0x7c  # Base register 12
+    DW_OP_breg13               = 0x7d  # Base register 13
+    DW_OP_breg14               = 0x7e  # Base register 14
+    DW_OP_breg15               = 0x7f  # Base register 15
+    DW_OP_breg16               = 0x80  # Base register 16
+    DW_OP_breg17               = 0x81  # Base register 17
+    DW_OP_breg18               = 0x82  # Base register 18
+    DW_OP_breg19               = 0x83  # Base register 19
+    DW_OP_breg20               = 0x84  # Base register 20
+    DW_OP_breg21               = 0x85  # Base register 21
+    DW_OP_breg22               = 0x86  # Base register 22
+    DW_OP_breg23               = 0x87  # Base register 23
+    DW_OP_breg24               = 0x88  # Base register 24
+    DW_OP_breg25               = 0x89  # Base register 25
+    DW_OP_breg26               = 0x8a  # Base register 26
+    DW_OP_breg27               = 0x8b  # Base register 27
+    DW_OP_breg28               = 0x8c  # Base register 28
+    DW_OP_breg29               = 0x8d  # Base register 29
+    DW_OP_breg30               = 0x8e  # Base register 30
+    DW_OP_breg31               = 0x8f  # Base register 31
+    DW_OP_regx                 = 0x90  # Unsigned LEB128 register
+    DW_OP_fbreg                = 0x91  # Signed LEB128 offset
+    DW_OP_bregx                = 0x92  # ULEB128 register followed by SLEB128 off
+    DW_OP_piece                = 0x93  # ULEB128 size of piece addressed
+    DW_OP_deref_size           = 0x94  # 1-byte size of data retrieved
+    DW_OP_xderef_size          = 0x95  # 1-byte size of data retrieved
+    DW_OP_nop                  = 0x96  #
+    DW_OP_push_object_address  = 0x97  #
+    DW_OP_call2                = 0x98  #
+    DW_OP_call4                = 0x99  #
+    DW_OP_call_ref             = 0x9a  #
+    DW_OP_form_tls_address     = 0x9b  # TLS offset to address in current thread
+    DW_OP_call_frame_cfa       = 0x9c  # CFA as determined by CFI
+    DW_OP_bit_piece            = 0x9d  # ULEB128 size and ULEB128 offset in bits
+    DW_OP_implicit_value       = 0x9e  # DW_FORM_block follows opcode
+    DW_OP_stack_value          = 0x9f  # No operands, special like DW_OP_piece
+    #
+    DW_OP_implicit_pointer     = 0xa0  #
+    DW_OP_addrx                = 0xa1  #
+    DW_OP_constx               = 0xa2  #
+    DW_OP_entry_value          = 0xa3  #
+    DW_OP_const_type           = 0xa4  #
+    DW_OP_regval_type          = 0xa5  #
+    DW_OP_deref_type           = 0xa6  #
+    DW_OP_xderef_type          = 0xa7  #
+    DW_OP_convert              = 0xa8  #
+    DW_OP_reinterpret          = 0xa9  #
+    # GNU extensions
+    DW_OP_GNU_push_tls_address = 0xe0  #
+    DW_OP_GNU_uninit           = 0xf0  #
+    DW_OP_GNU_encoded_addr     = 0xf1  #
+    DW_OP_GNU_implicit_pointer = 0xf2  #
+    DW_OP_GNU_entry_value      = 0xf3  #
+    DW_OP_GNU_const_type       = 0xf4  #
+    DW_OP_GNU_regval_type      = 0xf5  #
+    DW_OP_GNU_deref_type       = 0xf6  #
+    DW_OP_GNU_convert          = 0xf7  #
+    DW_OP_GNU_reinterpret      = 0xf9  #
+    DW_OP_GNU_parameter_ref    = 0xfa  #
+    # GNU Debug Fission extensions
+    DW_OP_GNU_addr_index       = 0xfb  #
+    DW_OP_GNU_const_index      = 0xfc  #
+    DW_OP_GNU_variable_value   = 0xfd  #
+    DW_OP_lo_user              = 0xe0  # Implementation-defined range start
+    DW_OP_hi_user              = 0xff  # Implementation-defined range end # noqa: F841
+
+    DWARF_ONE_KNOWN_DW_OP = {
+        DW_OP_GNU_addr_index       : "GNU_addr_index",
+        DW_OP_GNU_const_index      : "GNU_const_index",
+        DW_OP_GNU_const_type       : "GNU_const_type",
+        DW_OP_GNU_convert          : "GNU_convert",
+        DW_OP_GNU_deref_type       : "GNU_deref_type",
+        DW_OP_GNU_encoded_addr     : "GNU_encoded_addr",
+        DW_OP_GNU_entry_value      : "GNU_entry_value",
+        DW_OP_GNU_implicit_pointer : "GNU_implicit_pointer",
+        DW_OP_GNU_parameter_ref    : "GNU_parameter_ref",
+        DW_OP_GNU_push_tls_address : "GNU_push_tls_address",
+        DW_OP_GNU_regval_type      : "GNU_regval_type",
+        DW_OP_GNU_reinterpret      : "GNU_reinterpret",
+        DW_OP_GNU_uninit           : "GNU_uninit",
+        DW_OP_GNU_variable_value   : "GNU_variable_value",
+        DW_OP_abs                  : "abs",
+        DW_OP_addr                 : "addr",
+        DW_OP_addrx                : "addrx",
+        DW_OP_and                  : "and",
+        DW_OP_bit_piece            : "bit_piece",
+        DW_OP_bra                  : "bra",
+        DW_OP_breg0                : "breg0",
+        DW_OP_breg1                : "breg1",
+        DW_OP_breg2                : "breg2",
+        DW_OP_breg3                : "breg3",
+        DW_OP_breg4                : "breg4",
+        DW_OP_breg5                : "breg5",
+        DW_OP_breg6                : "breg6",
+        DW_OP_breg7                : "breg7",
+        DW_OP_breg8                : "breg8",
+        DW_OP_breg9                : "breg9",
+        DW_OP_breg10               : "breg10",
+        DW_OP_breg11               : "breg11",
+        DW_OP_breg12               : "breg12",
+        DW_OP_breg13               : "breg13",
+        DW_OP_breg14               : "breg14",
+        DW_OP_breg15               : "breg15",
+        DW_OP_breg16               : "breg16",
+        DW_OP_breg17               : "breg17",
+        DW_OP_breg18               : "breg18",
+        DW_OP_breg19               : "breg19",
+        DW_OP_breg20               : "breg20",
+        DW_OP_breg21               : "breg21",
+        DW_OP_breg22               : "breg22",
+        DW_OP_breg23               : "breg23",
+        DW_OP_breg24               : "breg24",
+        DW_OP_breg25               : "breg25",
+        DW_OP_breg26               : "breg26",
+        DW_OP_breg27               : "breg27",
+        DW_OP_breg28               : "breg28",
+        DW_OP_breg29               : "breg29",
+        DW_OP_breg30               : "breg30",
+        DW_OP_breg31               : "breg31",
+        DW_OP_bregx                : "bregx",
+        DW_OP_call2                : "call2",
+        DW_OP_call4                : "call4",
+        DW_OP_call_frame_cfa       : "call_frame_cfa",
+        DW_OP_call_ref             : "call_ref",
+        DW_OP_const1s              : "const1s",
+        DW_OP_const1u              : "const1u",
+        DW_OP_const2s              : "const2s",
+        DW_OP_const2u              : "const2u",
+        DW_OP_const4s              : "const4s",
+        DW_OP_const4u              : "const4u",
+        DW_OP_const8s              : "const8s",
+        DW_OP_const8u              : "const8u",
+        DW_OP_const_type           : "const_type",
+        DW_OP_consts               : "consts",
+        DW_OP_constu               : "constu",
+        DW_OP_constx               : "constx",
+        DW_OP_convert              : "convert",
+        DW_OP_deref                : "deref",
+        DW_OP_deref_size           : "deref_size",
+        DW_OP_deref_type           : "deref_type",
+        DW_OP_div                  : "div",
+        DW_OP_drop                 : "drop",
+        DW_OP_dup                  : "dup",
+        DW_OP_entry_value          : "entry_value",
+        DW_OP_eq                   : "eq",
+        DW_OP_fbreg                : "fbreg",
+        DW_OP_form_tls_address     : "form_tls_address",
+        DW_OP_ge                   : "ge",
+        DW_OP_gt                   : "gt",
+        DW_OP_implicit_pointer     : "implicit_pointer",
+        DW_OP_implicit_value       : "implicit_value",
+        DW_OP_le                   : "le",
+        DW_OP_lit0                 : "lit0",
+        DW_OP_lit1                 : "lit1",
+        DW_OP_lit2                 : "lit2",
+        DW_OP_lit3                 : "lit3",
+        DW_OP_lit4                 : "lit4",
+        DW_OP_lit5                 : "lit5",
+        DW_OP_lit6                 : "lit6",
+        DW_OP_lit7                 : "lit7",
+        DW_OP_lit8                 : "lit8",
+        DW_OP_lit9                 : "lit9",
+        DW_OP_lit10                : "lit10",
+        DW_OP_lit11                : "lit11",
+        DW_OP_lit12                : "lit12",
+        DW_OP_lit13                : "lit13",
+        DW_OP_lit14                : "lit14",
+        DW_OP_lit15                : "lit15",
+        DW_OP_lit16                : "lit16",
+        DW_OP_lit17                : "lit17",
+        DW_OP_lit18                : "lit18",
+        DW_OP_lit19                : "lit19",
+        DW_OP_lit20                : "lit20",
+        DW_OP_lit21                : "lit21",
+        DW_OP_lit22                : "lit22",
+        DW_OP_lit23                : "lit23",
+        DW_OP_lit24                : "lit24",
+        DW_OP_lit25                : "lit25",
+        DW_OP_lit26                : "lit26",
+        DW_OP_lit27                : "lit27",
+        DW_OP_lit28                : "lit28",
+        DW_OP_lit29                : "lit29",
+        DW_OP_lit30                : "lit30",
+        DW_OP_lit31                : "lit31",
+        DW_OP_lt                   : "lt",
+        DW_OP_minus                : "minus",
+        DW_OP_mod                  : "mod",
+        DW_OP_mul                  : "mul",
+        DW_OP_ne                   : "ne",
+        DW_OP_neg                  : "neg",
+        DW_OP_nop                  : "nop",
+        DW_OP_not                  : "not",
+        DW_OP_or                   : "or",
+        DW_OP_over                 : "over",
+        DW_OP_pick                 : "pick",
+        DW_OP_piece                : "piece",
+        DW_OP_plus                 : "plus",
+        DW_OP_plus_uconst          : "plus_uconst",
+        DW_OP_push_object_address  : "push_object_address",
+        DW_OP_reg0                 : "reg0",
+        DW_OP_reg1                 : "reg1",
+        DW_OP_reg2                 : "reg2",
+        DW_OP_reg3                 : "reg3",
+        DW_OP_reg4                 : "reg4",
+        DW_OP_reg5                 : "reg5",
+        DW_OP_reg6                 : "reg6",
+        DW_OP_reg7                 : "reg7",
+        DW_OP_reg8                 : "reg8",
+        DW_OP_reg9                 : "reg9",
+        DW_OP_reg10                : "reg10",
+        DW_OP_reg11                : "reg11",
+        DW_OP_reg12                : "reg12",
+        DW_OP_reg13                : "reg13",
+        DW_OP_reg14                : "reg14",
+        DW_OP_reg15                : "reg15",
+        DW_OP_reg16                : "reg16",
+        DW_OP_reg17                : "reg17",
+        DW_OP_reg18                : "reg18",
+        DW_OP_reg19                : "reg19",
+        DW_OP_reg20                : "reg20",
+        DW_OP_reg21                : "reg21",
+        DW_OP_reg22                : "reg22",
+        DW_OP_reg23                : "reg23",
+        DW_OP_reg24                : "reg24",
+        DW_OP_reg25                : "reg25",
+        DW_OP_reg26                : "reg26",
+        DW_OP_reg27                : "reg27",
+        DW_OP_reg28                : "reg28",
+        DW_OP_reg29                : "reg29",
+        DW_OP_reg30                : "reg30",
+        DW_OP_reg31                : "reg31",
+        DW_OP_regval_type          : "regval_type",
+        DW_OP_regx                 : "regx",
+        DW_OP_reinterpret          : "reinterpret",
+        DW_OP_rot                  : "rot",
+        DW_OP_shl                  : "shl",
+        DW_OP_shr                  : "shr",
+        DW_OP_shra                 : "shra",
+        DW_OP_skip                 : "skip",
+        DW_OP_stack_value          : "stack_value",
+        DW_OP_swap                 : "swap",
+        DW_OP_xderef               : "xderef",
+        DW_OP_xderef_size          : "xderef_size",
+        DW_OP_xderef_type          : "xderef_type",
+        DW_OP_xor                  : "xor",
+    }
+
+    def dwarf_locexpr_opcode_string(self, code):
+        if code in self.DWARF_ONE_KNOWN_DW_OP:
+            return self.DWARF_ONE_KNOWN_DW_OP[code]
+        elif code >= self.DW_OP_lo_user:
+            return "lo_user+{:#x}".format(code - self.DW_OP_lo_user)
+        else:
+            return "??? ({:#x})".format(code)
+
+    def parse_ops(self, vers, addrsize, length, data, pos, indent_n=0):
+        indent = " " * ((indent_n + 2) * 4)
+        entries = []
+        if vers < 3:
+            ref_size = addrsize
+        else:
+            ref_size = 4
+
+        if length == 0:
+            entries.append(self.DataEntry(pos, None, indent + "(empty)"))
+            return entries
+
+        offset = 0
+        try:
+            while length:
+                new_pos, op = self.read_1ubyte(data, pos)
+                op_name = self.dwarf_locexpr_opcode_string(op)
+
+                if op in [self.DW_OP_addr]:
+                    if addrsize == 4:
+                        new_pos, d = self.read_4ubyte(data, new_pos)
+                    elif addrsize == 8:
+                        new_pos, d = self.read_8ubyte(data, new_pos)
+                    extra_s = "push {:#x}".format(d)
+                    entries.append(self.DataEntry(
+                        pos, data[pos:new_pos],
+                        indent + "[{:#04x}] {:s} {:#x}".format(offset, op_name, d),
+                        None, extra_s,
+                    ))
+                elif op in [self.DW_OP_call_ref, self.DW_OP_GNU_variable_value]:
+                    if ref_size == 4:
+                        new_pos, d = self.read_4ubyte(data, new_pos)
+                    else:
+                        new_pos, d = self.read_8ubyte(data, new_pos)
+                    entries.append(self.DataEntry(
+                        pos, data[pos:new_pos],
+                        indent + "[{:#04x}] {:s} {:#x}".format(offset, op_name, d),
+                    ))
+                elif op in [self.DW_OP_deref]:
+                    typ = {4: "uint", 8: "ulong"}[addrsize]
+                    extra_s = "pop; push *({:s}*)popped_value".format(typ)
+                    entries.append(self.DataEntry(
+                        pos, data[pos:new_pos],
+                        indent + "[{:#04x}] {:s}".format(offset, op_name),
+                        None, extra_s,
+                    ))
+                elif op in [self.DW_OP_xderef]:
+                    typ = {4: "uint", 8: "ulong"}[addrsize]
+                    extra_s = "pop; pop; push *({:s}*)(popped_value2_as_segment:popped_value1)".format(typ)
+                    entries.append(self.DataEntry(
+                        pos, data[pos:new_pos],
+                        indent + "[{:#04x}] {:s}".format(offset, op_name),
+                        None, extra_s,
+                    ))
+                elif op in [self.DW_OP_deref_size]:
+                    new_pos, d = self.read_1ubyte(data, new_pos)
+                    typ = {1: "uchar", 2: "ushort", 4: "uint", 8: "ulong"}[d]
+                    extra_s = "pop; push *({:s}*)popped_value".format(typ)
+                    entries.append(self.DataEntry(
+                        pos, data[pos:new_pos],
+                        indent + "[{:#04x}] {:s} {:#x}".format(offset, op_name, d),
+                        None, extra_s,
+                    ))
+                elif op in [self.DW_OP_xderef_size]:
+                    new_pos, d = self.read_1ubyte(data, new_pos)
+                    typ = {1: "uchar", 2: "ushort", 4: "uint", 8: "ulong"}[d]
+                    extra_s = "pop; pop; push *({:s}*)(popped_value2_as_segment:popped_value1)".format(typ)
+                    entries.append(self.DataEntry(
+                        pos, data[pos:new_pos],
+                        indent + "[{:#04x}] {:s} {:#x}".format(offset, op_name, d),
+                        None, extra_s,
+                    ))
+                elif op in [self.DW_OP_pick]:
+                    new_pos, d = self.read_1ubyte(data, new_pos)
+                    extra_s = "push stack[{:d}]".format(d)
+                    entries.append(self.DataEntry(
+                        pos, data[pos:new_pos],
+                        indent + "[{:#04x}] {:s} {:#x}".format(offset, op_name, d),
+                        None, extra_s,
+                    ))
+                elif op in [self.DW_OP_const1u]:
+                    new_pos, d = self.read_1ubyte(data, new_pos)
+                    extra_s = "push {:#x}".format(d)
+                    entries.append(self.DataEntry(
+                        pos, data[pos:new_pos],
+                        indent + "[{:#04x}] {:s} {:#x}".format(offset, op_name, d),
+                        None, extra_s,
+                    ))
+                elif op in [self.DW_OP_const2u]:
+                    new_pos, d = self.read_2ubyte(data, new_pos)
+                    extra_s = "push {:#x}".format(d)
+                    entries.append(self.DataEntry(
+                        pos, data[pos:new_pos],
+                        indent + "[{:#04x}] {:s} {:#x}".format(offset, op_name, d),
+                        None, extra_s,
+                    ))
+                elif op in [self.DW_OP_const4u]:
+                    new_pos, d = self.read_4ubyte(data, new_pos)
+                    extra_s = "push {:#x}".format(d)
+                    entries.append(self.DataEntry(
+                        pos, data[pos:new_pos],
+                        indent + "[{:#04x}] {:s} {:#x}".format(offset, op_name, d),
+                        None, extra_s,
+                    ))
+                elif op in [self.DW_OP_const8u]:
+                    new_pos, d = self.read_8ubyte(data, new_pos)
+                    extra_s = "push {:#x}".format(d)
+                    entries.append(self.DataEntry(
+                        pos, data[pos:new_pos],
+                        indent + "[{:#04x}] {:s} {:#x}".format(offset, op_name, d),
+                        None, extra_s,
+                    ))
+                elif op in [self.DW_OP_const1s]:
+                    new_pos, d = self.read_1sbyte(data, new_pos)
+                    extra_s = "push {:#x}".format(d)
+                    entries.append(self.DataEntry(
+                        pos, data[pos:new_pos],
+                        indent + "[{:#04x}] {:s} {:#x}".format(offset, op_name, d),
+                        None, extra_s,
+                    ))
+                elif op in [self.DW_OP_const2s]:
+                    new_pos, d = self.read_2sbyte(data, new_pos)
+                    extra_s = "push {:#x}".format(d)
+                    entries.append(self.DataEntry(
+                        pos, data[pos:new_pos],
+                        indent + "[{:#04x}] {:s} {:#x}".format(offset, op_name, d),
+                        None, extra_s,
+                    ))
+                elif op in [self.DW_OP_const4s]:
+                    new_pos, d = self.read_4sbyte(data, new_pos)
+                    extra_s = "push {:#x}".format(d)
+                    entries.append(self.DataEntry(
+                        pos, data[pos:new_pos],
+                        indent + "[{:#04x}] {:s} {:#x}".format(offset, op_name, d),
+                        None, extra_s,
+                    ))
+                elif op in [self.DW_OP_const8s]:
+                    new_pos, d = self.read_8sbyte(data, new_pos)
+                    extra_s = "push {:#x}".format(d)
+                    entries.append(self.DataEntry(
+                        pos, data[pos:new_pos],
+                        indent + "[{:#04x}] {:s} {:#x}".format(offset, op_name, d),
+                        None, extra_s,
+                    ))
+                elif op in [self.DW_OP_piece, self.DW_OP_regx, self.DW_OP_plus_uconst]:
+                    new_pos, d = self.get_uleb128(data, new_pos)
+                    entries.append(self.DataEntry(
+                        pos, data[pos:new_pos],
+                        indent + "[{:#04x}] {:s} {:#x}".format(offset, op_name, d),
+                    ))
+                elif op in [self.DW_OP_constu]:
+                    new_pos, d = self.get_uleb128(data, new_pos)
+                    extra_s = "push {:#x}".format(d)
+                    entries.append(self.DataEntry(
+                        pos, data[pos:new_pos],
+                        indent + "[{:#04x}] {:s} {:#x}".format(offset, op_name, d),
+                        None, extra_s,
+                    ))
+                elif op in [self.DW_OP_consts]:
+                    new_pos, d = self.get_sleb128(data, new_pos)
+                    extra_s = "push {:#x}".format(d)
+                    entries.append(self.DataEntry(
+                        pos, data[pos:new_pos],
+                        indent + "[{:#04x}] {:s} {:#x}".format(offset, op_name, d),
+                        None, extra_s,
+                    ))
+                elif op in [self.DW_OP_addrx, self.DW_OP_GNU_addr_index,
+                            self.DW_OP_constx, self.DW_OP_GNU_const_index]:
+                    new_pos, d = self.get_uleb128(data, new_pos)
+                    entries.append(self.DataEntry(
+                        pos, data[pos:new_pos],
+                        indent + "[{:#04x}] {:s} [{:#x}]".format(offset, op_name, d),
+                    ))
+                elif op in [self.DW_OP_bit_piece]:
+                    new_pos, d1 = self.get_uleb128(data, new_pos)
+                    new_pos, d2 = self.get_uleb128(data, new_pos)
+                    entries.append(self.DataEntry(
+                        pos, data[pos:new_pos],
+                        indent + "[{:#04x}] {:s} {:#x},{:#x}".format(offset, op_name, d1, d2),
+                    ))
+                elif op in [self.DW_OP_lit0, self.DW_OP_lit1, self.DW_OP_lit2, self.DW_OP_lit3,
+                            self.DW_OP_lit4, self.DW_OP_lit5, self.DW_OP_lit6, self.DW_OP_lit7,
+                            self.DW_OP_lit8, self.DW_OP_lit9, self.DW_OP_lit10, self.DW_OP_lit11,
+                            self.DW_OP_lit12, self.DW_OP_lit13, self.DW_OP_lit14, self.DW_OP_lit15,
+                            self.DW_OP_lit16, self.DW_OP_lit17, self.DW_OP_lit18, self.DW_OP_lit19,
+                            self.DW_OP_lit20, self.DW_OP_lit21, self.DW_OP_lit22, self.DW_OP_lit23,
+                            self.DW_OP_lit24, self.DW_OP_lit25, self.DW_OP_lit26, self.DW_OP_lit27,
+                            self.DW_OP_lit28, self.DW_OP_lit29, self.DW_OP_lit30, self.DW_OP_lit31]:
+                    extra_s = "push {:#x}".format(op - 0x30)
+                    entries.append(self.DataEntry(
+                        pos, data[pos:new_pos],
+                        indent + "[{:#04x}] {:s}".format(offset, op_name),
+                        None, extra_s,
+                    ))
+                elif op in [self.DW_OP_reg0, self.DW_OP_reg1, self.DW_OP_reg2, self.DW_OP_reg3,
+                            self.DW_OP_reg4, self.DW_OP_reg5, self.DW_OP_reg6, self.DW_OP_reg7,
+                            self.DW_OP_reg8, self.DW_OP_reg9, self.DW_OP_reg10, self.DW_OP_reg11,
+                            self.DW_OP_reg12, self.DW_OP_reg13, self.DW_OP_reg14, self.DW_OP_reg15,
+                            self.DW_OP_reg16, self.DW_OP_reg17, self.DW_OP_reg18, self.DW_OP_reg19,
+                            self.DW_OP_reg20, self.DW_OP_reg21, self.DW_OP_reg22, self.DW_OP_reg23,
+                            self.DW_OP_reg24, self.DW_OP_reg25, self.DW_OP_reg26, self.DW_OP_reg27,
+                            self.DW_OP_reg28, self.DW_OP_reg29, self.DW_OP_reg30, self.DW_OP_reg31]:
+                    regname = self.get_register_name(op - 0x50)
+                    extra_s = "push {:s}".format(regname)
+                    entries.append(self.DataEntry(
+                        pos, data[pos:new_pos],
+                        indent + "[{:#04x}] {:s}".format(offset, op_name),
+                        None, extra_s,
+                    ))
+                elif op in [self.DW_OP_breg0, self.DW_OP_breg1, self.DW_OP_breg2, self.DW_OP_breg3,
+                            self.DW_OP_breg4, self.DW_OP_breg5, self.DW_OP_breg6, self.DW_OP_breg7,
+                            self.DW_OP_breg8, self.DW_OP_breg9, self.DW_OP_breg10, self.DW_OP_breg11,
+                            self.DW_OP_breg12, self.DW_OP_breg13, self.DW_OP_breg14, self.DW_OP_breg15,
+                            self.DW_OP_breg16, self.DW_OP_breg17, self.DW_OP_breg18, self.DW_OP_breg19,
+                            self.DW_OP_breg20, self.DW_OP_breg21, self.DW_OP_breg22, self.DW_OP_breg23,
+                            self.DW_OP_breg24, self.DW_OP_breg25, self.DW_OP_breg26, self.DW_OP_breg27,
+                            self.DW_OP_breg28, self.DW_OP_breg29, self.DW_OP_breg30, self.DW_OP_breg31]:
+                    new_pos, d = self.get_sleb128(data, new_pos)
+                    regname = self.get_register_name(op - 0x70)
+                    extra_s = "push {:s}{:+#x}".format(regname, d)
+                    entries.append(self.DataEntry(
+                        pos, data[pos:new_pos],
+                        indent + "[{:#04x}] {:s} {:#x}".format(offset, op_name, d),
+                        None, extra_s,
+                    ))
+                elif op in [self.DW_OP_fbreg]:
+                    new_pos, d = self.get_sleb128(data, new_pos)
+                    extra_s = "push frame_base{:+#x}".format(d)
+                    entries.append(self.DataEntry(
+                        pos, data[pos:new_pos],
+                        indent + "[{:#04x}] {:s} {:#x}".format(offset, op_name, d),
+                        None, extra_s,
+                    ))
+                elif op in [self.DW_OP_bregx]:
+                    new_pos, d1 = self.get_uleb128(data, new_pos)
+                    new_pos, d2 = self.get_sleb128(data, new_pos)
+                    regname = self.get_register_name(d1)
+                    extra_s = "push {:s}{:+#x}".format(regname, d2)
+                    entries.append(self.DataEntry(
+                        pos, data[pos:new_pos],
+                        indent + "[{:#04x}] {:s} {:#x},{:#x}".format(offset, op_name, d1, d2),
+                        None, extra_s,
+                    ))
+                elif op in [self.DW_OP_call2]:
+                    new_pos, d = self.read_2ubyte(data, new_pos)
+                    entries.append(self.DataEntry(
+                        pos, data[pos:new_pos],
+                        indent + "[{:#04x}] {:s} [{:#x}]".format(offset, op_name, d),
+                    ))
+                elif op in [self.DW_OP_call4]:
+                    new_pos, d = self.read_4ubyte(data, new_pos)
+                    entries.append(self.DataEntry(
+                        pos, data[pos:new_pos],
+                        indent + "[{:#04x}] {:s} [{:#x}]".format(offset, op_name, d),
+                    ))
+                elif op in [self.DW_OP_bra]:
+                    new_pos, d = self.read_2sbyte(data, new_pos)
+                    d += offset + 3
+                    extra_s = "pop; jmp to [{:#x}] if popped_value != 0".format(d)
+                    entries.append(self.DataEntry(
+                        pos, data[pos:new_pos],
+                        indent + "[{:#04x}] {:s} [{:#x}]".format(offset, op_name, d),
+                        None, extra_s,
+                    ))
+                elif op in [self.DW_OP_skip]:
+                    new_pos, d = self.read_2sbyte(data, new_pos)
+                    d += offset + 3
+                    entries.append(self.DataEntry(
+                        pos, data[pos:new_pos],
+                        indent + "[{:#04x}] {:s} [{:#x}]".format(offset, op_name, d),
+                    ))
+                elif op in [self.DW_OP_implicit_value]:
+                    new_pos, d = self.get_uleb128(data, new_pos)
+                    block_s = " ".join(["{:02x}".format(x) for x in data[new_pos:new_pos + d]])
+                    new_pos += d
+                    entries.append(self.DataEntry(
+                        pos, data[pos:new_pos],
+                        indent + "[{:#04x}] {:s} {:s}".format(offset, op_name, block_s),
+                    ))
+                elif op in [self.DW_OP_implicit_pointer, self.DW_OP_GNU_implicit_pointer]:
+                    if ref_size == 4:
+                        new_pos, d1 = self.read_4ubyte(data, new_pos)
+                    elif ref_size == 8:
+                        new_pos, d1 = self.read_8ubyte(data, new_pos)
+                    new_pos, d2 = self.get_sleb128(data, new_pos)
+                    entries.append(self.DataEntry(
+                        pos, data[pos:new_pos],
+                        indent + "[{:#04x}] {:s} [{:#x}] {:+#x}".format(offset, op_name, d1, d2),
+                    ))
+                elif op in [self.DW_OP_entry_value, self.DW_OP_GNU_entry_value]:
+                    new_pos, d = self.get_uleb128(data, new_pos)
+                    entries.append(self.DataEntry(
+                        pos, data[pos:new_pos],
+                        indent + "[{:#04x}] {:s}".format(offset, op_name),
+                    ))
+                    entries += self.parse_ops(vers, addrsize, d, data, new_pos, indent_n=indent_n + 1)
+                    new_pos += d
+                elif op in [self.DW_OP_const_type, self.DW_OP_GNU_const_type]:
+                    new_pos, d1 = self.get_uleb128(data, new_pos)
+                    new_pos, d2 = self.read_1ubyte(data, new_pos)
+                    block_s = " ".join(["{:02x}".format(x) for x in data[new_pos:new_pos + d2]])
+                    new_pos += d2
+                    entries.append(self.DataEntry(
+                        pos, data[pos:new_pos],
+                        indent + "[{:#04x}] {:s} [{:#x}] {:s}".format(offset, op_name, d1, block_s),
+                    ))
+                elif op in [self.DW_OP_regval_type, self.DW_OP_GNU_regval_type]:
+                    new_pos, d1 = self.get_uleb128(data, new_pos)
+                    new_pos, d2 = self.get_uleb128(data, new_pos)
+                    entries.append(self.DataEntry(
+                        pos, data[pos:new_pos],
+                        indent + "[{:#04x}] {:s} {:#x} [{:#x}]".format(offset, op_name, d1, d2),
+                    ))
+                elif op in [self.DW_OP_deref_type, self.DW_OP_GNU_deref_type]:
+                    new_pos, d1 = self.read_1ubyte(data, new_pos)
+                    new_pos, d2 = self.get_uleb128(data, new_pos)
+                    entries.append(self.DataEntry(
+                        pos, data[pos:new_pos],
+                        indent + "[{:#04x}] {:s} {:#x} [{:#x}]".format(offset, op_name, d1, d2),
+                    ))
+                elif op in [self.DW_OP_xderef_type]:
+                    new_pos, d1 = self.read_1ubyte(data, new_pos)
+                    new_pos, d2 = self.get_uleb128(data, new_pos)
+                    entries.append(self.DataEntry(
+                        pos, data[pos:new_pos],
+                        indent + "[{:#04x}] {:s} {:#x} [{:#x}]".format(offset, op_name, d1, d2),
+                    ))
+                elif op in [self.DW_OP_convert, self.DW_OP_GNU_convert,
+                            self.DW_OP_reinterpret, self.DW_OP_GNU_reinterpret]:
+                    new_pos, d = self.get_uleb128(data, new_pos)
+                    entries.append(self.DataEntry(
+                        pos, data[pos:new_pos],
+                        indent + "[{:#04x}] {:s} [{:#x}]".format(offset, op_name, d),
+                    ))
+                elif op in [self.DW_OP_GNU_parameter_ref]:
+                    new_pos, d = self.read_4ubyte(data, new_pos)
+                    entries.append(self.DataEntry(
+                        pos, data[pos:new_pos],
+                        indent + "[{:#04x}] {:s} [{:#x}]".format(offset, op_name, d),
+                    ))
+                elif op in [self.DW_OP_drop]:
+                    extra_s = "pop"
+                    entries.append(self.DataEntry(
+                        pos, data[pos:new_pos],
+                        indent + "[{:#04x}] {:s}".format(offset, op_name),
+                        None, extra_s,
+                    ))
+                elif op in [self.DW_OP_dup]:
+                    extra_s = "push stack[0]"
+                    entries.append(self.DataEntry(
+                        pos, data[pos:new_pos],
+                        indent + "[{:#04x}] {:s}".format(offset, op_name),
+                        None, extra_s,
+                    ))
+                elif op in [self.DW_OP_over]:
+                    extra_s = "push stack[1]"
+                    entries.append(self.DataEntry(
+                        pos, data[pos:new_pos],
+                        indent + "[{:#04x}] {:s}".format(offset, op_name),
+                        None, extra_s,
+                    ))
+                elif op in [self.DW_OP_swap]:
+                    extra_s = "stack[0],stack[1] = stack[1],stack[0]"
+                    entries.append(self.DataEntry(
+                        pos, data[pos:new_pos],
+                        indent + "[{:#04x}] {:s}".format(offset, op_name),
+                        None, extra_s,
+                    ))
+                elif op in [self.DW_OP_rot]:
+                    extra_s = "stack[0],stack[1],stack[2] = stack[1],stack[2],stack[0]"
+                    entries.append(self.DataEntry(
+                        pos, data[pos:new_pos],
+                        indent + "[{:#04x}] {:s}".format(offset, op_name),
+                        None, extra_s,
+                    ))
+                else:
+                    entries.append(self.DataEntry(
+                        pos, data[pos:new_pos],
+                        indent + "[{:#04x}] {:s}".format(offset, op_name),
+                    ))
+                length -= new_pos - pos
+                offset += new_pos - pos
+                pos = new_pos
+        except (KeyError, IndexError, ValueError):
+            _exc_type, exc_value, _exc_traceback = sys.exc_info()
+            entries.append(self.ErrorEntry("Parse Error", exc_value))
+        return entries
+
+    def parse_gcc_except_table(self, gcc_except_table):
+        data = gcc_except_table.data
+        sec_off = self.section_offset(".gcc_except_table")
+
+        entries = []
+        pos = 0
+        lsda_table_cnt = 0
+
+        try:
+            lsda_pos_padding = 0
+            while data[pos:]:
+                # search LSDA start address
+                if (sec_off + pos) not in self.lsda_info:
+                    lsda_pos_padding += 1
+                    pos += 1
+                    continue
+
+                # Found
+                if lsda_pos_padding:
+                    entries.append(self.SeparatorEntry(pos - lsda_pos_padding, "Padding"))
+                    entries.append(self.DataEntry(
+                        pos - lsda_pos_padding, data[pos - lsda_pos_padding:pos], "padding",
+                    ))
+                    lsda_pos_padding = 0
+
+                entries.append(self.SeparatorEntry(pos, "LSDA Table[{:4d}]".format(lsda_table_cnt)))
+                function_start = self.lsda_info[sec_off + pos]
+                lpstart = function_start
+
+                # parse lpstart_encoding
+                new_pos, lpstart_encoding = self.read_1ubyte(data, pos)
+                encoding_str = self.get_encoding_str(lpstart_encoding)
+                entries.append(self.DataEntry(
+                    pos, data[pos:new_pos],
+                    "landing_pad_start_encoding", lpstart_encoding,
+                    "encoding: {:s}".format(encoding_str),
+                ))
+                pos = new_pos
+
+                # parse lpstart
+                if lpstart_encoding != self.DW_EH_PE_omit:
+                    new_pos, lpstart = self.read_encoded(lpstart_encoding, data, pos) # overwrite lpstart
+                    entries.append(self.DataEntry(
+                        pos, data[pos:new_pos],
+                        "landing_pad_start", lpstart,
+                    ))
+                    lpstart = self.encoded_offset(
+                        lpstart_encoding, lpstart, sec_off + pos,
+                        func_off=function_start,
+                    )
+                    if lpstart is None or lpstart_encoding & self.DW_EH_PE_indirect:
+                        raise ValueError("unsupported landing pad base encoding")
+                    pos = new_pos
+
+                # parse ttype_encoding
+                new_pos, ttype_encoding = self.read_1ubyte(data, pos)
+                encoding_str = self.get_encoding_str(ttype_encoding)
+                entries.append(self.DataEntry(
+                    pos, data[pos:new_pos],
+                    "ttype_encoding", ttype_encoding,
+                    "encoding: {:s}".format(encoding_str),
+                ))
+                pos = new_pos
+
+                # parse ttype_base_offset
+                ttype_base = None
+                if ttype_encoding != self.DW_EH_PE_omit:
+                    new_pos, ttype_base_offset = self.get_uleb128(data, pos)
+                    ttype_base = new_pos + ttype_base_offset
+                    entries.append(self.DataEntry(
+                        pos, data[pos:new_pos],
+                        "ttype_base_offset", ttype_base_offset,
+                        "ttype_base: {:#x}".format(ttype_base),
+                    ))
+                    pos = new_pos
+
+                # parse call_site_encoding
+                new_pos, call_site_encoding = self.read_1ubyte(data, pos)
+                encoding_str = self.get_encoding_str(call_site_encoding)
+                entries.append(self.DataEntry(
+                    pos, data[pos:new_pos],
+                    "call_site_encoding", call_site_encoding,
+                    "encoding: {:s}".format(encoding_str),
+                ))
+                pos = new_pos
+
+                # parse call_site_table_len
+                new_pos, call_site_table_len = self.get_uleb128(data, pos)
+                entries.append(self.DataEntry(
+                    pos, data[pos:new_pos],
+                    "call_site_table_len", call_site_table_len,
+                ))
+                pos = new_pos
+
+                # parse call_site_table
+                action_table_pos = pos + call_site_table_len
+                table_cnt = 0
+                max_action = 0
+                while pos < action_table_pos:
+                    entries.append(self.SeparatorEntry(pos, "Call site table[{:4d}]".format(table_cnt)))
+
+                    new_pos, call_site_start = self.read_encoded(call_site_encoding, data, pos)
+                    extra_s = "try-start vma: {:s}".format(self.format_vma(lpstart + call_site_start))
+                    entries.append(self.DataEntry(
+                        pos, data[pos:new_pos], "call_site_start", call_site_start, extra_s,
+                    ))
+                    pos = new_pos
+
+                    new_pos, call_site_length = self.read_encoded(call_site_encoding, data, pos)
+                    call_site_end = call_site_start + call_site_length
+                    extra_s = "try-end vma: {:s}".format(self.format_vma(lpstart + call_site_end))
+                    entries.append(self.DataEntry(
+                        pos, data[pos:new_pos], "call_site_length", call_site_length, extra_s,
+                    ))
+                    pos = new_pos
+
+                    new_pos, call_site_lpad = self.read_encoded(call_site_encoding, data, pos)
+                    if call_site_lpad == 0:
+                        extra_s = ""
+                    else:
+                        extra_s = "catch vma: {:s}".format(self.format_vma(lpstart + call_site_lpad))
+                    entries.append(self.DataEntry(
+                        pos, data[pos:new_pos], "landing_pad", call_site_lpad, extra_s,
+                    ))
+                    pos = new_pos
+
+                    new_pos, action = self.get_uleb128(data, pos)
+                    max_action = max(action, max_action)
+                    if action == 0:
+                        extra_s = "no action"
+                    else:
+                        extra_s = "action: {:#x}".format(action_table_pos + action - 1)
+                    entries.append(self.DataEntry(
+                        pos, data[pos:new_pos], "action", action, extra_s,
+                    ))
+                    pos = new_pos
+
+                    table_cnt += 1
+
+                # parse action_table
+                max_ar_filter = 0
+                table_cnt = 0
+                if max_action:
+                    action_table_end_pos = action_table_pos + max_action + 1
+                    while pos < action_table_end_pos:
+                        entries.append(self.SeparatorEntry(pos, "Action table[{:4d}]".format(table_cnt)))
+
+                        new_pos, ar_filter = self.get_sleb128(data, pos)
+                        if ar_filter == 0:
+                            extra_s = "cleanup"
+                        else:
+                            enc_size = self.encoded_ptr_size(ttype_encoding, self.ptr_size)
+                            extra_s = "catch typeinfo: {:#x}".format(ttype_base - ar_filter * enc_size)
+                        entries.append(self.DataEntry(
+                            pos, data[pos:new_pos], "action_record_filter", ar_filter, extra_s,
+                        ))
+                        max_ar_filter = max(ar_filter, max_ar_filter)
+                        pos = new_pos
+
+                        new_pos, ar_disp = self.get_sleb128(data, pos)
+                        if ar_disp & 1:
+                            extra_s = "-> Action Table[{:4d}]".format(table_cnt + (ar_disp + 1) // 2)
+                        elif ar_disp:
+                            extra_s = "-> ???"
+                        else:
+                            extra_s = "list end"
+                        entries.append(self.DataEntry(
+                            pos, data[pos:new_pos], "action_record_next", ar_disp, extra_s,
+                        ))
+                        pos = new_pos
+
+                        table_cnt += 1
+
+                # parse ttype_table
+                if max_ar_filter > 0 and ttype_base is not None:
+                    enc_size = self.encoded_ptr_size(ttype_encoding, self.ptr_size)
+                    new_pos = ttype_base - max_ar_filter * enc_size
+                    if pos != new_pos:
+                        entries.append(self.SeparatorEntry(pos, "Padding"))
+                        entries.append(self.DataEntry(pos, data[pos:new_pos], "padding"))
+                        pos = new_pos
+                    current_ar_filter = max_ar_filter
+                    while pos < ttype_base:
+                        entries.append(self.SeparatorEntry(pos, "TType table[{:4d}]".format(current_ar_filter)))
+                        new_pos, ttype = self.read_encoded(ttype_encoding, data, pos)
+                        ttype_pointer = self.encoded_offset(ttype_encoding, ttype, sec_off + pos)
+                        if ttype == 0:
+                            extra_s = ""
+                        elif ttype_pointer is None:
+                            extra_s = "TType pointer"
+                        else:
+                            extra_s = "TType pointer vma: {:s}".format(self.format_vma(ttype_pointer))
+                        entries.append(self.DataEntry(pos, data[pos:new_pos], "ttype", ttype, extra_s))
+                        pos = new_pos
+                        current_ar_filter -= 1
+                if ttype_base is not None:
+                    entries.append(self.SeparatorEntry(ttype_base, "TType table base (Stored upwards)"))
+
+                # next LSDA
+                if ttype_base is None:
+                    pass
+                else:
+                    pos = ttype_base
+                lsda_table_cnt += 1
+
+            if lsda_pos_padding:
+                entries.append(self.SeparatorEntry(pos - lsda_pos_padding, "Padding"))
+                entries.append(self.DataEntry(
+                    pos - lsda_pos_padding, data[pos - lsda_pos_padding:pos], "padding",
+                ))
+        except (KeyError, IndexError, ValueError):
+            _exc_type, exc_value, _exc_traceback = sys.exc_info()
+            entries.append(self.ErrorEntry("Parse Error", exc_value))
+        return entries
+
+    def read_section(self, section_name, quiet=False):
+        shdr = self.elf.get_shdr(section_name)
+        if shdr is None:
+            if not quiet:
+                err("Could not find {} section".format(section_name))
+            return None
+
+        data = self.elf.read_shdr(section_name)
+        if data is None:
+            if not quiet:
+                err("Could not read {} section".format(section_name))
+            return None
+        if not quiet:
+            info("Found {} section".format(section_name))
+
+        dic = {"name": section_name, "offset": shdr.sh_offset, "data": data}
+        return GefUtil.dict_to_namedtuple("Section", dic)
+
+    def dump(self, with_hexdump=False):
+        eh_frame = self.read_section(".eh_frame")
+        if eh_frame is None:
+            return None
+        eh_frame_hdr = self.read_section(".eh_frame_hdr")
+        gcc_except_table = self.read_section(".gcc_except_table")
+
+        out = []
+        if eh_frame_hdr:
+            entries = self.parse_eh_frame_hdr(eh_frame_hdr)
+            out += self.format_entry(eh_frame_hdr, entries, with_hexdump)
+        entries = self.parse_eh_frame(eh_frame)
+        out += self.format_entry(eh_frame, entries, with_hexdump)
+        if gcc_except_table:
+            entries = self.parse_gcc_except_table(gcc_except_table)
+            out += self.format_entry(gcc_except_table, entries, with_hexdump)
+        return out

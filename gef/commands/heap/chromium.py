@@ -7,14 +7,17 @@ Auto-discovered by gef.bootstrap via pkgutil.walk_packages.
 
 import argparse
 import collections
+import hashlib
 import os
 import re
 import struct
 import sys
+import tempfile
 
 import gdb
 
 from gef.commands.base import (
+    ContextManager,
     BufferingOutput,
     GenericCommand,
     exclude_specific_gdb_mode,
@@ -24,10 +27,13 @@ from gef.commands.base import (
     register_command,
 )
 from gef.core import runtime
-from gef.core.address import AddressUtil, Permission
+from gef.core.address import AddressUtil, Permission, Section
+from gef.core.auxv import Auxv
+from gef.core.symbols import Symbol
 from gef.core.cache import Cache
 from gef.core.color import Color, err, gef_print, info, ok, titlify
 from gef.core.config import Config
+from gef.core.display import ProgressBar
 from gef.core.exec import ExecSyscall
 from gef.core.http import http_get
 from gef.core.memory import (
@@ -42,6 +48,7 @@ from gef.core.memory import (
 from gef.core.process import (
     Path,
     ProcessMap,
+    is_alive,
     get_pagesize,
     get_pagesize_mask_high,
     get_pagesize_mask_low,
@@ -49,7 +56,7 @@ from gef.core.process import (
     is_64bit,
 )
 from gef.core.syscall import Syscall
-from gef.core.utils import GEF_TEMP_DIR, GefUtil, align, byteswap, slice_unpack
+from gef.core.utils import GEF_TEMP_DIR, GefUtil, align, byteswap, slice_unpack, u2i
 
 @register_command
 class CageCommand(GenericCommand, BufferingOutput):
@@ -87,7 +94,7 @@ class CageCommand(GenericCommand, BufferingOutput):
             pass
         return None
 
-    @Cache.cache_until_next
+    @Cache.cache_until_next(per_inferior=True)
     def get_isolate(self, force_heuristic=False):
         sym = "&'v8::internal::g_current_isolate_'.isolate_data_"
         addr = self.get_sym_value(sym, force_heuristic)
@@ -95,10 +102,11 @@ class CageCommand(GenericCommand, BufferingOutput):
             return addr
 
         tls = runtime.current_arch.get_tls()
+        if tls is None:
+            return None
         for i in range(256 * 4): # heuristic; d8: 256, chromium: 1024
-            try:
-                x = read_int_from_memory(tls - runtime.current_arch.ptrsize * i)
-            except gdb.MemoryError:
+            x = read_int_from_memory(tls - runtime.current_arch.ptrsize * i, safe=True)
+            if x is None:
                 continue
             if x == 0:
                 continue
@@ -106,9 +114,8 @@ class CageCommand(GenericCommand, BufferingOutput):
                 continue
             if not is_valid_addr(x):
                 continue
-            try:
-                y = read_int_from_memory(x)
-            except gdb.MemoryError:
+            y = read_int_from_memory(x, safe=True)
+            if y is None:
                 continue
             if y == 0:
                 continue
@@ -119,7 +126,7 @@ class CageCommand(GenericCommand, BufferingOutput):
             return x
         return None
 
-    @Cache.cache_until_next
+    @Cache.cache_until_next(per_inferior=True)
     def get_cage_base(self, force_heuristic=False):
         sym = "'v8::internal::g_current_isolate_'.isolate_data_.cage_base_"
         addr = self.get_sym_addr(sym, force_heuristic)
@@ -131,7 +138,7 @@ class CageCommand(GenericCommand, BufferingOutput):
             return read_int_from_memory(addr)
         return None
 
-    @Cache.cache_until_next
+    @Cache.cache_until_next(per_inferior=True)
     def get_table_candidates(self):
         isolate = self.get_isolate(force_heuristic=True)
         if not isolate:
@@ -227,36 +234,36 @@ class CageCommand(GenericCommand, BufferingOutput):
         gef>
         """
 
-        # In d8 it is aligned to 0x100_0000 bytes.
-        candidates_z_ffffff = []
-        # In chromium it is aligned to 0x1000 bytes.
-        candidates_z_fff = []
+        # Require reservation starts and a matching IsolateData table layout.
+        candidates = {}
+        for offset in range(0, 256 * runtime.current_arch.ptrsize, runtime.current_arch.ptrsize):
+            value = read_int_from_memory(isolate + offset, safe=True)
+            if not value or value & 0xfff:
+                continue
+            section = ProcessMap.lookup(value).section
+            if section and section.page_start == value and section.permission.value == Permission.READ:
+                if section.size <= 0x10000 and (not section.path or section.path.startswith("[anon:v8")):
+                    candidates[offset] = value
 
-        for i in range(256):
-            addr = isolate + runtime.current_arch.ptrsize * i
-            try:
-                value = read_int_from_memory(addr)
-            except gdb.MemoryError:
-                return []
-            if value & 0xfff:
-                continue
-            if not is_valid_addr(value):
-                continue
-            pm = ProcessMap.lookup_address(value)
-            try:
-                if pm.section.permission.value != Permission.READ:
+        layouts = []
+        # external, cpp heap, trusted, code, JS dispatch (V8 12, 13 and 14).
+        for offsets in ((0, None, 0x20, None, None), (0, 0x18, 0x30, None, None),
+                        (0, 0x38, 0x70, 0xb0, 0xc0)):
+            for offset in candidates:
+                fields = [candidates.get(offset + field) if field is not None else None for field in offsets]
+                if any(fields[i] is None for i, field in enumerate(offsets) if field is not None):
                     continue
-            except Exception:
-                continue
-            if value & 0xff_ffff == 0:
-                candidates_z_ffffff.append(value)
-            candidates_z_fff.append(value)
+                trusted_base = read_int_from_memory(isolate + offset + offsets[2] - 8, safe=True)
+                if not trusted_base or trusted_base & 0xffff_ffff or not is_valid_addr(trusted_base):
+                    continue
+                if len({value for value in fields if value}) != sum(field is not None for field in offsets):
+                    continue
+                layouts.append([read_int_from_memory(isolate), *fields, trusted_base])
+        if len(layouts) == 1:
+            return layouts[0]
+        return []
 
-        if len(candidates_z_ffffff) >= 6:
-            return candidates_z_ffffff
-        return candidates_z_fff
-
-    @Cache.cache_until_next
+    @Cache.cache_until_next(per_inferior=True)
     def get_external_pointer_table_base(self, force_heuristic=False):
         sym = "'v8::internal::g_current_isolate_'.isolate_data_.external_pointer_table_.base_"
         addr = self.get_sym_addr(sym, force_heuristic)
@@ -268,7 +275,7 @@ class CageCommand(GenericCommand, BufferingOutput):
             return candidates[1]
         return None
 
-    @Cache.cache_until_next
+    @Cache.cache_until_next(per_inferior=True)
     def get_external_pointer_table_size(self, force_heuristic=False):
         sym = "'v8::internal::g_current_isolate_'.isolate_data_.external_pointer_table_.kReservationSize"
         value = self.get_sym_value(sym, force_heuristic)
@@ -276,7 +283,7 @@ class CageCommand(GenericCommand, BufferingOutput):
             return value
         return 0x400_0000 # hard-coded
 
-    @Cache.cache_until_next
+    @Cache.cache_until_next(per_inferior=True)
     def get_shared_external_pointer_table_base(self, force_heuristic=False):
         sym = "'v8::internal::g_current_isolate_'.isolate_data_.shared_external_pointer_table_.base_"
         addr = self.get_sym_addr(sym, force_heuristic)
@@ -284,7 +291,7 @@ class CageCommand(GenericCommand, BufferingOutput):
             return addr
         return None
 
-    @Cache.cache_until_next
+    @Cache.cache_until_next(per_inferior=True)
     def get_shared_external_pointer_table_size(self, force_heuristic=False):
         sym = "'v8::internal::g_current_isolate_'.isolate_data_.shared_external_pointer_table_.kReservationSize"
         value = self.get_sym_value(sym, force_heuristic)
@@ -292,7 +299,7 @@ class CageCommand(GenericCommand, BufferingOutput):
             return value
         return 0x400_0000 # hard-coded
 
-    @Cache.cache_until_next
+    @Cache.cache_until_next(per_inferior=True)
     def get_cpp_heap_pointer_table_base(self, force_heuristic=False):
         sym = "'v8::internal::g_current_isolate_'.isolate_data_.cpp_heap_pointer_table_.base_"
         addr = self.get_sym_addr(sym, force_heuristic)
@@ -304,7 +311,7 @@ class CageCommand(GenericCommand, BufferingOutput):
             return candidates[2]
         return None
 
-    @Cache.cache_until_next
+    @Cache.cache_until_next(per_inferior=True)
     def get_cpp_heap_pointer_table_size(self, force_heuristic=False):
         sym = "'v8::internal::g_current_isolate_'.isolate_data_.cpp_heap_pointer_table_.kReservationSize"
         value = self.get_sym_value(sym, force_heuristic)
@@ -312,7 +319,7 @@ class CageCommand(GenericCommand, BufferingOutput):
             return value
         return 0x400_0000 # hard-coded
 
-    @Cache.cache_until_next
+    @Cache.cache_until_next(per_inferior=True)
     def get_trusted_pointer_table_base(self, force_heuristic=False):
         sym = "'v8::internal::g_current_isolate_'.isolate_data_.trusted_pointer_table_.base_"
         addr = self.get_sym_addr(sym, force_heuristic)
@@ -324,7 +331,7 @@ class CageCommand(GenericCommand, BufferingOutput):
             return candidates[3]
         return None
 
-    @Cache.cache_until_next
+    @Cache.cache_until_next(per_inferior=True)
     def get_trusted_pointer_table_size(self, force_heuristic=False):
         sym = "'v8::internal::g_current_isolate_'.isolate_data_.trusted_pointer_table_.kReservationSize"
         value = self.get_sym_value(sym, force_heuristic)
@@ -332,7 +339,7 @@ class CageCommand(GenericCommand, BufferingOutput):
             return value
         return 0x400_0000 # hard-coded
 
-    @Cache.cache_until_next
+    @Cache.cache_until_next(per_inferior=True)
     def get_shared_trusted_pointer_table_base(self, force_heuristic=False):
         sym = "'v8::internal::g_current_isolate_'.isolate_data_.shared_trusted_pointer_table_.base_"
         addr = self.get_sym_addr(sym, force_heuristic)
@@ -340,7 +347,7 @@ class CageCommand(GenericCommand, BufferingOutput):
             return addr
         return None
 
-    @Cache.cache_until_next
+    @Cache.cache_until_next(per_inferior=True)
     def get_shared_trusted_pointer_table_size(self, force_heuristic=False):
         sym = "'v8::internal::g_current_isolate_'.isolate_data_.shared_trusted_pointer_table_.kReservationSize"
         value = self.get_sym_value(sym, force_heuristic)
@@ -348,7 +355,7 @@ class CageCommand(GenericCommand, BufferingOutput):
             return value
         return 0x400_0000 # hard-coded
 
-    @Cache.cache_until_next
+    @Cache.cache_until_next(per_inferior=True)
     def get_code_pointer_table_base(self, force_heuristic=False):
         sym = "'v8::internal::g_current_isolate_'.isolate_data_.code_pointer_table_base_address_"
         addr = self.get_sym_addr(sym, force_heuristic)
@@ -360,11 +367,11 @@ class CageCommand(GenericCommand, BufferingOutput):
             return candidates[4]
         return None
 
-    @Cache.cache_until_next
+    @Cache.cache_until_next(per_inferior=True)
     def get_code_pointer_table_size(self, force_heuristic=False):
         return 0x400_0000 # hard-coded
 
-    @Cache.cache_until_next
+    @Cache.cache_until_next(per_inferior=True)
     def get_js_dispatch_table_base(self, force_heuristic=False):
         sym = "'v8::internal::g_current_isolate_'.isolate_data_.js_dispatch_table_base_"
         addr = self.get_sym_addr(sym, force_heuristic)
@@ -376,11 +383,11 @@ class CageCommand(GenericCommand, BufferingOutput):
             return candidates[5]
         return None
 
-    @Cache.cache_until_next
+    @Cache.cache_until_next(per_inferior=True)
     def get_js_dispatch_table_size(self, force_heuristic=False):
         return 0x400_0000 # hard-coded
 
-    @Cache.cache_until_next
+    @Cache.cache_until_next(per_inferior=True)
     def get_code_range_base(self, force_heuristic=False):
         sym = "'v8::internal::g_current_isolate_'->heap_.code_range_.base_"
         addr = self.get_sym_addr(sym, force_heuristic)
@@ -407,7 +414,7 @@ class CageCommand(GenericCommand, BufferingOutput):
                 return m.page_start
         return None
 
-    @Cache.cache_until_next
+    @Cache.cache_until_next(per_inferior=True)
     def get_code_range_size(self, force_heuristic=False):
         sym = "'v8::internal::g_current_isolate_'->heap_.code_range_.size_"
         value = self.get_sym_value(sym, force_heuristic)
@@ -415,85 +422,154 @@ class CageCommand(GenericCommand, BufferingOutput):
             return value
         return 0x2000_0000 # hard-coded
 
-    @Cache.cache_until_next
-    def get_cage_rw_space_candidates(self):
-        maps = ProcessMap.get_process_maps()
-        if not maps:
+    @Cache.cache_until_next(per_inferior=True)
+    def get_page_metadata(self, page):
+        """Read validated x64 page metadata; unknown layouts remain unclassified.
+
+        V8 12: chunk + 0x08 -> inline metadata; area start/end +0x20/+0x28,
+               heap +0x18, owner +0x48.
+        V8 13/14: chunk + 0x08 contains a metadata table index (sandbox),
+                  metadata area start/end +0x48/+0x38, heap +0x40, owner +0x50.
+        V8 13 uses a global pointer table; V8 14 stores 16-byte entries in
+        IsolateGroup. Locate the latter by checking its entries against pages,
+        rather than assuming a fixed IsolateGroup field offset.
+        """
+        raw = read_int_from_memory(page + 8, safe=True)
+        if raw is None:
             return None
-        candidates = []
-        for m in maps:
-            if m.permission.value != Permission.READ | Permission.WRITE:
-                continue
-            if not self.is_cage(m):
-                continue
-            candidates.append(m)
-        return candidates
+        if raw == page:
+            metadata = page
+            start_offset, end_offset, heap_offset, owner_offset = 0x20, 0x28, 0x18, 0x48
+        else:
+            start_offset, end_offset, heap_offset, owner_offset = 0x48, 0x38, 0x40, 0x50
+            metadata = raw
+            index = raw & 0xffff_ffff
+            if index < 0x7fff and raw >> 32 in (0, 0xbeadbeef):
+                table = self.get_sym_value("&'v8::internal::MemoryChunk::metadata_pointer_table_'")
+                if table:
+                    metadata = read_int_from_memory(table + index * 8, safe=True)
+                else:
+                    group = self.get_sym_addr("'v8::internal::IsolateGroup::default_isolate_group_'")
+                    if not group:
+                        return None
+                    table = getattr(self, "metadata_pointer_table", None)
+                    if table is None:
+                        section = ProcessMap.lookup(group + index * 16).section
+                        if not section or not section.is_readable():
+                            return None
+                        size = min(0x10000, section.page_end - group - index * 16)
+                        try:
+                            data = read_memory(group + index * 16, size)
+                        except gdb.error:
+                            return None
+                        matches = []
+                        for offset in range(0, len(data) - 7, 8):
+                            value = int.from_bytes(data[offset:offset + 8], "little")
+                            if not value or value & 7:
+                                continue
+                            region = ProcessMap.lookup(value).section
+                            if not region or not region.is_readable() or value + 0x58 > region.page_end:
+                                continue
+                            start = read_int_from_memory(value + start_offset, safe=True)
+                            end = read_int_from_memory(value + end_offset, safe=True)
+                            if start and end and page < start < end <= page + 0x40000:
+                                matches.append(group + offset)
+                        if len(matches) != 1:
+                            return None
+                        table = self.metadata_pointer_table = matches[0]
+                    metadata = read_int_from_memory(table + index * 16, safe=True)
+            if not metadata or metadata & 7:
+                return None
+        start = read_int_from_memory(metadata + start_offset, safe=True)
+        end = read_int_from_memory(metadata + end_offset, safe=True)
+        heap = read_int_from_memory(metadata + heap_offset, safe=True)
+        owner = read_int_from_memory(metadata + owner_offset, safe=True)
+        if not start or not end or not heap or not owner or owner & 7:
+            return None
+        if not page < start < end <= page + 0x40000:
+            return None
+        if read_int_from_memory(owner + 8, safe=True) != heap:
+            return None
+        return {"start": start, "end": end, "owner": owner}
 
-    @Cache.cache_until_next
-    def get_new_space_start(self, force_heuristic=False):
-        sym = "'v8::internal::g_current_isolate_'.isolate_data_.new_allocation_info_.start_"
-        addr = self.get_sym_addr(sym, force_heuristic)
-        if addr:
-            return addr
-
-        candidates = self.get_cage_rw_space_candidates()
-        if candidates and len(candidates) > 1:
-            return candidates[1].page_start
+    @Cache.cache_until_next(per_inferior=True)
+    def get_owner_space(self, owner):
+        # StickySpace can mix generations in one page; do not call it old_space.
+        vtable = read_int_from_memory(owner, safe=True)
+        if not vtable:
+            return None
+        location = Symbol.lookup(vtable, ksym="off")
+        if location is None:
+            return None
+        symbol, _ = location
+        identity = read_int32_from_memory(owner + 0x10, safe=True)
+        if identity == 1 and symbol in ("vtable for v8::internal::SemiSpace",
+                                        "vtable for v8::internal::PagedSpaceForNewSpace"):
+            return "new_space"
+        if identity == 2 and symbol == "vtable for v8::internal::OldSpace":
+            return "old_space"
         return None
 
-    @Cache.cache_until_next
-    def get_new_space_limit(self, force_heuristic=False):
-        sym = "'v8::internal::g_current_isolate_'.isolate_data_.new_allocation_info_.limit_"
-        addr = self.get_sym_addr(sym, force_heuristic)
-        if addr:
-            return addr
-
-        candidates = self.get_cage_rw_space_candidates()
-        if candidates and len(candidates) > 1:
-            return candidates[1].page_end
-        return None
-
-    @Cache.cache_until_next
-    def get_old_space_start(self, force_heuristic=False):
-        sym = "'v8::internal::g_current_isolate_'.isolate_data_.old_allocation_info_.start_"
-        addr = self.get_sym_addr(sym, force_heuristic)
-        if addr:
-            return addr
-
-        candidates = self.get_cage_rw_space_candidates()
-        if candidates and len(candidates) > 0:
-            return candidates[0].page_start
-        return None
-
-    @Cache.cache_until_next
-    def get_old_space_limit(self, force_heuristic=False):
-        sym = "'v8::internal::g_current_isolate_'.isolate_data_.old_allocation_info_.limit_"
-        addr = self.get_sym_addr(sym, force_heuristic)
-        if addr:
-            return addr
-
-        candidates = self.get_cage_rw_space_candidates()
-        if candidates and len(candidates) > 0:
-            return candidates[0].page_end
-        return None
+    def get_detection_details(self, name):
+        if name in ("new_space", "old_space"):
+            return "validated page metadata and owner space (256 KiB pages)"
+        root = "'v8::internal::g_current_isolate_'"
+        data = root + ".isolate_data_."
+        fields = {
+            "external_pointer_table": "external_pointer_table_.base_",
+            "shared_external_pointer_table": "shared_external_pointer_table_.base_",
+            "cpp_heap_pointer_table": "cpp_heap_pointer_table_.base_",
+            "trusted_pointer_table": "trusted_pointer_table_.base_",
+            "shared_trusted_pointer_table": "shared_trusted_pointer_table_.base_",
+            "code_pointer_table": "code_pointer_table_base_address_",
+            "js_dispatch_table": "js_dispatch_table_base_",
+            "cage": "cage_base_",
+        }
+        if name in fields:
+            sym = data + fields[name]
+        elif name == "code_range":
+            sym = root + "->heap_.code_range_.base_"
+        else:
+            return "heuristic (mapping permissions, alignment or address proximity)"
+        base = self.get_sym_addr(sym, self.args.force_heuristic)
+        if base:
+            source = "symbol"
+        else:
+            source = "heuristic"
+        if not base and (name.endswith("pointer_table") or name == "js_dispatch_table"):
+            source += " (validated IsolateData layout)"
+        if name.endswith("pointer_table") and name != "code_pointer_table":
+            sym = data + name + "_.kReservationSize"
+            size = self.get_sym_value(sym, self.args.force_heuristic)
+            return "base={:s}, size={:s}".format(source, "symbol" if size else "fixed 64 MiB")
+        if name in ("code_pointer_table", "js_dispatch_table"):
+            return "base={:s}, size=fixed 64 MiB".format(source)
+        if name == "cage":
+            return ("base={:s}, window=fixed 1 TiB (sandbox reservation unverified); "
+                    "page generation unknown unless metadata and owner are verified").format(source)
+        return "base={:s}, bounds may use mapping heuristics".format(source)
 
     def dump_entry(self, entry, path):
+        if path and path not in self.detection_details:
+            name = path[4:-1]
+            self.detection_details[path] = self.get_detection_details(name)
+
         # get color
         line_color = ""
         if entry.path.startswith("[stack]"):
-            line_color = Config.get_gef_setting("theme.address_stack")
+            line_color = Config.get("theme.address_stack")
         elif entry.path.startswith("[heap]"):
-            line_color = Config.get_gef_setting("theme.address_heap")
+            line_color = Config.get("theme.address_heap")
         elif entry.permission.value & Permission.EXECUTE:
-            line_color = Config.get_gef_setting("theme.address_code")
+            line_color = Config.get("theme.address_code")
         elif entry.permission.value & Permission.WRITE:
-            line_color = Config.get_gef_setting("theme.address_writable")
+            line_color = Config.get("theme.address_writable")
         elif entry.permission.value & Permission.READ:
-            line_color = Config.get_gef_setting("theme.address_readonly")
+            line_color = Config.get("theme.address_readonly")
         elif entry.permission.value == Permission.NONE:
-            line_color = Config.get_gef_setting("theme.address_valid_but_none")
+            line_color = Config.get("theme.address_valid_but_none")
         if entry.permission.value == (Permission.READ | Permission.WRITE | Permission.EXECUTE):
-            line_color += " " + Config.get_gef_setting("theme.address_rwx")
+            line_color += " " + Config.get("theme.address_rwx")
 
         # make line
         lines = []
@@ -552,11 +628,7 @@ class CageCommand(GenericCommand, BufferingOutput):
         if area_start is not None and area_size is not None:
             area_end = area_start + area_size
             if area_start <= entry.page_start < area_end:
-                # keep trusted space address
-                if entry.permission.value == Permission.READ | Permission.WRITE:
-                    v = read_int_from_memory(entry.page_start)
-                    self.trusted_space_high = v & 0x0000_ffff_0000_0000
-                    return True
+                return entry.permission.value == Permission.READ | Permission.WRITE
         return False
 
     def is_shared_trusted_pointer_table(self, entry):
@@ -591,20 +663,6 @@ class CageCommand(GenericCommand, BufferingOutput):
             return area_start <= entry.page_start < area_end
         return False
 
-    def is_new_space(self, entry):
-        area_start = self.get_new_space_start(self.args.force_heuristic)
-        area_end = self.get_new_space_limit(self.args.force_heuristic)
-        if area_start is None or area_end is None:
-            return False
-        return entry.page_start <= area_start < area_end <= entry.page_end
-
-    def is_old_space(self, entry):
-        area_start = self.get_old_space_start(self.args.force_heuristic)
-        area_end = self.get_old_space_limit(self.args.force_heuristic)
-        if area_start is None or area_end is None:
-            return False
-        return entry.page_start <= area_start < area_end <= entry.page_end
-
     def is_ro_space(self, entry):
         if self.is_cage(entry):
             return entry.permission.value == Permission.READ
@@ -624,10 +682,10 @@ class CageCommand(GenericCommand, BufferingOutput):
         area_end = area_start + (1 * 1024 * 1024 * 1024 * 1024) # 1TB
         return area_start <= entry.page_start < area_end
 
-    def is_trusted_space(self, entry):
-        if not hasattr(self, "trusted_space_high"):
+    def is_trusted_space(self, entry, trusted_space_high):
+        if trusted_space_high is None:
             return False
-        if self.trusted_space_high == (entry.page_start & 0x0000_ffff_0000_0000):
+        if trusted_space_high == (entry.page_start & 0x0000_ffff_0000_0000):
             return True
         return False
 
@@ -647,7 +705,14 @@ class CageCommand(GenericCommand, BufferingOutput):
             args.verbose = True
 
         self.out = []
-        # To find the trusted_space from the trusted_pointer_table, traverse it in reverse order
+        self.detection_details = {}
+        self.metadata_pointer_table = None
+        candidates = self.get_table_candidates()
+        sym = "'v8::internal::g_current_isolate_'.isolate_data_.trusted_cage_base_"
+        trusted_space_high = self.get_sym_addr(sym, args.force_heuristic)
+        if trusted_space_high is None and candidates:
+            trusted_space_high = candidates[6]
+        # Traverse in reverse order; the output is reversed below.
         for entry in maps[::-1]:
             # location filtering
             if args.location is not None:
@@ -692,17 +757,33 @@ class CageCommand(GenericCommand, BufferingOutput):
                 self.dump_entry(entry, "[v8:js_dispatch_table]")
             elif self.is_code_range(entry):
                 self.dump_entry(entry, "[v8:code_range]")
-            elif self.is_new_space(entry):
-                self.dump_entry(entry, "[v8:new_space]")
-            elif self.is_old_space(entry):
-                self.dump_entry(entry, "[v8:old_space]")
             elif self.is_ro_space(entry):
                 self.dump_entry(entry, "[v8:ro_space]")
             elif self.is_array_buffer(entry):
                 self.dump_entry(entry, "[v8:ArrayBuffer]")
             elif self.is_cage(entry):
-                self.dump_entry(entry, "[v8:cage]")
-            elif self.is_trusted_space(entry):
+                base = self.get_cage_base(args.force_heuristic)
+                if entry.permission.value == Permission.READ | Permission.WRITE and entry.page_start < base + 0x100000000:
+                    # OS mappings can contain pages from several V8 spaces.
+                    for page in reversed(range(entry.page_start & ~0x3ffff, entry.page_end, 0x40000)):
+                        start = max(page, entry.page_start)
+                        end = min(entry.page_end, page + 0x40000)
+                        if args.location is not None and not start <= args.location < end:
+                            continue
+                        if start % 0x40000 == 0:
+                            metadata = self.get_page_metadata(start)
+                        else:
+                            metadata = None
+                        if metadata:
+                            space = self.get_owner_space(metadata["owner"])
+                        else:
+                            space = None
+                        section = Section(page_start=start, page_end=end, permission=entry.permission,
+                                          offset=entry.offset + start - entry.page_start, path=entry.path, inode=entry.inode)
+                        self.dump_entry(section, "[v8:{:s}]".format(space or "cage"))
+                else:
+                    self.dump_entry(entry, "[v8:cage]")
+            elif self.is_trusted_space(entry, trusted_space_high):
                 self.dump_entry(entry, "[v8:trusted_space]")
             else:
                 if args.vvverbose:
@@ -711,8 +792,21 @@ class CageCommand(GenericCommand, BufferingOutput):
         # Order the results in ascending order
         self.out = self.out[::-1]
 
+        inferior = gdb.selected_inferior()
+        info("V8 target: inferior {:d}, pid {:d}; cache is limited to this target session".format(
+            inferior.num, inferior.pid,
+        ))
+        tagged_size = self.get_sym_value("'v8::internal::kTaggedSize'")
+        sandbox_size = self.get_sym_value("'v8::internal::kSandboxSize'")
+        info("Tagged size: {:s}; sandbox size: {:s}".format(
+            str(tagged_size) if tagged_size is not None else "unknown (decoder requires 4)",
+            hex(sandbox_size) if sandbox_size is not None else "unknown",
+        ))
+        for path, details in self.detection_details.items():
+            info("{:s}: {:s}".format(path[4:-1], details))
         self.print_output(check_terminal_size=True)
         return
+
 
 
 @register_command
@@ -760,50 +854,48 @@ class V8ListMapsCommand(GenericCommand, BufferingOutput):
     _note_ = "\n".join(_note_)
 
     @staticmethod
-    def redirect_stdout(output_path):
-        from gef.commands.memory.patch import PatchCommand
+    def stdout_syscall(name, args):
         syscall_table = Syscall.get_syscall_table()
+        ret = ExecSyscall(syscall_table.name_table[name].nr, args).exec_code()
+        value = u2i(ret["reg"][runtime.current_arch.return_register])
+        if value < 0:
+            raise gdb.error("V8 stdout {:s} failed: {:d}".format(name, value))
+        return value
 
-        # dup
-        ret = ExecSyscall(syscall_table.name_table["dup"].nr, [1]).exec_code()
-        stdout_oldfd = ret["reg"][runtime.current_arch.return_register]
-
-        # open
-        p = PatchCommand.PatchInfo(runtime.current_arch.sp, output_path.encode() + b"\0")
-        p.patch(silent=True)
-        flags = 0o100 | 0o1 | 0o1000 # O_CREAT | O_WRONLY | O_TRUNC
-        ret = ExecSyscall(syscall_table.name_table["open"].nr, [runtime.current_arch.sp, flags, 0o666]).exec_code()
-        file_fd = ret["reg"][runtime.current_arch.return_register]
-        PatchCommand.PatchInfo.revert_to_tag(p.tag, silent=True)
-
-        def u2i(x):
-            x = struct.pack("<Q", x & 0xffff_ffff_ffff_ffff)
-            return struct.unpack("<q", x)[0]
-
-        if u2i(file_fd) < 0:
-            # fail, revert dup
-            ExecSyscall(syscall_table.name_table["dup2"].nr, [stdout_oldfd, 1]).exec_code()
-            return None
-
-        # dup2
-        ExecSyscall(syscall_table.name_table["dup2"].nr, [file_fd, 1]).exec_code()
-
-        # close
-        ExecSyscall(syscall_table.name_table["close"].nr, [file_fd]).exec_code()
+    @staticmethod
+    def redirect_stdout(output_path):
+        gdb.execute("call (void) fflush(0)", to_string=True)
+        stdout_oldfd = V8ListMapsCommand.stdout_syscall("dup", [1])
+        file_fd = None
+        redirected = False
+        try:
+            with ContextManager.temporary_memory(runtime.current_arch.sp, output_path.encode() + b"\0"):
+                flags = 0o100 | 0o1 | 0o1000 # O_CREAT | O_WRONLY | O_TRUNC
+                file_fd = V8ListMapsCommand.stdout_syscall("open", [runtime.current_arch.sp, flags, 0o600])
+            V8ListMapsCommand.stdout_syscall("dup2", [file_fd, 1])
+            redirected = True
+        finally:
+            try:
+                if file_fd is not None:
+                    V8ListMapsCommand.stdout_syscall("close", [file_fd])
+            except BaseException:
+                if redirected:
+                    V8ListMapsCommand.revert_stdout(stdout_oldfd)
+                    stdout_oldfd = None
+                raise
+            finally:
+                if not redirected and stdout_oldfd is not None:
+                    V8ListMapsCommand.stdout_syscall("close", [stdout_oldfd])
         return stdout_oldfd
 
     @staticmethod
     def revert_stdout(stdout_oldfd):
         if stdout_oldfd is None:
             return
-
-        syscall_table = Syscall.get_syscall_table()
-
-        # dup2
-        ExecSyscall(syscall_table.name_table["dup2"].nr, [stdout_oldfd, 1]).exec_code()
-
-        # close
-        ExecSyscall(syscall_table.name_table["close"].nr, [stdout_oldfd]).exec_code()
+        try:
+            V8ListMapsCommand.stdout_syscall("dup2", [stdout_oldfd, 1])
+        finally:
+            V8ListMapsCommand.stdout_syscall("close", [stdout_oldfd])
         return
 
     @staticmethod
@@ -855,29 +947,22 @@ class V8ListMapsCommand(GenericCommand, BufferingOutput):
             if not heap_base:
                 err("Could not find the glibc heap")
                 return None
-            heap_section = ProcessMap.lookup_address(heap_base).section
+            heap_section = ProcessMap.lookup(heap_base).section
             heap_contents = read_memory(heap_base, heap_section.size)
             heap_contents = slice_unpack(heap_contents, runtime.current_arch.ptrsize)
         return heap_contents
 
     def do_list_maps(self, region, cage_base):
-        # old_space+0x10 has heap_object
-        ofs = read_int32_from_memory(region + 0x10)
+        area_start = V8Command.get_object_start(region)
+        ofs = read_int32_from_memory(area_start)
         map1 = cage_base + ofs
-        if not is_valid_addr(map1):
+        if not ofs & 1 or not is_valid_addr(map1):
             err("Memory access error")
             return
 
         # get heap contents
         heap_contents = self.get_heap_contents(map1)
         if heap_contents is None:
-            return
-
-        # get reference index (from glibc heap)
-        try:
-            sidx = eidx = heap_contents.index(map1)
-        except ValueError:
-            err("Could not find wanted maps")
             return
 
         """
@@ -891,26 +976,32 @@ class V8ListMapsCommand(GenericCommand, BufferingOutput):
         0x5555558591b0|+0x0038|+007: 0x000011b7000014fd  ->  0xac4b000002000004
         """
 
-        # glibc heap contains a array of addresses of v8 heap objects
-        # find the top of the array
+        # glibc heap contains an array of addresses of v8 heap objects
         cage_mask = cage_base & 0xffff_ffff_0000_0000
-        while sidx >= 0:
-            v = heap_contents[sidx]
-            if v & 1 == 0:
+        best_start = best_end = eidx = 0
+        while True:
+            try:
+                sidx = eidx = heap_contents.index(map1, eidx)
+            except ValueError:
                 break
-            if cage_mask != (v & 0xffff_ffff_0000_0000):
-                break
-            sidx -= 1
-        sidx += 1
+            while sidx > 0:
+                v = heap_contents[sidx - 1]
+                if v & 1 == 0 or cage_mask != (v & 0xffff_ffff_0000_0000):
+                    break
+                sidx -= 1
+            while eidx < len(heap_contents):
+                v = heap_contents[eidx]
+                if v & 1 == 0 or cage_mask != (v & 0xffff_ffff_0000_0000):
+                    break
+                eidx += 1
+            if eidx - sidx > best_end - best_start:
+                best_start, best_end = sidx, eidx
+        if best_start == best_end:
+            err("Could not find wanted maps")
+            return
 
-        # find the tail of the array
-        while eidx < len(heap_contents):
-            v = heap_contents[eidx]
-            if v & 1 == 0:
-                break
-            if cage_mask != (v & 0xffff_ffff_0000_0000):
-                break
-            eidx += 1
+        meta_map = cage_base + read_int32_from_memory(map1 - 1) - 1
+        map_type = read_int16_from_memory(meta_map + 8)
 
         # dump
         try:
@@ -919,26 +1010,45 @@ class V8ListMapsCommand(GenericCommand, BufferingOutput):
             # Therefore, GEF temporarily redirect stdout to collect the results.
             stdout_oldfd = None
             stdout_oldfd = V8ListMapsCommand.redirect_stdout(self.output_path)
-            if stdout_oldfd is None:
-                raise RuntimeError("Failed to redirect: {:s}".format(self.output_path))
-            tqdm = GefUtil.get_tqdm()
-            for idx in tqdm(range(sidx, eidx), leave=False):
+            count = 0
+            seen = set()
+            for idx in ProgressBar(range(best_start, best_end)):
                 v = heap_contents[idx]
-                gdb.execute("v8 {:#x}".format(v), to_string=True)
+                if v in seen:
+                    continue
+                seen.add(v)
+                map_raw = read_int32_from_memory(v - 1, safe=True)
+                if map_raw is None or not map_raw & 1:
+                    continue
+                type_addr = cage_base + map_raw - 1 + 8
+                if read_int16_from_memory(type_addr, safe=True) != map_type:
+                    continue
+                V8Command.print_object(v)
+                count += 1
         finally:
             V8ListMapsCommand.revert_stdout(stdout_oldfd)
-        return
+        return count > 0
 
     def list_maps(self, region, cage_base):
-        self.output_path = os.path.join(GEF_TEMP_DIR, "v8-list-maps-{:#x}.txt".format(cage_base))
-
-        # not found a cache file
-        if self.args.rescan or not os.path.exists(self.output_path):
-            self.do_list_maps(region, cage_base)
+        cache = V8Command.get_cache()["maps"]
+        key = (region, cage_base)
+        if self.args.rescan:
+            cache.pop(key, None)
+        if key not in cache:
+            with tempfile.NamedTemporaryFile(prefix="v8-list-maps-", dir=GEF_TEMP_DIR) as output:
+                self.output_path = output.name
+                if not self.do_list_maps(region, cage_base):
+                    return
+                output.seek(0)
+                content = output.read().decode(errors="replace")
+                if not content:
+                    err("V8 map scan produced no output")
+                    return
+                cache[key] = content
         else:
-            info("Use cache")
+            info("Use current inferior map cache")
 
-        res = open(self.output_path).read()
+        res = cache[key]
         for line in res.splitlines():
             line = re.sub(r"^(0x[0-9a-f]+)", lambda x:Color.blueify(x.group(1)), line)
             self.out.append(line)
@@ -960,9 +1070,14 @@ class V8ListMapsCommand(GenericCommand, BufferingOutput):
             return
 
         self.out = []
-        self.list_maps(old_space_region, cage_base)
+        try:
+            self.list_maps(old_space_region, cage_base)
+        except (gdb.error, OSError) as e:
+            err("V8 map scan failed: {!s}".format(e))
+            return
         self.print_output(check_terminal_size=True)
         return
+
 
 
 @register_command
@@ -1502,25 +1617,96 @@ class V8Command(GenericCommand):
                        help="load gdbinit for v8 from internet.")
     group.add_argument("-L", "--list-command", action="store_true",
                        help="show newly added commands from v8 gdbinit.")
+    parser.add_argument("--revision", default="main", help="V8 revision or tag for the external gdbinit.")
     _syntax_ = parser.format_help()
 
-    def get_gdbinit(self):
-        gdbinit_filename = os.path.join(GEF_TEMP_DIR, "gdbinit-v8")
+    loaded_gdbinit = set()
+
+    def load_gdbinit(self, revision):
+        filename = self.get_gdbinit(revision)
+        if filename in self.loaded_gdbinit:
+            return filename
+        lines = []
+        for line in open(filename).read().splitlines():
+            if line.startswith("alias "):
+                name = line.split()[1]
+                try:
+                    gdb.execute("help " + name, to_string=True)
+                except gdb.error:
+                    pass
+                else:
+                    continue
+            lines.append(line)
+        with tempfile.NamedTemporaryFile(mode="w", prefix="v8-gdbinit-", dir=GEF_TEMP_DIR) as output:
+            output.write("\n".join(lines) + "\n")
+            output.flush()
+            gdb.execute("source " + output.name, to_string=True)
+        self.loaded_gdbinit.add(filename)
+        return filename
+
+    def get_gdbinit(self, revision):
+        if not re.fullmatch(r"[A-Za-z0-9_./-]+", revision) or ".." in revision:
+            raise gdb.error("Invalid V8 revision")
+        cache_key = hashlib.sha256(revision.encode()).hexdigest()[:16]
+        gdbinit_filename = os.path.join(GEF_TEMP_DIR, "gdbinit-v8-" + cache_key)
         if not os.path.exists(gdbinit_filename):
-            # https://chromium.googlesource.com/v8/v8/+/refs/heads/main/tools/gdbinit
-            url = "https://chromium.googlesource.com/v8/v8/+/refs/heads/main/tools/gdbinit?format=TEXT"
+            url = "https://chromium.googlesource.com/v8/v8/+/{:s}/tools/gdbinit?format=TEXT".format(revision)
             gdbinit_data = http_get(url)
+            if gdbinit_data is None:
+                raise gdb.error("Could not download V8 gdbinit for revision {:s}".format(revision))
             import base64
             gdbinit_data = base64.b64decode(gdbinit_data)
             open(gdbinit_filename, "wb").write(gdbinit_data)
             info("Download gdbinit from internet")
         else:
             info("Reuse gdbinit cached previously")
+        info("V8 gdbinit revision: {:s}; target compatibility is not verified".format(revision))
         return gdbinit_filename
 
     @staticmethod
-    @Cache.cache_this_session
+    @Cache.cache_this_session(per_inferior=True, until_new_objfile=True)
+    def get_cache():
+        return {"maps": {}, "instance_types": {}}
+
+    @staticmethod
+    def get_object_start(start):
+        if read_int32_from_memory(start) & 1:
+            return start
+        if read_int_from_memory(start + 8) == start:
+            area_start = read_int_from_memory(start + 0x20)
+            area_end = read_int_from_memory(start + 0x28)
+            if start < area_start < area_end <= start + 0x40000:
+                return area_start
+        if read_int32_from_memory(start + 12) == 0xbeadbeef:
+            area_start = read_int_from_memory(start + 0x58)
+            area_end = read_int_from_memory(start + 0x48)
+            if start < area_start < area_end <= start + 0x40000:
+                return area_start
+        return start + 0x10
+
+    @staticmethod
+    def capture_object(address, output_path):
+        stdout_oldfd = None
+        try:
+            stdout_oldfd = V8ListMapsCommand.redirect_stdout(output_path)
+            V8Command.print_object(address)
+        finally:
+            V8ListMapsCommand.revert_stdout(stdout_oldfd)
+        return open(output_path).read()
+
+    @staticmethod
+    def print_object(address):
+        gdb.execute("call (void) _v8_internal_Print_Object((void*)({:#x}))".format(address), to_string=True)
+        if V8Command.is_chromium():
+            gdb.execute("call (void) putchar(0x0a)", to_string=True)
+        gdb.execute("call (void) fflush(0)", to_string=True)
+        return
+
+    @staticmethod
+    @Cache.cache_this_session(cache_None=False, per_inferior=True, until_new_objfile=True)
     def is_chromium():
+        if not is_alive():
+            return None
         maps = ProcessMap.get_process_maps()
         for m in maps:
             if m.path.startswith("[anon:partition_alloc]"):
@@ -1532,17 +1718,19 @@ class V8Command(GenericCommand):
     @exclude_specific_gdb_mode(mode=("qemu-system", "kgdb", "vmware", "wine"))
     def do_invoke(self, args):
         if args.load_v8_gdbinit:
-            gdbinit_filename = self.get_gdbinit()
             try:
-                gdb.execute("source {:s}".format(gdbinit_filename))
+                self.load_gdbinit(args.revision)
                 info("Successfully loaded")
-            except gdb.error:
-                err("Failed to load")
+            except (gdb.error, OSError) as e:
+                err("Failed to load V8 gdbinit: {!s}".format(e))
             return
 
         if args.list_command:
-            gdb.execute("v8 -l", to_string=True)
-            gdbinit_filename = self.get_gdbinit()
+            try:
+                gdbinit_filename = self.load_gdbinit(args.revision)
+            except (gdb.error, OSError) as e:
+                err("Failed to load V8 gdbinit: {!s}".format(e))
+                return
             data = open(gdbinit_filename).read()
             for line in data.splitlines():
                 line = line.strip()
@@ -1556,21 +1744,13 @@ class V8Command(GenericCommand):
                     gdb.execute("help {:s}".format(comm))
             return
 
-        if args.address:
+        if args.address is not None:
             try:
-                # Since this command is used so often, it can be implemented without loading from internet.
-                cmd = "call (void) _v8_internal_Print_Object((void*)({:#x}))".format(args.address)
-                gdb.execute(cmd)
-                # When attached to chromium and run, the newline is not generated,
-                # so it is not displayed immediately due to buffering. As a workaround, run putchar('\n') and fflush(0).
-                if V8Command.is_chromium():
-                    cmd = "call (void) putchar(0x0a)"
-                    gdb.execute(cmd)
-                    cmd = "call (void) fflush(0)"
-                    gdb.execute(cmd)
-            except gdb.error:
-                pass
+                self.print_object(args.address)
+            except gdb.error as e:
+                err("V8 object print failed: {!s}".format(e))
         return
+
 
 
 @register_command
@@ -1579,6 +1759,8 @@ class PartitionAllocDumpCommand(GenericCommand, BufferingOutput):
 
     _cmdline_ = "partition-alloc-dump"
     _category_ = "05-b. Heap - Chromium/V8"
+
+    max_chain_length = 0x10000
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     modes = ["fast_malloc", "array_buffer", "buffer", "fm", "ab", "b"]
@@ -1600,7 +1782,9 @@ class PartitionAllocDumpCommand(GenericCommand, BufferingOutput):
     _example_ = "\n".join(_example_).format(_cmdline_)
 
     _note_ = [
-        "Chromium mainline is too fast to develop. So if parse is failed, you need fix this gef.py.",
+        "Version numbers do not identify the build layout; the fixed layout is checked against the heap.",
+        "Requires 4 KiB system pages, 2 MiB super pages and 32-byte metadata entries.",
+        "Settings must occupy 0x40, 0x80 or 0xc0 bytes; metadata placement is checked against the extents.",
         "",
         "Simplified partition alloc structure:",
         "",
@@ -1645,7 +1829,7 @@ class PartitionAllocDumpCommand(GenericCommand, BufferingOutput):
         "",
         "`extent`, `slot_span` and `slot` are in super_page.",
         "",
-        "     [~v144.x]                    [v145.x~; PA_CONFIG(MOVE_METADATA_OUT_OF_GIGACAGE)=y]",
+        "     [inline layout]              [PA_CONFIG(MOVE_METADATA_OUT_OF_GIGACAGE)=y]",
         "     +-super_page-(2MB)-----+      +-super_page(for meta)-+ +-super_page(for chunk)+",
         "4KB  | Guard Page           |      | Guard Page           | | Guard Page           |",
         "     +----------------------+      +----------------------+ +----------------------+",
@@ -1680,22 +1864,50 @@ class PartitionAllocDumpCommand(GenericCommand, BufferingOutput):
         super().__init__(complete="use_user_complete")
         return
 
-    def complete(self, text, word): # noqa
-        if text.strip() in self.modes:
-            # already matched
-            return []
+    def complete(self, text, word):
+        return GefUtil.complete_candidates(self.modes, text, word)
 
-        if text == "":
-            # no prefix
-            return [s for s in self.modes if ((word is None) or (s and word in s))]
+    def initialize(self):
+        auxv = Auxv.get_auxiliary_values()
+        page_size = None
+        if auxv:
+            page_size = auxv.get("AT_PAGESZ")
+        self.out.append("PartitionAlloc version: unknown (build layout is checked, not inferred from a version).")
+        self.out.append("Layout source: memory heuristic; fixed root/bucket/slot-span fields.")
+        self.out.append("Supported layout: system page=0x1000, super page=0x200000, metadata entry=0x20.")
+        self.out.append("Supported Settings size: 0x40/0x80/0xc0; inline or verified separated metadata.")
+        if page_size is None:
+            self.err_add_out("Cannot verify the target system page size: AT_PAGESZ is unavailable.")
+            return False
+        self.out.append("Target system page size: {:#x}".format(page_size))
+        if page_size != 0x1000:
+            self.err_add_out("Unsupported system page size; this fixed layout requires 4 KiB pages.")
+            return False
 
-        # finally, look for possible values for given prefix
-        return [s for s in self.modes if s and s.startswith(text.strip())]
+        return True
+
+    def validate_root(self, root):
+        if not root.buckets_ or root.sentinel_bucket_.slot_size != 0 or \
+                root.sentinel_bucket_.num_system_pages_per_slot_span != 0:
+            raise gdb.error("Unsupported or corrupted root: invalid sentinel bucket")
+        if root.global_empty_slot_span_ring_size_ > len(root.global_empty_slot_span_ring_) or \
+                root.global_empty_slot_span_ring_index_ >= root.global_empty_slot_span_ring_size_:
+            raise gdb.error("Unsupported or corrupted root: invalid empty slot-span ring")
+        for head in (root.first_extent_, root.current_extent_):
+            if not head:
+                continue
+            extent, _ = self.read_extent(head)
+            if extent.root != root.addr or extent.number_of_consecutive_super_pages == 0:
+                raise gdb.error("Unsupported or corrupted extent @{:#x}: root or page count mismatch".format(head))
+            if head == root.current_extent_ and root.next_partition_page_ and \
+                    not extent.super_page_base <= root.next_partition_page_ <= extent.super_page_end:
+                raise gdb.error("Unsupported or corrupted extent @{:#x}: metadata/data placement mismatch".format(head))
+        return
 
     @Cache.cache_this_session
     def get_roots_heuristic(self):
-        """Search for fast_malloc_root, array_buffer_root_ and buffer_root_"""
         from gef.commands.process.base_address import HeapBaseCommand
+        """Search for fast_malloc_root, array_buffer_root_ and buffer_root_"""
 
         # the pointers to each root are in the RW area.
         # first, we list the RW area.
@@ -1703,12 +1915,16 @@ class PartitionAllocDumpCommand(GenericCommand, BufferingOutput):
         maps = ProcessMap.get_process_maps()
         if is_64bit():
             codebase = ProcessMap.get_section_base_address(filepath)
+            if codebase is None:
+                return []
             mask = 0x0000_ffff_0000_0000
             chromium_rw_maps = [p for p in maps if p.permission.value == Permission.READ | Permission.WRITE]
             chromium_rw_maps = [p for p in chromium_rw_maps if (p.page_start & mask) == (codebase & mask) and p.path != filepath]
         elif is_32bit():
             mask = 0xff00_0000
             heapbase = HeapBaseCommand.heap_base()
+            if heapbase is None:
+                return []
             chromium_rw_maps = [p for p in maps if p.permission.value == Permission.READ | Permission.WRITE]
             chromium_rw_maps = [p for p in chromium_rw_maps if p.page_start < heapbase and p.path != filepath]
 
@@ -1824,20 +2040,11 @@ class PartitionAllocDumpCommand(GenericCommand, BufferingOutput):
     def get_roots(self, force_heuristic):
 
         def get_root(root_string):
-            # newer version
-            try:
-                root_addr = AddressUtil.parse_address("&'blink::Partitions::{:s}'".format(root_string))
-                Root = collections.namedtuple("Root", ["name", "address"])
-                return [Root(root_string, root_addr)]
-            except gdb.error:
-                pass
-            # older version
-            try:
-                root_addr = AddressUtil.parse_address("&'WTF::Partitions::{:s}'".format(root_string))
-                Root = collections.namedtuple("Root", ["name", "address"])
-                return [Root(root_string, root_addr)]
-            except gdb.error:
-                pass
+            for namespace in ("blink", "WTF"):
+                root_addr = Symbol.resolve_address("'{:s}::Partitions::{:s}'".format(namespace, root_string))
+                if root_addr is not None:
+                    Root = collections.namedtuple("Root", ["name", "address"])
+                    return [Root(root_string, root_addr)]
             return []
 
         roots = []
@@ -1865,25 +2072,17 @@ class PartitionAllocDumpCommand(GenericCommand, BufferingOutput):
         sentinel = []
 
         # new version
-        try:
-            ns = "partition_alloc::internal::SlotSpanMetadata<(partition_alloc::internal::MetadataKind)1>"
-            t = AddressUtil.parse_address("&'{:s}::sentinel_slot_span_'".format(ns))
+        ns = "partition_alloc::internal::SlotSpanMetadata<(partition_alloc::internal::MetadataKind)1>"
+        t = Symbol.resolve_address("'{:s}::sentinel_slot_span_'".format(ns))
+        if t is not None:
             sentinel.append(t)
             return sentinel
-        except gdb.error:
-            pass
 
         # old version
-        try:
-            t = AddressUtil.parse_address("&'base::internal::SlotSpanMetadata<true>::sentinel_slot_span_'")
-            sentinel.append(t)
-        except gdb.error:
-            pass
-        try:
-            f = AddressUtil.parse_address("&'base::internal::SlotSpanMetadata<false>::sentinel_slot_span_'")
-            sentinel.append(f)
-        except gdb.error:
-            pass
+        for flag in ("true", "false"):
+            address = Symbol.resolve_address("'base::internal::SlotSpanMetadata<{:s}>::sentinel_slot_span_'".format(flag))
+            if address is not None:
+                sentinel.append(address)
         return sentinel
 
     def read_root(self, addr, name):
@@ -1954,67 +2153,57 @@ class PartitionAllocDumpCommand(GenericCommand, BufferingOutput):
             internal::GlobalSchedulerLoopQuarantineBranch scheduler_loop_quarantine_for_advanced_memory_safety_checks_;
         };
         """
-        x = read_int_from_memory(current + 0x40 + 8) # sizeof(struct Settings) + sizeof(lock_)
-        if is_valid_addr(x): # buckets[0]->active_slot_spans_head
-            current += 0x40 # sizeof(struct Settings) is 1 cache line
+        for settings_size in (0x40, 0x80, 0xc0):
+            if is_valid_addr(read_int_from_memory(current + settings_size + 8)):
+                break
         else:
-            x = read_int_from_memory(current + 0x80 + 8) # sizeof(struct Settings) + sizeof(lock_)
-            if is_valid_addr(x): # buckets[0]->active_slot_spans_head
-                current += 0x80 # sizeof(struct Settings) is 2 cache lines
-            else:
-                current += 0xc0 # sizeof(struct Settings) is 3 cache lines
+            raise gdb.error("Unsupported Settings layout: first bucket not found")
+        current += settings_size
 
-        def get_metadata_offset(root_addr, current_addr):
-            """
-            # v145.x~ has PA_CONFIG(MOVE_METADATA_OUT_OF_GIGACAGE)
-            0x599a3e48af40|+0x0000|+000: settings (=&root)        : 0x0000000000010000
-            0x599a3e48af48|+0x0008|+001:                          : 0x0000000000000004
-            0x599a3e48af50|+0x0010|+002:                          : 0x0000000000000002
-            0x599a3e48af58|+0x0018|+003:                          : 0x000009f400000000
-            0x599a3e48af60|+0x0020|+004:                          : 0xfffffffc00000000
-            0x599a3e48af68|+0x0028|+005:                          : 0x0000599a3e1dc018
-            0x599a3e48af70|+0x0030|+006:                          : 0x000009f400000000
-            0x599a3e48af78|+0x0038|+007:                          : 0xfffffffc00000000
-            0x599a3e48af80|+0x0040|+008:                          : 0x0000000000000000
-            0x599a3e48af88|+0x0048|+009:                          : 0x0000000000000000
-            0x599a3e48af90|+0x0050|+010:                          : 0xaaaaaaaaaa000000
-            0x599a3e48af98|+0x0058|+011:                          : 0x00000000000f0000
-            0x599a3e48afa0|+0x0060|+012:                          : 0x0000000000000000
-            0x599a3e48afa8|+0x0068|+013:                          : 0x0000000000000000
-            0x599a3e48afb0|+0x0070|+014:                          : 0x0000000000000000
-            0x599a3e48afb8|+0x0078|+015:                          : 0x0000000000000000
-            0x599a3e48afc0|+0x0080|+016:                          : 0x00000000ffffffff
-            0x599a3e48afc8|+0x0088|+017:                          : 0x0000000000000004
-            0x599a3e48afd0|+0x0090|+018: settings.metadata_offset_: 0x00002e37f278b000 <-- here
-            0x599a3e48afd8|+0x0098|+019:                          : 0x0000000000000100
-            0x599a3e48afe0|+0x00a0|+020:                          : 0x0000000000000000
-            0x599a3e48afe8|+0x00a8|+021:                          : 0x0000000000000000
-            0x599a3e48aff0|+0x00b0|+022:                          : 0x0000000000000000
-            0x599a3e48aff8|+0x00b8|+023:                          : 0x0000000000000000
-            0x599a3e48b000|+0x00c0|+024: lock_                    : 0x0000000000000000
-            0x599a3e48b008|+0x00c8|+025: buckets[0]               : 0x0000382bf298b920
-            0x599a3e48b010|+0x00d0|+026: buckets[0]               : 0x0000000000000000
-            0x599a3e48b018|+0x00d8|+027: buckets[0]               : 0x0000000000000000
-            0x599a3e48b020|+0x00e0|+028: buckets[0]               : 0x0000000400000010
-            0x599a3e48b028|+0x00e8|+029: buckets[0]               : 0x0000004000000000
-            0x599a3e48b030|+0x00f0|+030: buckets[0]               : 0x0000000000000000
-            """
-            if current_addr - root_addr != 0xc0:
-                return get_pagesize()
-            data = read_memory(root_addr + 0x80, 0x40)
-            for x in slice_unpack(data, runtime.current_arch.ptrsize):
-                if x & 0xfff:
-                    continue
-                if x == 0:
-                    continue
-                if (root_addr & 0x0000_ffff_ff00_0000) == (x & 0x0000_ffff_ff00_0000):
-                    continue
-                if (x & 0xffff_ffff) == 0:
-                    continue
-                return x
-            return get_pagesize()
-
-        root["metadata_offset_"] = get_metadata_offset(root["addr"], current)
+        """
+        Observed layout with PA_CONFIG(MOVE_METADATA_OUT_OF_GIGACAGE) enabled.
+        0x599a3e48af40|+0x0000|+000: settings (=&root)        : 0x0000000000010000
+        0x599a3e48af48|+0x0008|+001:                          : 0x0000000000000004
+        0x599a3e48af50|+0x0010|+002:                          : 0x0000000000000002
+        0x599a3e48af58|+0x0018|+003:                          : 0x000009f400000000
+        0x599a3e48af60|+0x0020|+004:                          : 0xfffffffc00000000
+        0x599a3e48af68|+0x0028|+005:                          : 0x0000599a3e1dc018
+        0x599a3e48af70|+0x0030|+006:                          : 0x000009f400000000
+        0x599a3e48af78|+0x0038|+007:                          : 0xfffffffc00000000
+        0x599a3e48af80|+0x0040|+008:                          : 0x0000000000000000
+        0x599a3e48af88|+0x0048|+009:                          : 0x0000000000000000
+        0x599a3e48af90|+0x0050|+010:                          : 0xaaaaaaaaaa000000
+        0x599a3e48af98|+0x0058|+011:                          : 0x00000000000f0000
+        0x599a3e48afa0|+0x0060|+012:                          : 0x0000000000000000
+        0x599a3e48afa8|+0x0068|+013:                          : 0x0000000000000000
+        0x599a3e48afb0|+0x0070|+014:                          : 0x0000000000000000
+        0x599a3e48afb8|+0x0078|+015:                          : 0x0000000000000000
+        0x599a3e48afc0|+0x0080|+016:                          : 0x00000000ffffffff
+        0x599a3e48afc8|+0x0088|+017:                          : 0x0000000000000004
+        0x599a3e48afd0|+0x0090|+018: settings.metadata_offset_: 0x00002e37f278b000 <-- here
+        0x599a3e48afd8|+0x0098|+019:                          : 0x0000000000000100
+        0x599a3e48afe0|+0x00a0|+020:                          : 0x0000000000000000
+        0x599a3e48afe8|+0x00a8|+021:                          : 0x0000000000000000
+        0x599a3e48aff0|+0x00b0|+022:                          : 0x0000000000000000
+        0x599a3e48aff8|+0x00b8|+023:                          : 0x0000000000000000
+        0x599a3e48b000|+0x00c0|+024: lock_                    : 0x0000000000000000
+        0x599a3e48b008|+0x00c8|+025: buckets[0]               : 0x0000382bf298b920
+        0x599a3e48b010|+0x00d0|+026: buckets[0]               : 0x0000000000000000
+        0x599a3e48b018|+0x00d8|+027: buckets[0]               : 0x0000000000000000
+        0x599a3e48b020|+0x00e0|+028: buckets[0]               : 0x0000000400000010
+        0x599a3e48b028|+0x00e8|+029: buckets[0]               : 0x0000004000000000
+        0x599a3e48b030|+0x00f0|+030: buckets[0]               : 0x0000000000000000
+        """
+        root["metadata_offset_"] = get_pagesize()
+        if settings_size == 0xc0:
+            root["metadata_offset_"] = read_int_from_memory(root["addr"] + 0x90)
+        for type_name in ("partition_alloc::PartitionRoot::Settings", "base::PartitionRoot::Settings"):
+            field = GefUtil.lookup_field(type_name, "metadata_offset_")
+            if field is not None:
+                root["metadata_offset_"] = read_int_from_memory(root["addr"] + field.bitpos // 8)
+                break
+        if not root["metadata_offset_"] or root["metadata_offset_"] & get_pagesize_mask_low():
+            raise gdb.error("Unsupported or corrupted metadata offset")
 
         root["lock_"] = read_int64_from_memory(current)
         current += 8
@@ -2031,11 +2220,21 @@ class PartitionAllocDumpCommand(GenericCommand, BufferingOutput):
                 current += ptrsize
 
         root["buckets_"] = []
-        while True:
+        self.bucket_slot_size_width = 4
+        if is_64bit() and read_int32_from_memory(current + 3 * ptrsize + 4) == 0 and \
+                read_int64_from_memory(current + 5 * ptrsize) > 1:
+            self.bucket_slot_size_width = ptrsize
+        for _ in range(1024):
             if read_int_from_memory(current) == 1: # search for `bool initialized`
                 break
             bucket, current = self.read_bucket(current)
+            if bucket.can_store_raw_size not in (0, 1):
+                raise gdb.error("Unsupported or corrupted bucket layout @{:#x}".format(bucket.addr))
             root["buckets_"].append(bucket)
+        else:
+            raise gdb.error("Unsupported or corrupted root: initialized flag not found within 1024 buckets")
+        if not root["buckets_"]:
+            raise gdb.error("Unsupported or corrupted root: no sentinel bucket")
 
         root["sentinel_bucket_"] = root["buckets_"].pop()
 
@@ -2053,10 +2252,10 @@ class PartitionAllocDumpCommand(GenericCommand, BufferingOutput):
         current += ptrsize
         root["max_size_of_allocated_bytes_"] = read_int_from_memory(current)
         current += ptrsize
-        root["syscall_count_"] = read_int_from_memory(current)
-        current += ptrsize
-        root["syscall_total_time_ns_"] = read_int_from_memory(current)
-        current += ptrsize
+        root["syscall_count_"] = read_int64_from_memory(current)
+        current += 8
+        root["syscall_total_time_ns_"] = read_int64_from_memory(current)
+        current += 8
         root["total_size_of_brp_quarantined_bytes"] = read_int_from_memory(current)
         current += ptrsize
         root["total_count_of_brp_quarantined_slots_"] = read_int_from_memory(current)
@@ -2065,7 +2264,7 @@ class PartitionAllocDumpCommand(GenericCommand, BufferingOutput):
         current += ptrsize
         root["cumulative_count_of_brp_quarantined_slots_"] = read_int_from_memory(current)
         current += ptrsize
-        root["empty_slot_spans_dirty_bytes_"] = read_int32_from_memory(current)
+        root["empty_slot_spans_dirty_bytes_"] = read_int_from_memory(current)
         current += ptrsize # with pad
         root["max_empty_slot_spans_dirty_bytes_shift_"] = read_int32_from_memory(current)
         current += ptrsize # with pad
@@ -2084,12 +2283,14 @@ class PartitionAllocDumpCommand(GenericCommand, BufferingOutput):
 
         root["global_empty_slot_span_ring_"] = []
         inv = root["addr"] ^ AddressUtil.get_vmem_end_mask()
-        while True:
+        for _ in range(1025):
             if read_int_from_memory(current + ptrsize) == inv: # search for `inverted_self_`
                 break
             x = read_int_from_memory(current)
             current += ptrsize
             root["global_empty_slot_span_ring_"].append(x)
+        else:
+            raise gdb.error("Unsupported or corrupted root: inverted_self not found within 1024 ring entries")
         root["global_empty_slot_span_ring_index_"] = read_int16_from_memory(current)
         current += 2
         root["global_empty_slot_span_ring_size_"] = read_int16_from_memory(current)
@@ -2100,7 +2301,7 @@ class PartitionAllocDumpCommand(GenericCommand, BufferingOutput):
         current += ptrsize
         root["thread_cache_construction_lock_"] = read_int64_from_memory(current)
         current += 8
-        root["scheduler_loop_quarantine_branch_capacity_in_bytes_"] = read_int32_from_memory(current)
+        root["scheduler_loop_quarantine_branch_capacity_in_bytes_"] = read_int_from_memory(current)
         current += ptrsize # with pad
         root["scheduler_loop_quarantine_root_"] = read_int_from_memory(current)
         current += ptrsize
@@ -2109,8 +2310,7 @@ class PartitionAllocDumpCommand(GenericCommand, BufferingOutput):
         root["scheduler_loop_quarantine_for_advanced_memory_safety_checks_"] = read_int_from_memory(current)
         current += ptrsize
 
-        Root = collections.namedtuple("Root", root.keys())
-        root = Root(*root.values())
+        root = GefUtil.dict_to_namedtuple("Root", root)
         return root, current
 
     @Cache.cache_until_next
@@ -2126,7 +2326,7 @@ class PartitionAllocDumpCommand(GenericCommand, BufferingOutput):
             SlotSpanMetadata* active_slot_spans_head;
             SlotSpanMetadata* empty_slot_spans_head;
             SlotSpanMetadata* decommitted_slot_spans_head;
-            uint32_t slot_size;
+            size_t slot_size; // uint32_t in older builds
             uint32_t num_system_pages_per_slot_span : 8;
             uint32_t num_full_slot_spans : 24;
             uint64_t slot_size_reciprocal;
@@ -2139,12 +2339,17 @@ class PartitionAllocDumpCommand(GenericCommand, BufferingOutput):
         current += ptrsize
         bucket["decommitted_slot_spans_head"] = read_int_from_memory(current)
         current += ptrsize
-        bucket["slot_size"] = read_int32_from_memory(current)
-        current += 4
+        if self.bucket_slot_size_width == 8:
+            bucket["slot_size"] = read_int64_from_memory(current)
+        else:
+            bucket["slot_size"] = read_int32_from_memory(current)
+        current += self.bucket_slot_size_width
         x = read_int32_from_memory(current)
         bucket["num_system_pages_per_slot_span"] = x & 0xff
         bucket["num_full_slot_spans"] = (x >> 8) & 0xff_ffff
         current += 4
+        if self.bucket_slot_size_width == 8:
+            current += 4 # pad
 
         # for 32bit, there is 2 patterns because aligned or packed
         if is_32bit() and self.align_pad:
@@ -2156,8 +2361,7 @@ class PartitionAllocDumpCommand(GenericCommand, BufferingOutput):
         bucket["can_store_raw_size"] = x & 0xff
         current += ptrsize # with pad
 
-        Bucket = collections.namedtuple("Bucket", bucket.keys())
-        bucket = Bucket(*bucket.values())
+        bucket = GefUtil.dict_to_namedtuple("Bucket", bucket)
         return bucket, current
 
     @Cache.cache_until_next
@@ -2165,7 +2369,9 @@ class PartitionAllocDumpCommand(GenericCommand, BufferingOutput):
         ptrsize = runtime.current_arch.ptrsize
         extent = {}
         extent["addr"] = current = addr
-        extent["super_page_base"] = current - 0x1000
+        extent["super_page_base"] = AddressUtil.normalize_address(current - self.root.metadata_offset_)
+        if extent["super_page_base"] & 0x1f_ffff:
+            raise gdb.error("Unsupported or corrupted metadata placement @{:#x}: unaligned super page".format(addr))
         """
         https://source.chromium.org/chromium/chromium/src/+/main:base/allocator/partition_allocator/  \
         src/partition_alloc/partition_superpage_extent_entry.h
@@ -2187,8 +2393,7 @@ class PartitionAllocDumpCommand(GenericCommand, BufferingOutput):
         current += 2
         extent["super_page_end"] = extent["super_page_base"] + extent["number_of_consecutive_super_pages"] * 0x20_0000
 
-        Extent = collections.namedtuple("Extent", extent.keys())
-        extent = Extent(*extent.values())
+        extent = GefUtil.dict_to_namedtuple("Extent", extent)
         return extent, current
 
     @Cache.cache_until_next
@@ -2219,8 +2424,7 @@ class PartitionAllocDumpCommand(GenericCommand, BufferingOutput):
         direct_map["padding_for_alignment"] = read_int_from_memory(current)
         current += ptrsize
 
-        DirectMap = collections.namedtuple("DirectMap", direct_map.keys())
-        direct_map = DirectMap(*direct_map.values())
+        direct_map = GefUtil.dict_to_namedtuple("DirectMap", direct_map)
         return direct_map, current
 
     @Cache.cache_until_next
@@ -2270,32 +2474,40 @@ class PartitionAllocDumpCommand(GenericCommand, BufferingOutput):
         slot_span["in_empty_cache_"] = (x >> 1) & 1
         slot_span["empty_cache_index_"] = (x >> 2) & 0x3ff
 
-        SlotSpan = collections.namedtuple("SlotSpan", slot_span.keys())
-        slot_span = SlotSpan(*slot_span.values())
+        slot_span = GefUtil.dict_to_namedtuple("SlotSpan", slot_span)
         return slot_span, current
 
     def C(self, address):
         # coloring function for heap address
-        management_color = Config.get_gef_setting("theme.heap_management_address")
+        management_color = Config.get("theme.heap_management_address")
 
         # in extent
-        current = self.root.current_extent_
+        current = self.root.first_extent_
+        seen = set()
         while current:
-            extent, _ = self.read_extent(current)
+            if current in seen:
+                return "{:#x} (extent loop at {:#x})".format(address, current)
+            if len(seen) >= self.max_chain_length:
+                return "{:#x} (extent traversal limit at {:#x})".format(address, current)
+            seen.add(current)
+            try:
+                extent, _ = self.read_extent(current)
+            except gdb.error:
+                return "{:#x} (unreadable extent at {:#x})".format(address, current)
             if extent.super_page_base <= address < extent.super_page_end:
                 return Color.colorify_hex(address, management_color)
             current = extent.next
 
         # not in extent, but valid
         if is_valid_addr(address):
-            return str(ProcessMap.lookup_address(address))
+            return str(ProcessMap.lookup(address))
 
         # not valid
         return "{:#x}".format(address)
 
     def P(self, address):
         # coloring function for heap page address
-        page_address_color = Config.get_gef_setting("theme.heap_page_address")
+        page_address_color = Config.get("theme.heap_page_address")
         return Color.colorify_hex(address, page_address_color)
 
     def dump_root(self, root):
@@ -2403,7 +2615,7 @@ class PartitionAllocDumpCommand(GenericCommand, BufferingOutput):
         ))
         inv_inv = root.inverted_self_ ^ AddressUtil.get_vmem_end_mask()
         self.out.append("uintptr_t inverted_self_:                                       {:#x} (=~{!s})".format(
-            root.inverted_self_, ProcessMap.lookup_address(inv_inv),
+            root.inverted_self_, ProcessMap.lookup(inv_inv),
         ))
         self.out.append("internal::Lock thread_cache_construction_lock_:                 {:#x}".format(
             root.thread_cache_construction_lock_,
@@ -2426,13 +2638,21 @@ class PartitionAllocDumpCommand(GenericCommand, BufferingOutput):
     def dump_extent_list(self, head):
         try:
             current = head
+            seen = set()
             while current:
+                if current in seen:
+                    self.err_add_out("Extent chain loop at {:#x}".format(current))
+                    break
+                if len(seen) >= self.max_chain_length:
+                    self.err_add_out("Extent traversal limit reached at {:#x}".format(current))
+                    break
+                seen.add(current)
                 extent, _ = self.read_extent(current)
                 self.out.append("    -> extent @{:s}".format(
                     self.C(extent.addr),
                 ))
                 self.out.append("           root:{!s} ".format(
-                    ProcessMap.lookup_address(extent.root),
+                    ProcessMap.lookup(extent.root),
                 ))
                 super_page_info = "{:s} - {:s}".format(
                     self.P(extent.super_page_base), self.P(extent.super_page_end),
@@ -2450,14 +2670,22 @@ class PartitionAllocDumpCommand(GenericCommand, BufferingOutput):
                     self.C(extent.next),
                 ))
                 current = extent.next
-        except Exception:
-            self.err_add_out("Corrupted?")
+        except gdb.error as e:
+            self.err_add_out("Corrupted extent at {:#x}: {!s}".format(current, e))
         return
 
     def dump_direct_map_list(self, head, root):
         try:
             current = head
+            seen = set()
             while current:
+                if current in seen:
+                    self.err_add_out("Direct-map chain loop at {:#x}".format(current))
+                    break
+                if len(seen) >= self.max_chain_length:
+                    self.err_add_out("Direct-map traversal limit reached at {:#x}".format(current))
+                    break
+                seen.add(current)
                 direct_map, _ = self.read_direct_map(current)
                 self.out.append("    -> direct_map @{:s}: ".format(
                     self.C(direct_map.addr),
@@ -2480,8 +2708,8 @@ class PartitionAllocDumpCommand(GenericCommand, BufferingOutput):
                 bucket, _ = self.read_bucket(direct_map.bucket)
                 self.dump_bucket(bucket, root)
                 current = direct_map.next_extent
-        except Exception:
-            self.err_add_out("Corrupted?")
+        except gdb.error as e:
+            self.err_add_out("Corrupted direct map at {:#x}: {!s}".format(current, e))
         return
 
     def dump_bucket(self, bucket, root, idx=None):
@@ -2493,18 +2721,18 @@ class PartitionAllocDumpCommand(GenericCommand, BufferingOutput):
             if bucket.active_slot_spans_head in sentinel_or_0:
                 return # skip printing
 
-        chunk_size_color = Config.get_gef_setting("theme.heap_chunk_size")
-        label_active_color = Config.get_gef_setting("theme.heap_label_active")
-        label_inactive_color = Config.get_gef_setting("theme.heap_label_inactive")
+        chunk_size_color = Config.get("theme.heap_chunk_size")
+        label_active_color = Config.get("theme.heap_label_active")
+        label_inactive_color = Config.get("theme.heap_label_inactive")
 
         slot_size = Color.colorify("{:#7x}".format(bucket.slot_size), chunk_size_color)
         if idx is not None:
             self.out.append("    buckets_[{:3d}](slot_size:{:s}) @{!s}".format(
-                idx, slot_size, ProcessMap.lookup_address(bucket.addr),
+                idx, slot_size, ProcessMap.lookup(bucket.addr),
             ))
         else:
             self.out.append("    bucket(slot_size:{:s}) @{!s}".format(
-                slot_size, ProcessMap.lookup_address(bucket.addr),
+                slot_size, ProcessMap.lookup(bucket.addr),
             ))
         self.out.append("        num_system_pages_per_slot_span:{:#x} ".format(
             bucket.num_system_pages_per_slot_span,
@@ -2527,6 +2755,7 @@ class PartitionAllocDumpCommand(GenericCommand, BufferingOutput):
                 # print sentinel (verbose)
                 colored_key = Color.colorify(key, label_inactive_color)
                 self.out.append("        {:s}:{:s} (=sentinel_pages)".format(colored_key, self.C(head)))
+                continue
             else:
                 # default
                 colored_key = Color.colorify(key, label_active_color)
@@ -2536,11 +2765,19 @@ class PartitionAllocDumpCommand(GenericCommand, BufferingOutput):
 
     def dump_slot_span(self, head, bucket):
         current = head
+        seen = set()
         while current:
+            if current in seen:
+                self.err_add_out("Slot-span chain loop at {:#x}".format(current))
+                break
+            if len(seen) >= self.max_chain_length:
+                self.err_add_out("Slot-span traversal limit reached at {:#x}".format(current))
+                break
+            seen.add(current)
             try:
                 slot_span, _ = self.read_slot_span(current)
-            except Exception:
-                self.err_add_out("Corrupted?")
+            except gdb.error as e:
+                self.err_add_out("Corrupted slot span at {:#x}: {!s}".format(current, e))
                 break
             self.out.append("            -> slot_span @{:s} (#{:3d} of super_page @{:s})".format(
                 self.C(slot_span.addr), slot_span.partition_page_index, self.P(slot_span.super_page_addr),
@@ -2560,19 +2797,22 @@ class PartitionAllocDumpCommand(GenericCommand, BufferingOutput):
         return
 
     def dump_freelist(self, head, bucket, slot_span):
-        corrupted_msg_color = Config.get_gef_setting("theme.heap_corrupted_msg")
-        freed_address_color = Config.get_gef_setting("theme.heap_chunk_address_freed")
+        corrupted_msg_color = Config.get("theme.heap_corrupted_msg")
+        freed_address_color = Config.get("theme.heap_chunk_address_freed")
 
         self.out.append("                   freelist_head:{:s} ".format(self.C(head)))
 
         slot_size = bucket.slot_size
         page_start = slot_span.partition_page_start
         page_end = page_start + bucket.num_system_pages_per_slot_span * get_pagesize()
+        if head and slot_size == 0:
+            self.err_add_out("Corrupted freelist at {:#x}: zero slot size".format(head))
+            return
 
         text = ""
         cnt = 0
         chunk = head
-        seen = []
+        seen = set()
         while chunk:
             if cnt % 6 == 0:
                 if cnt > 0:
@@ -2603,7 +2843,7 @@ class PartitionAllocDumpCommand(GenericCommand, BufferingOutput):
 
             text += "-> " + Color.colorify_hex(chunk, freed_address_color) + " "
             cnt += 1
-            seen.append(chunk)
+            seen.add(chunk)
             chunk = next_chunk
 
         if cnt > 0:
@@ -2628,8 +2868,17 @@ class PartitionAllocDumpCommand(GenericCommand, BufferingOutput):
         elif self.args.target_buffer_root == "ab":
             self.args.target_buffer_root = "array_buffer"
 
+        if args.debug:
+            # the debug print is emitted from inside the cached `get_roots_heuristic()`
+            Cache.clear_cache_for(self.get_roots_heuristic)
+
         self.out = []
-        for r in self.get_roots(args.force_heuristic):
+        if not self.initialize():
+            self.print_output()
+            return
+        roots = self.get_roots(args.force_heuristic)
+
+        for r in roots:
 
             ok = False
             if args.target_buffer_root == "fast_malloc":
@@ -2647,17 +2896,13 @@ class PartitionAllocDumpCommand(GenericCommand, BufferingOutput):
 
             try:
                 root, _ = self.read_root(r.address, r.name)
-            except Exception:
-                mem_value = read_int_from_memory(r.address)
-                err("Parse error {:s}: @ {:#x} -> {:#x}".format(r.name, r.address, mem_value))
-                exc_type, exc_value, exc_traceback = sys.exc_info()
-                gef_print(exc_value)
+                self.root = root
+                self.validate_root(root)
+            except gdb.error as e:
+                self.err_add_out("Parse error {:s} @{:#x}: {!s}".format(r.name, r.address, e))
                 continue
 
-            self.root = root # for coloring
             self.dump_root(root)
 
         self.print_output()
         return
-
-

@@ -98,12 +98,10 @@ class RegistersCommand(GenericCommand):
             all_registers = runtime.current_arch.all_registers
         return all_registers
 
-    def check_unavailable_regs(self):
-        """Detect and record unavailable registers for later display handling."""
-        if hasattr(self, "regs_to_check_unavailable"):
-            return
-
-        self.regs_to_check_unavailable = []
+    @Cache.cache_this_session
+    def get_unavailable_regs(self):
+        """Return registers that may be unavailable when their values are displayed."""
+        unavailable_regs = []
         for regname in self.get_all_registers():
             try:
                 reg = gdb.parse_and_eval(regname)
@@ -113,13 +111,13 @@ class RegistersCommand(GenericCommand):
             if reg.type.code == gdb.TYPE_CODE_VOID:
                 continue
             if str(reg) == "<unavailable>":
-                self.regs_to_check_unavailable.append(regname)
-        return
+                unavailable_regs.append(regname)
+        return tuple(unavailable_regs)
 
     def get_regname_color(self, regname, regvalue):
         """Return the appropriate color for a register name based on whether its value has changed."""
-        unchanged_color = Config.get_gef_setting("theme.registers_register_name")
-        changed_color = Config.get_gef_setting("theme.registers_value_changed")
+        unchanged_color = Config.get("theme.registers_register_name")
+        changed_color = Config.get("theme.registers_value_changed")
 
         old_value = ContextRegistersCommand.old_registers.get(regname, 0)
 
@@ -135,7 +133,7 @@ class RegistersCommand(GenericCommand):
         for regname, (seg, reg) in runtime.current_arch.seg_extended_registers.items():
             segval = get_register(seg) & 0xffff
             regval = get_register(reg) & 0xffff
-            value = runtime.current_arch.real2phys(segval, regval)
+            value = runtime.current_arch.real2phys(seg, reg)
 
             # colorling
             color = self.get_regname_color(regname, value)
@@ -151,7 +149,7 @@ class RegistersCommand(GenericCommand):
             lines.append(line)
         return lines
 
-    def dump_regs(self, target_regs):
+    def dump_regs(self, target_regs, unavailable_regs):
         """Format and return register values for display, with color, alignment, and optional dereferencing."""
         aliased_registers = runtime.current_arch.get_aliased_registers()
         widest = runtime.current_arch.get_aliased_registers_name_max()
@@ -170,12 +168,12 @@ class RegistersCommand(GenericCommand):
                 continue
 
             # str(reg) is slow, so skip if unneeded
-            if regname in self.regs_to_check_unavailable:
+            if regname in unavailable_regs:
                 # for qiling framework, fs_base/gs_base (x86), cpsr/fpsr/fpcr (Aarch64) are unavailable
                 if str(reg) == "<unavailable>":
                     padreg = aliased_registers.get(regname, regname).ljust(widest, " ")
                     line = "{:s}: {:s}".format(
-                        Color.colorify(padreg, Config.get_gef_setting("theme.registers_register_name")),
+                        Color.colorify(padreg, Config.get("theme.registers_register_name")),
                         Color.colorify("<unavailable>", "yellow underline"),
                     )
                     lines.append(line)
@@ -216,7 +214,7 @@ class RegistersCommand(GenericCommand):
             line = "{:s}: ".format(Color.colorify(padreg, color))
             if self.args.simple:
                 # not dereference
-                line += "{:s} ".format(ProcessMap.lookup_address(value).long_fmt())
+                line += "{:s} ".format(ProcessMap.lookup(value).long_fmt())
             else:
                 # dereference values
                 if is_x86_16():
@@ -236,7 +234,7 @@ class RegistersCommand(GenericCommand):
 
         if self.args.simple:
             one_width = widest + 5 + runtime.current_arch.ptrsize * 2
-            nb = GefUtil.get_terminal_size()[1] // one_width
+            nb = max(1, GefUtil.get_terminal_size()[1] // one_width)
             lines = ["".join(r) for r in slicer(lines, nb)]
 
         if flag_line:
@@ -254,17 +252,19 @@ class RegistersCommand(GenericCommand):
     @only_if_gdb_running
     @require_arch_set
     def do_invoke(self, args):
-        self.check_unavailable_regs()
+        unavailable_regs = self.get_unavailable_regs()
 
         if args.registers:
             target_regs = args.registers
         else:
             target_regs = self.get_all_registers()
 
-        out = self.dump_regs(target_regs)
+        out = self.dump_regs(target_regs, unavailable_regs)
         if out:
             gef_print("\n".join(out))
         return
+
+
 
 @register_command
 class ContextCommand(GenericCommand):
@@ -1364,11 +1364,26 @@ class ContextMemoryAccessCommand(GenericCommand):
     RE_MATCH_REG2 = re.compile(r"r\d+")
     RE_MATCH_REG3 = re.compile(r"[xw]\d+")
 
+    def get_x86_memory_expression(self, code, codesize):
+        code = code.replace("+", " + ")
+        code = code.replace("-", " - ")
+        code = code.replace("*", " * ")
+        code = code.replace("eiz", " 0 ")
+        code = code.split()
+        code = ["$" + x if x.isalpha() or self.RE_MATCH_REG1.match(x) else x for x in code]
+        code = "".join(code)
+        code_orig = code
+        if is_x86_64():
+            code = re.sub(r"\$(?:rip|eip)\b", "{:#x}".format(runtime.current_arch.pc + codesize), code)
+            if re.search(r"\$e(?:ax|bx|cx|dx|si|di|sp|bp|ip)\b|\$r\d+d\b", code_orig):
+                code = "({:s})&0xffffffff".format(code)
+        return code_orig, code
+
     def context_memory_access1(self, redirect):
         if not (is_x86() or is_arm32() or is_arm32_cortex_m() or is_arm64()):
             return
 
-        inst_iter = Disasm.gef_disassemble(runtime.current_arch.pc, 2)
+        inst_iter = Disasm.gef_disassemble(runtime.current_arch.pc, 1)
         try:
             insn_here = inst_iter.__next__()
         except StopIteration:
@@ -1385,23 +1400,13 @@ class ContextMemoryAccessCommand(GenericCommand):
         if not r:
             return
 
-        insn_next = inst_iter.__next__()
-        codesize = insn_next.address - insn_here.address
+        codesize = insn_here.size
 
         for code in r:
             code = code[1:-1] # skip "[" and "]"
 
             if is_x86():
-                # add "$" to resiter
-                code = code.replace("+", " + ")
-                code = code.replace("-", " - ")
-                code = code.replace("*", " * ")
-                code = code.replace("eiz", " 0 ") # $eiz is always 0x0
-                code = code.split()
-                code = ["$" + x if x.isalpha() or self.RE_MATCH_REG1.match(x) else x for x in code]
-                code = "".join(code)
-                # $rip/$eip points next instruction
-                code_orig, code = code, code.replace("$rip", "$rip+{:#x}".format(codesize))
+                code_orig, code = self.get_x86_memory_expression(code, codesize)
 
             elif is_arm32() or is_arm32_cortex_m():
                 # add "$" to resiter
@@ -1413,35 +1418,41 @@ class ContextMemoryAccessCommand(GenericCommand):
                 if "<<" in code[-1]:
                     code = code[:-2] + ["(" + code[-2] + code[-1] + ")"]
                 code = "+".join(code)
-                # $pc points next next instruction
-                code_orig, code = code, code.replace("$pc", "$pc+{:#x}".format(codesize * 2))
+                if runtime.current_arch.is_thumb():
+                    pc_base = "(($pc+4)&~3)"
+                else:
+                    pc_base = "($pc+8)"
+                code_orig, code = code, code.replace("$pc", pc_base)
 
             elif is_arm64():
                 # add "$" to resiter
                 code = code.replace(" ", "")
                 code = code.replace("#", "")
-                code = code.replace("lsl", "<<").replace("sxtw", "<<").replace("uxtw", "<<")
                 code = code.replace("xzr", " 0 ") # $xzr is always 0x0
                 code = code.replace("wzr", " 0 ") # $wzr is always 0x0
-                code = code.replace("wsp", " ($sp&0xffff) ") # $wsp is a half of $sp
+                code = code.replace("wsp", " ($sp&0xffffffff) ")
                 code = code.split(",")
                 code = ["$" + x if x.isalpha() or self.RE_MATCH_REG3.match(x) else x for x in code]
-                if "<<" == code[-1]:
-                    code[-1] += "0"
-                if "<<" in code[-1]:
-                    code = code[:-2] + ["(" + code[-2] + code[-1] + ")"]
+                extend = re.fullmatch(r"(lsl|sxtw|uxtw|sxtx|uxtx)(\d*)", code[-1].lstrip("$"))
+                if extend:
+                    cast = {"lsl": "long long", "sxtw": "int", "uxtw": "unsigned int",
+                            "sxtx": "long long", "uxtx": "unsigned long long"}[extend.group(1)]
+                    shift = int(extend.group(2) or "0")
+                    offset = "((long long)({:s}){:s}<<{:d})".format(cast, code[-2], shift)
+                    code = code[:-2] + [offset]
                 code = "+".join(code)
-                # $pc points next next instruction
-                code_orig, code = code, code.replace("$pc", "$pc+{:#x}".format(codesize * 2))
+                code = re.sub(r"\$w(\d+)\b", r"($x\1&0xffffffff)", code)
+                code_orig = code
 
             # print
+            code_eval = code
             try:
                 code = code.replace("$", "(long)$")
                 addr = AddressUtil.parse_address(code)
             except gdb.error:
                 # some binary fails to resolve "(long)"
                 try:
-                    addr = AddressUtil.parse_address(code_orig)
+                    addr = AddressUtil.parse_address(code_eval)
                 except gdb.error:
                     return
             ContextCommand.context_title("memory access: {:s} = {:#x}".format(code_orig, addr), redirect)
@@ -1450,13 +1461,12 @@ class ContextMemoryAccessCommand(GenericCommand):
         return
 
     RE_FINDALL_SEG2 = re.compile(r"((fs|gs):\[?([^,\]]+)\]?)")
-    RE_MATCH_REG4 = re.compile(r"r\d+d?")
 
     def context_memory_access2(self, redirect):
         if not is_x86():
             return
 
-        inst_iter = Disasm.gef_disassemble(runtime.current_arch.pc, 2)
+        inst_iter = Disasm.gef_disassemble(runtime.current_arch.pc, 1)
         try:
             insn_here = inst_iter.__next__()
         except StopIteration:
@@ -1468,11 +1478,7 @@ class ContextMemoryAccessCommand(GenericCommand):
         insn = ",".join(insn_here.operands)
         insn = re.sub(r"<.+>", "", insn)
 
-        try:
-            insn_next = inst_iter.__next__()
-        except StopIteration:
-            return
-        codesize = insn_next.address - insn_here.address
+        codesize = insn_here.size
 
         r = self.RE_FINDALL_SEG2.findall(str(insn))
         if r:
@@ -1483,15 +1489,7 @@ class ContextMemoryAccessCommand(GenericCommand):
                 fsgs_val = runtime.current_arch.get_gs()
             if fsgs_val is None:
                 return
-            offset = offset.replace("+", " + ")
-            offset = offset.replace("-", " - ")
-            offset = offset.replace("*", " * ")
-            offset = offset.replace("eiz", " 0 ") # $eiz is always 0x0
-            offset = offset.split()
-            offset = ["$" + x if x.isalpha() or self.RE_MATCH_REG4.match(x) else x for x in offset]
-            offset = "".join(offset)
-            # $rip/$eip points next instruction
-            offset = offset.replace("$rip", "$rip+{:#x}".format(codesize))
+            code_orig, offset = self.get_x86_memory_expression(offset, codesize)
             offset = AddressUtil.parse_address(offset)
             addr = AddressUtil.normalize_address(fsgs_val + offset)
             ContextCommand.context_title("memory access: {:s} = {:#x}".format(code, addr), redirect)
@@ -1500,7 +1498,6 @@ class ContextMemoryAccessCommand(GenericCommand):
         return
 
     RE_FINDALL_SEG3 = re.compile(r"((es|ds|ss|cs):\[?([^,\]]+)\]?)")
-    RE_MATCH_REG5 = re.compile(r"r\d+d?")
 
     def context_memory_access3(self, redirect):
         if not is_x86():
@@ -1521,13 +1518,8 @@ class ContextMemoryAccessCommand(GenericCommand):
         r = self.RE_FINDALL_SEG3.findall(str(insn))
         for rr in r:
             code, addr = rr[0], rr[2]
-            addr = addr.replace("+", " + ")
-            addr = addr.replace("-", " - ")
-            addr = addr.replace("*", " * ")
-            addr = addr.replace("eiz", " 0 ") # $eiz is always 0x0
-            addr = addr.split()
-            addr = ["$" + x if x.isalpha() or self.RE_MATCH_REG5.match(x) else x for x in addr]
-            addr = AddressUtil.parse_address("".join(addr))
+            code_orig, addr = self.get_x86_memory_expression(addr, insn_here.size)
+            addr = AddressUtil.parse_address(addr)
             ContextCommand.context_title("memory access: {:s} = {:#x}".format(code, addr), redirect)
             self.is_context_title_written = True
             ContextCommand.execute_command("dereference {:#x} 4 --no-pager".format(addr), redirect)
@@ -1550,6 +1542,8 @@ class ContextMemoryAccessCommand(GenericCommand):
                 ContextCommand.context_title("memory access", redirect)
             err(str(e), redirect=redirect)
         return
+
+
 
 @register_command
 class ContextArgumentsCommand(GenericCommand):
@@ -1808,25 +1802,41 @@ class ContextSourceCommand(GenericCommand):
         self.add_setting("nb_lines", 6, "Number of source code after $pc")
         return
 
-    def get_source_breakpoints(self, file_base_name):
+    # Reading the whole file on every step dominates this pane when the source is large.
+    # Only the last file is kept, keyed by (path, mtime), because stepping stays in one file.
+    cached_source = None # (fpath, mtime, lines)
+
+    def get_source_lines(self, fpath):
+        mtime = os.path.getmtime(fpath)
+        cached = ContextSourceCommand.cached_source
+        if cached is not None and cached[0] == fpath and cached[1] == mtime:
+            return cached[2]
+        with open(fpath, "r") as f:
+            lines = [x.rstrip() for x in f.readlines()]
+        ContextSourceCommand.cached_source = (fpath, mtime, lines)
+        return lines
+
+    def get_source_breakpoints(self):
         breakpoints = gdb.breakpoints()
         if not breakpoints:
             return []
-        bp_locations = []
+        bp_locations = set()
         for b in breakpoints:
-            if hasattr(b, "locations") and b.locations:
-                for bl in b.locations:
-                    if bl and bl.source:
-                        bp_locations.append("{:s}:{:d}".format(bl.source[0], bl.source[1]))
-            else: # for old gdb
-                bp_locations.append(b.location)
+            locations = [gdb.find_pc_line(x) for x in GefUtil.get_breakpoint_addresses(b)]
+            if not locations and b.location: # for old gdb
+                try:
+                    _, locations = gdb.decode_line(b.location)
+                except gdb.error:
+                    continue
+            for sal in locations or []:
+                if sal.symtab and sal.line:
+                    bp_locations.add((os.path.realpath(sal.symtab.fullname()), sal.line))
         return bp_locations
 
     def line_has_breakpoint(self, file_name, line_number, bp_locations):
         if not bp_locations:
             return False
-        filename_line = "{}:{}".format(file_name, line_number)
-        return any(filename_line in loc for loc in bp_locations)
+        return (os.path.realpath(file_name), line_number) in bp_locations
 
     def get_pc_context_info(self, pc, line):
         try:
@@ -1838,12 +1848,12 @@ class ContextSourceCommand(GenericCommand):
             return []
 
         m = []
-        seen_symbol = []
+        seen_symbol = set()
         while current_block and not current_block.is_static:
             for sym in current_block:
                 if sym.is_function:
                     continue
-                if re.search(r"\W{}\W".format(sym.name), line):
+                if re.search(r"\b{}\b".format(re.escape(sym.name)), line):
                     try:
                         val = gdb.parse_and_eval(sym.name)
                     except gdb.error:
@@ -1862,7 +1872,7 @@ class ContextSourceCommand(GenericCommand):
                         continue
 
                     if sym.name not in seen_symbol:
-                        seen_symbol.append(sym.name)
+                        seen_symbol.add(sym.name)
                         msg = "{} = {}".format(Color.yellowify(sym.name), val)
                         m.append(msg)
             current_block = current_block.superblock
@@ -1880,8 +1890,7 @@ class ContextSourceCommand(GenericCommand):
             if not symtab.is_valid():
                 return
             fpath = symtab.fullname()
-            with open(fpath, "r") as f:
-                lines = [x.rstrip() for x in f.readlines()]
+            lines = self.get_source_lines(fpath)
         except Exception:
             return
 
@@ -1892,14 +1901,13 @@ class ContextSourceCommand(GenericCommand):
         if self.args.nb_lines is not None:
             nb_lines = self.args.nb_lines
         else:
-            nb_lines = Config.get_gef_setting("context_source.nb_lines")
-        past_lines_color = Config.get_gef_setting("theme.context_code_past")
-        cur_line_color = Config.get_gef_setting("theme.source_current_line")
-        future_lines_color = Config.get_gef_setting("theme.context_code_future")
-        show_extra_info = Config.get_gef_setting("context_source.show_source_code_variable_values")
+            nb_lines = Config.get("context_source.nb_lines")
+        past_lines_color = Config.get("theme.context_code_past")
+        cur_line_color = Config.get("theme.source_current_line")
+        future_lines_color = Config.get("theme.context_code_future")
+        show_extra_info = Config.get("context_source.show_source_code_variable_values")
 
-        file_base_name = os.path.basename(symtab.filename)
-        bp_locations = self.get_source_breakpoints(file_base_name)
+        bp_locations = self.get_source_breakpoints()
 
         for i in range(line_num - nb_lines + 1, line_num + nb_lines):
             if i < 0:
@@ -1908,7 +1916,7 @@ class ContextSourceCommand(GenericCommand):
             if len(lines) <= i:
                 break
 
-            if self.line_has_breakpoint(file_base_name, i + 1, bp_locations):
+            if self.line_has_breakpoint(fpath, i + 1, bp_locations):
                 bp_prefix = Color.redify("*")
             else:
                 bp_prefix = " "
@@ -1941,6 +1949,8 @@ class ContextSourceCommand(GenericCommand):
         except Exception as e:
             err(str(e), redirect=redirect)
         return
+
+
 
 @register_command
 class ContextMemoryWatchCommand(GenericCommand):

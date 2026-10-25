@@ -5,6 +5,8 @@ Syscall commands (depends on gef.core.syscall from Phase 2.0).
 Auto-discovered by gef.bootstrap via pkgutil.walk_packages.
 """
 import argparse
+import contextlib
+import ctypes
 import os
 import re
 import struct
@@ -13,6 +15,7 @@ import gdb
 
 from gef.commands.base import (
     BufferingOutput,
+    ContextManager,
     GenericCommand,
     exclude_specific_arch,
     exclude_specific_gdb_mode,
@@ -24,11 +27,12 @@ from gef.commands.base import (
 )
 from gef.core import runtime
 from gef.core.address import AddressUtil, Permission
+from gef.core.auxv import Auxv
 from gef.core.cache import Cache
 from gef.core.color import Color, err, gef_print, info, ok, titlify, warn
 from gef.core.events import EventHandler, EventHooking
 from gef.core.exec import ExecSyscall
-from gef.core.memory import hexdump, p16, read_int_from_memory, read_memory, write_memory
+from gef.core.memory import hexdump, p16, p64, read_int_from_memory, read_memory, u32, write_memory
 from gef.core.process import (
     ProcessMap,
     get_pagesize,
@@ -42,13 +46,14 @@ from gef.core.process import (
     is_sparc32,
     is_sparc32plus,
     is_sparc64,
+    is_s390x,
     is_x86_32,
     is_x86_64,
 )
 from gef.core.registers import get_register
 from gef.core.strings import String
 from gef.core.syscall import Syscall
-from gef.core.utils import GefUtil
+from gef.core.utils import GefUtil, u2i
 
 
 @register_command
@@ -61,10 +66,6 @@ class HijackFdCommand(GenericCommand):
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("old_fd", metavar="OLD_FD", type=int, help="file descriptor number to redirect.")
     parser.add_argument("new_output", metavar="NEW_OUTPUT", type=str, help="the location redirected data is stored.")
-    parser.add_argument("--fd-adjust-connect", type=int, default=0,
-                        help="slide value when `connect` syscall result and the actual opened FD differ (for old qemu-user).")
-    parser.add_argument("--fd-adjust-dup3", type=int, default=0,
-                        help="slide value when `dup3` syscall result and the actual opened FD differ (for old qemu-user).")
     parser.add_argument("-q", "--quiet", action="store_true", help="quiet execution.")
     _syntax_ = parser.format_help()
 
@@ -73,6 +74,11 @@ class HijackFdCommand(GenericCommand):
         "{0:s} 2 localhost:8000  # determined as the socket by the presence of `:`.",
     ]
     _example_ = "\n".join(_example_).format(_cmdline_)
+
+    _note_ = [
+        "`socketcall` is not supported; on i386 with Linux < 4.3 (or old qemu-user), the socket redirection fails with ENOSYS.",
+    ]
+    _note_ = "\n".join(_note_)
 
     def call_syscall(self, syscall_name, args):
         args = " ".join([hex(x) if x >= 0 else str(x) for x in args])
@@ -83,6 +89,7 @@ class HijackFdCommand(GenericCommand):
         self.quiet_info(output_line)
         return int(output_line.split()[2], 0)
 
+    @contextlib.contextmanager
     def write_stack(self, data):
         data = String.str2bytes(data)
 
@@ -91,83 +98,110 @@ class HijackFdCommand(GenericCommand):
         stack_addrs = [entry.page_start for entry in vmmap if entry.path == "[stack]"]
         if len(stack_addrs) == 0:
             err("Could not find the stack")
-            return None, None
+            yield None
+            return
         stack_addr = stack_addrs[0]
 
-        # read original contents
-        try:
-            original_contents = read_memory(stack_addr, len(data))
-        except gdb.MemoryError:
-            err("Failed to read stack")
-            return None, None
+        with ContextManager.temporary_memory(stack_addr, length=len(data), safe=True) as original_contents:
+            if original_contents is None:
+                err("Failed to read stack")
+                yield None
+                return
 
-        self.quiet_info("Original contents: {!s} @ {:#x}".format(original_contents, stack_addr))
-        self.quiet_info("Overwrite data: {!s}".format(data))
+            self.quiet_info("Original contents: {!s} @ {:#x}".format(original_contents, stack_addr))
+            self.quiet_info("Overwrite data: {!s}".format(data))
 
-        # overwrite it
-        try:
-            write_memory(stack_addr, data)
-        except Exception:
-            err("Failed to write stack")
-            return None, None
+            # overwrite it
+            try:
+                write_memory(stack_addr, data)
+            except Exception:
+                err("Failed to write stack")
+                yield None
+                return
 
-        # read again and check
-        if read_memory(stack_addr, len(data)) != data:
-            err("Failed to write stack")
-            return None, None
+            # read again and check
+            if read_memory(stack_addr, len(data)) != data:
+                err("Failed to write stack")
+                yield None
+                return
+            yield stack_addr
+        return
 
-        return stack_addr, original_contents
+    def close_fd(self, fd):
+        close_result = self.call_syscall("close", [fd])
+        if AddressUtil.is_msb_on(close_result):
+            err("Failed to close fd #{:d}".format(fd))
+            return False
+        self.quiet_info("Closed extra fd #{:d}".format(fd))
+        return True
 
     def get_fd_from_file_open(self):
-        # call open
-        stack_addr, original_contents = self.write_stack(self.args.new_output + "\0")
-        if stack_addr is None:
-            return None
+        open_fd = None
+        success = False
+        try:
+            # call open
+            with self.write_stack(self.args.new_output + "\0") as stack_addr:
+                if stack_addr is None:
+                    return None
+                self.quiet_info("Trying to open {:s}".format(Color.boldify(self.args.new_output)))
 
-        self.quiet_info("Trying to open {:s}".format(Color.boldify(self.args.new_output)))
+                AT_FDCWD = -100
+                flags = self.O_APPEND | self.O_CREAT | self.O_RDWR
+                mode = 0o666
+                # open does not exist in aarch64. So use openat instead of open.
+                open_fd = self.call_syscall("openat", [AT_FDCWD, stack_addr, flags, mode])
 
-        AT_FDCWD = -100
-        flags = self.O_APPEND | self.O_CREAT | self.O_RDWR
-        mode = 0o666
-        # open does not exist in aarch64. So use openat instead of open.
-        open_fd = self.call_syscall("openat", [AT_FDCWD, stack_addr, flags, mode])
-        write_memory(stack_addr, original_contents) # revert
+            if AddressUtil.is_msb_on(open_fd):
+                err("Failed to open {:s}".format(self.args.new_output))
+                return None
 
-        if AddressUtil.is_msb_on(open_fd):
-            err("Failed to open {:s}".format(self.args.new_output))
-            return None
-
-        self.quiet_info("Opened {:s} with 0o666 as fd #{:d}".format(Color.boldify(self.args.new_output), open_fd))
-        return open_fd
+            self.quiet_info("Opened {:s} with 0o666 as fd #{:d}".format(Color.boldify(self.args.new_output), open_fd))
+            success = True
+            return open_fd
+        finally:
+            if not success and open_fd is not None and not AddressUtil.is_msb_on(open_fd):
+                self.close_fd(open_fd)
 
     def get_fd_from_connect_server(self):
         import socket
-        address = socket.gethostbyname(self.args.new_output.split(":")[0])
-        port = int(self.args.new_output.split(":")[1])
+        host, port_text = self.args.new_output.rsplit(":", 1)
+        try:
+            port = int(port_text)
+        except ValueError:
+            err("Invalid port: {:s}".format(port_text))
+            return None
+        if not 1 <= port <= 65535:
+            err("Invalid port: {:s}".format(port_text))
+            return None
+        address = socket.gethostbyname(host)
 
         # call socket
         sock_fd = self.call_syscall("socket", [self.AF_INET, self.SOCK_STREAM, 0])
         if AddressUtil.is_msb_on(sock_fd):
             err("Failed to create socket")
             return None
-        self.quiet_info("Created socket fd #{:d}".format(sock_fd))
+        success = False
+        try:
+            self.quiet_info("Created socket fd #{:d}".format(sock_fd))
 
-        # call connect (Also supports big endian)
-        sockaddr_in = p16(self.AF_INET) + struct.pack("<H", socket.htons(port)) + socket.inet_aton(address)
-        stack_addr, original_contents = self.write_stack(sockaddr_in)
-        if stack_addr is None:
-            return None
+            # call connect (Also supports big endian)
+            sockaddr_in = p16(self.AF_INET) + struct.pack("<H", socket.htons(port)) + socket.inet_aton(address)
+            with self.write_stack(sockaddr_in) as stack_addr:
+                if stack_addr is None:
+                    return None
+                self.quiet_info("Trying to connect to {:s}".format(Color.boldify(self.args.new_output)))
+                connect_result = self.call_syscall("connect", [sock_fd, stack_addr, 16])
 
-        self.quiet_info("Trying to connect to {:s}".format(Color.boldify(self.args.new_output)))
-        connect_result = self.call_syscall("connect", [sock_fd - self.args.fd_adjust_connect, stack_addr, 16])
-        write_memory(stack_addr, original_contents) # revert
+            if AddressUtil.is_msb_on(connect_result):
+                err("Failed to connect to {:s}:{:d}".format(address, port))
+                return None
 
-        if AddressUtil.is_msb_on(connect_result):
-            err("Failed to connect to {:s}:{:d}".format(address, port))
-            return
-
-        self.quiet_info("Connected to {:s} as fd #{:d}".format(Color.boldify(self.args.new_output), sock_fd))
-        return sock_fd
+            self.quiet_info("Connected to {:s} as fd #{:d}".format(Color.boldify(self.args.new_output), sock_fd))
+            success = True
+            return sock_fd
+        finally:
+            if not success:
+                self.close_fd(sock_fd)
 
     def hijack_fd(self):
         if ":" in self.args.new_output:
@@ -177,20 +211,25 @@ class HijackFdCommand(GenericCommand):
         if new_fd is None:
             return
 
-        # call dup3
-        # dup2 does not exist in aarch64. So use dup3 instead of dup2.
-        dup3_result = self.call_syscall("dup3", [new_fd - self.args.fd_adjust_dup3, self.args.old_fd, 0])
-        if dup3_result - self.args.fd_adjust_dup3 != self.args.old_fd:
-            err("Failed to dup3 (result {:d} != fd #{:d})".format(dup3_result, self.args.old_fd))
+        # OLD_FD was closed and got reused; dup3 rejects the same fds with EINVAL
+        if new_fd == self.args.old_fd:
+            self.quiet_info("Already opened as fd #{:d}".format(self.args.old_fd))
+            ok("Success")
             return
-        self.quiet_info("Duplicated fd #{:d} -> #{:d}".format(new_fd, self.args.old_fd))
 
-        # call close
-        close_result = self.call_syscall("close", [new_fd])
-        if AddressUtil.is_msb_on(close_result):
-            err("Failed to close fd #{:d}".format(new_fd))
+        try:
+            # call dup3
+            # dup2 does not exist in aarch64. So use dup3 instead of dup2.
+            dup3_result = self.call_syscall("dup3", [new_fd, self.args.old_fd, 0])
+            if dup3_result != self.args.old_fd:
+                err("Failed to dup3 (result {:d} != fd #{:d})".format(dup3_result, self.args.old_fd))
+                return
+            self.quiet_info("Duplicated fd #{:d} -> #{:d}".format(new_fd, self.args.old_fd))
+        finally:
+            closed = self.close_fd(new_fd)
+
+        if not closed:
             return
-        self.quiet_info("Closed extra fd #{:d}".format(new_fd))
 
         ok("Success")
         return
@@ -201,12 +240,6 @@ class HijackFdCommand(GenericCommand):
     @exclude_specific_arch(arch=("CRIS",))
     @require_arch_set
     def do_invoke(self, args):
-        # In old version of qemu, the file descriptor was sometimes shifted by a
-        # constant value on i386 (fd returned by the syscall == actual opened fd + 80).
-        # This had been hard-coded as a workaround, but the issue appears to be fixed,
-        # so it should now be specified via a command argument.
-        # Currently supported: dup3, connect
-
         self.AF_INET = 2
         self.SOCK_STREAM = 1
         self.O_APPEND = 0o2000
@@ -239,6 +272,7 @@ class HijackFdCommand(GenericCommand):
         return
 
 
+
 @register_command
 class XtapCommand(GenericCommand):
     """Tap read/write syscalls on specific file descriptors and hexdump the transferred data."""
@@ -267,7 +301,7 @@ class XtapCommand(GenericCommand):
         "  write-like: write, sendto, sendmsg, sendmmsg, pwrite64, pwritev, pwritev2, writev",
         "",
         "- Relies on `catch syscall`.",
-        "- Auto-continues; stops on a user breakpoint or Ctrl+C.",
+        "- Auto-continues; stops on a user breakpoint, signal, or Ctrl+C.",
         "- qemu-user is unsupported: its gdbstub does not update the return-value register",
         "  at syscall-return, so read-like sizes are wrong. Use a native target.",
     ]
@@ -335,8 +369,8 @@ class XtapCommand(GenericCommand):
         msg_iovlen = read_int_from_memory(msg_addr + runtime.current_arch.ptrsize * 3)
         return self.read_iovec_array(msg_iov, msg_iovlen)
 
-    def read_mmsghdr_entries(self, mmsg_addr, vlen):
-        """Return a flat list of iovec entries across a struct mmsghdr array.
+    def read_mmsghdr(self, mmsg_addr, vlen):
+        """Return a list of (iovec entries, msg_len) tuples from a struct mmsghdr array.
 
         struct mmsghdr layout:
           struct msghdr msg_hdr     off 0
@@ -348,63 +382,34 @@ class XtapCommand(GenericCommand):
         """
         msghdr_size = runtime.current_arch.ptrsize * 7
         mmsghdr_stride = msghdr_size + runtime.current_arch.ptrsize  # msg_len is unsigned int but padded to ptrsize
-        entries = []
+        messages = []
         cur = mmsg_addr
         for _ in range(vlen):
-            entries += self.read_msghdr(cur)
+            msg_len = u32(read_memory(cur + msghdr_size, 4))
+            messages.append((self.read_msghdr(cur), msg_len))
             cur += mmsghdr_stride
-        return entries
-
-    def extract_entry_data(self, name, arg_regs):
-        """Read data for write-like syscalls at entry. Returns (label, bytes) or None."""
-        kind = self.syscall_spec[name][1]
-
-        if kind == "buf":
-            # buf is 2nd arg, count is 3rd arg
-            buf = get_register(arg_regs[1])
-            count = get_register(arg_regs[2])
-            if self.maxlen is not None:
-                count = min(count, self.maxlen)
-            try:
-                data = read_memory(buf, count)
-            except gdb.error:
-                return None
-            return ("buf={:#x} count={:#x}".format(buf, count), data)
-
-        if kind == "iovec":
-            # iov is 2nd arg, iovcnt is 3rd arg
-            iov = get_register(arg_regs[1])
-            iovcnt = get_register(arg_regs[2])
-            entries = self.read_iovec_array(iov, iovcnt)
-            data = self.gather_iovec_bytes(entries, self.maxlen)
-            return ("iov={:#x} iovcnt={:#x}".format(iov, iovcnt), data)
-
-        if kind == "msghdr":
-            # msg is 2nd arg
-            msg = get_register(arg_regs[1])
-            entries = self.read_msghdr(msg)
-            data = self.gather_iovec_bytes(entries, self.maxlen)
-            return ("msghdr={:#x}".format(msg), data)
-
-        if kind == "mmsghdr":
-            # msgvec is 2nd arg, vlen is 3rd arg
-            msgvec = get_register(arg_regs[1])
-            vlen = get_register(arg_regs[2])
-            entries = self.read_mmsghdr_entries(msgvec, vlen)
-            data = self.gather_iovec_bytes(entries, self.maxlen)
-            return ("mmsghdr={:#x} vlen={:#x}".format(msgvec, vlen), data)
-
-        return None
+        return messages
 
     def extract_exit_data(self, name, entry_args, retval):
-        """Read data for read-like syscalls at exit. Returns (label, bytes) or None.
-        `retval` is the number of bytes actually transferred. `entry_args` carries
-        the argument register values captured at entry.
+        """Read the transferred data at exit. Returns a list of (label, bytes).
+        `retval` is the number of bytes (messages for mmsghdr) actually transferred.
+        `entry_args` carries the argument register values captured at entry.
         """
         kind = self.syscall_spec[name][1]
 
         if retval is None or retval <= 0:
-            return ("returned {}".format(retval if retval is not None else "?"), b"")
+            return [("returned {}".format(retval if retval is not None else "?"), b"")]
+
+        if kind == "mmsghdr":
+            msgvec = entry_args[1]
+            results = []
+            for i, (entries, msg_len) in enumerate(self.read_mmsghdr(msgvec, retval)):
+                limit = msg_len
+                if self.maxlen is not None:
+                    limit = min(limit, self.maxlen)
+                data = self.gather_iovec_bytes(entries, limit)
+                results.append(("mmsghdr={:#x} msg[{:d}/{:d}] len={:#x}".format(msgvec, i, retval, msg_len), data))
+            return results
 
         limit = retval
         if self.maxlen is not None:
@@ -415,63 +420,27 @@ class XtapCommand(GenericCommand):
             try:
                 data = read_memory(buf, limit)
             except gdb.error:
-                return None
-            return ("buf={:#x} ret={:#x}".format(buf, retval), data)
+                return []
+            return [("buf={:#x} ret={:#x}".format(buf, retval), data)]
 
         if kind == "iovec":
             iov = entry_args[1]
             iovcnt = entry_args[2]
             entries = self.read_iovec_array(iov, iovcnt)
             data = self.gather_iovec_bytes(entries, limit)
-            return ("iov={:#x} ret={:#x}".format(iov, retval), data)
+            return [("iov={:#x} ret={:#x}".format(iov, retval), data)]
 
         if kind == "msghdr":
             msg = entry_args[1]
             entries = self.read_msghdr(msg)
             data = self.gather_iovec_bytes(entries, limit)
-            return ("msghdr={:#x} ret={:#x}".format(msg, retval), data)
+            return [("msghdr={:#x} ret={:#x}".format(msg, retval), data)]
 
-        return None
+        return []
 
     def entry_fd(self, arg_regs):
         """All hooked syscalls take fd as their first argument."""
         return get_register(arg_regs[0])
-
-    def close_stdout_stderr(self):
-        self.stdout = 1
-        self.stdout_bak = os.dup(self.stdout)
-        f = open("/dev/null")
-        os.dup2(f.fileno(), self.stdout)
-        f.close()
-
-        self.stderr = 2
-        self.stderr_bak = os.dup(self.stderr)
-        f = open("/dev/null")
-        os.dup2(f.fileno(), self.stderr)
-        f.close()
-        return
-
-    def revert_stdout_stderr(self):
-        os.dup2(self.stdout_bak, self.stdout)
-        os.close(self.stdout_bak)
-        os.dup2(self.stderr_bak, self.stderr)
-        os.close(self.stderr_bak)
-        return
-
-    def force_write_stdout(self, msg):
-        open("/proc/self/fd/0", "wb").write(msg)
-        return
-
-    def dump_transfer(self, name, direction, fd, label, data):
-        arrow = "<-" if direction == "in" else "->"
-        head = "[fd {:d}] {:s} {:s} {:s}".format(fd, name, arrow, label)
-        lines = [titlify(head)]
-        if data:
-            lines.append(hexdump(data, base=0))
-        else:
-            lines.append("(no data)")
-        self.force_write_stdout(String.str2bytes("\n".join(lines) + "\n"))
-        return
 
     def setup_catchpoints(self):
         """Set a catch syscall for every supported+available syscall. Returns count set."""
@@ -540,17 +509,35 @@ class XtapCommand(GenericCommand):
             return None
         return entry.name
 
+    def remember_stop(self, event):
+        self.stop_event = event
+        return
+
     def identify_stop(self):
         """Determine if the current stop is one of our tapped syscalls."""
+        event = self.stop_event
+        if event is None or isinstance(event, gdb.SignalEvent):
+            return None
+        if isinstance(event, gdb.BreakpointEvent):
+            numbers = [bp.number for bp in event.breakpoints]
+        else:
+            stop = GefUtil.get_stop_reason()
+            if stop is None:
+                return None
+            numbers = [num for num in stop["breakpoints"] if num is not None]
+        if not numbers or any(num not in self.catch_numbers for num in numbers):
+            return None
+
         try:
             tid = gdb.selected_thread().num
         except Exception:
             tid = 0
 
+        reason = getattr(event, "details", {}).get("reason")
         pending_name = self.in_syscall_by_thread.get(tid, None)
-        if pending_name is not None:
-            # this stop is the return matching the previous entry on this thread
+        if reason == "syscall-return" or (reason != "syscall-entry" and pending_name is not None):
             self.in_syscall_by_thread[tid] = None
+            pending_name = pending_name or self.current_syscall_name()
             if pending_name not in self.hooked_set:
                 return None
             return pending_name, False
@@ -573,21 +560,13 @@ class XtapCommand(GenericCommand):
         if fd not in self.target_fds:
             self.pending_by_thread.pop(tid, None)
             return
-        direction = self.syscall_spec[name][0]
-        if direction == "out":
-            # write-like: buffer is ready now, dump immediately, nothing to wait for
-            extracted = self.extract_entry_data(name, arg_regs)
-            if extracted is not None:
-                label, data = extracted
-                self.dump_transfer(name, direction, fd, label, data)
-            self.pending_by_thread.pop(tid, None)
-        else:
-            # read-like: snapshot args now (they may be clobbered by exit) and wait for the return
-            arg_values = [get_register(r) for r in arg_regs]
-            self.pending_by_thread[tid] = {"name": name, "fd": fd, "arg_values": arg_values}
+        # snapshot args now (they may be clobbered by exit) and wait for the return,
+        # since even write-like syscalls may transfer less than requested
+        arg_values = [get_register(r) for r in arg_regs]
+        self.pending_by_thread[tid] = {"name": name, "fd": fd, "arg_values": arg_values}
         return
 
-    def handle_return(self, name):
+    def handle_return(self, name, write_stdout):
         try:
             tid = gdb.selected_thread().num
         except Exception:
@@ -597,45 +576,56 @@ class XtapCommand(GenericCommand):
             return
         entry = self.syscall_table.name_table[name]
         retval = get_register(entry.ret_regs[0])
-        # ret value is signed; treat large unsigned as negative error
-        if retval >= (1 << (runtime.current_arch.ptrsize * 8 - 1)):
-            retval = retval - (1 << (runtime.current_arch.ptrsize * 8))
+        retval = u2i(retval, runtime.current_arch.ptrsize * 8)
         direction = self.syscall_spec[name][0]
         fd = pending["fd"]
-        extracted = self.extract_exit_data(name, pending["arg_values"], retval)
-        if extracted is not None:
-            label, data = extracted
-            self.dump_transfer(name, direction, fd, label, data)
+        if direction == "in":
+            arrow = "<-"
+        else:
+            arrow = "->"
+        for label, data in self.extract_exit_data(name, pending["arg_values"], retval):
+            head = "[fd {:d}] {:s} {:s} {:s}".format(fd, name, arrow, label)
+            lines = [titlify(head)]
+            if data:
+                lines.append(hexdump(data, base=0))
+            else:
+                lines.append("(no data)")
+            write_stdout(String.str2bytes("\n".join(lines) + "\n"))
         return
 
     def trace(self):
         bp_was_hit = False
         inferior_exited = False
-        EventHooking.gef_on_stop_unhook(EventHandler.hook_stop_handler)
-        self.close_stdout_stderr()
-        try:
-            while True:
-                gdb.execute("continue", to_string=True)
-                if not is_alive():
-                    inferior_exited = True
-                    break
-                hit = self.identify_stop()
-                if hit is None:
-                    # stopped for some other reason (user breakpoint, signal, etc.)
-                    bp_was_hit = True
-                    break
-                name, is_entry = hit
-                if is_entry:
-                    self.handle_entry(name)
-                else:
-                    self.handle_return(name)
-        except KeyboardInterrupt:
-            bp_was_hit = True
-        except gdb.error as e:
-            self.err = e
-        finally:
-            self.revert_stdout_stderr()
-            EventHooking.gef_on_stop_hook(EventHandler.hook_stop_handler)
+        libc = ctypes.CDLL(None)
+        gdb.flush()
+        libc.fflush(None)
+        with ContextManager.redirect_output() as write_stdout, ContextManager.suspend_stop_handler():
+            try:
+                with EventHooking.temporary("stop", self.remember_stop):
+                    while True:
+                        self.stop_event = None
+                        gdb.execute("continue", to_string=True)
+                        Cache.reset_gef_caches() # hook_stop_handler that does this is unhooked
+                        if not is_alive():
+                            inferior_exited = True
+                            break
+                        hit = self.identify_stop()
+                        if hit is None:
+                            # stopped for some other reason (user breakpoint, signal, etc.)
+                            bp_was_hit = True
+                            break
+                        name, is_entry = hit
+                        if is_entry:
+                            self.handle_entry(name)
+                        else:
+                            self.handle_return(name, write_stdout)
+            except KeyboardInterrupt:
+                bp_was_hit = True
+            except gdb.error as e:
+                self.err = e
+            finally:
+                gdb.flush()
+                libc.fflush(None)
         if inferior_exited:
             info("Inferior exited")
         return bp_was_hit
@@ -689,11 +679,12 @@ class XtapCommand(GenericCommand):
         return
 
 
+
 @register_command
 class KillThreadsCommand(GenericCommand):
     """Invoke pthread_exit(0) for a specific THREAD_ID."""
 
-    _cmdline_ = "killthreads"
+    _cmdline_ = "kill-threads"
     _category_ = "01-g. Debugging Support - Syscall"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
@@ -722,7 +713,6 @@ class KillThreadsCommand(GenericCommand):
 
         # list target thread id
         orig_thread = gdb.selected_thread()
-        orig_frame = gdb.selected_frame()
         target_threads = []
         for th in gdb.selected_inferior().threads():
             if th.num == orig_thread.num:
@@ -745,21 +735,14 @@ class KillThreadsCommand(GenericCommand):
 
         # kill
         if args.commit:
-            # backup
-            sched_lock = gdb.parameter("scheduler-locking")
-            # change temporarily
-            gdb.execute("set scheduler-locking on", to_string=True)
-            # kill
-            for th in target_threads:
-                th.switch()
-                try:
-                    gdb.execute("call pthread_exit(0)")
-                except gdb.error:
-                    pass
-            # restore
-            orig_thread.switch()
-            orig_frame.select()
-            gdb.execute("set scheduler-locking {:s}".format(sched_lock), to_string=True)
+            with ContextManager.gdb_parameter("scheduler-locking", "on"):
+                with ContextManager.threads(target_threads) as threads:
+                    # kill
+                    for _thread in threads:
+                        try:
+                            gdb.execute("call (void)pthread_exit(0)")
+                        except (gdb.error, RuntimeError):
+                            pass
         else:
             warn('This dry run mode skips killing; add "--commit" to proceed')
         return
@@ -839,8 +822,8 @@ class MmapMemoryCommand(GenericCommand):
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("location", metavar="LOCATION", nargs="?", type=AddressUtil.parse_address, default=None,
                         help="the address to allocate. (default: %(default)s)")
-    parser.add_argument("size", metavar="SIZE", nargs="?", type=AddressUtil.parse_address, default=get_pagesize(),
-                        help="the size to allocate. (default: %(default)s)")
+    parser.add_argument("size", metavar="SIZE", nargs="?", type=AddressUtil.parse_address, default=None,
+                        help="the size to allocate. (default: one target page)")
     parser.add_argument("permission", metavar="PERMISSION", nargs="?", default="rwx",
                         help="the permission to allocate. `_` is interpreted as `-`. (default: %(default)s)")
     _syntax_ = parser.format_help()
@@ -878,21 +861,32 @@ class MmapMemoryCommand(GenericCommand):
                 continue
             mmap_syscall_name = entry.name
             break
+        if mmap_syscall_name is None and is_s390x():
+            mmap_syscall_name = "mmap" # takes a pointer to the six arguments
         if mmap_syscall_name is None:
             err("Could not find the mmap syscall")
             return
 
         # location
-        if args.location and args.location % get_pagesize():
-            err("Address is not a multiple of {:#x}".format(get_pagesize()))
+        page_size = get_pagesize()
+        if args.location is not None:
+            auxval = Auxv.get_auxiliary_values()
+            if not auxval or "AT_PAGESZ" not in auxval:
+                err("Could not get the page size from auxv; omit LOCATION to let the kernel choose the address")
+                return
+            page_size = auxval["AT_PAGESZ"]
+        if args.location and args.location % page_size:
+            err("Address is not a multiple of {:#x}".format(page_size))
             return
 
         # size
-        if args.size < 0 or AddressUtil.get_vmem_end() <= args.size:
+        if args.size is None:
+            args.size = page_size
+        if args.size <= 0 or AddressUtil.get_vmem_end() <= args.size:
             err("Invalid size")
             return
-        if args.size % get_pagesize():
-            err("Size is not a multiple of {:#x}".format(get_pagesize()))
+        if args.size % page_size:
+            err("Size is not a multiple of {:#x}".format(page_size))
             return
 
         # permission
@@ -913,18 +907,35 @@ class MmapMemoryCommand(GenericCommand):
 
         # flags
         flags = 0x22 # MAP_ANONYMOUS | MAP_PRIVATE
+        map_fixed = 0x10
+        if is_alpha():
+            flags = 0x12
+            map_fixed = 0x100
+        elif is_hppa32() or is_hppa64():
+            flags = 0x12
+            map_fixed = 0x04
         if args.location is not None:
-            flags |= 0x10 # MAP_FIXED
+            flags |= map_fixed
         if is_mips32() or is_mips64() or is_mipsn32():
             flags |= 0x800 # MAP_DENYWRITE (why?)
 
         # doit
-        cmd = "call-syscall {:s} {:#x} {:#x} {:#x} {:#x} -1 0".format(
-            mmap_syscall_name, args.location or 0, args.size, perm, flags,
-        )
-        gdb.execute(cmd)
+        if is_s390x():
+            mmap_args = b"".join(p64(x) for x in [args.location or 0, args.size, perm, flags, 0xffff_ffff_ffff_ffff, 0])
+            address = runtime.current_arch.sp
+            with ContextManager.temporary_memory(address, mmap_args, safe=True) as backup:
+                if backup is None:
+                    err("Could not reserve scratch space on the inferior stack")
+                    return
+                gdb.execute("call-syscall {:s} {:#x}".format(mmap_syscall_name, address))
+        else:
+            cmd = "call-syscall {:s} {:#x} {:#x} {:#x} {:#x} -1 0".format(
+                mmap_syscall_name, args.location or 0, args.size, perm, flags,
+            )
+            gdb.execute(cmd)
         Cache.reset_gef_caches()
         return
+
 
 
 @register_command
@@ -1254,4 +1265,3 @@ class SyscallSearchCommand(GenericCommand, BufferingOutput):
         self.make_output(syscall_table, syscall_num, syscall_name_pattern, skip_x32)
         self.print_output(check_terminal_size=True)
         return
-

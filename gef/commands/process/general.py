@@ -556,6 +556,7 @@ class ProcDumpCommand(GenericCommand, BufferingOutput):
 
     _cmdline_ = "proc-dump"
     _category_ = "02-a. Process Information - General"
+    _aliases_ = ["prd"]
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("-n", "--no-pager", action="store_true", help="do not use the pager.")

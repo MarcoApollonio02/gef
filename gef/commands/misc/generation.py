@@ -23,7 +23,8 @@ from gef.commands.base import (
     parse_args,
     register_command,
 )
-from gef.core.address import AddressUtil
+from gef.core import runtime
+from gef.core.address import AddressUtil, Endian
 from gef.core.color import err, gef_print, info, ok, titlify
 from gef.core.config import Config
 from gef.core.memory import p32, p64, read_int_from_memory, read_memory
@@ -63,6 +64,7 @@ class PrintFormatCommand(GenericCommand):
     _note_ = [
         '"hexn" means hex with new-line.',
         '"hexs" means hex with separator.',
+        "JavaScript uses BigInt for 64-bit values.",
     ]
     _note_ = "\n".join(_note_)
 
@@ -77,12 +79,19 @@ class PrintFormatCommand(GenericCommand):
         else:
             end_addr = self.args.location + self.args.length * unit_size
 
-        bit_format = {8: "<B", 16: "<H", 32: "<I", 64: "<Q"}[self.args.bitlen]
+        size = end_addr - self.args.location
+        if size < 0:
+            err("Invalid range")
+            return None
+        if size % unit_size:
+            err("Range size must be a multiple of {:d}".format(unit_size))
+            return None
+
+        bit_format = Endian.endian_str() + {8: "B", 16: "H", 32: "I", 64: "Q"}[self.args.bitlen]
         data = []
         for address in range(self.args.location, end_addr, unit_size):
-            try:
-                mem = read_memory(address, unit_size)
-            except gdb.MemoryError:
+            mem = read_memory(address, unit_size, safe=True)
+            if mem is None:
                 err("Memory read error")
                 return None
             value = struct.unpack(bit_format, mem)[0]
@@ -105,10 +114,14 @@ class PrintFormatCommand(GenericCommand):
             for x in data:
                 sdata += "{:02x}{:s}".format(x, separator)
         else:
+            if self.args.format == "js" and self.args.bitlen == 64:
+                suffix = "n"
+            else:
+                suffix = ""
             for i, x in enumerate(data):
                 if (i % 8) == 0:
                     sdata += "    "
-                sdata += "{:#0{}x}, ".format(x, self.args.bitlen // 4 + 2)
+                sdata += "{:#0{}x}{:s}, ".format(x, self.args.bitlen // 4 + 2, suffix)
                 if (i % 8) == 7:
                     sdata += "\n"
         sdata = sdata.rstrip()
@@ -124,7 +137,11 @@ class PrintFormatCommand(GenericCommand):
             out = "var buf = [\n{:s}\n];".format(sdata)
         elif self.args.format == "asm":
             asm_type = {8: "db", 16: "dw", 32: "dd", 64: "dq"}
-            out = "buf {:s}\n{:s}".format(asm_type[self.args.bitlen], sdata)
+            sdata = "\n".join(
+                "    {:s} {:s}".format(asm_type[self.args.bitlen], line.strip().rstrip(","))
+                for line in sdata.splitlines()
+            )
+            out = "buf:\n{:s}".format(sdata)
         elif self.args.format in ["hex", "hexn", "hexs", "hexsn"]:
             out = sdata
         return out
@@ -143,6 +160,7 @@ class PrintFormatCommand(GenericCommand):
         out = self.make_format(sdata)
         gef_print(out)
         return
+
 
 
 @register_command
@@ -170,6 +188,7 @@ class PatternCommand(GenericCommand):
     def do_invoke(self, args):
         self.usage()
         return
+
 
 
 @register_command
@@ -246,6 +265,8 @@ class PatternSearchCommand(GenericCommand):
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("-c", "--charset", help="the charset of pattern. (default: abc..z)")
+    parser.add_argument("-w", "--width", type=int, choices=(1, 2, 4, 8),
+                        help="the integer search width in bytes. (default: target pointer size)")
     parser.add_argument("pattern", metavar="PATTERN", help="the pattern to offset search.")
     parser.add_argument("size", metavar="SIZE", type=AddressUtil.parse_address, nargs="?",
                         help="the size of pattern. (default: 0x10000)")
@@ -293,17 +314,25 @@ class PatternSearchCommand(GenericCommand):
     @only_if_gdb_running
     def do_invoke(self, args):
         if args.size is None:
-            size = Config.get_gef_setting("pattern.length") * 64
+            size = Config.get("pattern.length") * 64
         else:
             size = args.size
 
-        cyclic_pattern = PatternCreateCommand.generate_cyclic_pattern(size, args.charset)
-        pack = p32 if is_32bit() else p64
+        try:
+            cyclic_pattern = PatternCreateCommand.generate_cyclic_pattern(size, args.charset)
+        except ValueError as e:
+            err(e)
+            return
+        width = args.width or runtime.current_arch.ptrsize
+        mask = (1 << (width * 8)) - 1
+
+        def pack(value):
+            return (value & mask).to_bytes(width, "little")
 
         # 1. check if it's a symbol (like "$sp")
         try:
             address = AddressUtil.parse_address(args.pattern)
-            value = read_int_from_memory(address)
+            value = int.from_bytes(read_memory(address, width), "little")
             self.search("As symbol (with dereference)", cyclic_pattern, pack(value))
         except gdb.error:
             pass
@@ -320,6 +349,7 @@ class PatternSearchCommand(GenericCommand):
         if set(pattern) - set(cyclic_pattern) == set():
             self.search("As string", cyclic_pattern, pattern)
         return
+
 
 
 @register_command

@@ -46,6 +46,20 @@ def is_remote_debug():
         return "remote" in res
 
 
+@Cache.cache_this_session(cache_None=False, per_inferior=True)
+def is_core_file():
+    """GDB mode determination function for core file."""
+    if not is_alive():
+        return None
+    try:
+        connection = gdb.selected_inferior().connection
+        return connection is not None and connection.type == "core"
+    except AttributeError:
+        # before gdb 11.x: AttributeError: 'gdb.Inferior' object has no attribute 'connection'
+        res = gdb.execute("maintenance print target-stack", to_string=True)
+        return "core" in res
+
+
 # Removed is_remote_same_host.
 # It can detect that gdb connects to a process in the same host.
 # However, it cannot detect that traffic is being redirected to another host.
@@ -308,50 +322,11 @@ def is_smp_enabled():
         return False
 
 
-@Cache.cache_until_next
+@Cache.cache_until_next(per_cpu=True)
 def is_in_smm():
-    """Determine whether the CPU is currently in System Management Mode (SMM).
-
-    SMM entry code (SMBASE + 0x8000 in the legacy DOS layout) lies inside the
-    SMRAM physical window, which is otherwise inaccessible to instruction
-    fetch. Thus ``$pc in SMRAM`` is a reliable in-SMM indicator on QEMU.
-    Cached ``until_next`` so it ticks over as the user steps/continues.
-    """
-    from gef.core.qemu import QemuMonitor
-    smram = QemuMonitor.get_smram_map()
-    if smram is None:
-        return False
-    smram_base, smram_size = smram
-    pc = get_register("$pc")
-    if pc is None:
-        return False
-    return smram_base <= pc < smram_base + smram_size
-
-
-@Cache.cache_until_next
-def scan_smm_token_in_monitor():
-    """Scan ``monitor info registers`` for an SMM indicator token.
-
-    Returns ``(bool, token_or_None)``. QEMU's x86 dump prints a state line
-    like ``EIP=... EFL=... SMM=N HLT=...`` where ``SMM=0`` means inactive and
-    ``SMM=1`` means active. We trigger only on a nonzero ``SMM=`` value (plus
-    two defensive substrings for QEMU-version variation). Absence of a token
-    does not prove non-SMM state.
-    """
-    if not is_qemu_system() or not is_x86():
-        return False, None
-    try:
-        res = gdb.execute("monitor info registers", to_string=True)
-    except gdb.error:
-        return False, None
-    low = res.lower()
-    m = re.search(r"\bsmm=([0-9]+)\b", low)
-    if m and int(m.group(1)) != 0:
-        return True, "SMM={}".format(int(m.group(1)))
-    for needle in ("in smm", "smmode"):
-        if needle in low:
-            return True, needle
-    return False, None
+    """Return whether the current QEMU x86 CPU is in System Management Mode."""
+    from gef.core.qemu import SystemManagementMemory
+    return SystemManagementMemory.get_smm_status()["state"] is True
 
 
 def is_alive():
@@ -409,6 +384,11 @@ def is_x86_64():
 def is_x86_32():
     """Architecture determination function for x86-32."""
     return runtime.current_arch and runtime.current_arch.arch == "X86" and runtime.current_arch.mode == "32"
+
+
+def is_x86():
+    """Architecture determination function for x86-32 or x86-64 or x86_16."""
+    return is_x86_32() or is_x86_64() or is_x86_16()
 
 
 def is_x86_16():
@@ -561,6 +541,55 @@ def is_csky():
     return runtime.current_arch and runtime.current_arch.arch == "CSKY"
 
 
+GDB_MODE_CHECKERS = {
+    "pin": is_pin,
+    "qemu-system": is_qemu_system,
+    "qemu-user": is_qemu_user,
+    "vmware": is_vmware,
+    "kgdb": is_kgdb,
+    "kdb": is_kdb,
+    "core": is_core_file,
+    "qiling": is_qiling,
+    "rr": is_rr,
+    "wine": is_wine,
+}
+
+
+ARCH_CHECKERS = {
+    "x86_32": is_x86_32,
+    "x86_64": is_x86_64,
+    "x86_16": is_x86_16,
+    "ARM32": is_arm32,
+    "ARM32M": is_arm32_cortex_m,
+    "ARM64": is_arm64,
+    "MIPS32": is_mips32,
+    "MIPS64": is_mips64,
+    "MIPSN32": is_mipsn32,
+    "PPC32": is_ppc32,
+    "PPC64": is_ppc64,
+    "SPARC32": is_sparc32,
+    "SPARC32PLUS": is_sparc32plus,
+    "SPARC64": is_sparc64,
+    "RISCV32": is_riscv32,
+    "RISCV64": is_riscv64,
+    "S390X": is_s390x,
+    "SH4": is_sh4,
+    "M68K": is_m68k,
+    "ALPHA": is_alpha,
+    "HPPA32": is_hppa32,
+    "HPPA64": is_hppa64,
+    "OR1K": is_or1k,
+    "NIOS2": is_nios2,
+    "MICROBLAZE": is_microblaze,
+    "XTENSA": is_xtensa,
+    "CRIS": is_cris,
+    "LOONGARCH64": is_loongarch64,
+    "ARC32": is_arc32,
+    "ARC64": is_arc64,
+    "CSKY": is_csky,
+}
+
+
 @Cache.cache_until_next
 def get_arch():
     """Return the binary's architecture."""
@@ -600,12 +629,65 @@ def get_arch():
     return arch_str
 
 
+def get_arch_context():
+    """Return the selected inferior and its GDB architecture name.
+    `current_arch` must be resolved again when this value changes (e.g., `inferior N`, or reconnecting to another target)."""
+    try:
+        inferior = gdb.selected_inferior()
+    except Exception:
+        return None
+    if not hasattr(inferior, "architecture"): # ~gdb 10.1
+        return inferior.num, None
+    try:
+        return inferior.num, inferior.architecture().name()
+    except gdb.error:
+        return inferior.num, None
+
+
+@Cache.cache_until_next(per_cpu=True)
+def is_in_kpti_transition():
+    """Return whether arm64 is stopped while switching TTBR1 for KPTI."""
+    from gef.core.kernel import Ksym
+    from gef.core.utils import slice_unpack
+    if not is_arm64() or not is_in_kernel():
+        return False
+
+    pc = runtime.current_arch.pc
+    sp = runtime.current_arch.sp
+    instruction_length = runtime.current_arch.instruction_length
+    if pc is None or sp is None:
+        return False
+
+    # `msr ttbr1_el1, x0` is encoded as 0xd518_2020. The source register xN is
+    # encoded in the low 5 bits, so mask them out when matching the instruction.
+    code = read_memory(pc - 8 * instruction_length, 17 * instruction_length, safe=True)
+    if code is None:
+        return False
+    if not any(insn & 0xffff_ffe0 == 0xd518_2020 for insn in slice_unpack(code, 4)):
+        return False
+
+    if not is_valid_addr(sp):
+        return True
+
+    # If kallsyms was already resolved, also check a known regular kernel mapping.
+    ret = Ksym.peek()
+    if ret is None:
+        return False
+    kallsyms, kallsyms_map = ret
+    known_addresses = kallsyms_map.get("_stext", [])
+    if not known_addresses:
+        return False
+    return not is_valid_addr(known_addresses[0])
+
+
 def set_arch(arch_str=None):
     """Set the current architecture.
     If an arch is explicitly specified, use that one, otherwise try to parse it out of the current target.
     If that fails, and default is specified, select and set that arch.
     Return the selected arch, or raise an OSError."""
     from gef.arch.mips import MIPS64
+
+    runtime.current_arch_context = get_arch_context()
 
     # Determined from the specified arch string
     if arch_str:
@@ -821,9 +903,53 @@ class Pid:
         ptid = gdb.selected_thread().ptid
         return ptid[1] or ptid[2]
 
+    @staticmethod
+    def get_pid_from_thread_ids(tids, filepath):
+        """Return the PID of the only process that has all `tids` as its thread IDs, or None."""
+        candidate = []
+        for process in Pid.get_all_process():
+            if not process["filepath"].startswith(filepath):
+                continue
+            pid = process["pid"]
+            own_tids = set()
+            try:
+                for tid in os.listdir("/proc/{:d}/task".format(pid)):
+                    status = open("/proc/{:d}/task/{:s}/status".format(pid, tid)).read()
+                    m = re.search(r"^NSpid:\s+(.+)$", status, re.MULTILINE)
+                    own_tids.add(int(m.group(1).split()[-1]) if m else int(tid))
+            except (FileNotFoundError, ProcessLookupError, OSError):
+                continue
+            if tids <= own_tids:
+                candidate.append(pid)
+        if len(candidate) == 1:
+            return candidate[0]
+        return None
+
+    @staticmethod
+    def get_qemu_thread_ids():
+        """Return the host thread IDs that the QEMU gdbstub reports (in the PID namespace of QEMU)."""
+        if is_qemu_system():
+            try:
+                res = gdb.execute("monitor info cpus", to_string=True)
+            except gdb.error:
+                return set()
+            return {int(x) for x in re.findall(r"thread_id=(\d+)", res)}
+        return {thread.ptid[1] for thread in gdb.selected_inferior().threads() if thread.ptid[1] > 0}
+
 
 class Path:
     """A collection of utility functions that obtains a path."""
+
+    @staticmethod
+    def get_remote_filepath():
+        """Return the path on the remote target of the file currently debugged."""
+        filepath = gdb.current_progspace().filename
+        if filepath is None:
+            return None
+        for prefix in [".gnu_debugdata for target:", "target:"]:
+            if filepath.startswith(prefix):
+                return filepath[len(prefix):]
+        return filepath
 
     @staticmethod
     def append_proc_root(filepath):
@@ -904,6 +1030,25 @@ class Path:
             data = open(tmp_name, "r").read()
         os.unlink(tmp_name)
         return data
+
+    @staticmethod
+    def get_binary_map_path():
+        maps = ProcessMap.get_process_maps() or []
+        entry = (Auxv.get_auxiliary_values() or {}).get("AT_ENTRY")
+        if entry is not None:
+            for section in maps:
+                if section.page_start <= entry < section.page_end and section.path:
+                    if not section.path.startswith("[") or section.path == "[code]":
+                        return section.path
+
+        paths = [Path.get_remote_filepath(), Path.get_filepath(append_proc_root_prefix=False)]
+        if is_qemu_user():
+            paths.append("[code]")
+        for path in paths:
+            if path and any(section.path == path for section in maps):
+                return path
+        err("Could not determine the executable memory map")
+        return None
 
 
 class ProcessMap:
@@ -1569,6 +1714,12 @@ class ProcessMap:
         return None
 
     @staticmethod
+    @Cache.cache_until_next(per_inferior=True)
+    def lookup(addr):
+        """Try to find the address in the process address space. Return an Address object with caching."""
+        return Address(addr)
+
+    @staticmethod
     @Cache.cache_until_next
     def lookup_address(addr):
         """Try to find the address in the process address space. Return an Address object with caching."""
@@ -1607,3 +1758,136 @@ class ProcessMap:
         filepath = Path.get_filepath_from_info_proc()
         code_base = ProcessMap.get_section_base_address(filepath)
         return code_base
+
+    @staticmethod
+    @Cache.cache_until_next(per_inferior=True)
+    def get_process_map_index():
+        """Return sorted starts and sections, preserving the original order when regions overlap."""
+        maps = ProcessMap.get_process_maps()
+        ordered = sorted(maps, key=lambda section: section.page_start)
+        if any(first.page_end > second.page_start for first, second in zip(ordered, ordered[1:])):
+            return None, maps
+        return [section.page_start for section in ordered], ordered
+
+    @staticmethod
+    @Cache.cache_this_session(per_inferior=True, until_new_objfile=True)
+    def supports_info_proc_mappings():
+        try:
+            res = gdb.execute("info proc mappings", to_string=True)
+            return "warning" not in res and "Perms" in res
+        except gdb.error:
+            return False
+
+
+class LinuxSignal:
+    """Linux signal names and sigaction flags shared by userland and kernel commands."""
+
+    NAMES = {
+        1: "SIGHUP",
+        2: "SIGINT",
+        3: "SIGQUIT",
+        4: "SIGILL",
+        5: "SIGTRAP",
+        6: "SIGABRT",
+        7: "SIGBUS",
+        8: "SIGFPE",
+        9: "SIGKILL",
+        10: "SIGUSR1",
+        11: "SIGSEGV",
+        12: "SIGUSR2",
+        13: "SIGPIPE",
+        14: "SIGALRM",
+        15: "SIGTERM",
+        16: "SIGSTKFLT",
+        17: "SIGCHLD",
+        18: "SIGCONT",
+        19: "SIGSTOP",
+        20: "SIGTSTP",
+        21: "SIGTTIN",
+        22: "SIGTTOU",
+        23: "SIGURG",
+        24: "SIGXCPU",
+        25: "SIGXFSZ",
+        26: "SIGVTALRM",
+        27: "SIGPROF",
+        28: "SIGWINCH",
+        29: "SIGIO",
+        30: "SIGPWR",
+        31: "SIGSYS",
+        32: "SIGCANCEL",
+        33: "SIGSETXID",
+        34: "SIGRTMIN",
+        64: "SIGRTMAX",
+    }
+    for number in range(35, 50):
+        NAMES[number] = "SIGRTMIN+{:d}".format(number - 34)
+    for number in range(63, 49, -1):
+        NAMES[number] = "SIGRTMAX-{:d}".format(64 - number)
+
+    # the kernel UAPI numbers the RT signals from SIGRTMIN = 32
+    KERNEL_NAMES = {number: name for number, name in NAMES.items() if number < 32}
+    KERNEL_NAMES[32] = "SIGRTMIN"
+    for number in range(33, 49):
+        KERNEL_NAMES[number] = "SIGRTMIN+{:d}".format(number - 32)
+    for number in range(49, 65):
+        if number < 64:
+            KERNEL_NAMES[number] = "SIGRTMAX-{:d}".format(64 - number)
+        else:
+            KERNEL_NAMES[number] = "SIGRTMAX"
+
+    # the libc reserves the first RT signals for its internal use and moves its SIGRTMIN after them
+    LIBC_NAMES = {
+        "glibc": {32: "SIGCANCEL", 33: "SIGSETXID"},
+        "musl": {32: "SIGTIMER", 33: "SIGCANCEL", 34: "SIGSYNCCALL"},
+    }
+    for libc_names, rtmin in [(LIBC_NAMES["glibc"], 34), (LIBC_NAMES["musl"], 35)]:
+        libc_names[rtmin] = "SIGRTMIN"
+        for number in range(rtmin + 1, 50):
+            libc_names[number] = "SIGRTMIN+{:d}".format(number - rtmin)
+        for number in range(50, 65):
+            if number < 64:
+                libc_names[number] = "SIGRTMAX-{:d}".format(64 - number)
+            else:
+                libc_names[number] = "SIGRTMAX"
+
+    FLAGS = (
+        (0x0000_0001, "SA_NOCLDSTOP"),
+        (0x0000_0002, "SA_NOCLDWAIT"),
+        (0x0000_0004, "SA_SIGINFO"),
+        (0x0000_0400, "SA_UNSUPPORTED"),
+        (0x0000_0800, "SA_EXPOSE_TAGBITS"),
+        (0x0400_0000, "SA_RESTORER"),
+        (0x0800_0000, "SA_ONSTACK"),
+        (0x1000_0000, "SA_RESTART"),
+        (0x2000_0000, "SA_INTERRUPT"),
+        (0x4000_0000, "SA_NODEFER"),
+        (0x8000_0000, "SA_RESETHAND"),
+    )
+
+    # the flags that only the kernel sees
+    KERNEL_FLAGS = (
+        (0x0080_0000, "SA_IMMUTABLE"),
+    )
+
+    @classmethod
+    def format_flags(cls, flags, extra=()):
+        from gef.core.utils import GefUtil
+        names, unknown = GefUtil.flags_to_names(flags, cls.FLAGS + tuple(extra))
+        if unknown:
+            names.append("{:#x}".format(unknown))
+        if names:
+            return "|".join(names)
+        return "-"
+
+    @classmethod
+    def format_mask(cls, mask, names=None, compact=False):
+        if names is None:
+            names = cls.NAMES
+        if compact and bin(mask & 0xffff_ffff_ffff_ffff).count("1") > 32:
+            # a mask made by sigfillset() is shown by the signals it lacks
+            return "all except " + (cls.format_mask(~mask & 0xffff_ffff_ffff_ffff, names) if ~mask & 0xffff_ffff_ffff_ffff else "none")
+        names = [names.get(number, "SIG{:d}".format(number))
+                 for number in range(1, 65) if mask & (1 << (number - 1))]
+        if names:
+            return ",".join(names)
+        return "-"

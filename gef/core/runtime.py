@@ -94,11 +94,13 @@ class ArchRegistry:
 
 
 current_arch = None
+current_arch_context = None
 missing_modules: dict = {}
 # command *instantiation* failures keyed by `_cmdline_` (vs `missing_modules`,
 # which holds *module-import* failures keyed by dotted module name).
 missing_commands: dict = {}
 alias_instances: dict = {}
+registered_aliases: set = set()
 
 
 def get_current_arch():

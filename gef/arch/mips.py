@@ -220,6 +220,12 @@ class MIPS(Architecture):
     def encode_cookie(self, value, cookie):
         return value
 
+    def decode_cookie_legacy(self, value, cookie):
+        return value
+
+    def encode_cookie_legacy(self, value, cookie):
+        return value
+
 
 class MIPS64(MIPS):
     """GEF representation of MIPS-64 architecture."""

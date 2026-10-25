@@ -12,6 +12,7 @@ import re
 import gdb
 
 from gef.commands.base import (
+    ContextManager,
     BufferingOutput,
     GenericCommand,
     exclude_specific_gdb_mode,
@@ -143,6 +144,29 @@ class HeapBaseCommand(GenericCommand):
             return None
 
     @staticmethod
+    def heap_base_from_noncontiguous_main_arena():
+        # If brk fails (e.g., memory tagging on ARM64, some qemu-user runs), glibc allocates the main heap
+        # with mmap and sets NONCONTIGUOUS_BIT. Then the heap is not in `[heap]`, so use the mapping of top.
+        if get_libc_version(silent=True) is None:
+            return None
+
+        try:
+            main_arena_addr = GlibcHeap.search_for_main_arena()
+        except OSError:
+            return None
+        if main_arena_addr is None:
+            return None
+
+        main_arena = GlibcHeap.MallocStateStruct(main_arena_addr)
+        if (main_arena.flags & 2) == 0: # NONCONTIGUOUS_BIT
+            return None
+
+        sect = ProcessMap.process_lookup_address(main_arena.top)
+        if sect is None or sect.path == "[heap]":
+            return None
+        return sect.page_start
+
+    @staticmethod
     def heap_base_from_info_proc_map(force_heuristic=False):
         # For non-static binaries, this is mostly sufficient.
         if force_heuristic:
@@ -181,7 +205,8 @@ class HeapBaseCommand(GenericCommand):
         # and can be used to find the starting address of the heap.
         # This path is useful for old qemu-user emulation, etc.
 
-        if get_libc_version() < (2, 26):
+        libc_version = get_libc_version(silent=True)
+        if libc_version is None or libc_version < (2, 26):
             return None
 
         # In 2.42 and later, tcache_perthread_struct is not necessarily the first chunk,
@@ -189,13 +214,16 @@ class HeapBaseCommand(GenericCommand):
         # However, glibc 2.42 is used in an Ubuntu 25.10 environment, and in this environment qemu-user is 10.1.
         # This version of qemu-user can obtain the exact heap base address via `info proc map`,
         # so the heuristic method should not be necessary.
-        if get_libc_version() >= (2, 42):
+        if libc_version >= (2, 42):
             return None
 
         if not runtime.current_arch.tls_supported:
             return None
 
-        main_arena_addr = GlibcHeap.search_for_main_arena()
+        try:
+            main_arena_addr = GlibcHeap.search_for_main_arena()
+        except OSError:
+            return None
         if main_arena_addr is None:
             return None
 
@@ -214,7 +242,13 @@ class HeapBaseCommand(GenericCommand):
     def heap_base_from_mp():
         # However, in the case of qemu-user runs static binary, the heapbase cannot be obtained even with
         # `info proc map`, and this way may be necessary.
-        main_arena_addr = GlibcHeap.search_for_main_arena()
+        if get_libc_version(silent=True) is None:
+            return None
+
+        try:
+            main_arena_addr = GlibcHeap.search_for_main_arena()
+        except OSError:
+            return None
         if main_arena_addr is None:
             return None
 
@@ -265,13 +299,17 @@ class HeapBaseCommand(GenericCommand):
         return None
 
     @staticmethod
-    @Cache.cache_this_session_skip_None_cache
+    @Cache.cache_this_session(cache_None=False, per_inferior=True, until_new_objfile=True)
     def heap_base(force_heuristic=False):
-        heap_base = getattr(HeapBaseCommand, "heap_base_user_specific", None)
+        heap_base = GefUtil.get_user_base("heapbase")
         if is_valid_addr(heap_base):
             return heap_base
 
         heap_base = HeapBaseCommand.heap_base_from_symbol(force_heuristic)
+        if is_valid_addr(heap_base):
+            return heap_base
+
+        heap_base = HeapBaseCommand.heap_base_from_noncontiguous_main_arena()
         if is_valid_addr(heap_base):
             return heap_base
 
@@ -295,12 +333,12 @@ class HeapBaseCommand(GenericCommand):
     def do_invoke(self, args):
         # user specific
         if args.set is not None:
-            HeapBaseCommand.heap_base_user_specific = args.set
+            GefUtil.set_user_base("heapbase", args.set)
             Cache.reset_gef_caches(all=True)
 
         if args.reset:
-            if hasattr(HeapBaseCommand, "heap_base_user_specific"):
-                delattr(HeapBaseCommand, "heap_base_user_specific")
+            GefUtil.set_user_base("heapbase", None)
+            Cache.reset_gef_caches(all=True)
 
         # auto estimation
         heap_base = HeapBaseCommand.heap_base()
@@ -310,9 +348,10 @@ class HeapBaseCommand(GenericCommand):
 
         # print
         self.quiet_print(titlify("Heap base"))
-        gdb.execute(f"set $heapbase = {heap_base:#x}")
+        gdb.set_convenience_variable("heapbase", heap_base)
         self.quiet_print(f"$heapbase = {heap_base:#x}")
         return
+
 
 
 @register_command
@@ -550,6 +589,12 @@ class TlsCommand(GenericCommand, BufferingOutput):
     ]
     _example_ = "\n".join(_example_).format(_cmdline_)
 
+    _note_ = [
+        "Under qemu-user, multi-threaded mips/mipsn32/mips64/m68k targets may produce unreliable TLS/heap results",
+        "because ExecAsm/ExecSyscall can fail after thread switches.",
+    ]
+    _note_ = "\n".join(_note_)
+
     @staticmethod
     def get_direction():
         if is_x86() or is_sparc64() or is_s390x():
@@ -559,8 +604,6 @@ class TlsCommand(GenericCommand, BufferingOutput):
         return direction
 
     def get_specific_tls(self, thread_id):
-        orig_thread = gdb.selected_thread()
-        orig_frame = gdb.selected_frame()
         threads = gdb.selected_inferior().threads()
         threads = [th for th in threads if th.num == thread_id]
 
@@ -568,19 +611,15 @@ class TlsCommand(GenericCommand, BufferingOutput):
             err("Could not find the target thread")
             return
 
-        try:
-            threads[0].switch()
-            tls = runtime.current_arch.get_tls()
-        except Exception:
-            tls = None
-
-        orig_thread.switch() # revert
-        orig_frame.select()
+        with ContextManager.selected_thread():
+            try:
+                threads[0].switch()
+                tls = runtime.current_arch.get_tls()
+            except Exception:
+                tls = None
         return tls
 
     def print_all_tls(self):
-        orig_thread = gdb.selected_thread()
-        orig_frame = gdb.selected_frame()
         threads = gdb.selected_inferior().threads()
         threads = sorted(threads, key=lambda th: th.num)
 
@@ -588,19 +627,24 @@ class TlsCommand(GenericCommand, BufferingOutput):
             err("No thread is detected")
             return
 
-        for thread in threads:
-            msg = "Thread Id:{:d}".format(thread.num)
-            try:
-                thread.switch()
-            except gdb.error:
-                msg += " - Failed to switch to this thread"
-                continue
-            tls = runtime.current_arch.get_tls()
-            msg += " - {:#x}".format(tls)
-            gef_print(msg)
-
-        orig_thread.switch() # revert
-        orig_frame.select()
+        with ContextManager.selected_thread():
+            for thread in threads:
+                msg = "Thread Id:{:d}".format(thread.num)
+                try:
+                    thread.switch()
+                except (gdb.error, RuntimeError):
+                    msg += " - Failed to switch to this thread"
+                    gef_print(msg)
+                    continue
+                try:
+                    tls = runtime.current_arch.get_tls()
+                except Exception:
+                    tls = None
+                if tls is None:
+                    msg += " - Failed to get TLS address"
+                else:
+                    msg += " - {:#x}".format(tls)
+                gef_print(msg)
         return
 
     def get_varnames(self):
@@ -671,6 +715,7 @@ class TlsCommand(GenericCommand, BufferingOutput):
         return
 
 
+
 @register_command
 class FsbaseCommand(GenericCommand):
     """Display fsbase address."""
@@ -718,4 +763,3 @@ class GsbaseCommand(GenericCommand):
         if gsbase is not None:
             gef_print("$gs_base: {:#x}".format(gsbase))
         return
-
