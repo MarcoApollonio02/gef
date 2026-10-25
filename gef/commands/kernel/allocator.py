@@ -27,7 +27,7 @@ from gef.core.cache import Cache
 from gef.core.color import Color, err, gef_print, info, titlify, warn
 from gef.core.config import Config
 from gef.core.display import ProgressBar
-from gef.core.kernel import AddrMap, Kernel, KernelRBTree, Ksym
+from gef.core.kernel import AddrMap, Kernel, KernelListHead, KernelRBTree, KernelSlub, Ksym
 from gef.core.memory import (
     hexdump,
     is_double_link_list,
@@ -47,6 +47,7 @@ from gef.core.process import (
     is_64bit,
     is_arm32,
     is_arm64,
+    is_kgdb,
     is_x86,
     is_x86_64,
 )
@@ -4992,7 +4993,7 @@ class SlabContainsCommand(GenericCommand):
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("address", metavar="ADDRESS", type=AddressUtil.parse_address, help="target address.")
     parser.add_argument("-r", "--rescan", action="store_true", help="do not use cache.")
-    parser.add_argument("-v", "--verbose", action="store_true", help="enable verbose mode.")
+    parser.add_argument("--meta", action="store_true", help="display offset information.")
     parser.add_argument("-q", "--quiet", action="store_true", help="show result only.")
     _syntax_ = parser.format_help()
 
@@ -5020,98 +5021,123 @@ class SlabContainsCommand(GenericCommand):
     ]
     _note_ = "\n".join(_note_)
 
-    def initialize(self):
-        if hasattr(self, "initialized") and self.initialized:
+    @Cache.cache_this_session(cache_None=False)
+    def initialize(self, allocator):
+        if allocator == "SLAB" and Kernel.version() < "3.13":
+            return Kernel.slab().initialize()
+        if is_kgdb() and allocator in ("SLAB", "SLUB_TINY"):
+            if allocator == "SLAB":
+                resolver = Kernel.slab()
+            else:
+                resolver = Kernel.slub_tiny()
+            if not resolver.initialize():
+                return None
+            if allocator == "SLAB":
+                prefix = "page"
+            else:
+                prefix = "slab"
+            self.page_offset_slab_cache = getattr(resolver, prefix + "_offset_slab_cache")
+            self.page_offset_next = getattr(resolver, prefix + "_offset_next")
+            self.kmem_cache_offset_name = resolver.kmem_cache_offset_name
+            self.kmem_cache_offset_size = resolver.kmem_cache_offset_size
+            self.kmem_cache_offset_object_size = resolver.kmem_cache_offset_object_size
+            self.slab_virtual_enabled = False
+            if allocator == "SLAB":
+                self.page_offset_s_mem = resolver.page_offset_s_mem
+                self.kmem_cache_offset_gfporder = resolver.kmem_cache_offset_gfporder
+                self.kmem_cache_offset_num = resolver.kmem_cache_offset_num
+            else:
+                self.kmem_cache_offset_red_left_pad = resolver.kmem_cache_offset_red_left_pad
+                self.page_offset_inuse_objects_frozen = resolver.slab_offset_inuse_objects_frozen
             return True
-
-        cmd = {"SLUB": "slub-dump", "SLAB": "slab-dump", "SLUB_TINY": "slub-tiny-dump"}[self.allocator]
+        cmd = {"SLUB": "slub-dump", "SLAB": "slab-dump", "SLUB_TINY": "slub-tiny-dump"}[allocator]
         res = gdb.execute("{:s} --meta".format(cmd), to_string=True)
 
         r = re.search(r"offsetof\((?:page|slab), slab_cache\): (0x\S+)", res)
         if not r:
-            return False
+            return None
         self.page_offset_slab_cache = int(r.group(1), 16)
-        if self.args.verbose:
-            info("offsetof({:s}, slab_cache): {:#x}".format(Kernel.slab_page_str(), self.page_offset_slab_cache))
 
         r = re.search(r"offsetof\((?:page|slab), next\): (0x\S+)", res)
         if not r:
-            return False
+            return None
         self.page_offset_next = int(r.group(1), 16)
-        if self.args.verbose:
-            info("offsetof({:s}, next): {:#x}".format(Kernel.slab_page_str(), self.page_offset_next))
 
         r = re.search(r"offsetof\(kmem_cache, name\): (0x\S+)", res)
         if not r:
-            return False
+            return None
         self.kmem_cache_offset_name = int(r.group(1), 16)
-        if self.args.verbose:
-            info("offsetof(kmem_cache, name): {:#x}".format(self.kmem_cache_offset_name))
 
         r = re.search(r"offsetof\(kmem_cache, size\): (0x\S+)", res)
         if not r:
-            return False
+            return None
         self.kmem_cache_offset_size = int(r.group(1), 16)
-        if self.args.verbose:
-            info("offsetof(kmem_cache, size): {:#x}".format(self.kmem_cache_offset_size))
 
         r = re.search(r"offsetof\(kmem_cache, object_size\): (0x\S+)", res)
         if not r:
-            return False
+            return None
         self.kmem_cache_offset_object_size = int(r.group(1), 16)
-        if self.args.verbose:
-            info("offsetof(kmem_cache, object_size): {:#x}".format(self.kmem_cache_offset_object_size))
 
         # for aligned check
-        if self.allocator in ["SLUB", "SLUB_TINY"]:
+        if allocator in ["SLUB", "SLUB_TINY"]:
             r = re.search(r"offsetof\(kmem_cache, red_left_pad\): (0x\S+)", res)
             if not r:
-                return False
+                return None
             self.kmem_cache_offset_red_left_pad = int(r.group(1), 16)
-            if self.args.verbose:
-                info("offsetof(kmem_cache, red_left_pad): {:#x}".format(self.kmem_cache_offset_red_left_pad))
 
-        if self.allocator == "SLAB":
+        if allocator == "SLAB":
             r = re.search(r"offsetof\((?:page|slab), s_mem\): (0x\S+)", res)
             if not r:
-                return False
+                return None
             self.page_offset_s_mem = int(r.group(1), 16)
-            if self.args.verbose:
-                info("offsetof({:s}, s_mem): {:#x}".format(Kernel.slab_page_str(), self.page_offset_s_mem))
 
         # for slab-virtual
+        self.slab_virtual_enabled = False
         if is_x86_64():
             r = re.search(r"offsetof\(kmem_cache, freed_slabs_min\): (0x\S+)", res)
             if r:
                 self.slab_virtual_enabled = True
-                if self.args.verbose:
-                    info("offsetof(kmem_cache, freed_slabs_min): {:#x}".format(int(r.group(1), 16)))
-            else:
-                self.slab_virtual_enabled = False
-        else:
-            self.slab_virtual_enabled = False
+                self.kmem_cache_offset_freed_slabs_min = int(r.group(1), 16)
 
         # for num of pages
-        if self.allocator in ["SLUB", "SLUB_TINY"]:
+        if allocator in ["SLUB", "SLUB_TINY"]:
             r = re.search(r"offsetof\((?:page|slab), inuse_objects_frozen\): (0x\S+)", res)
             if not r:
-                return False
+                return None
             self.page_offset_inuse_objects_frozen = int(r.group(1), 16)
-            if self.args.verbose:
-                info("offsetof({:s}, inuse_objects_frozen): {:#x}".format(
-                    Kernel.slab_page_str(), self.page_offset_inuse_objects_frozen,
-                ))
 
-        elif self.allocator == "SLAB":
+        elif allocator == "SLAB":
             r = re.search(r"offsetof\(kmem_cache, gfporder\): (0x\S+)", res)
             if not r:
-                return False
+                return None
             self.kmem_cache_offset_gfporder = int(r.group(1), 16)
-            if self.args.verbose:
-                info("offsetof(kmem_cache, gfporder): {:#x}".format(self.kmem_cache_offset_gfporder))
-
-        self.initialized = True
+            r = re.search(r"offsetof\(kmem_cache, num\): (0x\S+)", res)
+            if not r:
+                return None
+            self.kmem_cache_offset_num = int(r.group(1), 16)
         return True
+
+    def print_meta(self):
+        if self.allocator == "SLAB" and Kernel.version() < "3.13":
+            for func, line in Kernel.export_meta(self, Kernel.slab().meta):
+                func(line)
+            return
+        info("offsetof({:s}, slab_cache): {:#x}".format(Kernel.slab_page_str(), self.page_offset_slab_cache))
+        info("offsetof({:s}, next): {:#x}".format(Kernel.slab_page_str(), self.page_offset_next))
+        info("offsetof(kmem_cache, name): {:#x}".format(self.kmem_cache_offset_name))
+        info("offsetof(kmem_cache, size): {:#x}".format(self.kmem_cache_offset_size))
+        info("offsetof(kmem_cache, object_size): {:#x}".format(self.kmem_cache_offset_object_size))
+        if self.allocator in ["SLUB", "SLUB_TINY"]:
+            info("offsetof(kmem_cache, red_left_pad): {:#x}".format(self.kmem_cache_offset_red_left_pad))
+        if self.allocator == "SLAB":
+            info("offsetof({:s}, s_mem): {:#x}".format(Kernel.slab_page_str(), self.page_offset_s_mem))
+        if self.slab_virtual_enabled:
+            info("offsetof(kmem_cache, freed_slabs_min): {:#x}".format(self.kmem_cache_offset_freed_slabs_min))
+        if self.allocator in ["SLUB", "SLUB_TINY"]:
+            info("offsetof({:s}, inuse_objects_frozen): {:#x}".format(Kernel.slab_page_str(), self.page_offset_inuse_objects_frozen))
+        elif self.allocator == "SLAB":
+            info("offsetof(kmem_cache, gfporder): {:#x}".format(self.kmem_cache_offset_gfporder))
+        return
 
     def virt2page_wrapper(self, vaddr):
         if self.slab_virtual_enabled:
@@ -5125,152 +5151,174 @@ class SlabContainsCommand(GenericCommand):
             return int(r.group(1), 16)
         return None
 
-    def check_slab_dump(self, target_addr, slab_cache_name):
+    @staticmethod
+    def is_freed(object_base, slab_cache_name):
+        """Return True if `object_base` is in a freelist of the cache, or None if the cache cannot be parsed."""
+        allocator, kmem_caches = Kernel.get_slab_caches([slab_cache_name])
+        if not kmem_caches:
+            return None
+        kmem_cache = kmem_caches[0]
+        freed_addresses = []
+        if allocator == "SLUB":
+            for kmem_cache_cpu in kmem_cache.get("kmem_cache_cpu", {}).values():
+                freed_addresses += kmem_cache_cpu["freelist"]
+                freed_addresses += kmem_cache_cpu.get("active_page", {}).get("freelist", [])
+                for page in kmem_cache_cpu.get("partial_pages", []):
+                    freed_addresses += page.get("freelist", [])
+            for page_list in kmem_cache.get("nodes_partial", []) + kmem_cache.get("nodes_full", []):
+                for page in page_list:
+                    freed_addresses += page.get("freelist", [])
+            freed_addresses += KernelSlub.get_sheaf_objects(kmem_cache)
+        elif allocator == "SLUB_TINY":
+            for page_list in kmem_cache["nodes"]:
+                for page in page_list:
+                    freed_addresses += page.get("freelist", [])
+        elif allocator == "SLAB":
+            freed_addresses += kmem_cache["array_cache"]["freelist_all"]
+            for slabs_list in kmem_cache["nodes"]:
+                for page_list in slabs_list.values():
+                    for page in page_list:
+                        freed_addresses += [page["s_mem"] + kmem_cache["size"] * idx for idx in page.get("freelist", [])]
+        return object_base in freed_addresses
 
-        def get_freed_addresses(res):
-            freed_addresses = []
-            res = Color.remove_color(res)
-            in_freelist_section = 0
-            for line in res.splitlines():
-                line = line.rstrip()
-                if not in_freelist_section:
-                    if re.match(r"^        (freelist|objects:)", line):
-                        in_freelist_section = 1
-                    elif re.match(r"^        entry:", line):
-                        in_freelist_section = 2
-                elif in_freelist_section == 1:
-                    if not line.startswith("                  0x"):
-                        in_freelist_section = 0
-                elif in_freelist_section == 2:
-                    if not line.startswith("               0x"):
-                        in_freelist_section = 0
-                if in_freelist_section == 1:
-                    r = re.search(r"0x\S+ (0x\S+)", line)
-                    if r:
-                        freed_chunk = int(r.group(1), 16)
-                        freed_addresses.append(freed_chunk)
-                elif in_freelist_section == 2:
-                    r = re.search(r"(0x\S+)", line)
-                    if r:
-                        freed_chunk = int(r.group(1), 16)
-                        freed_addresses.append(freed_chunk)
-            return freed_addresses
+    def get_slab_object(self, address):
+        """Return the dict of the slab object that contains `address`.
+        `error` is set if it is not resolved, and the other members are set as far as they are resolved."""
+        pagesize = KernelAddressHeuristicFinder.consts().PAGE_SIZE
+        allocator = Kernel.get_slab_type()
+        if allocator == "SLAB" and Kernel.version() < "3.13":
+            return Kernel.slab().get_legacy_slab_object(address)
+        obj = {"pages": [], "error": None}
+        if not self.initialize(allocator):
+            obj["error"] = "Failed to initialize"
+            return obj
 
-        if self.allocator == "SLUB":
-            res = gdb.execute("slub-dump --node --no-pager --quiet {:s}".format(slab_cache_name), to_string=True)
-        elif self.allocator == "SLUB_TINY":
-            res = gdb.execute("slub-tiny-dump --no-pager --quiet {:s}".format(slab_cache_name), to_string=True)
-        elif self.allocator == "SLAB":
-            res = gdb.execute("slab-dump --no-pager --quiet {:s}".format(slab_cache_name), to_string=True)
-        else:
-            return
-
-        freed_addresses = get_freed_addresses(res)
-
-        freed_address_color = Config.get_gef_setting("theme.heap_chunk_address_freed")
-        used_address_color = Config.get_gef_setting("theme.heap_chunk_address_used")
-        if target_addr in freed_addresses:
-            self.quiet_print("status: {:s} (found object base in freelist)".format(
-                Color.colorify("freed", freed_address_color),
-            ))
-        else:
-            self.quiet_print("status: {:s} (not found object base in freelist)".format(
-                Color.colorify("in-use", used_address_color),
-            ))
-        return
-
-    def slab_contains(self):
-        current = self.args.address & get_pagesize_mask_high()
-        chunk_label_color = Config.get_gef_setting("theme.heap_chunk_label")
-        chunk_size_color = Config.get_gef_setting("theme.heap_chunk_size")
-
+        current = address & -pagesize
         try:
             while True:
                 page = self.virt2page_wrapper(current)
                 if page is None:
-                    self.quiet_err("Invalid address")
-                    return
+                    obj["error"] = "Invalid address"
+                    return obj
 
-                self.quiet_print("{:s}: {:#x}".format(Kernel.slab_page_str(), page))
+                obj["pages"].append(page)
 
                 page_next = read_int_from_memory(page + self.page_offset_next)
                 if page_next & 1:
-                    current -= get_pagesize()
+                    current -= pagesize
                     continue
 
                 kmem_cache = read_int_from_memory(page + self.page_offset_slab_cache)
                 if kmem_cache == 0:
-                    self.quiet_err("This address is not managed by slab (kmem_cache=0)")
-                    return
+                    obj["error"] = "This address is not managed by slab (kmem_cache=0)"
+                    return obj
 
-                if (kmem_cache & get_pagesize_mask_high()) == 0xdead_0000_0000_0000:
-                    current -= get_pagesize()
+                if (kmem_cache & -pagesize) == 0xdead_0000_0000_0000:
+                    current -= pagesize
                     continue
 
                 if kmem_cache & 1:
-                    current -= get_pagesize()
+                    current -= pagesize
                     continue
 
-                self.quiet_print("kmem_cache: {:#x}".format(kmem_cache))
-                self.quiet_print("base: {:#x}".format(current))
+                obj["kmem_cache"] = kmem_cache
+                obj["base"] = current
                 break
         except (gdb.MemoryError, ZeroDivisionError):
-            self.quiet_err("Memory read error")
-            return
+            obj["error"] = "Memory read error"
+            return obj
 
         try:
             slab_cache_name_ptr = read_int_from_memory(kmem_cache + self.kmem_cache_offset_name)
             slab_cache_name = read_cstring_from_memory(slab_cache_name_ptr)
             if slab_cache_name is None:
-                self.quiet_err("This address is not managed by slab (slab_cache_name=\"\")")
-                return
+                obj["error"] = 'This address is not managed by slab (slab_cache_name="")'
+                return obj
 
             slab_cache_size = read_int32_from_memory(kmem_cache + self.kmem_cache_offset_size)
             slab_cache_object_size = read_int32_from_memory(kmem_cache + self.kmem_cache_offset_object_size)
 
-            if self.allocator in ["SLUB", "SLUB_TINY"]:
-                red_left_pad = read_int_from_memory(kmem_cache + self.kmem_cache_offset_red_left_pad)
+            if allocator in ["SLUB", "SLUB_TINY"]:
+                red_left_pad = read_int32_from_memory(kmem_cache + self.kmem_cache_offset_red_left_pad)
                 color_offset = 0
                 x = read_int_from_memory(page + self.page_offset_inuse_objects_frozen)
                 objects = (x >> 16) & 0x7fff
-                num_pages = (slab_cache_size * objects + get_pagesize_mask_low()) // get_pagesize()
+                pages_needed = (slab_cache_size * objects + (pagesize - 1)) // pagesize
+                # Round the required page count up to 2^n.
+                if pages_needed:
+                    num_pages = 1 << (pages_needed - 1).bit_length()
+                else:
+                    num_pages = 0
             else:
                 red_left_pad = 0
                 s_mem = read_int_from_memory(page + self.page_offset_s_mem)
-                color_offset = s_mem & get_pagesize_mask_low()
+                color_offset = s_mem & (pagesize - 1)
                 gfporder = read_int32_from_memory(kmem_cache + self.kmem_cache_offset_gfporder)
                 num_pages = 1 << gfporder
+                objects = read_int32_from_memory(kmem_cache + self.kmem_cache_offset_num)
 
-            # `inuse` is not displayed because it is not a reliable reference value.
+            # `inuse` is not resolved because it is not a reliable reference value.
             # The value of `slab->inuse` also includes the number of chunks registered in `kmem_cache_cpu->freelist` etc.
             # However, what the user actually wants is the number of chunks that are truly in use,
             # excluding those accounted for by `kmem_cache_cpu->freelist`.
             # Accurately deriving that value is non-trivial.
-            gef_print("name: {:s}  object_size: {:s} (chunk_size: {:#x})  num_pages: {:#x}".format(
-                Color.colorify(slab_cache_name, chunk_label_color),
-                Color.colorify_hex(slab_cache_object_size, chunk_size_color),
-                slab_cache_size, num_pages,
-            ))
+            obj["name"] = slab_cache_name
+            obj["object_size"] = slab_cache_object_size
+            obj["chunk_size"] = slab_cache_size
+            obj["num_pages"] = num_pages
 
             first_object = current + red_left_pad + color_offset
-            delta = self.args.address - first_object
-
-            if delta < 0:
-                gef_print("remarks: {:s}".format(Color.redify("before first object")))
-                return
-
-            object_base = first_object + (delta // slab_cache_size) * slab_cache_size
-            object_offset = delta % slab_cache_size
-
-            self.quiet_print("object_base: {:#x}".format(object_base))
-
-            if object_offset != 0:
-                gef_print("remarks: {:s} (offset: +{:#x})".format(Color.redify("unaligned"), object_offset))
-
-            # resolve freelist and print chunk status (in-use or freed)
-            self.check_slab_dump(object_base, slab_cache_name)
+            delta = address - first_object
+            if delta < 0 or delta >= objects * slab_cache_size:
+                obj["object_base"] = None
+                obj["offset"] = None
+                if delta < 0:
+                    obj["error"] = "before first object"
+                else:
+                    obj["error"] = "after last object (slab padding)"
+            else:
+                obj["object_base"] = first_object + (delta // slab_cache_size) * slab_cache_size
+                obj["offset"] = delta % slab_cache_size
         except (gdb.MemoryError, ZeroDivisionError):
-            self.quiet_err("Memory read error")
+            obj["error"] = "Memory read error"
+        return obj
+
+    def slab_contains(self):
+        chunk_label_color = Config.get("theme.heap_chunk_label")
+        chunk_size_color = Config.get("theme.heap_chunk_size")
+
+        obj = self.get_slab_object(self.args.address)
+        for page in obj["pages"]:
+            self.quiet_print("{:s}: {:#x}".format(Kernel.slab_page_str(), page))
+        if "kmem_cache" in obj:
+            self.quiet_print("kmem_cache: {:#x}".format(obj["kmem_cache"]))
+            self.quiet_print("base: {:#x}".format(obj["base"]))
+        if "name" in obj:
+            gef_print("name: {:s}  object_size: {:s} (chunk_size: {:#x})  num_pages: {:#x}".format(
+                Color.colorify(obj["name"], chunk_label_color),
+                Color.colorify_hex(obj["object_size"], chunk_size_color),
+                obj["chunk_size"], obj["num_pages"],
+            ))
+            if obj["object_base"] is None:
+                gef_print("remarks: {:s}".format(Color.redify(obj["error"])))
+                return
+            self.quiet_print("object_base: {:#x}".format(obj["object_base"]))
+            if obj["offset"] != 0:
+                gef_print("remarks: {:s} (offset: +{:#x})".format(Color.redify("unaligned"), obj["offset"]))
+        if obj["error"]:
+            self.quiet_err(obj["error"])
+            return
+
+        # resolve freelist and print chunk status (in-use or freed)
+        freed = self.is_freed(obj["object_base"], obj["name"])
+        if freed:
+            self.quiet_print("status: {:s} (found object base in freelist)".format(
+                Color.colorify("freed", Config.get("theme.heap_chunk_address_freed")),
+            ))
+        elif freed is not None:
+            self.quiet_print("status: {:s} (not found object base in freelist)".format(
+                Color.colorify("in-use", Config.get("theme.heap_chunk_address_used")),
+            ))
         return
 
     @parse_args
@@ -5281,26 +5329,24 @@ class SlabContainsCommand(GenericCommand):
     def do_invoke(self, args):
         self.quiet_info("Wait for memory scan")
 
-        if not hasattr(self, "initialized"):
-            self.initialized = False
-
         if args.rescan:
-            self.initialized = False
+            Cache.clear_cache_for(self.initialize)
 
-        if not hasattr(self, "allocator"):
-            self.allocator = Kernel.get_slab_type()
-
+        self.allocator = Kernel.get_slab_type()
         if self.allocator not in ["SLUB", "SLUB_TINY", "SLAB"]:
             self.quiet_err("Unsupported: SLOB, Unknown allocator")
             return
 
-        ret = self.initialize()
-        if not ret:
+        if not self.initialize(self.allocator):
             self.quiet_err("Failed to initialize")
             return
 
+        if args.meta:
+            self.print_meta()
+
         self.slab_contains()
         return
+
 
 
 @register_command
@@ -6356,7 +6402,7 @@ class VmallocDumpCommand(GenericCommand, BufferingOutput):
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("-hh", "--help-simple", action="store_true", help="show help without ASCII diagram.")
     parser.add_argument("--only-used", action="store_true", help="display only used area.")
-    parser.add_argument("--only-freed", action="store_true", help="display only freed area.")
+    parser.add_argument("--only-freed", action="store_true", help="display only free area.")
     parser.add_argument("--meta", action="store_true", help="display offset information.")
     parser.add_argument("--hexdump-used", metavar="SIZE", type=lambda x: int(x, 16), default=0,
                         help="hexdump `used chunks` if layout is resolved.")
@@ -6375,17 +6421,17 @@ class VmallocDumpCommand(GenericCommand, BufferingOutput):
     _note_ = [
         "Simplified vmalloc structure:"
         "",
-        "                           +-vmap_area--+",
-        "                           | va_start   |",
-        "(~v6.8)                    | va_end     |",
-        "+---------------------+    | ...        |",
-        "| vmap_area_list      |--->| list       |--->...",
-        "+---------------------+    | ...        |",
-        "                           | vm         |---->+-vm_struct--+",
-        "                           | ...        |     | ...        |",
-        "                           +------------+     | flags      |",
-        "                                              | ...        |",
-        "                                              +------------+",
+        "                                       +-vmap_area--+",
+        "                                       | va_start   |",
+        "                                       | va_end     |",
+        "+---------------------------------+    | ...        |",
+        "| vmap_area_list (~v6.8)          |--->| list       |--->...",
+        "| vmap_nodes[i].busy.head (v6.9~) |    | ...        |",
+        "+---------------------------------+    | vm         |---->+-vm_struct--+",
+        "                                       | ...        |     | ...        |",
+        "                                       +------------+     | flags      |",
+        "                                                          | ...        |",
+        "                                                          +------------+",
         "                           +-vmap_area--+",
         "                           | va_start   |",
         "(v5.2~)                    | va_end     |",
@@ -6393,19 +6439,22 @@ class VmallocDumpCommand(GenericCommand, BufferingOutput):
         "| free_vmap_area_list |--->| list       |--->...",
         "+---------------------+    | ...        |",
         "                           +------------+",
+        "",
+        "`unpurged` is an area freed lazily but not purged yet. It is still linked to vmap_area_list (~v5.3),",
+        "or linked to vmap_purge_list (v5.4~v5.10), purge_vmap_area_list (v5.11~v6.8) or vmap_nodes[i].lazy.head (v6.9~).",
+        "`pooled` is a purged area kept in vmap_nodes[i].pool[] for reuse (v6.9~).",
+        "`free` is an unallocated range of the vmalloc space, not a history of vfree().",
+        "--hexdump-used and --telescope-used skip VM_IOREMAP areas, since reading device registers may have side effects.",
     ]
     _note_ = "\n".join(_note_)
 
+    @Cache.cache_this_session(cache_None=False)
     def initialize(self):
-        if hasattr(self, "initialized") and self.initialized:
-            if not self.args.meta and not self.args.rescan:
-                return True
-
         """
         struct vmap_area {
             unsigned long va_start;
             unsigned long va_end;
-            unsigned long subtree_max_size; // v5.2.0~v5.2.21
+            unsigned long subtree_max_size; // v5.2~v5.3
             unsigned long flags;            // ~v5.3
             struct rb_node {
                 unsigned long __rb_parent_color;
@@ -6419,7 +6468,7 @@ class VmallocDumpCommand(GenericCommand, BufferingOutput):
                 struct llist_node purge_list;   // v5.4~v5.10
             };                                  // v5.4~
             struct llist_node purge_list; // v4.7~v5.3
-            struct list_head purge_list;  // ~v4.7
+            struct list_head purge_list;  // ~v4.6
             struct vm_struct *vm;         // ~v5.3
             unsigned long flags; // v6.3~
         };
@@ -6438,30 +6487,27 @@ class VmallocDumpCommand(GenericCommand, BufferingOutput):
             const void *caller;
             unsigned long requested_size; // v6.12~
         };
+
+        struct vmap_node { // v6.9~
+            struct vmap_pool {
+                struct list_head head;
+                unsigned long len;
+            } pool[MAX_VA_SIZE_PAGES]; // 256
+            spinlock_t pool_lock;
+            bool skip_populate;
+            struct rb_list {
+                struct rb_root root;
+                struct list_head head;
+                spinlock_t lock;
+            } busy;
+            struct rb_list lazy;
+            struct list_head purge_list;
+            struct work_struct purge_work;
+            unsigned long nr_purged;
+        };
         """
 
-        kversion = Kernel.kernel_version()
-
-        if kversion and kversion < "6.9":
-            self.vmap_area_list = KernelAddressHeuristicFinder.get_vmap_area_list()
-            if not self.vmap_area_list:
-                self.quiet_err("Could not find vmap_area_list")
-            else:
-                self.quiet_info("vmap_area_list: {:#x}".format(self.vmap_area_list))
-        else:
-            self.vmap_area_list = None
-
-        if kversion and "5.2" <= kversion:
-            self.free_vmap_area_list = KernelAddressHeuristicFinder.get_free_vmap_area_list()
-            if not self.free_vmap_area_list:
-                self.quiet_err("Could not find free_vmap_area_list")
-            else:
-                self.quiet_info("free_vmap_area_list: {:#x}".format(self.free_vmap_area_list))
-        else:
-            self.free_vmap_area_list = None
-
-        if not self.vmap_area_list and not self.free_vmap_area_list:
-            return False
+        kversion = Kernel.version()
 
         # vmap_area->list
         if kversion and "5.4" <= kversion:
@@ -6470,7 +6516,6 @@ class VmallocDumpCommand(GenericCommand, BufferingOutput):
             self.offset_list = runtime.current_arch.ptrsize * 7
         else:
             self.offset_list = runtime.current_arch.ptrsize * 6
-        self.quiet_info("offsetof(vmap_area, list): {:#x}".format(self.offset_list))
 
         # vmap_area->vm
         if kversion and "5.4" <= kversion:
@@ -6479,107 +6524,297 @@ class VmallocDumpCommand(GenericCommand, BufferingOutput):
             self.offset_vm = self.offset_list + runtime.current_arch.ptrsize * 3
         else:
             self.offset_vm = self.offset_list + runtime.current_arch.ptrsize * 4
-        self.quiet_info("offsetof(vmap_area, vm): {:#x}".format(self.offset_vm))
+
+        # vmap_area->flags (~v5.3)
+        self.offset_va_flags = self.offset_list - runtime.current_arch.ptrsize * 4
+
+        # vmap_area->purge_list (~v5.10)
+        self.offset_purge_list = self.offset_list + runtime.current_arch.ptrsize * 2
 
         # vm_struct->flags
         self.offset_flags = runtime.current_arch.ptrsize * 3
-        self.quiet_info("offsetof(vm_struct, flags): {:#x}".format(self.offset_flags))
 
-        self.initialized = True
+        self.vmap_area_lists = []
+        self.lazy_lists = []
+        self.vmap_nodes = []
+        self.sizeof_vmap_node = None
+        if kversion is None:
+            pass
+        elif kversion < "6.9":
+            x = KernelAddressHeuristicFinder.get_vmap_area_list()
+            if x:
+                self.vmap_area_lists.append(("vmap_area_list", x))
+            if "5.11" <= kversion:
+                x = KernelAddressHeuristicFinder.get_purge_vmap_area_list()
+                if x:
+                    self.lazy_lists.append(("purge_vmap_area_list", x))
+        else:
+            x = KernelAddressHeuristicFinder.get_vmap_nodes_busy_head()
+            if x:
+                self.vmap_area_lists = self.get_vmap_nodes_busy_heads(x)
+                self.lazy_lists = self.get_vmap_nodes_lazy_heads(x)
+
+        # v4.7~v5.10 link lazily freed areas to vmap_purge_list, and ~v5.3 keep them in vmap_area_list too
+        if kversion and "4.7" <= kversion < "5.11":
+            self.vmap_purge_list = KernelAddressHeuristicFinder.get_vmap_purge_list()
+        else:
+            self.vmap_purge_list = None
+
+        if kversion and "5.2" <= kversion:
+            self.free_vmap_area_list = KernelAddressHeuristicFinder.get_free_vmap_area_list()
+        else:
+            self.free_vmap_area_list = None
+
+        if not self.vmap_area_lists and not self.free_vmap_area_list:
+            return None
         return True
 
-    def parse_vmap_area_list(self, head, used):
-        if head is None or not is_valid_addr(head):
+    def get_vmap_nodes_busy_heads(self, head):
+        heads = [("vmap_nodes[0].busy.head", head)]
+
+        # vmap_nodes[0] starts at the pool array, and `busy` is behind `pool_lock` (see get_vmap_nodes_busy_head)
+        ptrsize = runtime.current_arch.ptrsize
+        for i in range(32):
+            node = head - ptrsize * (3 * 256 + i)
+            if self.is_vmap_node(node, None):
+                break
+        else:
+            return heads
+        busy_offset = head - node
+        self.vmap_nodes = [node]
+
+        # 32-bit kernels have only one node
+        if is_32bit():
+            return heads
+
+        # sizeof(struct vmap_node) depends on spinlock_t and work_struct, so find vmap_nodes[1]
+        start = node + busy_offset + ptrsize * 2
+        data = read_memory(start, ptrsize * 130, safe=True)
+        if data is None:
+            return heads
+        data = slice_unpack(data, ptrsize)
+        for i in range(128):
+            # the first pool list of vmap_nodes[1] is empty or points to vmap_areas
+            next_node = start + ptrsize * i
+            if data[i] != next_node and (data[i] == 0 or data[i + 1] == 0 or next_node in data[i:i + 2]):
+                continue
+            if self.is_vmap_node(next_node, busy_offset):
+                break
+        else:
+            return heads
+        self.sizeof_vmap_node = next_node - node
+
+        # nr_vmap_nodes is up to 128
+        for i in range(1, 128):
+            node_i = node + self.sizeof_vmap_node * i
+            if not self.is_vmap_node(node_i, busy_offset):
+                break
+            self.vmap_nodes.append(node_i)
+            heads.append(("vmap_nodes[{:d}].busy.head".format(i), node_i + busy_offset))
+        return heads
+
+    def get_vmap_nodes_lazy_heads(self, head):
+        if not self.vmap_nodes:
             return []
 
-        seen = [head]
-        current = read_int_from_memory(head)
-        idx = 0
-        areas = []
-        while True:
-            if current in seen:
+        # `lazy` follows `busy` (struct rb_list { root; head; lock; }). The gap between pool[] and `busy.head` tells
+        # sizeof(spinlock_t) only up to ptrsize, so try both. The wrong one is `lazy.root` or `lazy.head.prev`.
+        ptrsize = runtime.current_arch.ptrsize
+        busy_offset = head - self.vmap_nodes[0]
+        gap = busy_offset - ptrsize * (3 * 256 + 1)
+        for lazy_offset in (busy_offset + ptrsize * 2 + gap, busy_offset + ptrsize * 3 + gap):
+            if is_double_link_list(self.vmap_nodes[0] + lazy_offset):
                 break
-            seen.append(current)
+        else:
+            return []
+        return [("vmap_nodes[{:d}].lazy.head".format(i), node + lazy_offset) for i, node in enumerate(self.vmap_nodes)]
 
-            vmap_area = current - self.offset_list
-            va_start = read_int_from_memory(vmap_area)
-            va_end = read_int_from_memory(vmap_area + runtime.current_arch.ptrsize)
+    def get_vmap_nodes_pool_heads(self):
+        heads = []
+        ptrsize = runtime.current_arch.ptrsize
+        for i, node in enumerate(self.vmap_nodes):
+            data = read_memory(node, ptrsize * 3 * 256, safe=True)
+            if data is None:
+                continue
+            data = slice_unpack(data, ptrsize)
+            for j in range(256):
+                head = node + ptrsize * 3 * j
+                if data[j * 3] != head:
+                    heads.append(("vmap_nodes[{:d}].pool[{:d}].head".format(i, j), head))
+        return heads
+
+    def is_vmap_node(self, node, busy_offset):
+        ptrsize = runtime.current_arch.ptrsize
+        data = read_memory(node, ptrsize * 3 * 256, safe=True)
+        if data is None:
+            return False
+        data = slice_unpack(data, ptrsize)
+
+        # pool[] lists
+        for i in range(256):
+            head = node + ptrsize * 3 * i
+            next_entry, prev_entry = data[i * 3], data[i * 3 + 1]
+            if next_entry == prev_entry == head:
+                continue
+            if head in (next_entry, prev_entry) or not is_valid_addr(next_entry) or not is_valid_addr(prev_entry):
+                return False
+
+        if busy_offset is None:
+            return True
+
+        # busy.head
+        head = node + busy_offset
+        next_entry = read_int_from_memory(head, safe=True)
+        if next_entry is None or not is_valid_addr(next_entry):
+            return False
+        return read_int_from_memory(next_entry + ptrsize, safe=True) == head
+
+    def print_meta(self):
+        kversion = Kernel.version()
+
+        if kversion is not None:
+            if self.vmap_area_lists:
+                for name, head in self.vmap_area_lists:
+                    self.quiet_info("{:s}: {:#x}".format(name, head))
+            else:
+                if kversion < "6.9":
+                    name = "vmap_area_list"
+                else:
+                    name = "vmap_nodes[0].busy.head"
+                self.quiet_err("Could not find {:s}".format(name))
+
+        if self.sizeof_vmap_node:
+            self.quiet_info("sizeof(vmap_node): {:#x}".format(self.sizeof_vmap_node))
+
+        if kversion and "4.7" <= kversion < "5.11":
+            if self.vmap_purge_list:
+                self.quiet_info("vmap_purge_list: {:#x}".format(self.vmap_purge_list))
+            else:
+                self.quiet_err("Could not find vmap_purge_list")
+
+        if kversion and "5.11" <= kversion:
+            if self.lazy_lists:
+                for name, head in self.lazy_lists:
+                    self.quiet_info("{:s}: {:#x}".format(name, head))
+            else:
+                if kversion < "6.9":
+                    name = "purge_vmap_area_list"
+                else:
+                    name = "vmap_nodes[0].lazy.head"
+                self.quiet_err("Could not find {:s}".format(name))
+
+        if kversion and "5.2" <= kversion:
+            if self.free_vmap_area_list:
+                self.quiet_info("free_vmap_area_list: {:#x}".format(self.free_vmap_area_list))
+            else:
+                self.quiet_err("Could not find free_vmap_area_list")
+
+        self.quiet_info("offsetof(vmap_area, list): {:#x}".format(self.offset_list))
+        self.quiet_info("offsetof(vmap_area, vm): {:#x}".format(self.offset_vm))
+        if kversion and kversion < "5.4":
+            self.quiet_info("offsetof(vmap_area, flags): {:#x}".format(self.offset_va_flags))
+        if kversion and kversion < "5.11":
+            self.quiet_info("offsetof(vmap_area, purge_list): {:#x}".format(self.offset_purge_list))
+        self.quiet_info("offsetof(vm_struct, flags): {:#x}".format(self.offset_flags))
+        return
+
+    def parse_vmap_purge_list(self):
+        unpurged = set()
+        if not self.vmap_purge_list:
+            return unpurged, None
+
+        node = read_int_from_memory(self.vmap_purge_list, safe=True)
+        while node:
+            vmap_area = node - self.offset_purge_list
+            if vmap_area in unpurged:
+                return unpurged, "cyclic at {:#x}".format(vmap_area)
+            unpurged.add(vmap_area)
+            node = read_int_from_memory(node, safe=True)
+        if node is None:
+            return unpurged, "unreadable at {:#x}".format(vmap_area if unpurged else self.vmap_purge_list)
+        return unpurged, None
+
+    def parse_vmap_area_list(self, head, state, unpurged=()):
+        lh = KernelListHead(head, self.offset_list)
+        areas, error = self.parse_vmap_areas(lh.iter_entries(), state, unpurged)
+        if lh.broken:
+            return areas, "{:s} at {:#x}".format(lh.broken_reason, lh.broken_at)
+        return areas, error
+
+    def parse_vmap_areas(self, vmap_areas, state, unpurged=()):
+        kversion = Kernel.version()
+
+        areas = []
+        for vmap_area in vmap_areas:
+            va_start = read_int_from_memory(vmap_area, safe=True)
+            va_end = read_int_from_memory(vmap_area + runtime.current_arch.ptrsize, safe=True)
+            if va_start is None or va_end is None:
+                return areas, "unreadable at {:#x}".format(vmap_area)
             va_size = va_end - va_start
 
-            flags = None
-            if used:
-                vm = read_int_from_memory(vmap_area + self.offset_vm)
-                if is_valid_addr(vm):
-                    flags = read_int_from_memory(vm + self.offset_flags)
-                else:
-                    flags = 0
-            areas.append([used, va_start, va_end, va_size, flags])
+            if state != "in-use":
+                areas.append([state, va_start, va_end, va_size, None])
+                continue
 
-            try:
-                current = read_int_from_memory(current)
-            except gdb.MemoryError:
-                break
+            vm = read_int_from_memory(vmap_area + self.offset_vm, safe=True)
+            if kversion and kversion < "5.4":
+                # VM_LAZY_FREE|VM_LAZY_FREEING (~v4.6) or VM_LAZY_FREE (v4.13~v5.3) marks a lazily freed area,
+                # and ~v3.9 leave VM_VM_AREA and `vm` as they are. ~v3.7 give VM_IOREMAP etc. to the early areas.
+                va_flags = read_int_from_memory(vmap_area + self.offset_va_flags, safe=True) or 0
+                if vmap_area in unpurged or (va_flags & 0x3 and (vm or not va_flags & 0x4)):
+                    areas.append(["unpurged", va_start, va_end, va_size, None])
+                    continue
+                # `vm` of the vm_map_ram area is not initialized
+                if not va_flags & 0x4:
+                    vm = 0
 
-            idx += 1
-        return areas
-
-    def get_flags(self, flags_value):
-        flags_dic = {
-            0x0000_0001: "VM_IOREMAP",
-            0x0000_0002: "VM_ALLOC",
-            0x0000_0004: "VM_MAP",
-            0x0000_0008: "VM_USERMAP",
-            0x0000_0010: "VM_DMA_COHERENT",
-            0x0000_0020: "VM_UNINITIALIZED",
-            0x0000_0040: "VM_NO_GUARD",
-            0x0000_0080: "VM_KASAN",
-            0x0000_0100: "VM_FLUSH_RESET_PERMS",
-            0x0000_0200: "VM_MAP_PUT_PAGES",
-        }
-        flags = []
-        for k, v in flags_dic.items():
-            if flags_value & k:
-                flags.append(v)
-        return "|".join(flags)
+            if is_valid_addr(vm):
+                flags = read_int_from_memory(vm + self.offset_flags, safe=True)
+            else:
+                flags = 0
+            areas.append(["in-use", va_start, va_end, va_size, flags])
+        return areas, None
 
     def dump_areas(self, areas):
         from gef.commands.debugging.context import DereferenceCommand
-        fmt = "{:4s} {:6s} {:37s} {:18s} {:s}"
+        fmt = "{:4s} {:8s} {:37s} {:18s} {:s}"
         legend = ["#", "state", "virtual address", "size", "flags"]
         self.out.append(GefUtil.make_legend(fmt.format(*legend)))
 
-        used_address_color = Config.get_gef_setting("theme.heap_chunk_address_used")
-        freed_address_color = Config.get_gef_setting("theme.heap_chunk_address_freed")
-        chunk_size_color = Config.get_gef_setting("theme.heap_chunk_size")
+        used_address_color = Config.get("theme.heap_chunk_address_used")
+        freed_address_color = Config.get("theme.heap_chunk_address_freed")
+        chunk_size_color = Config.get("theme.heap_chunk_size")
 
-        for idx, (used, va_start, va_end, va_size, flags) in enumerate(areas):
+        for idx, (state, va_start, va_end, va_size, flags) in enumerate(areas):
+            used = state == "in-use"
             size_str = "{:<#18x}".format(va_size)
             size_str = Color.colorify(size_str, chunk_size_color)
             virt_str = "{:#018x}-{:#018x}".format(va_start, va_end)
             if used:
                 virt_str = Color.colorify(virt_str, used_address_color)
-                state = "in-use"
-                flags_str = self.get_flags(flags)
-                flags_str = flags_str.rstrip()
-                if not flags_str:
-                    flags_str = "-"
             else:
                 virt_str = Color.colorify(virt_str, freed_address_color)
-                state = "freed"
+            if flags is None:
                 flags_str = "-"
-            self.out.append("{:<4d} {:6s} {:s} {:s} {:s}".format(idx, state, virt_str, size_str, flags_str))
+            else:
+                flags_str = "{:#x}".format(flags)
+            self.out.append("{:<4d} {:8s} {:s} {:s} {:s}".format(
+                idx, state, virt_str, size_str, flags_str,
+            ))
 
             # dump chunks
-            if self.args.hexdump_used and used:
+            # VM_IOREMAP maps device registers, whose reads may have side effects (QEMU dies reading the ARM GIC)
+            dumpable = used and va_end > va_start and not (flags or 0) & 0x1
+            if self.args.hexdump_used and dumpable:
                 try:
-                    peeked_data = read_memory(va_start, self.args.hexdump_used)
+                    peeked_data = read_memory(va_start, min(self.args.hexdump_used, va_end - va_start))
                     h = hexdump(peeked_data, 0x10, base=va_start, unit=runtime.current_arch.ptrsize)
                     self.out.append(h)
                 except Exception:
                     pass
 
-            if self.args.telescope_used and used:
-                n = self.args.telescope_used // runtime.current_arch.ptrsize
+            if self.args.telescope_used and dumpable:
+                n = min(self.args.telescope_used, va_end - va_start) // runtime.current_arch.ptrsize
                 for i in range(n):
                     try:
                         line = DereferenceCommand.pprint_dereferenced(va_start, i)
@@ -6596,33 +6831,85 @@ class VmallocDumpCommand(GenericCommand, BufferingOutput):
     def do_invoke(self, args):
         self.quiet_info("Wait for memory scan")
 
+        if args.rescan:
+            Cache.clear_cache_for(self.initialize)
+
         ret = self.initialize()
-        if ret is False:
+        if args.meta or not ret:
+            self.print_meta()
+        if not ret:
             return
 
-        if self.args.meta:
+        if args.meta:
             return
 
         self.out = []
         areas = []
+        errors = []
 
-        kversion = Kernel.kernel_version()
+        kversion = Kernel.version()
 
         # parse used list
         if not args.only_freed:
-            if kversion and kversion < "6.9":
-                areas += self.parse_vmap_area_list(self.vmap_area_list, used=True)
+            unpurged, error = self.parse_vmap_purge_list()
+            if error:
+                errors.append("vmap_purge_list: the walk stopped ({:s})".format(error))
+            elif kversion and "4.7" <= kversion < "5.4" and not self.vmap_purge_list:
+                errors.append("Could not find vmap_purge_list; lazily freed areas may be shown as in-use")
+            elif kversion and "5.4" <= kversion < "5.11" and not self.vmap_purge_list:
+                errors.append("Could not find vmap_purge_list; lazily freed areas are not shown")
+            elif kversion and "5.11" <= kversion and not self.lazy_lists:
+                if kversion < "6.9":
+                    name = "purge_vmap_area_list"
+                else:
+                    name = "vmap_nodes[0].lazy.head"
+                errors.append("Could not find {:s}; lazily freed areas are not shown".format(name))
 
-        # parse freed list
+            if not self.vmap_area_lists:
+                if kversion and kversion < "6.9":
+                    name = "vmap_area_list"
+                else:
+                    name = "vmap_nodes[0].busy.head"
+                errors.append("Could not find {:s}".format(name))
+
+            # v5.4~v5.10 link lazily freed areas only to vmap_purge_list
+            if kversion and "5.4" <= kversion < "5.11":
+                parsed, error = self.parse_vmap_areas(unpurged, "unpurged")
+                areas += parsed
+                if error:
+                    errors.append("vmap_purge_list: the walk stopped ({:s})".format(error))
+
+            lists = [(name, head, "in-use") for name, head in self.vmap_area_lists]
+            lists += [(name, head, "unpurged") for name, head in self.lazy_lists]
+            lists += [(name, head, "pooled") for name, head in self.get_vmap_nodes_pool_heads()]
+            for name, head, state in lists:
+                parsed, error = self.parse_vmap_area_list(head, state, unpurged)
+                areas += parsed
+                if error:
+                    errors.append("{:s}: the walk stopped ({:s})".format(name, error))
+
+        # parse free list
         if not args.only_used:
             if kversion and "5.2" <= kversion:
-                areas += self.parse_vmap_area_list(self.free_vmap_area_list, used=False)
+                if self.free_vmap_area_list:
+                    parsed, error = self.parse_vmap_area_list(self.free_vmap_area_list, "free")
+                    areas += parsed
+                    if error:
+                        errors.append("free_vmap_area_list: the walk stopped ({:s})".format(error))
+                else:
+                    errors.append("Could not find free_vmap_area_list")
+            elif args.only_freed:
+                errors.append("free_vmap_area_list does not exist before v5.2")
 
         areas = sorted(areas, key=lambda x:x[1])
         self.dump_areas(areas)
+        if not args.quiet:
+            for error in errors:
+                self.err_add_out(error)
 
         self.print_output()
         return
+
 
 
 @register_command

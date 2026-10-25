@@ -35,9 +35,10 @@ from gef.core.color import Color, err, info, titlify, warn
 from gef.core.config import Config
 from gef.core.instruction import Disasm, get_insn, get_insn_next
 from gef.core.display import ProgressBar
+from gef.core.http import http_get
 from gef.core.kernel import (Kernel, KernelDevice, KernelListHead, KernelMapleTree, KernelNftables,
-                             KernelRBTree, KernelRadixTree, KernelSlub, KernelTask, KernelVersion,
-                             KernelXArray, Ksym)
+                             KernelRBTree, KernelRadixTree, KernelResourceLayout, KernelSlub,
+                             KernelTask, KernelVersion, KernelXArray, Ksym)
 from gef.core.memory import (
     hexdump,
     is_ascii_string,
@@ -56,6 +57,7 @@ from gef.core.memory import (
     u64,
 )
 from gef.core.pagewalk import KernelAddressHeuristicFinder, KernelAddressHeuristicFinderUtil
+from gef.core.qemu import QemuMonitor
 from gef.core.process import (
     ProcessMap,
     get_pagesize,
@@ -102,6 +104,7 @@ class KernelModuleCommand(GenericCommand, BufferingOutput):
     parser.add_argument("--symbol-unsort", action="store_true",
                         help="print resolved symbols without sorting by address.")
     parser.add_argument("-f", "--filter", action="append", type=re.compile, default=[], help="REGEXP filter.")
+    parser.add_argument("--meta", action="store_true", help="display offset information.")
     parser.add_argument("-n", "--no-pager", action="store_true", help="do not use the pager.")
     parser.add_argument("-q", "--quiet", action="store_true", help="enable quiet mode.")
     _syntax_ = parser.format_help()
@@ -116,621 +119,43 @@ class KernelModuleCommand(GenericCommand, BufferingOutput):
         "",
         "Simplified module structure:",
         "",
-        "                   +-module------------------+",
-        "+-modules-----+    | ...                     |",
-        "| list_head   |--->| list                    |--->...",
-        "+-------------+    | name[]                  |",
-        "                   | ...                     |",
-        "                   | mem[] (v6.4~)           |",
-        "                   |     base                |",
-        "                   |     size                |",
-        "                   |     ...                 |",
-        "                   | init_layout (v4.5~v6.4) |",
-        "                   |     base                |",
-        "                   |     size                |",
-        "                   |     text_size           |",
-        "                   |     ro_size             |",
-        "                   |     ro_after_init_size  |",
-        "                   |     ...                 |",
-        "                   | module_core    (~v4.4)  |",
-        "                   | init_size      (~v4.4)  |",
-        "                   | core_size      (~v4.4)  |",
-        "                   | init_text_size (~v4.4)  |  +-->+-mod_kallsyms---+",
-        "                   | core_text_size (~v4.4)  |  |   | symtab         |",
-        "                   | ...                     |  |   | num_symtab     |",
-        "                   | kallsyms                |--+   | strtab         |",
-        "                   | ...                     |      | typetab (v5.2~)|",
-        "                   +-------------------------+      +----------------+",
+        "                   +-module-------------------------+",
+        "+-modules-----+    | ...                            |",
+        "| list_head   |--->| list                           |--->...",
+        "+-------------+    | name[]                         |",
+        "                   | ...                            |",
+        "                   | mem[] (v6.4~)                  |",
+        "                   |     base                       |",
+        "                   |     size                       |",
+        "                   |     ...                        |",
+        "                   | core_layout (v4.5~v6.4)        |",
+        "                   |     base                       |",
+        "                   |     size                       |",
+        "                   |     text_size                  |",
+        "                   |     ro_size                    |",
+        "                   |     ro_after_init_size (v4.8~) |",
+        "                   |     ...                        |",
+        "                   | module_core    (~v4.4)         |",
+        "                   | init_size      (~v4.4)         |",
+        "                   | core_size      (~v4.4)         |",
+        "                   | init_text_size (~v4.4)         |  +-->+-mod_kallsyms---+",
+        "                   | core_text_size (~v4.4)         |  |   | symtab         |",
+        "                   | ...                            |  |   | num_symtab     |",
+        "                   | kallsyms                       |--+   | strtab         |",
+        "                   | ...                            |      | typetab (v5.2~)|",
+        "                   +--------------------------------+      +----------------+",
+        "",
+        "Since v6.4, each type of mem[] (text, data, rodata, ro_after_init, init_*) is allocated separately,",
+        "so each allocated type is displayed on its own line. Before v6.4, the whole core is displayed as `core`.",
         "",
         "Notes for -a option:",
         "- You can check the added symbols with the `symbols` command.",
+        "- Symbols are applied per region of the module memory. Symbols outside them (e.g., per-cpu variables) are skipped.",
         "- Added symbols are in the format `module_name.symbol` to avoid collisions.",
         "  When used from the command line, they must be enclosed in single quotes.",
         "  e.g., `p 'virtio_net.__this_module'`",
     ]
     _note_ = "\n".join(_note_)
-
-    def get_modules_list(self, modules):
-        # use cache
-        if self.module_addrs:
-            return self.module_addrs
-
-        # slow path
-        if modules is None:
-            return None
-
-        module_addrs = []
-        current = modules
-        while True:
-            try:
-                addr = read_int_from_memory(current)
-            except gdb.MemoryError:
-                return None
-            if addr == modules:
-                break
-            module_addrs.append(addr - runtime.current_arch.ptrsize)
-            current = addr
-        return module_addrs
-
-    def get_offset_name(self, module_addrs):
-        # fast path
-        try:
-            return to_unsigned_long(gdb.parse_and_eval("&((struct module*)0).name"))
-        except gdb.error:
-            pass
-
-        # slow_path
-        for i in range(0x10):
-            offset_name = i * runtime.current_arch.ptrsize
-            valid = True
-            for module in module_addrs:
-                if not is_ascii_string(module + offset_name):
-                    valid = False
-                    break
-                s = read_cstring_from_memory(module + offset_name)
-                if len(s) < 2:
-                    valid = False
-                    break
-            if valid:
-                return offset_name
-
-        return None
-
-    def get_offset_mem(self, module_addrs): # v6.4~
-        """
-        ac3b43283923440900b4f36ca5f9f0b1ca43b70e changed the module layout information structure
-        MOD_TEXT = 0,
-        MOD_DATA,
-        MOD_RODATA,
-        MOD_RO_AFTER_INIT,
-        MOD_INIT_TEXT,
-        MOD_INIT_DATA,
-        MOD_INIT_RODATA,
-
-        struct module {
-            enum module_state state;
-            struct list_head list;
-            char name[MODULE_NAME_LEN]; // 64 - sizeof(unsigned long) bytes
-        #ifdef CONFIG_STACKTRACE_BUILD_ID
-            unsigned char build_id[BUILD_ID_SIZE_MAX]; // 20 bytes
-        #endif
-            struct module_kobject mkobj;
-            struct module_attribute *modinfo_attrs;
-            const char *version;
-            const char *srcversion;
-            struct kobject *holders_dir;
-            const struct kernel_symbol *syms;
-            const s32 *crcs;
-            unsigned int num_syms;
-        #ifdef CONFIG_ARCH_USES_CFI_TRAPS
-            s32 *kcfi_traps;
-            s32 *kcfi_traps_end;
-        #endif
-        #ifdef CONFIG_SYSFS
-            struct mutex param_lock;
-        #endif
-            struct kernel_param *kp;
-            unsigned int num_kp;
-            unsigned int num_gpl_syms;
-            const struct kernel_symbol *gpl_syms;
-            const s32 *gpl_crcs;
-            bool using_gplonly_symbols;
-        #ifdef CONFIG_MODULE_SIG
-            bool sig_ok;
-        #endif
-            bool async_probe_requested;
-            unsigned int num_exentries;
-            struct exception_table_entry *extable;
-            int (*init)(void);
-            struct module_memory mem[MOD_MEM_NUM_TYPES] __module_memory_align;    <-- here
-            struct mod_arch_specific arch;
-            unsigned long taints;
-        #ifdef CONFIG_GENERIC_BUG
-            unsigned num_bugs;
-            struct list_head bug_list;
-            struct bug_entry *bug_table;
-        #endif
-        #ifdef CONFIG_KALLSYMS
-            struct mod_kallsyms __rcu *kallsyms;
-            struct mod_kallsyms core_kallsyms;
-            struct module_sect_attrs *sect_attrs;
-            struct module_notes_attrs *notes_attrs;
-        #endif
-        };
-
-        struct module_memory {
-            void *base;
-            void *rw_copy; // v6.13~6.14
-            bool is_rox;   // v6.13~
-            unsigned int size;
-        #ifdef CONFIG_MODULES_TREE_LOOKUP
-            struct mod_tree_node mtn; (0x38)
-        #endif
-        };
-        """
-        # fast path
-        try:
-            offset_mem = to_unsigned_long(gdb.parse_and_eval("&((struct module*)0).mem"))
-            offset_size = to_unsigned_long(gdb.parse_and_eval("&((struct module_memory*)0).size"))
-            return offset_mem, offset_mem + offset_size
-        except gdb.error:
-            pass
-
-        # slow_path
-        MOD_TEXT = 0
-        MOD_DATA = 1
-        MOD_RODATA = 2
-        MOD_RO_AFTER_INIT = 3 # noqa: F841
-        MOD_INIT_TEXT = 4 # noqa: F841
-        MOD_INIT_DATA = 5 # noqa: F841
-        MOD_INIT_RODATA = 6 # noqa: F841
-        MOD_MEM_NUM_TYPES = 7 # noqa: F841
-
-        kversion = Kernel.kernel_version()
-        if kversion < "6.13":
-            offset_size = runtime.current_arch.ptrsize # void*
-        elif "6.13" <= kversion < "6.15":
-            offset_size = runtime.current_arch.ptrsize * 2 + 4 # void*, void*, bool
-        else:
-            offset_size = runtime.current_arch.ptrsize + 4 # void*, bool
-        sizeof_module_memory_min = align_to_ptrsize(offset_size + 4)
-        sizeof_mod_tree_node = runtime.current_arch.ptrsize * 7
-        sizeof_module_memory_max = sizeof_module_memory_min + sizeof_mod_tree_node
-
-        # TODO: only handles non init module type
-        for i in range(300):
-            offset_mem = i * runtime.current_arch.ptrsize
-            for sizeof_module_memory in (sizeof_module_memory_min, sizeof_module_memory_max):
-                valid = True
-                for module in module_addrs:
-                    for mem_type in (MOD_TEXT, MOD_DATA, MOD_RODATA):
-                        mem_ptr = module + offset_mem + mem_type * sizeof_module_memory
-                        # memory access check
-                        if not is_valid_addr(mem_ptr):
-                            valid = False
-                            break
-                        # base align check
-                        cand_base = read_int_from_memory(mem_ptr)
-                        if cand_base == 0 or cand_base & 0xfff:
-                            valid = False
-                            break
-                        # size check
-                        cand_size = read_int32_from_memory(mem_ptr + offset_size)
-                        if cand_size == 0 or cand_size > 0x10_0000:
-                            valid = False
-                            break
-                if valid:
-                    return offset_mem, offset_mem + offset_size
-        return None
-
-    def get_offset_init_layout(self, module_addrs): # v4.5 ~ v6.4
-        """
-        struct module { // kernel v4.5~
-            enum module_state state;
-            struct list_head list;
-            char name[MODULE_NAME_LEN]; // 64 - sizeof(unsigned long) bytes
-        #ifdef CONFIG_STACKTRACE_BUILD_ID
-            unsigned char build_id[BUILD_ID_SIZE_MAX]; // 20 bytes
-        #endif
-            struct module_kobject mkobj;
-            struct module_attribute *modinfo_attrs;
-            const char *version;
-            const char *srcversion;
-            struct kobject *holders_dir;
-            const struct kernel_symbol *syms;
-            const s32 *crcs;
-            unsigned int num_syms;
-        #ifdef CONFIG_CFI_CLANG
-            cfi_check_fn cfi_check;
-        #endif
-        #ifdef CONFIG_SYSFS
-            struct mutex param_lock;
-        #endif
-            struct kernel_param *kp;
-            unsigned int num_kp;
-            unsigned int num_gpl_syms;
-            const struct kernel_symbol *gpl_syms;
-            const s32 *gpl_crcs;
-            bool using_gplonly_symbols;
-        #ifdef CONFIG_MODULE_SIG
-            bool sig_ok;
-        #endif
-            bool async_probe_requested;
-            unsigned int num_exentries;
-            struct exception_table_entry *extable;
-            int (*init)(void);
-            struct module_layout core_layout __module_layout_align;
-            struct module_layout init_layout;                                     <-- here
-        #ifdef CONFIG_ARCH_WANTS_MODULES_DATA_IN_VMALLOC
-            struct module_layout data_layout;
-        #endif
-            struct mod_arch_specific arch;
-            unsigned long taints;
-        #ifdef CONFIG_GENERIC_BUG
-            unsigned num_bugs;
-            struct list_head bug_list;
-            struct bug_entry *bug_table;
-        #endif
-        #ifdef CONFIG_KALLSYMS
-            struct mod_kallsyms __rcu *kallsyms;
-            struct mod_kallsyms core_kallsyms;
-            struct module_sect_attrs *sect_attrs;
-            struct module_notes_attrs *notes_attrs;
-        #endif
-            ...
-        };
-
-        struct module_layout {
-            /* The actual code + data. */
-            void *base;
-            /* Total size. */
-            unsigned int size;
-            /* The size of the executable code.  */
-            unsigned int text_size;
-            /* Size of RO section of the module (text+rodata) */
-            unsigned int ro_size;
-            /* Size of RO after init section */
-            unsigned int ro_after_init_size;
-        #ifdef CONFIG_MODULES_TREE_LOOKUP
-            struct mod_tree_node mtn;
-        #endif
-        };
-
-        [Example arm32]
-            gef> x/128xw 0x00000000bf22b084
-            0xbf22b084:     0xbf1bb044      0xc1696530      0x00006773      0x00000000
-            0xbf22b094:     0x00000000      0x00000000      0x00000000      0x00000000
-            0xbf22b0a4:     0x00000000      0x00000000      0x00000000      0x00000000
-            0xbf22b0b4:     0x00000000      0x00000000      0x00000000      0x00000000
-            0xbf22b0c4:     0x00000000      0xc1ec2d00      0xc1a11d80      0xbf1bb08c
-            0xbf22b0d4:     0xc1a11d8c      0xc1a11d80      0xc1628e38      0xc8e0b2c0
-            0xbf22b0e4:     0x00000003      0x00000007      0xbf22b080      0x00000000
-            0xbf22b0f4:     0xc8d4f380      0x00000000      0xc1e47400      0xc8f6d900
-            0xbf22b104:     0xc8f6d080      0xc8004300      0x00000000      0x00000000
-            0xbf22b114:     0x00000000      0x00000000      0x00000000      0x00000000
-            0xbf22b124:     0xbf22b124      0xbf22b124      0xbf22a990      0x00000003
-            0xbf22b134:     0x00000000      0x00000000      0x00000000      0x00000001
-            0xbf22b144:     0x00000000      0x00000000      0x00000000      0x00000000
-            0xbf22b154:     0x00000000      0xbf17e000      0x00000000      0x00000000
-            0xbf22b164:     0x00000000      0x00000000      0x00000000      0x00000000
-            0xbf22b174:     0x00000000      0x00000000      0x00000000      0xbf225000 <- init_layout.base
-            0xbf22b184:     0x00008000      0x00005000      0x00006000      0x00006000
-        """
-        # fast path
-        try:
-            return to_unsigned_long(gdb.parse_and_eval("&((struct module*)0).init_layout"))
-        except gdb.error:
-            pass
-
-        # slow_path
-        for i in range(300):
-            offset_init_layout = i * runtime.current_arch.ptrsize
-            valid = True
-            for module in module_addrs:
-                # memory access check
-                init_layout_ptr = module + offset_init_layout
-                if not is_valid_addr(init_layout_ptr):
-                    valid = False
-                    break
-                # base align check
-                cand_base = read_int_from_memory(init_layout_ptr)
-                if cand_base == 0 or cand_base & 0xfff:
-                    valid = False
-                    break
-                # size check
-                cand_size = read_int32_from_memory(init_layout_ptr + runtime.current_arch.ptrsize)
-                if cand_size == 0 or cand_size > 0x20_0000:
-                    valid = False
-                    break
-                # text_size check
-                cand_text_size = read_int32_from_memory(init_layout_ptr + runtime.current_arch.ptrsize + 4 * 1)
-                if cand_text_size == 0 or cand_text_size > 0x20_0000:
-                    valid = False
-                    break
-                # ro_size check
-                cand_ro_size = read_int32_from_memory(init_layout_ptr + runtime.current_arch.ptrsize + 4 * 2)
-                if cand_ro_size == 0 or cand_ro_size > 0x20_0000:
-                    valid = False
-                    break
-                # ro_after_init_size check
-                cand_ro_after_init_size = read_int32_from_memory(init_layout_ptr + runtime.current_arch.ptrsize + 4 * 3)
-                if cand_ro_after_init_size == 0 or cand_ro_after_init_size > 0x20_0000:
-                    valid = False
-                    break
-            if valid:
-                return offset_init_layout
-        return None
-
-    def get_offset_module_core(self, module_addrs): # ~v4.4
-        """
-        struct module { // ~v4.4
-            enum module_state state;
-            struct list_head list;
-            char name[MODULE_NAME_LEN];
-            struct module_kobject mkobj;
-            struct module_attribute *modinfo_attrs;
-            const char *version;
-            const char *srcversion;
-            struct kobject *holders_dir;
-            const struct kernel_symbol *syms;
-            const unsigned long *crcs;
-            unsigned int num_syms;
-        #ifdef CONFIG_SYSFS
-            struct mutex param_lock;
-        #endif
-            struct kernel_param *kp;
-            unsigned int num_kp;
-            unsigned int num_gpl_syms;
-            const struct kernel_symbol *gpl_syms;
-            const unsigned long *gpl_crcs;
-        #ifdef CONFIG_UNUSED_SYMBOLS
-            const struct kernel_symbol *unused_syms;
-            const unsigned long *unused_crcs;
-            unsigned int num_unused_syms;
-            unsigned int num_unused_gpl_syms;
-            const struct kernel_symbol *unused_gpl_syms;
-            const unsigned long *unused_gpl_crcs;
-        #endif
-        #ifdef CONFIG_MODULE_SIG
-            bool sig_ok;
-        #endif
-            bool async_probe_requested;
-            const struct kernel_symbol *gpl_future_syms;
-            const unsigned long *gpl_future_crcs;
-            unsigned int num_gpl_future_syms;
-            unsigned int num_exentries;
-            struct exception_table_entry *extable;
-            int (*init)(void);
-            void *module_init ____cacheline_aligned;
-            /* Here is the actual code + data, vfree'd on unload. */
-            void *module_core;                                                    <-- here
-            /* Here are the sizes of the init and core sections */
-            unsigned int init_size, core_size;
-            /* The size of the executable code in each section. */
-            unsigned int init_text_size, core_text_size;
-        #ifdef CONFIG_MODULES_TREE_LOOKUP
-            struct mod_tree_node mtn_core;
-            struct mod_tree_node mtn_init;
-        #endif
-            unsigned int init_ro_size, core_ro_size;
-            struct mod_arch_specific arch;
-            unsigned int taints;
-        #ifdef CONFIG_GENERIC_BUG
-            unsigned num_bugs;
-            struct list_head bug_list;
-            struct bug_entry *bug_table;
-        #endif
-        #ifdef CONFIG_KALLSYMS
-            struct mod_kallsyms *kallsyms;                                        <-- here
-            struct mod_kallsyms core_kallsyms;
-            struct module_sect_attrs *sect_attrs;
-            struct module_notes_attrs *notes_attrs;
-        #endif
-            ...
-        };
-        """
-        # fast path
-        try:
-            return to_unsigned_long(gdb.parse_and_eval("&((struct module*)0).module_core"))
-        except gdb.error:
-            pass
-
-        # slow_path
-        for i in range(300):
-            offset_module_core = i * runtime.current_arch.ptrsize
-            valid = True
-            for module in module_addrs:
-                module_core_ptr = module + offset_module_core
-                # memory access check
-                if not is_valid_addr(module_core_ptr):
-                    valid = False
-                    break
-                # module_core align check
-                cand_module_core = read_int_from_memory(module_core_ptr)
-                if cand_module_core == 0 or cand_module_core & 0xfff:
-                    valid = False
-                    break
-                # init_size check
-                cand_init_size = read_int32_from_memory(module_core_ptr + runtime.current_arch.ptrsize)
-                if cand_init_size > 0x10_0000:
-                    valid = False
-                    break
-                # core_size check
-                cand_core_size = read_int32_from_memory(module_core_ptr + runtime.current_arch.ptrsize + 4 * 1)
-                if cand_core_size == 0 or cand_core_size > 0x10_0000:
-                    valid = False
-                    break
-                # init_text_size check
-                cand_init_text_size = read_int32_from_memory(module_core_ptr + runtime.current_arch.ptrsize + 4 * 2)
-                if cand_init_text_size > 0x10_0000:
-                    valid = False
-                    break
-                # core_text_size check
-                cand_core_text_size = read_int32_from_memory(module_core_ptr + runtime.current_arch.ptrsize + 4 * 3)
-                if cand_core_text_size == 0 or cand_core_text_size > 0x10_0000:
-                    valid = False
-                    break
-            if valid:
-                return offset_module_core
-        return None
-
-    def get_offset_kallsyms(self, module_addrs):
-        """
-        struct mod_kallsyms {
-            Elf_Sym *symtab;
-            unsigned int num_symtab;
-            char *strtab;
-            char *typetab; // v5.2~
-        };
-        """
-        # fast path
-        try:
-            return to_unsigned_long(gdb.parse_and_eval("&((struct module*)0).kallsyms"))
-        except gdb.error:
-            pass
-
-        # slow_path
-        kversion = Kernel.kernel_version()
-        for i in range(300):
-            offset_kallsyms = i * runtime.current_arch.ptrsize
-            valid = True
-            for module in module_addrs:
-                kallsyms_ptr = module + offset_kallsyms
-                # access check
-                if not is_valid_addr(kallsyms_ptr):
-                    valid = False
-                    break
-                # kallsyms access check
-                cand_kallsyms = read_int_from_memory(kallsyms_ptr)
-                if not is_valid_addr(cand_kallsyms):
-                    valid = False
-                    break
-                # struct mod_kallsyms member access check
-                cand_symtab = read_int_from_memory(cand_kallsyms)
-                if not is_valid_addr(cand_symtab):
-                    valid = False
-                    break
-                cand_num_symtab = read_int_from_memory(cand_kallsyms + runtime.current_arch.ptrsize * 1)
-                if is_valid_addr(cand_num_symtab) or cand_num_symtab == 0:
-                    valid = False
-                    break
-                cand_strtab = read_int_from_memory(cand_kallsyms + runtime.current_arch.ptrsize * 2)
-                if not is_valid_addr(cand_strtab):
-                    valid = False
-                    break
-                if "5.2" <= kversion:
-                    cand_typetab = read_int_from_memory(cand_kallsyms + runtime.current_arch.ptrsize * 3)
-                    if not is_valid_addr(cand_typetab):
-                        valid = False
-                        break
-            if valid:
-                return offset_kallsyms
-        return None
-
-    def initialize(self):
-        if hasattr(self, "initialized"):
-            return True
-
-        kversion = Kernel.kernel_version()
-        if kversion is None:
-            self.quiet_err("Failed to resolve kernel version")
-            return False
-
-        # modules
-        self.modules = KernelAddressHeuristicFinder.get_modules()
-        if self.modules is None:
-            self.quiet_err("Could not find modules (CONFIG_MODULES may not be set)")
-            return False
-        self.quiet_info("modules: {:#x}".format(self.modules))
-
-        # modules list
-        self.module_addrs = self.get_modules_list(self.modules)
-        if self.module_addrs is None:
-            return False
-        if self.module_addrs == []:
-            self.quiet_err("Could not find any modules")
-            return False
-
-        # module->name
-        self.offset_name = self.get_offset_name(self.module_addrs)
-        if self.offset_name is None:
-            self.quiet_err("Could not find module->name[MODULE_NAME_LEN]")
-            return False
-        self.quiet_info("offsetof(module, name): {:#x}".format(self.offset_name))
-
-        # modules->{mem,mem_size,module_core}
-        if "6.4" <= kversion:
-            ret = self.get_offset_mem(self.module_addrs)
-            if ret is None:
-                self.quiet_err("Could not find module->mem")
-                return False
-            self.offset_mem, self.offset_mem_size = ret
-            self.quiet_info("offsetof(module, mem): {:#x}".format(self.offset_mem))
-            self.quiet_info("offsetof(module, mem.size): {:#x}".format(self.offset_mem_size))
-        elif "4.5" <= kversion:
-            self.offset_init_layout = self.get_offset_init_layout(self.module_addrs)
-            if self.offset_init_layout is None:
-                self.quiet_err("Could not find module->init_layout")
-                return False
-            self.quiet_info("offsetof(module, init_layout): {:#x}".format(self.offset_init_layout))
-        else: # kversion < v4.5
-            self.offset_module_core = self.get_offset_module_core(self.module_addrs)
-            if self.offset_module_core is None:
-                self.quiet_err("Could not find module->module_core")
-                return False
-            self.quiet_info("offsetof(module, module_core): {:#x}".format(self.offset_module_core))
-
-        # module->kallsyms
-        self.offset_kallsyms = self.get_offset_kallsyms(self.module_addrs)
-        if self.offset_kallsyms is None:
-            self.quiet_err("Could not find module->kallsyms")
-            return False
-        self.quiet_info("offsetof(module, kallsyms): {:#x}".format(self.offset_kallsyms))
-
-        self.initialized = True
-        return True
-
-    def parse_kallsyms(self, kallsyms):
-        kversion = Kernel.kernel_version()
-
-        symtab = read_int_from_memory(kallsyms + runtime.current_arch.ptrsize * 0)
-        sizeof_symtab_entry = 24 if is_64bit() else 16
-        num_symtab = read_int_from_memory(kallsyms + runtime.current_arch.ptrsize * 1)
-        strtab = read_int_from_memory(kallsyms + runtime.current_arch.ptrsize * 2)
-        strtab_pos = 0
-        if "5.2" <= kversion:
-            typetab = read_int_from_memory(kallsyms + runtime.current_arch.ptrsize * 3)
-
-        #gef_print("symtab: {:#x}".format(symtab))
-        #gef_print("sizeof_symtab_entry: {:#x}".format(sizeof_symtab_entry))
-        #gef_print("num_symab: {:#x}".format(num_symtab))
-        #gef_print("strtab: {:#x}".format(strtab))
-        #if "5.2" <= kversion:
-        #    gef_print("typetab: {:#x}".format(typetab))
-
-        entries = []
-        tqdm = GefUtil.get_tqdm(not self.args.quiet and not self.args.apply_symbol)
-        for i in tqdm(range(num_symtab), leave=False):
-            sym_addr = read_int_from_memory(symtab + sizeof_symtab_entry * i + runtime.current_arch.ptrsize)
-            sym_name = read_cstring_from_memory(strtab + strtab_pos)
-            strtab_pos += len(sym_name) + 1
-
-            if "5.2" <= kversion:
-                sym_type = chr(read_int8_from_memory(typetab + i))
-            elif "5.0" <= kversion:
-                # st_size
-                if is_64bit():
-                    sym_type = chr(read_int8_from_memory(symtab + sizeof_symtab_entry * i + 16))
-                else:
-                    sym_type = chr(read_int8_from_memory(symtab + sizeof_symtab_entry * i + 8))
-            else:
-                # st_info
-                if is_64bit():
-                    sym_type = chr(read_int8_from_memory(symtab + sizeof_symtab_entry * i + 4))
-                else:
-                    sym_type = chr(read_int8_from_memory(symtab + sizeof_symtab_entry * i + 12))
-            entries.append([sym_addr, sym_type, sym_name])
-        return entries
 
     def print_symbol(self, entries, symbol_unsort):
         self.out.append(titlify("module symbols"))
@@ -743,123 +168,144 @@ class KernelModuleCommand(GenericCommand, BufferingOutput):
         self.out.append(titlify(""))
         return
 
-    def apply_symbol(self, module_name, text_base, entries):
+    def apply_symbol_region(self, module_name, region_name, text_base, text_end, entries):
         # remove old file
-        from gef.commands.debugging.other import AddSymbolTemporaryCommand
-        sym_elf_path = os.path.join(GEF_TEMP_DIR, "kmod-{:s}.elf".format(module_name))
+        sym_elf_path = os.path.join(GEF_TEMP_DIR, "kmod-{:s}-{:s}.elf".format(module_name, region_name))
+        for objfile in gdb.objfiles():
+            if objfile.filename == sym_elf_path:
+                gdb.execute("remove-symbol-file {:s}".format(GefUtil.quote_gdb_argument(sym_elf_path)), to_string=True)
         if os.path.exists(sym_elf_path):
             os.unlink(sym_elf_path)
 
         # make blank ELF
         text_base &= get_pagesize_mask_high()
-        text_end = entries[-1][0]
-        blank_elf = AddSymbolTemporaryCommand.create_blank_elf(text_base, text_end)
+        blank_elf = GefUtil.create_blank_elf(text_base, text_end)
         if blank_elf is None:
             self.quiet_err("Failed to create blank ELF")
             return
 
-        # create command
-        cmd_string_arr = []
-        for sym_addr, sym_type, sym_name in entries:
-            if sym_addr < text_base:
-                continue
-
-            if sym_type in ["T", "t", "W", None]:
-                type_flag = "function"
-            else:
-                type_flag = "object"
-            if sym_type and sym_type in "abcdefghijklmnopqrstuvwxyz":
-                global_flag = "local"
-            else:
-                global_flag = "global"
-
-            # higher address needs relative
-            relative_addr = sym_addr - text_base
-            cmd_string_arr.append("--add-symbol")
-            cmd_string_arr.append("{:s}.{:s}=.text:{:#x},{:s},{:s}".format(
-                # modules often contain the same symbols, such as "__this_module".
-                # to avoid collisions, register them in the form "module_name.symbol".
-                module_name, sym_name, relative_addr, global_flag, type_flag,
-            ))
+        # modules often contain the same symbols, such as "__this_module".
+        # to avoid collisions, register them in the form "module_name.symbol".
+        symbols = [(sym_addr, sym_type, "{:s}.{:s}".format(module_name, sym_name)) for sym_addr, sym_type, sym_name in entries]
 
         # embedding symbols
-        objcopy = GefUtil.which(Config.get_gef_setting("gef.objcopy_command"))
-        processed_count = 0
-        for cmd_string_arr_sliced in slicer(cmd_string_arr, 10000 * 2):
-            subprocess.check_output([objcopy] + cmd_string_arr_sliced + [blank_elf])
-            processed_count += len(cmd_string_arr_sliced) // 2
-        self.quiet_info("{:s}: {:d} entries were processed".format(module_name, processed_count))
+        for processed_count in GefUtil.embed_symbols(blank_elf, text_base, symbols):
+            self.quiet_info("{:s} ({:s}): {:d} entries were processed".format(module_name, region_name, processed_count))
         os.rename(blank_elf, sym_elf_path)
 
         # apply
-        cmd = "add-symbol-file {!r} {:#x}".format(sym_elf_path, text_base)
+        cmd = "add-symbol-file {:s} {:#x}".format(GefUtil.quote_gdb_argument(sym_elf_path), text_base)
         self.quiet_info("Execute `{:s}`".format(cmd))
         gdb.execute(cmd, to_string=True)
+        return
+
+    def apply_symbol(self, module_name, regions, entries):
+        # the null symbol
+        entries = [entry for entry in entries if entry[0] and entry[2]]
+        if not entries:
+            self.quiet_err("No symbols")
+            return
+
+        # v6.4~ allocates each region separately, and a lower region may be placed after a higher one,
+        # so the symbols are embedded into an ELF per region
+        groups = {region_name: [] for region_name, _base, _size in regions}
+        skipped = []
+        for entry in entries:
+            sym_addr = entry[0]
+            region_name = next((name for name, base, size in regions if base <= sym_addr < base + size), None)
+            if region_name is None:
+                # the end marker of a region
+                region_name = next((name for name, base, size in regions if sym_addr == base + size), None)
+            if region_name is None:
+                skipped.append(entry)
+                continue
+            groups[region_name].append(entry)
+
+        if skipped:
+            # e.g., per-cpu variables
+            names = ", ".join(sym_name for _sym_addr, _sym_type, sym_name in skipped[:5])
+            if len(skipped) > 5:
+                names += ", ..."
+            self.quiet_warn("{:s}: {:d} symbols outside the module memory were skipped ({:s})".format(module_name, len(skipped), names))
+
+        for region_name, base, size in regions:
+            if not groups[region_name]:
+                continue
+            # `entries` is in symtab order, not sorted by address
+            text_end = max([base + size] + [entry[0] for entry in groups[region_name]])
+            self.apply_symbol_region(module_name, region_name, base, text_end, groups[region_name])
         return
 
     def parse_module(self):
         if not self.args.apply_symbol:
             if not self.args.quiet:
-                fmt = "{:<18s} {:<24s} {:<18s} {:<18s}"
-                legend = ["module", "module->name", "base", "size"]
+                fmt = "{:<18s} {:<24s} {:<18s} {:<18s} {:s}"
+                legend = ["module", "module->name", "base", "size", "type"]
                 self.out.append(GefUtil.make_legend(fmt.format(*legend)))
 
-        kversion = Kernel.kernel_version()
-        tqdm = GefUtil.get_tqdm(not self.args.quiet and not self.args.apply_symbol)
-        for module in tqdm(self.module_addrs, leave=False):
-            name_string = read_cstring_from_memory(module + self.offset_name)
-            if self.args.filter:
-                if not any(re_pattern.search(name_string) for re_pattern in self.args.filter):
-                    continue
+        progress = not self.args.quiet and not self.args.apply_symbol
+        for module in ProgressBar(self.module_addrs, disable=not progress):
+            name_string = self.kmod.get_name(module)
+            if not GefUtil.matches_regex(name_string, self.args.filter):
+                continue
 
-            if "6.4" <= kversion:
-                base = read_int_from_memory(module + self.offset_mem)
-                size = read_int32_from_memory(module + self.offset_mem_size)
-            elif "4.5" <= kversion:
-                base = read_int_from_memory(module + self.offset_init_layout)
-                size = read_int32_from_memory(module + self.offset_init_layout + runtime.current_arch.ptrsize)
-            else: # kversion < "4.5"
-                base = read_int_from_memory(module + self.offset_module_core)
-                size = read_int32_from_memory(module + self.offset_module_core + runtime.current_arch.ptrsize + 4)
+            regions = self.kmod.get_regions(module)
 
             if not self.args.apply_symbol:
-                self.out.append("{:#018x} {:<24s} {:#018x} {:#018x}".format(module, name_string, base, size))
+                for region_name, base, size in regions:
+                    self.out.append("{:#018x} {:<24s} {:#018x} {:#018x} {:s}".format(module, name_string, base, size, region_name))
 
             if self.args.resolve_symbol:
-                kallsyms = read_int_from_memory(module + self.offset_kallsyms)
-                entries = self.parse_kallsyms(kallsyms)
+                entries = self.kmod.parse_kallsyms(module, progress=progress)
                 self.print_symbol(entries, self.args.symbol_unsort)
 
             elif self.args.apply_symbol:
-                kallsyms = read_int_from_memory(module + self.offset_kallsyms)
-                entries = self.parse_kallsyms(kallsyms)
-                self.apply_symbol(name_string, base, entries)
+                entries = self.kmod.parse_kallsyms(module)
+                self.apply_symbol(name_string, regions, entries)
         return
 
     @parse_args
     @only_if_gdb_running
     @only_if_specific_gdb_mode(mode=("qemu-system", "vmware", "kgdb"))
-    @only_if_specific_arch(arch=("x86_32", "x86_64", "ARM32", "ARM64"))
+    @only_if_specific_arch(arch=("x86_32", "x86_64", "ARM32", "ARM64", "RISCV32", "RISCV64"))
     @only_if_in_kernel_or_kpti_disabled
     def do_invoke(self, args):
         self.quiet_info("Wait for memory scan")
+        self.kmod = Kernel.modules()
 
-        # initialize
-        self.module_addrs = None
-        ret = self.initialize()
+        # modules
+        ret = self.kmod.initialize()
+        if args.meta or not ret:
+            for func, line in Kernel.export_meta(self, self.kmod.meta):
+                func(line)
         if not ret:
             self.quiet_err("Failed to initialize")
             return
 
         # get module addrs
-        if not self.module_addrs:
-            self.module_addrs = self.get_modules_list(self.modules)
-        if self.module_addrs is None:
-            return
+        self.module_addrs, meta = self.kmod.get_addrs()
+        for func, line in Kernel.export_meta(self, meta):
+            func(line)
         if self.module_addrs == []:
             self.quiet_err("Could not find any modules")
             return
-        self.quiet_info("Num of modules: {:#x}".format(len(self.module_addrs)))
+        self.quiet_info("Num of modules: {:d}".format(len(self.module_addrs)))
+
+        # module->{mem,core_layout,module_core}, and module->kallsyms if needed
+        initializers = [(self.kmod.initialize_memory, "memory_meta")]
+        if args.resolve_symbol or args.apply_symbol:
+            initializers.append((self.kmod.initialize_kallsyms, "kallsyms_meta"))
+        for initializer, meta_name in initializers:
+            ret = initializer(self.module_addrs)
+            if args.meta or not ret:
+                for func, line in Kernel.export_meta(self, getattr(self.kmod, meta_name)):
+                    func(line)
+            if not ret:
+                self.quiet_err("Failed to initialize")
+                return
+
+        if args.meta:
+            return
 
         # parse modules
         self.out = []
@@ -6102,6 +5548,7 @@ class KernelPciDeviceCommand(GenericCommand, BufferingOutput):
     _category_ = "06-g. Qemu-system/KGDB Cooperation - Linux Advanced"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
+    parser.add_argument("--meta", action="store_true", help="display offset information.")
     parser.add_argument("-n", "--no-pager", action="store_true", help="do not use the pager.")
     parser.add_argument("-v", "--verbose", action="store_true", help="enable verbose mode.")
     parser.add_argument("-q", "--quiet", action="store_true", help="enable quiet mode.")
@@ -6143,24 +5590,123 @@ class KernelPciDeviceCommand(GenericCommand, BufferingOutput):
     ]
     _note_ = "\n".join(_note_)
 
-    def initialize(self):
-        from gef.core.http import http_get
-        if hasattr(self, "initialized") and self.initialized:
-            return True
+    def type_offset(self, type_name, member, fallback=None):
+        offset = GefUtil.offsetof(type_name, member)
+        if offset is None:
+            return fallback
+        return int(offset)
 
-        # pci_root_buses
+    def list_items(self, head, container_offset=0):
+        items = []
+        first = read_int_from_memory(head, safe=True)
+        previous = head
+        node = first
+        seen = set()
+        while node and node != head:
+            if not is_valid_addr(node) or node in seen:
+                self.incomplete.append("invalid or cyclic list at {:#x}".format(node))
+                break
+            seen.add(node)
+            node_previous = read_int_from_memory(node + runtime.current_arch.ptrsize, safe=True)
+            next_node = read_int_from_memory(node, safe=True)
+            if node_previous != previous or not next_node:
+                self.incomplete.append("broken list backlink at {:#x}".format(node))
+                break
+            items.append(node - container_offset)
+            previous = node
+            node = next_node
+            if len(seen) > 100000:
+                self.incomplete.append("list limit reached at {:#x}".format(head))
+                break
+        if first is None:
+            self.incomplete.append("unreadable list head at {:#x}".format(head))
+        return items
+
+    def find_name_offset(self, objects, type_offset, pattern):
+        if type_offset is not None:
+            for obj in objects:
+                name_ptr = read_int_from_memory(obj + type_offset, safe=True)
+                if name_ptr and is_valid_addr(name_ptr):
+                    name = read_cstring_from_memory(name_ptr, safe=True)
+                else:
+                    name = None
+                if name and re.fullmatch(pattern, name):
+                    return type_offset, "DWARF"
+
+        scores = {}
+        for obj in objects:
+            for i in range(128):
+                offset = runtime.current_arch.ptrsize * i
+                name_ptr = read_int_from_memory(obj + offset, safe=True)
+                if not name_ptr or not is_valid_addr(name_ptr):
+                    continue
+                name = read_cstring_from_memory(name_ptr, safe=True)
+                if name and re.fullmatch(pattern, name):
+                    scores[offset] = scores.get(offset, 0) + 1
+        if not scores:
+            return None, None
+        return max(scores, key=scores.get), "heuristic"
+
+    def get_all_buses(self, roots):
+        buses = []
+        seen = set()
+        stack = list(reversed(roots))
+        while stack:
+            bus = stack.pop()
+            if bus in seen:
+                continue
+            seen.add(bus)
+            buses.append(bus)
+            children = self.list_items(bus + self.offset_pci_bus_children, self.offset_pci_bus_node)
+            stack.extend(reversed(children))
+        return buses
+
+    def infer_resource_array(self, dev, dev_name):
+        resource_layout = KernelResourceLayout.get_type_layout()
+        type_offset = self.type_offset("struct pci_dev", "resource")
+        if resource_layout and type_offset is not None:
+            name_ptr = read_int_from_memory(dev + type_offset + resource_layout["name"], safe=True)
+            if name_ptr and read_cstring_from_memory(name_ptr, safe=True) == dev_name:
+                return type_offset, resource_layout, "DWARF"
+
+        candidates = []
+        for width in dict.fromkeys((runtime.current_arch.ptrsize, 8, 4)):
+            for has_desc in (False, True):
+                layout = KernelResourceLayout.fallback_layout(width, has_desc)
+                for i in range(1, 300):
+                    name_addr = dev + self.offset_pci_dev_dev + runtime.current_arch.ptrsize * i
+                    name_ptr = read_int_from_memory(name_addr, safe=True)
+                    if not name_ptr or not is_valid_addr(name_ptr):
+                        continue
+                    if read_cstring_from_memory(name_ptr, safe=True) != dev_name:
+                        continue
+                    base = name_addr - layout["name"]
+                    if base <= dev + self.offset_pci_dev_dev or base % runtime.current_arch.ptrsize:
+                        continue
+                    matches = 0
+                    for index in range(16):
+                        entry = base + layout["size"] * index
+                        pointer = read_int_from_memory(entry + layout["name"], safe=True)
+                        if pointer and read_cstring_from_memory(pointer, safe=True) == dev_name:
+                            matches += 1
+                    if matches >= 6:
+                        candidates.append((matches, base - dev, layout))
+        if not candidates:
+            return None, None, None
+        matches, offset, layout = max(candidates, key=lambda item: item[0])
+        layout["source"] = "heuristic"
+        return offset, layout, "heuristic"
+
+    def initialize(self):
+        self.meta = []
+        self.incomplete = []
         self.pci_root_buses = KernelAddressHeuristicFinder.get_pci_root_buses()
         if not self.pci_root_buses:
-            self.quiet_err("Could not find pci_root_buses (maybe, CONFIG_PCI is not set)")
-            return False
-        self.quiet_info("pci_root_buses: {:#x}".format(self.pci_root_buses))
+            self.meta.append((self.quiet_err, "Could not find pci_root_buses"))
+            return None
+        self.meta.append((self.quiet_info, "pci_root_buses: {:#x}".format(self.pci_root_buses)))
 
-        first_root_bus = read_int_from_memory(self.pci_root_buses)
-        if self.pci_root_buses == first_root_bus:
-            warn("No PCI devices found")
-            return False
-
-        # pci_bus->{node,children,devices}
+        # pci_bus->{node,children,devices,dev}
         """
         struct pci_bus {
             struct list_head node;
@@ -6189,7 +5735,7 @@ class KernelPciDeviceCommand(GenericCommand, BufferingOutput):
             struct device *bridge;
             struct device {
                 struct kobject {
-                    const char *name; <-- search for this
+                    const char *name; // e.g. "0000:00"
                     ...
                 } kobj;
                 ...
@@ -6200,23 +5746,12 @@ class KernelPciDeviceCommand(GenericCommand, BufferingOutput):
         };
         """
 
-        self.offset_pci_bus_node = 0
-        self.offset_pci_bus_children = runtime.current_arch.ptrsize * 3
-        self.offset_pci_bus_devices = runtime.current_arch.ptrsize * 5
+        ptrsize = runtime.current_arch.ptrsize
+        self.offset_pci_bus_node = self.type_offset("struct pci_bus", "node", 0)
+        self.offset_pci_bus_children = self.type_offset("struct pci_bus", "children", ptrsize * 3)
+        self.offset_pci_bus_devices = self.type_offset("struct pci_bus", "devices", ptrsize * 5)
 
-        # pci_bus->dev
-        for i in range(100):
-            v = read_int_from_memory(first_root_bus + runtime.current_arch.ptrsize * i)
-            if is_valid_addr(v):
-                if read_cstring_from_memory(v) == "0000:00":
-                    self.offset_pci_bus_dev = runtime.current_arch.ptrsize * i
-                    self.quiet_info("offsetof(pci_bus, dev): {:#x}".format(self.offset_pci_bus_dev))
-                    break
-        else:
-            self.quiet_err("Could not find pci_bus->dev")
-            return False
-
-        # pci_dev->{bus_list,vendor,device,subsystem_vendor,subsystem_device,class,revision}
+        # pci_dev->{bus_list,vendor,device,subsystem_vendor,subsystem_device,class,revision,dev,resource}
         """
         struct pci_dev {
             struct list_head bus_list;
@@ -6236,7 +5771,7 @@ class KernelPciDeviceCommand(GenericCommand, BufferingOutput):
             ...
             struct device {
                 struct kobject {
-                    const char *name; <-- search for this
+                    const char *name; // e.g. "0000:00:00.0"
                     ...
                 } kobj;
                 ...
@@ -6248,72 +5783,88 @@ class KernelPciDeviceCommand(GenericCommand, BufferingOutput):
         };
         """
 
-        self.offset_pci_dev_bus_list = 0
-        self.offset_pci_dev_vendor = runtime.current_arch.ptrsize * 7 + 4
-        self.offset_pci_dev_device = self.offset_pci_dev_vendor + 2
-        self.offset_pci_dev_subsystem_vendor = self.offset_pci_dev_device + 2
-        self.offset_pci_dev_subsystem_device = self.offset_pci_dev_subsystem_vendor + 2
-        self.offset_pci_dev_class = self.offset_pci_dev_subsystem_device + 2
-        self.offset_pci_dev_revision = self.offset_pci_dev_class + 4
+        self.offset_pci_dev_bus_list = self.type_offset("struct pci_dev", "bus_list", 0)
+        self.offset_pci_dev_bus = self.type_offset("struct pci_dev", "bus", ptrsize * 2)
+        self.offset_pci_dev_vendor = self.type_offset("struct pci_dev", "vendor", ptrsize * 7 + 4)
+        self.offset_pci_dev_device = self.type_offset("struct pci_dev", "device", self.offset_pci_dev_vendor + 2)
+        self.offset_pci_dev_subsystem_vendor = self.type_offset(
+            "struct pci_dev", "subsystem_vendor", self.offset_pci_dev_device + 2,
+        )
+        self.offset_pci_dev_subsystem_device = self.type_offset(
+            "struct pci_dev", "subsystem_device", self.offset_pci_dev_subsystem_vendor + 2,
+        )
+        self.offset_pci_dev_class = self.type_offset("struct pci_dev", "class", self.offset_pci_dev_subsystem_device + 2)
+        self.offset_pci_dev_revision = self.type_offset("struct pci_dev", "revision", self.offset_pci_dev_class + 4)
 
-        # pci_dev->dev
-        first_dev = read_int_from_memory(first_root_bus + self.offset_pci_bus_devices)
-        for i in range(100):
-            v = read_int_from_memory(first_dev + runtime.current_arch.ptrsize * i)
-            if is_valid_addr(v):
-                if read_cstring_from_memory(v) == "0000:00:00.0":
-                    self.offset_pci_dev_dev = runtime.current_arch.ptrsize * i
-                    self.quiet_info("offsetof(pci_dev, dev): {:#x}".format(self.offset_pci_dev_dev))
-                    break
-        else:
-            self.quiet_err("Could not find pci_dev->dev")
-            return False
+        self.root_buses = self.list_items(self.pci_root_buses, self.offset_pci_bus_node)
+        if not self.root_buses:
+            self.meta.append((warn, "No PCI devices found"))
+            return None
+        self.buses = self.get_all_buses(self.root_buses)
+        self.offset_pci_bus_dev, bus_source = self.find_name_offset(
+            self.buses, self.type_offset("struct pci_bus", "dev.kobj.name"), r"[0-9a-fA-F]{4}:[0-9a-fA-F]{2}",
+        )
+        if self.offset_pci_bus_dev is None:
+            self.meta.append((self.quiet_err, "Could not find pci_bus->dev"))
+            return None
+        self.meta.append((self.quiet_info, "offsetof(pci_bus, dev): {:#x} ({:s})".format(self.offset_pci_bus_dev, bus_source)))
 
-        # pci_dev->resource
-        """
-        struct resource {
-            resource_size_t start;
-            resource_size_t end;
-            const char *name;
-            unsigned long flags;
-            unsigned long desc;
-            struct resource *parent, *sibling, *child;
-        };
-        """
+        devices = []
+        for bus in self.buses:
+            devices.extend(self.list_items(bus + self.offset_pci_bus_devices, self.offset_pci_dev_bus_list))
+        if not devices:
+            self.meta.append((warn, "No PCI devices found"))
+            return None
+        self.offset_pci_dev_dev, dev_source = self.find_name_offset(
+            devices, self.type_offset("struct pci_dev", "dev.kobj.name"),
+            r"[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]",
+        )
+        if self.offset_pci_dev_dev is None:
+            self.meta.append((self.quiet_err, "Could not find pci_dev->dev"))
+            return None
+        self.meta.append((self.quiet_info, "offsetof(pci_dev, dev): {:#x} ({:s})".format(self.offset_pci_dev_dev, dev_source)))
 
-        ofs_base = self.offset_pci_dev_dev + runtime.current_arch.ptrsize
-        for i in range(200):
-            v = read_int_from_memory(first_dev + ofs_base + runtime.current_arch.ptrsize * i)
-            if is_valid_addr(v):
-                if read_cstring_from_memory(v) == "0000:00:00.0":
-                    self.offset_pci_dev_resource = ofs_base + runtime.current_arch.ptrsize * i - 0x10
-                    self.sizeof_resource = 0x10 + runtime.current_arch.ptrsize * 6
-                    self.quiet_info("offsetof(pci_dev, resource): {:#x}".format(self.offset_pci_dev_resource))
-                    break
-        else:
-            self.quiet_err("Could not find pci_dev->resource")
-            return False
+        resource_offset = self.resource_layout = resource_source = None
+        for dev in devices:
+            dev_name_ptr = read_int_from_memory(dev + self.offset_pci_dev_dev, safe=True)
+            if dev_name_ptr and is_valid_addr(dev_name_ptr):
+                dev_name = read_cstring_from_memory(dev_name_ptr, safe=True)
+            else:
+                dev_name = None
+            if not dev_name:
+                continue
+            resource_offset, self.resource_layout, resource_source = self.infer_resource_array(dev, dev_name)
+            if resource_offset is not None:
+                break
+        if resource_offset is None:
+            self.meta.append((self.quiet_err, "Could not find pci_dev->resource"))
+            return None
+        self.offset_pci_dev_resource = resource_offset
+        self.sizeof_resource = self.resource_layout["size"]
+        self.meta.append((self.quiet_info, "offsetof(pci_dev, resource): {:#x} ({:s})".format(resource_offset, resource_source)))
+        self.meta.append((self.quiet_info, "struct resource: source={:s}, size={:#x}, resource_size_t={:d}".format(
+            self.resource_layout["source"], self.sizeof_resource, self.resource_layout["width"],
+        )))
 
         # pci.ids
         pci_ids_file_name = "/usr/share/misc/pci.ids"
-        if os.path.exists(pci_ids_file_name):
-            self.quiet_info("use {:s}".format(pci_ids_file_name))
+        if os.path.exists(pci_ids_file_name) and os.path.getsize(pci_ids_file_name) > 0:
+            self.meta.append((self.quiet_info, "use {:s}".format(pci_ids_file_name)))
             content = open(pci_ids_file_name).read()
         else:
             pci_ids_file_name = os.path.join(GEF_TEMP_DIR, "pci.ids")
-            if os.path.exists(pci_ids_file_name):
-                self.quiet_info("use {:s}".format(pci_ids_file_name))
+            if os.path.exists(pci_ids_file_name) and os.path.getsize(pci_ids_file_name) > 0:
+                self.meta.append((self.quiet_info, "use {:s}".format(pci_ids_file_name)))
                 content = open(pci_ids_file_name).read()
             else:
                 url = "https://raw.githubusercontent.com/pciutils/pciids/master/pci.ids"
-                self.quiet_info("use {:s}".format(url))
+                self.meta.append((self.quiet_info, "use {:s}".format(url)))
                 content = String.bytes2str(http_get(url) or "")
-                if not content:
-                    self.quiet_info("Connection timed out: {:s}".format(url))
-                open(pci_ids_file_name, "w").write(content)
+                if content:
+                    open(pci_ids_file_name, "w").write(content)
+                else:
+                    self.meta.append((self.quiet_info, "Connection timed out: {:s}".format(url)))
         self.pci_ids = self.parse_pci_ids(content)
-
-        self.initialized = True
         return True
 
     def parse_pci_ids(self, content):
@@ -6433,17 +5984,14 @@ class KernelPciDeviceCommand(GenericCommand, BufferingOutput):
             0x0000_0200: "IORESOURCE_MEM",
             0x0000_0100: "IORESOURCE_IO",
         }
-        flags = []
-        for k, v in flags_dic.items():
-            if flags_value & k:
-                flags.append(v)
+        flags, _ = GefUtil.flags_to_names(flags_value, flags_dic)
 
         if "IORESOURCE_IO" in flags and "IORESOURCE_MEM" in flags:
             flags.remove("IORESOURCE_IO")
             flags.remove("IORESOURCE_MEM")
             flags.append("IORESOURCE_REG")
 
-        flags_str = " | ".join(flags)
+        flags_str = "|".join(flags)
         if flags_str == "":
             flags_str = "none"
         return flags_str.replace("IORESOURCE_", "")
@@ -6453,21 +6001,11 @@ class KernelPciDeviceCommand(GenericCommand, BufferingOutput):
             return []
 
         label_list = []
-        res = gdb.execute("monitor info mtree -f", to_string=True)
-        for line in res.splitlines():
-            if not line.startswith("  "):
+        for s, e, attr, name in QemuMonitor.get_mtree_regions():
+            if not (start <= s and e - 1 <= end):
                 continue
 
-            m = re.search(r"  ([0-9a-f]+)-([0-9a-f]+)", line)
-            if not m:
-                continue
-
-            s = int(m.group(1), 16)
-            e = int(m.group(2), 16)
-            if not (start <= s and e <= end):
-                continue
-
-            line = "      -> " + line.lstrip()
+            line = "      -> {:016x}-{:016x} ({:s}): {:s}".format(s, e - 1, attr, name)
             if line not in label_list:
                 label_list.append(line)
 
@@ -6475,120 +6013,128 @@ class KernelPciDeviceCommand(GenericCommand, BufferingOutput):
             label_list.append("      -> No results found from `monitor info mtree -f`")
         return label_list
 
-    def walk_devices(self, dev):
+    def walk_devices(self, bus):
         if not self.args.quiet:
             fmt = "{:18s} {:12s} {:7s} {:10s} {:10s} {:3s} {:s}"
             legend = ["pci_dev", "name", "class", "vendor:dev", "subsystem", "rev", "description"]
             self.out.append(GefUtil.make_legend(fmt.format(*legend)))
 
-        if not dev:
-            return
+        for dev in self.list_items(bus + self.offset_pci_bus_devices, self.offset_pci_dev_bus_list):
+            if dev in self.seen_dev:
+                self.incomplete.append("duplicate PCI device at {:#x}".format(dev))
+                continue
+            self.seen_dev.add(dev)
+            if read_int_from_memory(dev + self.offset_pci_dev_bus, safe=True) != bus:
+                self.incomplete.append("invalid pci_dev->bus at {:#x}".format(dev))
+                continue
 
-        while dev not in self.seen_dev:
-            self.seen_dev.append(dev)
+            name_ptr = read_int_from_memory(dev + self.offset_pci_dev_dev, safe=True)
+            if name_ptr and is_valid_addr(name_ptr):
+                dev_name = read_cstring_from_memory(name_ptr, safe=True)
+            else:
+                dev_name = None
+            if not dev_name or not re.fullmatch(r"[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]", dev_name):
+                self.incomplete.append("invalid pci_dev name at {:#x}".format(dev))
+                continue
 
-            # parse device info
-            dev_name = read_cstring_from_memory(read_int_from_memory(dev + self.offset_pci_dev_dev))
-            vendor = read_int16_from_memory(dev + self.offset_pci_dev_vendor)
-            device = read_int16_from_memory(dev + self.offset_pci_dev_device)
-            sub_vendor = read_int16_from_memory(dev + self.offset_pci_dev_subsystem_vendor)
-            sub_device = read_int16_from_memory(dev + self.offset_pci_dev_subsystem_device)
-            revision = read_int8_from_memory(dev + self.offset_pci_dev_revision)
+            vendor = read_int16_from_memory(dev + self.offset_pci_dev_vendor, safe=True)
+            device = read_int16_from_memory(dev + self.offset_pci_dev_device, safe=True)
+            sub_vendor = read_int16_from_memory(dev + self.offset_pci_dev_subsystem_vendor, safe=True)
+            sub_device = read_int16_from_memory(dev + self.offset_pci_dev_subsystem_device, safe=True)
+            revision = read_int8_from_memory(dev + self.offset_pci_dev_revision, safe=True)
+            class_val = read_int32_from_memory(dev + self.offset_pci_dev_class, safe=True)
+            if None in (vendor, device, sub_vendor, sub_device, revision, class_val):
+                self.incomplete.append("unreadable PCI device at {:#x}".format(dev))
+                continue
 
-            # u32:class = u8:unused || u8:base_class || u8:sub_class || u8:programming-interface
-            class_val = read_int32_from_memory(dev + self.offset_pci_dev_class)
             prgif = class_val & 0xff
             sub_class = (class_val >> 8) & 0xff
             base_class = (class_val >> 16) & 0xff
-
             desc = self.get_description(base_class, sub_class, prgif, vendor, device, sub_vendor, sub_device)
             self.out.append("{:#018x} {:s} {:02x}{:02x}:{:02x} {:04x}:{:04x}  {:04x}:{:04x}  {:02x}  {:s}".format(
                 dev, dev_name, base_class, sub_class, prgif, vendor, device, sub_vendor, sub_device, revision, desc,
             ))
 
-            if self.args.verbose:
-                # parse resource
-                i = 0
-                while True:
-                    resource_i = dev + self.offset_pci_dev_resource + self.sizeof_resource * i
-
-                    # parse resource name
-                    resource_i_name = read_int_from_memory(resource_i + 8 * 2)
-                    if not is_valid_addr(resource_i_name):
-                        break
-                    if read_cstring_from_memory(resource_i_name) != dev_name:
-                        break
-
-                    # parse resource address
-                    resource_i_start = read_int_from_memory(resource_i + 8 * 0)
-                    resource_i_end = read_int_from_memory(resource_i + 8 * 1)
-                    resource_i_size = resource_i_end - resource_i_start
-
-                    if resource_i_start != 0 and resource_i_end != 0:
-                        # parse resource flags
-                        resource_i_flags = read_int_from_memory(resource_i + 8 * 2 + runtime.current_arch.ptrsize)
-                        flag_str = KernelPciDeviceCommand.get_flags_str(resource_i_flags)
-                        if (resource_i_flags & 0x300) == 0x300:
-                            type_str = "RegOffs"
-                        elif resource_i_flags & 0x100:
-                            type_str = "I/O-Mem"
-                        elif resource_i_flags & 0x200:
-                            type_str = "PhysMem"
-                        else:
-                            type_str = "???"
-
-                        self.out.append("  [{:d}] {:7s}: {:#010x}-{:#010x} ({:#010x}) flags:{:#x} ({:s})".format(
-                            i, type_str, resource_i_start, resource_i_end, resource_i_size, resource_i_flags, flag_str,
-                        ))
-
-                        # add more details
-                        ret = self.search_label(resource_i_start, resource_i_end)
-                        self.out.extend(ret)
-                    i += 1
-
-            # goto next
-            dev = read_int_from_memory(dev + self.offset_pci_dev_bus_list)
-        return
-
-    def walk_pci_bus(self, bus):
-        if not bus:
-            return
-
-        while bus not in self.seen_bus:
-            self.seen_bus.append(bus)
-            bus_name = read_cstring_from_memory(read_int_from_memory(bus + self.offset_pci_bus_dev))
-            self.out.append(titlify("Bus {:s}: {:#x}".format(bus_name, bus)))
-
-            # parse device
-            self.seen_dev.append(bus + self.offset_pci_bus_devices)
-            dev = read_int_from_memory(bus + self.offset_pci_bus_devices)
-            self.walk_devices(dev)
-
-            # parse child
-            self.seen_bus.append(bus + self.offset_pci_bus_children)
-            first_child_bus = read_int_from_memory(bus + self.offset_pci_bus_children)
-            self.walk_pci_bus(first_child_bus)
-
-            # goto next
-            bus = read_int_from_memory(bus + self.offset_pci_bus_node)
+            if not self.args.verbose:
+                continue
+            for i in range(16):
+                resource_i = dev + self.offset_pci_dev_resource + self.sizeof_resource * i
+                resource_name_ptr = read_int_from_memory(resource_i + self.resource_layout["name"], safe=True)
+                if not resource_name_ptr or not is_valid_addr(resource_name_ptr):
+                    continue
+                if read_cstring_from_memory(resource_name_ptr, safe=True) != dev_name:
+                    continue
+                resource_i_start = KernelResourceLayout.read_size(
+                    resource_i + self.resource_layout["start"], self.resource_layout["width"],
+                )
+                resource_i_end = KernelResourceLayout.read_size(
+                    resource_i + self.resource_layout["end"], self.resource_layout["width"],
+                )
+                resource_i_flags = read_int_from_memory(resource_i + self.resource_layout["flags"], safe=True)
+                if None in (resource_i_start, resource_i_end, resource_i_flags):
+                    self.incomplete.append("unreadable PCI resource at {:#x}".format(resource_i))
+                    break
+                if resource_i_start == 0 and resource_i_end == 0:
+                    continue
+                resource_i_size = resource_i_end - resource_i_start + 1
+                flag_str = KernelPciDeviceCommand.get_flags_str(resource_i_flags)
+                if (resource_i_flags & 0x300) == 0x300:
+                    type_str = "RegOffs"
+                elif resource_i_flags & 0x100:
+                    type_str = "I/O-Mem"
+                elif resource_i_flags & 0x200:
+                    type_str = "PhysMem"
+                else:
+                    type_str = "???"
+                self.out.append("  [{:d}] {:7s}: {:#010x}-{:#010x} (sz:{:#010x}) flags:{:#x} ({:s})".format(
+                    i, type_str, resource_i_start, resource_i_end, resource_i_size, resource_i_flags, flag_str,
+                ))
+                self.out.extend(self.search_label(resource_i_start, resource_i_end))
         return
 
     def dump_pci(self):
-        first_root_bus = read_int_from_memory(self.pci_root_buses)
-        self.seen_bus = [self.pci_root_buses]
-        self.seen_dev = []
-        self.walk_pci_bus(first_root_bus)
+        self.seen_bus = set()
+        self.seen_dev = set()
+        self.incomplete = list(self.incomplete)
+        stack = list(reversed(self.root_buses))
+        while stack:
+            bus = stack.pop()
+            if bus in self.seen_bus:
+                self.incomplete.append("duplicate PCI bus at {:#x}".format(bus))
+                continue
+            self.seen_bus.add(bus)
+            name_ptr = read_int_from_memory(bus + self.offset_pci_bus_dev, safe=True)
+            if name_ptr and is_valid_addr(name_ptr):
+                bus_name = read_cstring_from_memory(name_ptr, safe=True)
+            else:
+                bus_name = None
+            if not bus_name or not re.fullmatch(r"[0-9a-fA-F]{4}:[0-9a-fA-F]{2}", bus_name):
+                self.incomplete.append("invalid pci_bus name at {:#x}".format(bus))
+                continue
+            self.out.append(titlify("Bus {:s}: {:#x}".format(bus_name, bus)))
+            self.walk_devices(bus)
+            children = self.list_items(bus + self.offset_pci_bus_children, self.offset_pci_bus_node)
+            stack.extend(reversed(children))
+        if self.incomplete:
+            self.out.extend("Incomplete: {:s}".format(reason) for reason in self.incomplete)
         return
 
     @parse_args
     @only_if_gdb_running
     @only_if_specific_gdb_mode(mode=("qemu-system", "vmware"))
-    @only_if_specific_arch(arch=("x86_32", "x86_64", "ARM32", "ARM64"))
+    @only_if_specific_arch(arch=("x86_32", "x86_64", "ARM32", "ARM64", "RISCV32", "RISCV64"))
     @only_if_in_kernel_or_kpti_disabled
     def do_invoke(self, args):
         self.quiet_info("Wait for memory scan")
 
-        if not self.initialize():
+        ret = self.initialize()
+        if args.meta or not ret:
+            for func, line in self.meta:
+                func(line)
+        if not ret:
+            return
+
+        if args.meta:
             return
 
         self.out = []
@@ -6911,6 +6457,8 @@ class KernelPipeCommand(GenericCommand, BufferingOutput):
                         help="filter by specific struct inode.")
     parser.add_argument("-f", "--file-filter", type=AddressUtil.parse_address, default=[], action="append",
                         help="filter by specific struct file.")
+    parser.add_argument("-r", "--rescan", action="store_true", help="do not use cached offset.")
+    parser.add_argument("--meta", action="store_true", help="display offset information.")
     parser.add_argument("-n", "--no-pager", action="store_true", help="do not use the pager.")
     parser.add_argument("-q", "--quiet", action="store_true", help="show result only.")
     _syntax_ = parser.format_help()
@@ -6921,7 +6469,8 @@ class KernelPipeCommand(GenericCommand, BufferingOutput):
     _example_ = "\n".join(_example_).format(_cmdline_)
 
     _note_ = [
-        "This command requires CONFIG_RANDSTRUCT=n.",
+        "This command requires CONFIG_RANDSTRUCT=n unless vmlinux with debug information is loaded.",
+        "A notification pipe (CONFIG_WATCH_QUEUE) can hold more entries than `max`.",
         "",
         "Simplified pipe structure:",
         "",
@@ -6950,359 +6499,6 @@ class KernelPipeCommand(GenericCommand, BufferingOutput):
     ]
     _note_ = "\n".join(_note_)
 
-    def initialize(self, pipe_files):
-        if hasattr(self, "initialized") and self.initialized:
-            return True
-
-        # inode->i_pipe
-        offset_i_pipe = self.get_offset_i_pipe(pipe_files)
-        if not offset_i_pipe:
-            self.quiet_err("Could not find inode->i_pipe")
-            return False
-        self.offset_i_pipe = offset_i_pipe
-        self.quiet_info("offsetof(inode, i_pipe): {:#x}".format(self.offset_i_pipe))
-
-        # pipe_inode_info->bufs
-        offset_bufs = self.get_offset_bufs(pipe_files)
-        if not offset_bufs:
-            self.quiet_err("Could not find pipe_inode_info->bufs")
-            return False
-        self.offset_bufs = offset_bufs
-        self.quiet_info("offsetof(pipe_inode_info, bufs): {:#x}".format(self.offset_bufs))
-
-        kversion = Kernel.kernel_version()
-        if "5.5" <= kversion:
-            # pipe_inode_info->{head,tail,max_usage,ring_size}
-            ret = self.get_offset_head_or_nrbuf(pipe_files)
-            if ret is None:
-                self.quiet_err("Could not find pipe_inode_info->head")
-                return False
-            self.offset_head = ret
-            self.quiet_info("offsetof(pipe_inode_info, head): {:#x}".format(self.offset_head))
-            self.offset_tail = self.offset_head + 4
-            self.quiet_info("offsetof(pipe_inode_info, tail): {:#x}".format(self.offset_tail))
-            self.offset_max_usage = self.offset_tail + 4
-            self.quiet_info("offsetof(pipe_inode_info, max_usage): {:#x}".format(self.offset_max_usage))
-            self.offset_ring_size = self.offset_max_usage + 4
-            self.quiet_info("offsetof(pipe_inode_info, ring_size): {:#x}".format(self.offset_ring_size))
-        else:
-            # pipe_inode_info->{nrbuf,curbuf,buffers}
-            ret = self.get_offset_head_or_nrbuf(pipe_files)
-            if ret is None:
-                self.quiet_err("Could not find pipe_inode_info->nrbuf")
-                return False
-            self.offset_nrbuf = ret
-            self.quiet_info("offsetof(pipe_inode_info, nrbuf): {:#x}".format(self.offset_nrbuf))
-            self.offset_curbuf = self.offset_nrbuf + 4
-            self.quiet_info("offsetof(pipe_inode_info, curbuf): {:#x}".format(self.offset_curbuf))
-            self.offset_buffers = self.offset_curbuf + 4
-            self.quiet_info("offsetof(pipe_inode_info, buffers): {:#x}".format(self.offset_buffers))
-
-        # pipe_buffer->{page, offset, len, flags}
-        """
-        struct pipe_buffer {
-            struct page *page;
-            unsigned int offset, len;
-            const struct pipe_buf_operations *ops;
-            unsigned int flags;
-            unsigned long private;
-        };
-        """
-        self.offset_page = 0
-        self.quiet_info("offsetof(pipe_buffer, page): {:#x}".format(self.offset_page))
-        self.offset_offset = runtime.current_arch.ptrsize
-        self.quiet_info("offsetof(pipe_buffer, offset): {:#x}".format(self.offset_offset))
-        self.offset_len = self.offset_offset + 4
-        self.quiet_info("offsetof(pipe_buffer, len): {:#x}".format(self.offset_len))
-        self.offset_flags = self.offset_len + 4 + runtime.current_arch.ptrsize
-        self.quiet_info("offsetof(pipe_buffer, flags): {:#x}".format(self.offset_flags))
-        self.sizeof_pipe_buffer = align_to_ptrsize(self.offset_flags + 4) + runtime.current_arch.ptrsize
-        self.quiet_info("sizeof(pipe_buffer): {:#x}".format(self.sizeof_pipe_buffer))
-
-        self.initialized = True
-        return True
-
-    def get_offset_i_pipe(self, pipe_files):
-        """
-        struct inode {
-            ...
-            struct list_head i_lru;
-            struct list_head i_sb_list;
-            struct list_head i_wb_list;
-            ...
-        #if defined(CONFIG_IMA) || defined(CONFIG_FILE_LOCKING)
-            atomic_t i_readcount;
-        #endif
-            const struct file_operations *i_fop;     // ~v5.1
-            union {                                  // v5.2~
-                const struct file_operations *i_fop; // v5.2~
-                void (*free_inode)(struct inode *);  // v5.2~
-            };                                       // v5.2~
-            struct file_lock_context *i_flctx;
-            struct address_space i_data;
-        #ifdef CONFIG_QUOTA                   // ~v3.18
-            struct dquot *i_dquot[MAXQUOTAS]; // ~v3.18 // MAXQUOTAS=2
-        #endif                                // ~v3.18
-            struct list_head i_devices;       // ~v6.13
-            union {                           // v6.14~
-                struct list_head i_devices;   // v6.14~
-                int i_linklen;                // v6.14~
-            };                                // v6.14~
-            union {
-                struct pipe_inode_info *i_pipe;  <-- here
-                struct block_device *i_bdev;
-                struct cdev *i_cdev;
-                char *i_link;
-                unsigned i_dir_seq;
-            };
-            ...
-        };
-        """
-
-        # plan 1
-        inode = pipe_files[0][1]
-        for i in range(0x100):
-            # search three list_head
-            if not is_double_link_list(inode + runtime.current_arch.ptrsize * (i + 0)):
-                continue
-            if not is_double_link_list(inode + runtime.current_arch.ptrsize * (i + 2)):
-                continue
-            if not is_double_link_list(inode + runtime.current_arch.ptrsize * (i + 4)):
-                continue
-            # search i_pipe
-            for j in range(i + 6, 0x100):
-                if not is_double_link_list(inode + runtime.current_arch.ptrsize * (j + 0)): # i_devices
-                    continue
-                if not is_valid_addr_addr(inode + runtime.current_arch.ptrsize * (j + 2)): # i_pipe
-                    continue
-                if is_double_link_list(inode + runtime.current_arch.ptrsize * (j + 2)): # i_pipe
-                    continue
-                i_pipe = read_int_from_memory(inode + runtime.current_arch.ptrsize * (j + 2))
-                # count 0x10 and 0x01 value
-                count_0x10 = 0
-                count_0x01 = 0
-                for k in range(0x20):
-                    v = read_int32_from_memory(i_pipe + 4 * k)
-                    if v == 0x01:
-                        count_0x01 += 1
-                    if v == 0x10:
-                        count_0x10 += 1
-                    if count_0x10 > 1 or count_0x01 > 3:
-                        return runtime.current_arch.ptrsize * (j + 2)
-
-        # plan 2
-        for i in range(0x100):
-            v = read_int_from_memory(inode + runtime.current_arch.ptrsize * i)
-            # i_pipe is valid addr
-            if v < 0x10000 or not is_valid_addr(v):
-                continue
-            # skip invalid chunk
-            ret = Kernel.get_slab_contains(v)
-            if ret is None:
-                continue
-            # pipe_inode_info is allocated from kmalloc-192 (x64) or kmalloc-256 (arm64).
-            # sometimes it is allocated from kmalloc-512, kmalloc-128, kmalloc-96 and kmalloc-64.
-            # Other candidates found are kmalloc-2k, kmalloc-1024 and inode_cache (these are false positives),
-            # so these should be excluded.
-            if re.search(r"kmalloc(-cg)?-(64|96|128|192|256|512)", ret):
-                return runtime.current_arch.ptrsize * i
-
-        return None
-
-    def get_offset_bufs(self, pipe_files):
-        """
-        [v5.5~]
-        struct pipe_inode_info {
-            struct mutex mutex;
-            wait_queue_head_t rd_wait, wr_wait; // v5.6~
-            wait_queue_head_t wait; // ~v5.5
-            unsigned int head;
-            unsigned int tail;
-            unsigned int max_usage;
-            unsigned int ring_size;
-        #ifdef CONFIG_WATCH_QUEUE // v5.8~
-            bool note_loss;       // v5.8~
-        #endif                    // v5.8~
-            unsigned int nr_accounted; // v5.8~
-            unsigned int readers;
-            unsigned int writers;
-            unsigned int files;
-            unsigned int r_counter;
-            unsigned int w_counter;
-            bool poll_usage; // v5.10~
-            struct page *tmp_page;
-            struct fasync_struct *fasync_readers;
-            struct fasync_struct *fasync_writers;
-            struct pipe_buffer *bufs;  <-- here
-            struct user_struct *user;
-        #ifdef CONFIG_WATCH_QUEUE            // v5.8~
-            struct watch_queue *watch_queue; // v5.8~
-        #endif                               // v5.8~
-        };
-
-        [~v5.4]
-        struct pipe_inode_info {
-            struct mutex mutex; // v3.10~
-            wait_queue_head_t wait;
-            unsigned int nrbufs, curbuf, buffers;
-            unsigned int readers;
-            unsigned int writers;
-            unsigned int files; // v3.10~
-            unsigned int waiting_writers;
-            unsigned int r_counter;
-            unsigned int w_counter;
-            struct page *tmp_page;
-            struct fasync_struct *fasync_readers;
-            struct fasync_struct *fasync_writers;
-            struct inode *inode; // ~v3.9
-            struct pipe_buffer *bufs; <-- here
-            struct user_struct *user; // v3.10, v3.12, v3.14, v3.16, v3.18, v4.1, v4.4~
-        };
-
-        struct pipe_buffer {
-            struct page *page;
-            unsigned int offset, len;
-            const struct pipe_buf_operations *ops; // allow NULL
-            unsigned int flags;
-            unsigned long private;
-        };
-        """
-
-        # plan 1
-        seen = []
-        for _file, inode in pipe_files:
-            if inode in seen:
-                continue
-            seen.append(inode)
-            pipe_inode_info = read_int_from_memory(inode + self.offset_i_pipe)
-            for i in range(0x40):
-                offset_bufs = runtime.current_arch.ptrsize * i
-                if not is_valid_addr_addr(pipe_inode_info + offset_bufs):
-                    continue
-                if is_double_link_list(pipe_inode_info + offset_bufs):
-                    continue
-                if is_double_link_list(pipe_inode_info + offset_bufs - runtime.current_arch.ptrsize):
-                    continue
-                # bufs
-                bufs = read_int_from_memory(pipe_inode_info + offset_bufs)
-                if is_64bit():
-                    if not is_valid_addr_addr(bufs + runtime.current_arch.ptrsize * 0): # page
-                        continue
-                    len_ = read_int32_from_memory(bufs + runtime.current_arch.ptrsize * 1 + 4) # len
-                    if len_ == 0 or is_valid_addr_addr(bufs + runtime.current_arch.ptrsize * 1): # offset||len
-                        continue
-                    ops = read_int_from_memory(bufs + runtime.current_arch.ptrsize * 2) # ops
-                    if ops != 0 and not is_valid_addr(ops):
-                        continue
-                    if is_valid_addr_addr(bufs + runtime.current_arch.ptrsize * 3): # flags
-                        continue
-                    if is_valid_addr_addr(bufs + runtime.current_arch.ptrsize * 4): # private
-                        continue
-                else:
-                    if not is_valid_addr_addr(bufs + runtime.current_arch.ptrsize * 0): # page
-                        continue
-                    if is_valid_addr_addr(bufs + runtime.current_arch.ptrsize * 1): # offset
-                        continue
-                    len_ = read_int_from_memory(bufs + runtime.current_arch.ptrsize * 2) # len
-                    if len_ == 0 or is_valid_addr_addr(len_):
-                        continue
-                    ops = read_int_from_memory(bufs + runtime.current_arch.ptrsize * 3) # ops
-                    if ops != 0 and not is_valid_addr(ops):
-                        continue
-                    if is_valid_addr_addr(bufs + runtime.current_arch.ptrsize * 4): # flags
-                        continue
-                    if is_valid_addr_addr(bufs + runtime.current_arch.ptrsize * 5): # private
-                        continue
-                # found
-                self.quiet_info("offset of bufs is found by heuristic way1")
-                return offset_bufs
-
-        # plan 2
-        kversion = Kernel.kernel_version()
-        inode = pipe_files[0][1]
-        pipe_inode_info = read_int_from_memory(inode + self.offset_i_pipe)
-        for i in range(0x80):
-            if not is_valid_addr(pipe_inode_info + runtime.current_arch.ptrsize * i):
-                break
-            v = read_int_from_memory(pipe_inode_info + runtime.current_arch.ptrsize * i)
-            # bufs is valid addr
-            if v < 0x10000 or not is_valid_addr(v):
-                continue
-            # bufs is not self
-            if v == pipe_inode_info:
-                continue
-            # skip invalid chunk
-            ret = Kernel.get_slab_contains(v)
-            if ret is None:
-                continue
-            # pipe_inode_info is allocated from kmalloc-1k (x64) or kmalloc-512 (x86)
-            if re.search(r"kmalloc(-cg)?-(1k|1024|512)", ret):
-                self.quiet_info("offset of bufs is found by heuristic way2-1")
-                return runtime.current_arch.ptrsize * i
-            # before v5.5, pipe_buffer is allocated not from slub, but `user` is allocated from slub.
-            if kversion < "5.5" and "uid_cache" in ret:
-                self.quiet_info("offset of bufs is found by heuristic way2-2")
-                return runtime.current_arch.ptrsize * (i - 1)
-        return None
-
-    def get_offset_head_or_nrbuf(self, pipe_files):
-        inode = pipe_files[0][1]
-        pipe_inode_info = read_int_from_memory(inode + self.offset_i_pipe)
-
-        for i in range(3, 0x40):
-            if is_64bit():
-                # head||tail/nrbuf||curbuf is not address
-                v1 = read_int_from_memory(pipe_inode_info + runtime.current_arch.ptrsize * i)
-                if is_valid_addr(v1):
-                    continue
-                # head/nrbuf is too large
-                v1_32 = read_int32_from_memory(pipe_inode_info + runtime.current_arch.ptrsize * i)
-                if v1_32 > 0x100:
-                    continue
-                # max_usage||ring_size/buffers||readers is not address
-                v2 = read_int_from_memory(pipe_inode_info + runtime.current_arch.ptrsize * (i + 1))
-                if is_valid_addr(v2):
-                    continue
-                # max_usage/buffers is too large or zero
-                v2_32 = read_int32_from_memory(pipe_inode_info + runtime.current_arch.ptrsize * (i + 1))
-                if v2_32 > 0x100 or v2_32 == 0:
-                    continue
-                return runtime.current_arch.ptrsize * i
-            else:
-                # head/nrbuf is not address
-                v1 = read_int_from_memory(pipe_inode_info + runtime.current_arch.ptrsize * i)
-                if is_valid_addr(v1):
-                    continue
-                # head/nrbuf is too large
-                v1_32 = read_int32_from_memory(pipe_inode_info + runtime.current_arch.ptrsize * i)
-                if v1_32 > 0x100:
-                    continue
-                # max_usage/buffers is not address
-                v2 = read_int_from_memory(pipe_inode_info + runtime.current_arch.ptrsize * (i + 2))
-                if is_valid_addr(v2):
-                    continue
-                # max_usage/buffers is too large or zero
-                v2_32 = read_int32_from_memory(pipe_inode_info + runtime.current_arch.ptrsize * (i + 2))
-                if v2_32 > 0x100 or v2_32 == 0:
-                    continue
-                return runtime.current_arch.ptrsize * i
-        return None
-
-    def get_pipe_files(self):
-        # struct file of pipe
-        ret = gdb.execute("ktask --quiet --no-pager --user-process-only --print-fd", to_string=True)
-        pipe_files = []
-        for line in ret.splitlines():
-            m = re.search(r"\d+\s+(0x\S+) 0x\S+ (0x\S+) pipe:\[\d+\]", line)
-            if not m:
-                continue
-            file = int(m.group(1), 16)
-            inode = int(m.group(2), 16)
-            pipe_files.append((file, inode))
-        if pipe_files:
-            self.quiet_info("Num of pipe: {:d}".format(len({x[1] for x in pipe_files})))
-        return pipe_files
-
     def get_flags_str(self, flags_value):
         flags_dic = {
             0x01: "PIPE_BUF_FLAG_LRU",
@@ -7313,21 +6509,17 @@ class KernelPipeCommand(GenericCommand, BufferingOutput):
             0x20: "PIPE_BUF_FLAG_WHOLE",
             0x40: "PIPE_BUF_FLAG_LOSS",
         }
-        flags = []
-        for k, v in flags_dic.items():
-            if flags_value & k:
-                flags.append(v)
+        flags, _ = GefUtil.flags_to_names(flags_value, flags_dic)
 
-        flags_str = " | ".join(flags)
+        flags_str = "|".join(flags)
         if flags_str == "":
             flags_str = "none"
         return flags_str
 
     def dump_pipe(self, pipe_files):
-        heap_page_color = Config.get_gef_setting("theme.heap_page_address")
-        freed_address_color = Config.get_gef_setting("theme.heap_chunk_address_freed")
-        used_address_color = Config.get_gef_setting("theme.heap_chunk_address_used")
-        kversion = Kernel.kernel_version()
+        heap_page_color = Config.get("theme.heap_page_address")
+        freed_address_color = Config.get("theme.heap_chunk_address_freed")
+        used_address_color = Config.get("theme.heap_chunk_address_used")
 
         inodes = {}
         for file, inode in pipe_files:
@@ -7343,63 +6535,50 @@ class KernelPipeCommand(GenericCommand, BufferingOutput):
             related_files = ", ".join(["{:#x}".format(x) for x in files])
             self.out.append("inode: {:#x} (related struct file: {:s})".format(inode, related_files))
 
-            pipe_inode_info = read_int_from_memory(inode + self.offset_i_pipe)
-            self.out.append("  pipe_inode_info: {:#x}".format(pipe_inode_info))
-
-            pipe_buffer = read_int_from_memory(pipe_inode_info + self.offset_bufs)
-            self.out.append("    pipe_buffer: {:#x}".format(pipe_buffer))
-
-            if "5.5" <= kversion:
-                head = read_int32_from_memory(pipe_inode_info + self.offset_head)
-                tail = read_int32_from_memory(pipe_inode_info + self.offset_tail)
-                max_usage = read_int32_from_memory(pipe_inode_info + self.offset_max_usage)
-                ring_size = read_int32_from_memory(pipe_inode_info + self.offset_ring_size)
+            pipe = self.kpipe.get_pipe(inode)
+            self.out.append("  pipe_inode_info: {:#x}".format(pipe["pipe_inode_info"]))
+            self.out.append("    pipe_buffer: {:#x}".format(pipe["bufs"]))
+            if self.kpipe.ring_buffer:
                 self.out.append("    head: {:d}, tail: {:d}, max: {:d}, ring_size: {:d}".format(
-                    head, tail, max_usage, ring_size,
+                    pipe["head"], pipe["tail"], pipe["max_usage"], pipe["ring_size"],
                 ))
             else:
-                nrbuf = read_int32_from_memory(pipe_inode_info + self.offset_nrbuf)
-                curbuf = read_int32_from_memory(pipe_inode_info + self.offset_curbuf)
-                buffers = read_int32_from_memory(pipe_inode_info + self.offset_buffers)
                 self.out.append("    nrbuf: {:d}, curbuf: {:d}, buffers: {:d}".format(
-                    nrbuf, curbuf, buffers,
+                    pipe["used"], pipe["tail"], pipe["ring_size"],
                 ))
-                head = curbuf + nrbuf
-                tail = curbuf
-                max_usage = buffers
+            if pipe["buffers"] is None:
+                self.err_add_out("Unexpected pipe state")
+                continue
 
-            used_range = [x % max_usage for x in range(tail, head)]
-            for idx in range(max_usage):
-                base = pipe_buffer + self.sizeof_pipe_buffer * idx
-                page = read_int_from_memory(base + self.offset_page)
-                offset = read_int32_from_memory(base + self.offset_offset)
-                len_ = read_int32_from_memory(base + self.offset_len)
-                flags = read_int32_from_memory(base + self.offset_flags)
-                virt = Kernel.page2virt(page)
+            if pipe["watch_queue"]:
+                self.out.append("    watch_queue: {:#x} (notification pipe)".format(pipe["watch_queue"]))
+            elif pipe["notification"]:
+                self.out.append("    notification pipe")
 
-                if idx in used_range:
+            for item in pipe["buffers"]:
+                if item["is_used"]:
                     status = Color.colorify("used", used_address_color)
                 else:
                     status = Color.colorify("free", freed_address_color)
 
-                if head % max_usage == idx:
+                if item["is_head"]:
                     head_marker = "head"
                 else:
                     head_marker = "    "
 
-                if tail % max_usage == idx:
+                if item["is_tail"]:
                     tail_marker = "tail"
                 else:
                     tail_marker = "    "
 
                 out = "    {:s} {:s} {:s} [{:02d}] page: {:#x}, ".format(
-                    head_marker, tail_marker, status, idx, page,
+                    head_marker, tail_marker, status, item["index"], item["page"],
                 )
-                if virt:
-                    colored_virt = Color.colorify_hex(virt, heap_page_color)
+                if item["virt"]:
+                    colored_virt = Color.colorify_hex(item["virt"], heap_page_color)
                     out += "(virt: {:s}), ".format(colored_virt)
                 out += "offset: {:#x}, len: {:#x}, flags: {:#x} ({:s})".format(
-                    offset, len_, flags, self.get_flags_str(flags),
+                    item["offset"], item["len"], item["flags"], self.get_flags_str(item["flags"]),
                 )
                 self.out.append(out)
         return
@@ -7412,24 +6591,36 @@ class KernelPipeCommand(GenericCommand, BufferingOutput):
     def do_invoke(self, args):
         self.quiet_info("Wait for memory scan")
 
+        # the allocator is only used by the fallback heuristics
         allocator = Kernel.get_slab_type()
-        if allocator not in ["SLUB", "SLUB_TINY", "SLAB"]:
-            err("Unsupported: SLOB, Unknown allocator")
+        if allocator not in ["SLUB", "SLUB_TINY", "SLAB", "SLOB"]:
+            err("Unsupported: Unknown allocator")
             return
 
         # init
-        kinfo = Kernel.get_kernel_layout()
-        if kinfo.has_none:
+        klayout = Kernel.layout()
+        if not klayout.is_complete:
             self.quiet_err("The kernel .text area could not be determined correctly")
             return
 
-        pipe_files = self.get_pipe_files()
+        self.kpipe = Kernel.pipe()
+        pipe_files, error = self.kpipe.get_pipe_files()
+        if pipe_files is None:
+            self.quiet_err(error)
+            return
         if not pipe_files:
             self.quiet_info("Nothing to dump")
             return
+        self.quiet_info("Num of pipe: {:d}".format(len({x[1] for x in pipe_files})))
 
-        ret = self.initialize(pipe_files)
-        if ret is False:
+        ret = self.kpipe.initialize(pipe_files, force=args.rescan)
+        if args.meta or not ret:
+            for func, line in Kernel.export_meta(self, self.kpipe.meta):
+                func(line)
+        if not ret:
+            return
+
+        if args.meta:
             return
 
         # dump
@@ -7664,12 +6855,14 @@ class KernelIpcsCommand(GenericCommand, BufferingOutput):
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("-hh", "--help-simple", action="store_true", help="show help without ASCII diagram.")
     parser.add_argument("-v", "--verbose", action="store_true", help="dump the beginning of msg_msg.")
+    parser.add_argument("--meta", action="store_true", help="display offset information.")
     parser.add_argument("-n", "--no-pager", action="store_true", help="do not use the pager.")
     parser.add_argument("-q", "--quiet", action="store_true", help="show result only.")
     _syntax_ = parser.format_help()
 
     _note_ = [
         "This command requires CONFIG_RANDSTRUCT=n.",
+        "Until v6.17, the IPC namespaces not used by any task (e.g., held only by a file descriptor) are not shown.",
         "",
         "Simplified ipc structure:",
         "",
@@ -7695,453 +6888,165 @@ class KernelIpcsCommand(GenericCommand, BufferingOutput):
     ]
     _note_ = "\n".join(_note_)
 
-    def get_all_ipc_ns(self):
-        res = gdb.execute("ktask --print-namespace --user-process-only --no-pager --quiet", to_string=True)
-        r = re.findall(r"nsproxy->ipc_ns\s+(0x\S+)", res)
-
-        ipc_ns_list = []
-        # do not use `set()` because the order is important.
-        for x in r:
-            x = int(x, 16)
-            if x not in ipc_ns_list:
-                ipc_ns_list.append(x)
-        return ipc_ns_list
-
-    def initialize(self, ipc_ns_list):
-        if hasattr(self, "initialized") and self.initialized:
-            return True
-
-        if ipc_ns_list == []:
-            return False
-
-        if ipc_ns_list == [0]:
-            err("Could not find valid ipc_ns (maybe CONFIG_SYSVIPC=n)")
-            return False
-
-        # ipc_namespace
-        """
-        struct ipc_namespace {
-            refcount_t count; // ~5.10
-            struct ipc_ids {
-                int in_use;
-                unsigned short seq;
-                struct rw_semaphore {
-                    atomic_long_t count;
-                    atomic_long_t owner;
-                #ifdef CONFIG_RWSEM_SPIN_ON_OWNER
-                    struct optimistic_spin_queue osq;
-                #endif
-                    raw_spinlock_t wait_lock;
-                    struct list_head wait_list;
-                #ifdef CONFIG_DEBUG_RWSEMS
-                    void *magic;
-                #endif
-                #ifdef CONFIG_DEBUG_LOCK_ALLOC
-                    struct lockdep_map dep_map;
-                #endif
-                } rwsem;
-                struct idr {
-                    struct radix_tree_root { // =struct xarray
-                        spinlock_t xa_lock;
-                        gfp_t xa_flags;
-                        void __rcu *xa_head;
-                    } idr_rt;
-                    unsigned int idr_base;
-                    unsigned int idr_next;
-                } ipcs_idr;
-                int max_idx;
-                int last_idx;
-            #ifdef CONFIG_CHECKPOINT_RESTORE
-                int next_id;
-            #endif
-                struct rhashtable key_ht;
-            } ids[3];
-            ...
-        """
-        kversion = Kernel.kernel_version()
-        if "5.11" <= kversion:
-            self.offset_ids = 0
-        else:
-            self.offset_ids = runtime.current_arch.ptrsize
-        self.quiet_info("offsetof(ipc_namespace, ids): {:#x}".format(self.offset_ids))
-
-        # offsetof(ipc_ids, ipcs_idr.idr_rt.xa_head): tagged valid pointer is `xa_head`.
-        # sizeof(ids[0]): find two `xa_head` and calculate the distance.
-        init_ipc_ns = ipc_ns_list[0]
-        found = []
-        first_xa_flags = None
-        for i in range(6, 120):
-            base = self.offset_ids + runtime.current_arch.ptrsize * i
-            """
-            [x64 before using IPC]
-            0xffffffff8b1841f8|+0x0038|+007: 0x0080000400000000 <- xa_lock, xa_flags
-            0xffffffff8b184200|+0x0040|+008: 0x0000000000000000 <- xa_head
-            0xffffffff8b184208|+0x0048|+009: 0x0000000000000000 <- idr_base, idr_next
-            [x64 after using IPC]
-            0xffffffff8b1841f8|+0x0038|+007: 0x0080000400000000
-            0xffffffff8b184200|+0x0040|+008: 0xffff9250c7dc2002 ->  0x0000000000000001
-            0xffffffff8b184208|+0x0048|+009: 0x0000000100000000
-            [x64 after deleting IPC]
-            0xffffffff8b1841f8|+0x0038|+007: 0x0080000400000000
-            0xffffffff8b184200|+0x0040|+008: 0x0000000000000000
-            0xffffffff8b184208|+0x0048|+009: 0x0000000100000000
-
-            [x86 before using IPC]
-            0xc1b4e104|+0x0024|+009: 0x00000000 <- xa_lock
-            0xc1b4e108|+0x0028|+010: 0x00800004 <- xa_flags
-            0xc1b4e10c|+0x002c|+011: 0x00000000 <- xa_head
-            0xc1b4e110|+0x0030|+012: 0x00000000 <- idr_base
-            0xc1b4e114|+0x0034|+013: 0x00000000 <- idr_next
-            [x86 after using IPC]
-            0xc1b4e104|+0x0024|+009: 0x00000000
-            0xc1b4e108|+0x0028|+010: 0x00800004
-            0xc1b4e10c|+0x002c|+011: 0xc2c67392  ->  0x00000001
-            0xc1b4e110|+0x0030|+012: 0x00000000
-            0xc1b4e114|+0x0034|+013: 0x00000001
-            [x86 after deleting IPC]
-            0xc1b4e104|+0x0024|+009: 0x00000000
-            0xc1b4e108|+0x0028|+010: 0x00800004
-            0xc1b4e10c|+0x002c|+011: 0x00000000
-            0xc1b4e110|+0x0030|+012: 0x00000000
-            0xc1b4e114|+0x0034|+013: 0x00000001
-            """
-
-            # xa_flags
-            x = read_int_from_memory(init_ipc_ns + base - runtime.current_arch.ptrsize)
-            if x == 0 or is_valid_addr(x):
-                continue
-            if first_xa_flags is not None and first_xa_flags != x:
-                continue
-
-            # xa_head
-            y = read_int_from_memory(init_ipc_ns + base)
-            if y:
-                if not is_valid_addr(y):
-                    continue
-                if y & 0x2 != 0x2: # xa_head is NULL or tagged address
-                    continue
-
-            # idr_base, idr_next
-            if is_32bit():
-                z1 = read_int_from_memory(init_ipc_ns + base + runtime.current_arch.ptrsize) # idr_base
-                z2 = read_int_from_memory(init_ipc_ns + base + runtime.current_arch.ptrsize * 2) # idr_next
-                if is_valid_addr(z1) or is_valid_addr(z2):
-                    continue
-                if y and z1 == 0 and z2 == 0:
-                    continue
+    @staticmethod
+    def format_permissions(item):
+        values = []
+        columns = [
+            ("id", "{:<5d}", 5), ("key", "{:#010x}", 10), ("uid", "{:<4d}", 4), ("gid", "{:<4d}", 4), ("mode", "{:#5o}", 5),
+        ]
+        for name, fmt, width in columns:
+            if item[name] is None:
+                values.append("{:{w}s}".format("?", w=width))
             else:
-                z = read_int_from_memory(init_ipc_ns + base + runtime.current_arch.ptrsize) # idr_base, idr_next
-                if is_valid_addr(z): # idr_base, idr_next
-                    continue
-                if y and z == 0:
-                    continue
-
-            # first found
-            if not hasattr(self, "offset_xa_head"):
-                self.offset_xa_head = base - self.offset_ids
-                first_xa_flags = x
-
-            # found
-            found.append(base - self.offset_ids)
-
-            # exit loop?
-            if len(found) >= 2:
-                self.sizeof_ipc_ids = found[1] - found[0]
-                break
-        else:
-            self.quiet_err("Could not find ipc_namespace->ids[0].ipcs_idr.idr_rt.xa_head")
-            self.quiet_err("Not recognized sizeof(struct ipc_ids)")
-            self.quiet_err("Maybe CONFIG_SYSVIPC=n")
-            return False
-        self.quiet_info("offsetof(ipc_ids, ipcs_idr.idr_rt.xa_head): {:#x}".format(self.offset_xa_head))
-        self.quiet_info("sizeof(struct ipc_ids): {:#x}".format(self.sizeof_ipc_ids))
-
-        # xa_node
-        """
-        struct xa_node {
-            unsigned char shift;
-            unsigned char offset;
-            unsigned char count;
-            unsigned char nr_values;
-            struct xa_node __rcu *parent;
-            struct xarray *array;
-            union {
-                struct list_head private_list;
-                struct rcu_head rcu_head;
-            };
-            void __rcu *slots[XA_CHUNK_SIZE];
-            union {
-                unsigned long tags[XA_MAX_MARKS][XA_MARK_LONGS];
-                unsigned long marks[XA_MAX_MARKS][XA_MARK_LONGS];
-            };
-        };
-        """
-        # xa_node->{shift,count,slots}
-        self.offset_shift = 0
-        self.offset_count = 2
-        self.offset_slots = runtime.current_arch.ptrsize * 5
-
-        # kern_ipc_perm
-        """
-        struct kern_ipc_perm {
-            spinlock_t lock;
-            bool deleted;
-            int id;
-            key_t key;
-            kuid_t uid;
-            kgid_t gid;
-            kuid_t cuid;
-            kgid_t cgid;
-            umode_t mode;
-            unsigned long seq;
-            void *security;
-            struct rhash_head khtnode;
-            struct rcu_head rcu;
-            refcount_t refcount;
-        } ____cacheline_aligned_in_smp __randomize_layout;
-        """
-        self.offset_id = 4 + 4
-        self.offset_key = self.offset_id + 4
-        self.offset_uid = self.offset_key + 4
-        self.offset_gid = self.offset_uid + 4
-        self.offset_mode = self.offset_gid + 4 + 4 + 4
-
-        self.initialized = True
-        return True
-
-    def parse_xarray(self, ptr, root=False):
-        if ptr == 0:
-            return []
-
-        ptr &= ~3 # untagged
-
-        if root:
-            # ptr is &ipc_ids[i]
-            node = read_int_from_memory(ptr + self.offset_xa_head)
-            return self.parse_xarray(node)
-
-        shift = read_int8_from_memory(ptr + self.offset_shift)
-        count = read_int8_from_memory(ptr + self.offset_count)
-        slots = ptr + self.offset_slots
-        elems = []
-        for i in range(64): # 16 or 64
-            x = read_int_from_memory(slots + runtime.current_arch.ptrsize * i)
-            if x == 0:
-                continue
-            if shift:
-                elems += self.parse_xarray(x)
-            else:
-                elems.append(x)
-            count -= 1
-            if count == 0:
-                break
-        return elems
+                values.append(fmt.format(item[name]))
+        return "{:#018x} {:s}".format(item["address"], " ".join(values))
 
     def dump_ipc_sem_ids(self, ipc_ids_ptr):
-        """
-        struct sem_array {
-            struct kern_ipc_perm sem_perm;
-            time64_t sem_ctime;
-            struct list_head pending_alter;
-            struct list_head pending_const;
-            struct list_head list_id;
-            int sem_nsems;
-            ...
-        } __randomize_layout;
-        """
         self.out.append(titlify("Semaphore Arrays"))
         fmt = "{:18s} {:5s} {:10s} {:4s} {:4s} {:5s} {:s}"
         legend = ["sem_array", "semid", "key", "uid", "gid", "perms", "nsems"]
         self.out.append(GefUtil.make_legend(fmt.format(*legend)))
 
-        elems = self.parse_xarray(ipc_ids_ptr, root=True)
-        for e in elems:
-            semid = read_int32_from_memory(e + self.offset_id)
-            key = read_int32_from_memory(e + self.offset_key)
-            uid = read_int32_from_memory(e + self.offset_uid)
-            gid = read_int32_from_memory(e + self.offset_gid)
-            mode = read_int16_from_memory(e + self.offset_mode)
-
-            if not hasattr(self, "offset_sem_nsems"):
-                for i in range(1, 64):
-                    # search pending_alter, pending_const, list_id
-                    base = self.offset_mode + runtime.current_arch.ptrsize * i
-                    addrs = [read_int_from_memory(e + base + runtime.current_arch.ptrsize * j) for j in range(6)]
-                    if all(is_valid_addr(x) for x in addrs):
-                        # found
-                        self.offset_sem_nsems = base + runtime.current_arch.ptrsize * 6
-                        break
-            if hasattr(self, "offset_sem_nsems"):
-                nsems = read_int_from_memory(e + self.offset_sem_nsems)
-                self.out.append("{:#018x} {:<5d} {:#010x} {:<4d} {:<4d} {:#5o} {:d}".format(
-                    e, semid, key, uid, gid, mode, nsems,
-                ))
+        result = self.kipcs.get_semaphores(ipc_ids_ptr)
+        for item in result["objects"]:
+            if item["nsems"] is not None:
+                nsems = "{:d}".format(item["nsems"])
             else:
-                self.out.append("{:#018x} {:<5d} {:#010x} {:<4d} {:<4d} {:#5o} {:s}".format(
-                    e, semid, key, uid, gid, mode, "?",
-                ))
-
+                nsems = "?"
+            self.out.append("{:s} {:s}".format(self.format_permissions(item), nsems))
+        for reason in result["incomplete"]:
+            self.warn_add_out("Incomplete: {:s}".format(reason))
         return
 
     def dump_ipc_msg_ids(self, ipc_ids_ptr):
-        """
-        struct msg_queue {
-            struct kern_ipc_perm q_perm;
-            time64_t q_stime;
-            time64_t q_rtime;
-            time64_t q_ctime;
-            unsigned long q_cbytes;
-            unsigned long q_qnum;
-            unsigned long q_qbytes;
-            struct pid *q_lspid;
-            struct pid *q_lrpid;
-            struct list_head q_messages; <--> msg_msg.m_list
-            struct list_head q_receivers;
-            struct list_head q_senders;
-        } __randomize_layout;
-
-        struct msg_msg {
-            struct list_head m_list;
-            long m_type;
-            size_t m_ts; /* message text size */
-            struct msg_msgseg *next;
-            void *security;
-        };
-        """
         self.out.append(titlify("Message Queues"))
         fmt = "{:18s} {:5s} {:10s} {:4s} {:4s} {:5s} {:10s} {:s}"
         legend = ["msg_queue", "msqid", "key", "uid", "gid", "perms", "used-bytes", "messages"]
         self.out.append(GefUtil.make_legend(fmt.format(*legend)))
 
-        elems = self.parse_xarray(ipc_ids_ptr, root=True)
-        for e in elems:
-            msqid = read_int32_from_memory(e + self.offset_id)
-            key = read_int32_from_memory(e + self.offset_key)
-            uid = read_int32_from_memory(e + self.offset_uid)
-            gid = read_int32_from_memory(e + self.offset_gid)
-            mode = read_int16_from_memory(e + self.offset_mode)
-
-            if not hasattr(self, "offset_q_cbytes"):
-                for i in range(1, 64):
-                    # search q_messages, q_receivers, q_senders
-                    base = self.offset_mode + runtime.current_arch.ptrsize * i
-                    addrs = [read_int_from_memory(e + base + runtime.current_arch.ptrsize * j) for j in range(6)]
-                    if all(is_valid_addr(x) for x in addrs):
-                        x = read_int_from_memory(e + base + runtime.current_arch.ptrsize * 6)
-                        if not is_valid_addr(x):
-                            # found
-                            self.offset_q_cbytes = base - runtime.current_arch.ptrsize * 5
-                            self.offset_q_qnum = base - runtime.current_arch.ptrsize * 4
-                            self.offset_q_messages = base
-                            break
-            if hasattr(self, "offset_q_cbytes"):
-                q_cbytes = read_int_from_memory(e + self.offset_q_cbytes)
-                q_qnum = read_int_from_memory(e + self.offset_q_qnum)
-                self.out.append("{:#018x} {:<5d} {:#010x} {:<4d} {:<4d} {:#5o} {:<#10x} {:<d}".format(
-                    e, msqid, key, uid, gid, mode, q_cbytes, q_qnum,
-                ))
+        result = self.kipcs.get_messages(ipc_ids_ptr)
+        for item in result["objects"]:
+            if item["q_cbytes"] is not None:
+                q_cbytes = "{:<#10x}".format(item["q_cbytes"])
             else:
-                self.out.append("{:#018x} {:<5d} {:#010x} {:<4d} {:<4d} {:#5o} {:10s} {:s}".format(
-                    e, msqid, key, uid, gid, mode, "?", "?",
-                ))
+                q_cbytes = "{:10s}".format("?")
+            if item["q_qnum"] is not None:
+                q_qnum = "{:<d}".format(item["q_qnum"])
+            else:
+                q_qnum = "?"
+            self.out.append("{:s} {:s} {:s}".format(self.format_permissions(item), q_cbytes, q_qnum))
 
-            if self.args.verbose:
-                if hasattr(self, "offset_q_messages"):
-                    current = e + self.offset_q_messages
-                    seen = [current]
-                    while is_valid_addr(current):
-                        current = read_int_from_memory(current)
-                        if current in seen:
-                            break
-                        seen.append(current)
-                        self.out.append("msg_msg: {:#x}".format(current))
-                        res = gdb.execute("dereference -n {:#x} 8".format(current), to_string=True)
-                        self.out.append(res.rstrip())
+            if self.args.verbose and item["messages"] is not None:
+                messages, incomplete = self.kipcs.get_message_entries(item["messages"], item["q_qnum"])
+                for current in messages:
+                    self.out.append("msg_msg: {:#x}".format(current))
+                    res = gdb.execute("dereference -n {:#x} 8".format(current), to_string=True)
+                    self.out.append(res.rstrip())
+                for reason in incomplete:
+                    self.warn_add_out("Incomplete: {:s}".format(reason))
+        for reason in result["incomplete"]:
+            self.warn_add_out("Incomplete: {:s}".format(reason))
         return
 
     def dump_ipc_shm_ids(self, ipc_ids_ptr):
-        """
-        struct shmid_kernel {
-            struct kern_ipc_perm shm_perm;
-            struct file *shm_file;
-            unsigned long shm_nattch;
-            unsigned long shm_segsz;
-            ...
-        } __randomize_layout;
-        """
         self.out.append(titlify("Shared Memory Segments"))
         fmt = "{:18s} {:5s} {:10s} {:4s} {:4s} {:5s} {:10s} {:s}"
         legend = ["shmid_kernel", "shmid", "key", "uid", "gid", "perms", "bytes", "nattch"]
         self.out.append(GefUtil.make_legend(fmt.format(*legend)))
 
-        elems = self.parse_xarray(ipc_ids_ptr, root=True)
-        for e in elems:
-            shmid = read_int32_from_memory(e + self.offset_id)
-            key = read_int32_from_memory(e + self.offset_key)
-            uid = read_int32_from_memory(e + self.offset_uid)
-            gid = read_int32_from_memory(e + self.offset_gid)
-            mode = read_int16_from_memory(e + self.offset_mode)
-
-            if not hasattr(self, "offset_shm_nattch"):
-                for i in range(1, 64):
-                    # search shm_file and shm_segsz
-                    base = self.offset_mode + runtime.current_arch.ptrsize * i
-                    x = read_int_from_memory(e + base)
-                    y = read_int_from_memory(e + base + runtime.current_arch.ptrsize * 2)
-                    if is_valid_addr(x) and y != 0 and y % 0x1000 == 0:
-                        # found
-                        self.offset_shm_nattch = base + runtime.current_arch.ptrsize
-                        self.offset_shm_segsz = base + runtime.current_arch.ptrsize * 2
-                        break
-            if hasattr(self, "offset_shm_nattch"):
-                nattch = read_int_from_memory(e + self.offset_shm_nattch)
-                segsz = read_int_from_memory(e + self.offset_shm_segsz)
-                self.out.append("{:#018x} {:<5d} {:#010x} {:<4d} {:<4d} {:#5o} {:<#10x} {:<d}".format(
-                    e, shmid, key, uid, gid, mode, segsz, nattch,
-                ))
+        result = self.kipcs.get_shared_memory(ipc_ids_ptr)
+        for item in result["objects"]:
+            if item["segsz"] is not None:
+                segsz = "{:<#10x}".format(item["segsz"])
             else:
-                self.out.append("{:#018x} {:<5d} {:#010x} {:<4d} {:<4d} {:#5o} {:10s} {:s}".format(
-                    e, shmid, key, uid, gid, mode, "?", "?",
-                ))
+                segsz = "{:10s}".format("?")
+            if item["nattch"] is not None:
+                nattch = "{:<d}".format(item["nattch"])
+            else:
+                nattch = "?"
+            self.out.append("{:s} {:s} {:s}".format(self.format_permissions(item), segsz, nattch))
+        for reason in result["incomplete"]:
+            self.warn_add_out("Incomplete: {:s}".format(reason))
         return
 
     @parse_args
     @only_if_gdb_running
-    @only_if_specific_gdb_mode(mode=("qemu-system", "vmware"))
-    @only_if_specific_arch(arch=("x86_32", "x86_64", "ARM32", "ARM64"))
+    @only_if_specific_gdb_mode(mode=("qemu-system", "vmware", "kgdb"))
+    @only_if_specific_arch(arch=("x86_32", "x86_64", "ARM32", "ARM64", "RISCV32", "RISCV64"))
     @only_if_in_kernel_or_kpti_disabled
     def do_invoke(self, args):
         self.quiet_info("Wait for memory scan")
 
-        kversion = Kernel.kernel_version()
+        kversion = Kernel.version()
         if kversion is None:
             err("Could not find Linux kernel")
             return
-        if kversion < "4.20":
-            # xarray is introduced from 4.20
-            self.quiet_err("Unsupported before v4.20")
-            return
+        self.kipcs = Kernel.ipcs()
 
-        ipc_ns_list = self.get_all_ipc_ns()
+        # every task, including init_task whose nsproxy is init_nsproxy
+        self.meta = []
+        try:
+            task_command = Kernel.task()
+            task_ready = task_command.initialize(namespaces=True)
+            self.meta.extend(Kernel.export_meta(self, task_command.meta))
+            if not task_ready:
+                task_command = None
+        except gdb.MemoryError:
+            task_command = None
+        offset_nsproxy = getattr(task_command, "offset_nsproxy", None)
+        task_addrs = []
+        if task_command is not None and offset_nsproxy is not None:
+            task_addrs = KernelTask.get_task_list(task_command.init_task, task_command.offset_tasks)
+        else:
+            offset_nsproxy = None
+        result = self.kipcs.get_all_ipc_ns(task_addrs, offset_nsproxy)
+        ipc_ns_list = result["namespaces"]
         if not ipc_ns_list:
-            self.quiet_info("Nothing to dump")
+            for func, line in self.meta:
+                func(line)
+            for reason in result["incomplete"]:
+                self.quiet_err(reason)
             return
 
-        ret = self.initialize(ipc_ns_list)
+        ret = self.kipcs.initialize(ipc_ns_list[0])
+        if args.meta:
+            for func, line in self.meta:
+                func(line)
+        if args.meta or not ret:
+            for func, line in Kernel.export_meta(self, self.kipcs.meta):
+                func(line)
         if not ret:
-            self.quiet_err("Failed to initialize")
+            if not self.kipcs.sysvipc_disabled and not self.kipcs.sysvipc_uninitialized:
+                self.quiet_err("Failed to initialize")
             return
 
+        if args.meta:
+            self.quiet_info("Number of ipc_ns: {:d}".format(len(ipc_ns_list)))
+            return
+
+        ipc_objects_present = self.kipcs.has_objects(ipc_ns_list)
+        if not ipc_objects_present:
+            self.quiet_info("SYSVIPC is enabled, but no IPC objects are present")
+
+        metadata_count = len(self.kipcs.meta)
         self.out = []
-        for i, ipc_ns in enumerate(ipc_ns_list):
-            if i == 0:
+        for reason in result["incomplete"]:
+            self.warn_add_out("Incomplete: {:s}".format(reason))
+        for ipc_ns in ipc_ns_list:
+            if ipc_ns == ipc_ns_list[0]:
                 self.out.append(titlify("init_ipc_ns: {:#x}".format(ipc_ns)))
             else:
                 self.out.append(titlify("ipc_ns: {:#x}".format(ipc_ns)))
-            self.dump_ipc_sem_ids(ipc_ns + self.offset_ids + self.sizeof_ipc_ids * 0)
-            self.dump_ipc_msg_ids(ipc_ns + self.offset_ids + self.sizeof_ipc_ids * 1)
-            self.dump_ipc_shm_ids(ipc_ns + self.offset_ids + self.sizeof_ipc_ids * 2)
+            dumps = [self.dump_ipc_sem_ids, self.dump_ipc_msg_ids, self.dump_ipc_shm_ids]
+            for i, dump in enumerate(dumps):
+                ipc_ids_ptr = ipc_ns + self.kipcs.offset_ids + self.kipcs.sizeof_ipc_ids * i
+                try:
+                    dump(ipc_ids_ptr)
+                except gdb.MemoryError:
+                    self.warn_add_out("Incomplete: ipc_ids {:#x} is unreadable".format(ipc_ids_ptr))
 
+        for func, line in Kernel.export_meta(self, self.kipcs.meta[metadata_count:]):
+            func(line)
         self.print_output(check_terminal_size=True)
         return
 
@@ -8156,6 +7061,8 @@ class KernelDeviceIOCommand(GenericCommand, BufferingOutput):
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("-hh", "--help-simple", action="store_true", help="show help without ASCII diagram.")
+    parser.add_argument("--meta", action="store_true", help="display resource layout information.")
+    parser.add_argument("--resource", type=lambda value: int(value, 0), help="walk a resource tree at ADDRESS.")
     parser.add_argument("-n", "--no-pager", action="store_true", help="do not use the pager.")
     parser.add_argument("-q", "--quiet", action="store_true", help="show result only.")
     _syntax_ = parser.format_help()
@@ -8189,126 +7096,138 @@ class KernelDeviceIOCommand(GenericCommand, BufferingOutput):
     ]
     _note_ = "\n".join(_note_)
 
-    def dump_resource(self, addr):
-        if not is_valid_addr(addr):
+    def dump_resource(self, addr, layout):
+        resources = []
+        seen = set()
+        stack = [(addr, None)]
+        root = addr
+
+        while stack:
+            addr, expected_parent = stack.pop()
+            if not addr:
+                continue
+            if not is_valid_addr(addr):
+                self.incomplete.append("invalid resource pointer {:#x}".format(addr))
+                continue
+            if addr in seen:
+                self.incomplete.append("resource cycle at {:#x}".format(addr))
+                continue
+            seen.add(addr)
+            if len(seen) > 100000:
+                self.incomplete.append("resource limit reached")
+                break
+
+            start = KernelResourceLayout.read_size(addr + layout["start"], layout["width"])
+            end = KernelResourceLayout.read_size(addr + layout["end"], layout["width"])
+            name_ptr = read_int_from_memory(addr + layout["name"], safe=True)
+            flags = read_int_from_memory(addr + layout["flags"], safe=True)
+            parent = read_int_from_memory(addr + layout["parent"], safe=True)
+            sibling = read_int_from_memory(addr + layout["sibling"], safe=True)
+            child = read_int_from_memory(addr + layout["child"], safe=True)
+            if None in (start, end, name_ptr, flags, parent, sibling, child):
+                self.incomplete.append("unreadable resource at {:#x}".format(addr))
+                if sibling and sibling != root and sibling != addr:
+                    stack.append((sibling, expected_parent))
+                if child:
+                    stack.append((child, addr))
+                continue
+            if expected_parent is not None and parent != expected_parent:
+                self.incomplete.append("invalid parent backlink at {:#x}".format(addr))
+                if sibling and sibling != addr:
+                    stack.append((sibling, expected_parent))
+                continue
+            if name_ptr == 0:
+                name = "<unnamed>"
+            else:
+                name = read_cstring_from_memory(name_ptr, safe=True)
+            if name is None:
+                name = "<unreadable>"
+                self.incomplete.append("unreadable resource name at {:#x}".format(addr))
+            if start > end:
+                self.incomplete.append("invalid resource range at {:#x}".format(addr))
+                if sibling and sibling != addr:
+                    stack.append((sibling, expected_parent))
+                if child:
+                    stack.append((child, addr))
+                continue
+
+            resources.append((addr, start, end, name, flags))
+            if sibling and sibling != root and sibling != addr:
+                stack.append((sibling, expected_parent))
+            if child:
+                stack.append((child, addr))
+        return resources
+
+    def get_resources(self, addr, expected_name=None, expected_flag=None):
+        self.layout = KernelResourceLayout.get_layout(addr, expected_name, expected_flag)
+        self.incomplete = []
+        if self.layout is None:
             return []
-        if addr in self.seen:
-            return []
-        self.seen.append(addr)
-
-        if not hasattr(self, "sizeof_resource_size_t"):
-            name_ptr = read_int_from_memory(addr + 0x8 * 2) # sizeof(resource_size_t) == 8
-            if name_ptr and is_valid_addr(name_ptr):
-                name = read_cstring_from_memory(name_ptr)
-                if name in ["PCI IO", "PCI mem"]:
-                    self.sizeof_resource_size_t = 0x8
-
-        if not hasattr(self, "sizeof_resource_size_t"):
-            name_ptr = read_int_from_memory(addr + 0x4 * 2) # sizeof(resource_size_t) == 4
-            if name_ptr and is_valid_addr(name_ptr):
-                name = read_cstring_from_memory(name_ptr)
-                if name in ["PCI IO", "PCI mem"]:
-                    self.sizeof_resource_size_t = 0x4
-
-        if not hasattr(self, "sizeof_resource_size_t"):
-            err("Not recognized sizeof(resource_size_t)")
-            return []
-
-        """
-        struct resource {
-            resource_size_t start; // 4 or 8
-            resource_size_t end; // 4 or 8
-            const char *name;
-            unsigned long flags;
-            unsigned long desc; // v4.5~
-            struct resource *parent, *sibling, *child;
-        };
-        """
-        if self.sizeof_resource_size_t == 8:
-            start = read_int64_from_memory(addr)
-            end = read_int64_from_memory(addr + 8)
-        elif self.sizeof_resource_size_t == 4:
-            start = read_int32_from_memory(addr)
-            end = read_int32_from_memory(addr + 4)
-        name = read_cstring_from_memory(read_int_from_memory(addr + self.sizeof_resource_size_t * 2))
-        flags = read_int_from_memory(addr + self.sizeof_resource_size_t * 2 + runtime.current_arch.ptrsize)
-
-        ret = [(addr, start, end, name, flags)]
-
-        kversion = Kernel.kernel_version()
-        if "4.5" <= kversion:
-            parent = read_int_from_memory(addr + self.sizeof_resource_size_t * 2 + runtime.current_arch.ptrsize * 3)
-            ret += self.dump_resource(parent)
-            sibling = read_int_from_memory(addr + self.sizeof_resource_size_t * 2 + runtime.current_arch.ptrsize * 4)
-            ret += self.dump_resource(sibling)
-            child = read_int_from_memory(addr + self.sizeof_resource_size_t * 2 + runtime.current_arch.ptrsize * 5)
-            ret += self.dump_resource(child)
-        else:
-            parent = read_int_from_memory(addr + self.sizeof_resource_size_t * 2 + runtime.current_arch.ptrsize * 2)
-            ret += self.dump_resource(parent)
-            sibling = read_int_from_memory(addr + self.sizeof_resource_size_t * 2 + runtime.current_arch.ptrsize * 3)
-            ret += self.dump_resource(sibling)
-            child = read_int_from_memory(addr + self.sizeof_resource_size_t * 2 + runtime.current_arch.ptrsize * 4)
-            ret += self.dump_resource(child)
-        return ret
+        return self.dump_resource(addr, self.layout)
 
     @parse_args
     @only_if_gdb_running
-    @only_if_specific_gdb_mode(mode=("qemu-system", "vmware"))
-    @only_if_specific_arch(arch=("x86_32", "x86_64", "ARM32", "ARM64"))
+    @only_if_specific_gdb_mode(mode=("qemu-system", "vmware", "kgdb", "core"))
     @only_if_in_kernel_or_kpti_disabled
     def do_invoke(self, args):
         self.quiet_info("Wait for memory scan")
 
         self.out = []
 
-        # ioport
-        ioport_resource = KernelAddressHeuristicFinder.get_ioport_resource()
-        if not ioport_resource:
-            err("Could not find ioport_resource")
+        if args.resource is not None:
+            roots = [("Resource tree", args.resource, None, None)]
         else:
-            info("ioport_resource: {:#x}".format(ioport_resource))
+            roots = [
+                ("I/O-port", KernelAddressHeuristicFinder.get_ioport_resource(), "PCI IO", 0x100),
+                ("I/O-memory", KernelAddressHeuristicFinder.get_iomem_resource(), "PCI mem", 0x200),
+            ]
 
-            self.seen = []
-            resources = self.dump_resource(ioport_resource)
+        for title, root, expected_name, expected_flag in roots:
+            if not root:
+                err("Could not find {:s}".format(title))
+                continue
+            resources = self.get_resources(root, expected_name, expected_flag)
+            if self.layout is None:
+                err("Could not recognize struct resource at {:#x}".format(root))
+                continue
+            info("{:s}: {:#x}".format(title, root))
+            if args.meta:
+                self.out.append("{:s}: {:#x}".format(title, root))
+                self.out.append("struct resource: source={:s}, size={:#x}, resource_size_t={:d}".format(
+                    self.layout["source"], self.layout["size"], self.layout["width"],
+                ))
+                for name in ("start", "end", "name", "flags", "desc", "parent", "sibling", "child"):
+                    if self.layout[name] is not None:
+                        self.out.append("offsetof(resource, {:s}): {:#x}".format(name, self.layout[name]))
+                self.out.append("resources: {:d}, status: {:s}".format(
+                    len(resources), "partial" if self.incomplete else "complete",
+                ))
+                self.out.extend("Incomplete: {:s}".format(reason) for reason in self.incomplete)
+                continue
+
             if resources:
                 name_width = max(len(res[3]) for res in resources)
             else:
                 name_width = 4
-
-            self.out.append(titlify("I/O-port"))
-            fmt = "{:18s} {:17s} {:{:d}s} {:s}"
-            legend = ["resource", "I/O address", "name", name_width, "flags"]
-            self.out.append(GefUtil.make_legend(fmt.format(*legend)))
-
-            for addr, start, end, name, flags in sorted(resources, key=lambda x: x[1]):
-                self.out.append("{:#018x} {:#08x}-{:#08x} {:{:d}s} {:#010x} ({:s})".format(
-                    addr, start, end, name, name_width, flags, KernelPciDeviceCommand.get_flags_str(flags),
-                ))
-
-        # iomem
-        iomem_resource = KernelAddressHeuristicFinder.get_iomem_resource()
-        if not iomem_resource:
-            err("Could not find iomem_resource")
-        else:
-            info("iomem_resource: {:#x}".format(iomem_resource))
-
-            self.seen = []
-            resources = self.dump_resource(iomem_resource)
-            if resources:
-                name_width = max(len(res[3]) for res in resources)
+            if title == "I/O-port":
+                fmt = "{:18s} {:17s} {:{:d}s} {:s}"
+                legend = ["resource", "I/O address", "name", name_width, "flags"]
             else:
-                name_width = 4
-
-            self.out.append(titlify("I/O-memory"))
-            fmt = "{:18s} {:37s} {:{:d}s} {:s}"
-            legend = ["resource", "Physical address", "name", name_width, "flags"]
+                fmt = "{:18s} {:37s} {:{:d}s} {:s}"
+                legend = ["resource", "Physical address", "name", name_width, "flags"]
+            self.out.append(titlify(title))
             self.out.append(GefUtil.make_legend(fmt.format(*legend)))
-
             for addr, start, end, name, flags in sorted(resources, key=lambda x: x[1]):
-                self.out.append("{:#018x} {:#018x}-{:#018x} {:{:d}s} {:#010x} ({:s})".format(
-                    addr, start, end, name, name_width, flags, KernelPciDeviceCommand.get_flags_str(flags),
-                ))
+                if title == "I/O-port":
+                    line = "{:#018x} {:#08x}-{:#08x} {:{:d}s} {:#010x} ({:s})".format(
+                        addr, start, end, name, name_width, flags, KernelPciDeviceCommand.get_flags_str(flags),
+                    )
+                else:
+                    line = "{:#018x} {:#018x}-{:#018x} {:{:d}s} {:#010x} ({:s})".format(
+                        addr, start, end, name, name_width, flags, KernelPciDeviceCommand.get_flags_str(flags),
+                    )
+                self.out.append(line)
+            self.out.extend("Incomplete: {:s}".format(reason) for reason in self.incomplete)
 
         self.print_output(check_terminal_size=True)
         return
@@ -8324,6 +7243,7 @@ class KernelDmaBufCommand(GenericCommand, BufferingOutput):
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("-hh", "--help-simple", action="store_true", help="show help without ASCII diagram.")
+    parser.add_argument("--meta", action="store_true", help="display offset information.")
     parser.add_argument("-n", "--no-pager", action="store_true", help="do not use the pager.")
     parser.add_argument("-q", "--quiet", action="store_true", help="show result only.")
     _syntax_ = parser.format_help()
@@ -8361,294 +7281,68 @@ class KernelDmaBufCommand(GenericCommand, BufferingOutput):
     ]
     _note_ = "\n".join(_note_)
 
-    def initialize(self):
-        kversion = Kernel.kernel_version()
-        if kversion is None:
-            err("Could not find kernel version")
-            return False
-        if "5.10" <= kversion < "6.10":
-            self.db_list = KernelAddressHeuristicFinder.get_db_list()
-        elif "6.10" <= kversion < "6.16":
-            self.db_list = KernelAddressHeuristicFinder.get_debugfs_list()
-        else:
-            self.db_list = KernelAddressHeuristicFinder.get_dmabuf_list()
-        if self.db_list is None:
-            err("Could not find db_list (maybe DMA_SHARED_BUFFER=n)")
-            return False
-
-        if "5.10" <= kversion < "6.10":
-            self.quiet_info("db_list: {:#x}".format(self.db_list))
-        elif "6.10" <= kversion < "6.16":
-            self.quiet_info("debugfs_list: {:#x}".format(self.db_list))
-        else:
-            self.quiet_info("dmabuf_list: {:#x}".format(self.db_list))
-
-        first_dma_buf = read_int_from_memory(self.db_list)
-        if first_dma_buf == self.db_list:
-            warn("Nothing to dump")
-            return False
-
-        """
-        struct dma_buf {
-            size_t size;
-            struct file *file;
-            struct list_head attachments;
-            const struct dma_buf_ops *ops;
-            struct mutex lock; // ~v6.2
-            unsigned vmapping_counter;
-            struct iosys_map {
-                union {
-                    void __iomem *vaddr_iomem;
-                    void *vaddr;
-                };
-                bool is_iomem;
-            } vmap_ptr;
-            const char *exp_name;
-            const char *name;
-            spinlock_t name_lock;
-            struct module *owner;
-            struct list_head list_node;
-            void *priv; <-- struct system_heap_buffer*
-            struct dma_resv *resv;
-            wait_queue_head_t poll;
-            ...
-        }
-
-        [v6.4 x64 example]
-        0xffff8880135f8a00|+0x0000|+000: 0x0000000000001000  // size
-        0xffff8880135f8a08|+0x0008|+001: 0xffff888000f85800  ->  0x0000000000000000 // file
-        0xffff8880135f8a10|+0x0010|+002: 0xffff8880135f8a10  ->  [loop detected] // attachments
-        0xffff8880135f8a18|+0x0018|+003: 0xffff8880135f8a10  ->  [loop detected]
-        0xffff8880135f8a20|+0x0020|+004: 0xffffffff83e79d00 <system_heap_buf_ops>  ->  0x0000000000000000 // ops
-        0xffff8880135f8a28|+0x0028|+005: 0x0000000000000000  // vmapping_counter
-        0xffff8880135f8a30|+0x0030|+006: 0x0000000000000000  // vmap_ptr.vaddr_iomem
-        0xffff8880135f8a38|+0x0038|+007: 0x0000000000000000  // vmap_ptr.is_iomem
-        0xffff8880135f8a40|+0x0040|+008: 0xffffffff8482754e <linux_banner+0x6d70ae>  ->  0x6e006d6574737973 ('system'?) // exp_name
-        0xffff8880135f8a48|+0x0048|+009: 0x0000000000000000  // name
-        0xffff8880135f8a50|+0x0050|+010: 0xdead4ead00000000  // name_lock
-        0xffff8880135f8a58|+0x0058|+011: 0x00000000ffffffff
-        0xffff8880135f8a60|+0x0060|+012: 0xffffffffffffffff
-        0xffff8880135f8a68|+0x0068|+013: 0xffffffff883cc330 <__key.7>  ->  0x0000000000000000
-        0xffff8880135f8a70|+0x0070|+014: 0x0000000000000000
-        0xffff8880135f8a78|+0x0078|+015: 0x0000000000000000
-        0xffff8880135f8a80|+0x0080|+016: 0xffffffff847790c3 <linux_banner+0x628c23>  ->  '&dmabuf->name_lock'
-        0xffff8880135f8a88|+0x0088|+017: 0x0000000000000200
-        0xffff8880135f8a90|+0x0090|+018: 0x0000000000000000  // owner
-        0xffff8880135f8a98|+0x0098|+019: 0xffff8880135f8c98  ->  0xffffffff883cc360 <db_list>  ->  [loop detected] // list_node
-        0xffff8880135f8aa0|+0x00a0|+020: 0xffffffff883cc360 <db_list>  ->  0xffff8880135f8a98  ->  0xffff8880135f8c98  ->  ...
-        0xffff8880135f8aa8|+0x00a8|+021: 0xffff88800f978600  ->  ... // priv
-        0xffff8880135f8ab0|+0x00b0|+022: 0xffff8880135f8b58  ->  0x0000000000000000
-        0xffff8880135f8ab8|+0x00b8|+023: 0xdead4ead00000000
-        0xffff8880135f8ac0|+0x00c0|+024: 0x00000000ffffffff
-        0xffff8880135f8ac8|+0x00c8|+025: 0xffffffffffffffff
-        """
-        for i in range(1, 50):
-            a = read_int_from_memory(first_dma_buf - runtime.current_arch.ptrsize * (i + 4)) # size
-            b = read_int_from_memory(first_dma_buf - runtime.current_arch.ptrsize * (i + 3)) # file
-            c = read_int_from_memory(first_dma_buf - runtime.current_arch.ptrsize * (i + 2)) # attachments
-            e = read_int_from_memory(first_dma_buf - runtime.current_arch.ptrsize * (i + 0)) # ops
-
-            # size check
-            if a == 0 or (is_valid_addr(a) and AddressUtil.is_msb_on(a)):
+    def dump_sgl(self, sg, nents):
+        for item in self.kdmabuf.get_sgl(sg, nents):
+            if "error" in item:
+                self.out.append("  scatterlist: {:s}".format(item["error"]))
                 continue
-            # file check
-            if not is_valid_addr(b):
-                continue
-            # attachments check
-            if not is_double_link_list(c):
-                continue
-            # ops check
-            if not is_valid_addr(e):
-                continue
-
-            self.offset_list_node = runtime.current_arch.ptrsize * (i + 4)
-            self.quiet_info("offsetof(dma_buf, list_node): {:#x}".format(self.offset_list_node))
-            break
-        else:
-            err("Could not find dma_buf->list_node")
-            return False
-
-        # dma_buf->{size,file,priv}
-        self.offset_size = 0
-        self.offset_file = runtime.current_arch.ptrsize
-        self.offset_priv = self.offset_list_node + runtime.current_arch.ptrsize * 2
-        self.quiet_info("offsetof(dma_buf, size): {:#x}".format(self.offset_size))
-        self.quiet_info("offsetof(dma_buf, file): {:#x}".format(self.offset_file))
-        self.quiet_info("offsetof(dma_buf, priv): {:#x}".format(self.offset_priv))
-
-        # dma_buf->{exp_name,name}
-        for i in range(1, 50):
-            top = first_dma_buf - self.offset_list_node
-            x = read_int_from_memory(top + runtime.current_arch.ptrsize * i)
-            s = read_cstring_from_memory(x)
-            if s and len(s) >= 3:
-                self.offset_exp_name = runtime.current_arch.ptrsize * i
-                self.offset_name = runtime.current_arch.ptrsize * (i + 1)
-                self.quiet_info("offsetof(dma_buf, exp_name): {:#x}".format(self.offset_exp_name))
-                self.quiet_info("offsetof(dma_buf, name): {:#x}".format(self.offset_name))
-                break
-        else:
-            err("Could not find dma_buf->{exp_name,name}")
-            return False
-
-        """
-        struct system_heap_buffer {
-            struct dma_heap *heap;
-            struct list_head attachments;
-            struct mutex lock;
-            unsigned long len;
-            struct sg_table {
-                struct scatterlist *sgl;
-                unsigned int nents;
-                unsigned int orig_nents;
-            } sg_table;
-            int vmap_cnt;
-            void *vaddr;
-        };
-        """
-        # system_heap_buffer->sg_table
-        size = read_int_from_memory(first_dma_buf - self.offset_list_node + self.offset_size)
-        priv = read_int_from_memory(first_dma_buf - self.offset_list_node + self.offset_priv)
-        for i in range(50):
-            x = read_int_from_memory(priv + runtime.current_arch.ptrsize * i)
-            if x == size:
-                self.offset_sg_table = runtime.current_arch.ptrsize * (i + 1)
-                break
-        else:
-            err("Could not find system_heap_buffer->sg_table")
-            return False
-        self.quiet_info("offsetof(system_heap_buffer, sg_table): {:#x}".format(self.offset_sg_table))
-        return True
-
-    def dump_sgl(self, sg):
-        while True:
-            page_link = read_int_from_memory(sg)
-
-            # check if chain
-            if page_link & 1: # SG_CHAIN
-                sg = page_link & ~3
-                continue
-
-            # output page, phys, virt
-            page = page_link & ~3
-
-            phys = None
-            phys_str = "???"
-            ret = gdb.execute("page2phys {:#x}".format(page), to_string=True)
-            r = re.search(r"Page: \S+ -> Phys: (\S+)", ret)
-            if r:
-                phys = int(r.group(1), 16)
+            page, offset, length = item["page"], item["offset"], item["length"]
+            phys = item["phys"]
+            if phys is not None:
                 phys_str = "{:#018x}".format(phys)
-
-            virt_str = "???"
-            if phys:
-                r = Kernel.p2v(phys)
-                if r:
-                    r = [hex(x) for x in r if AddressUtil.is_msb_on(x)]
-                    virt_str = ",".join(r)
-
-            offset = read_int32_from_memory(sg + runtime.current_arch.ptrsize)
-            length = read_int32_from_memory(sg + runtime.current_arch.ptrsize + 4)
-
+            else:
+                phys_str = "???"
+            if item["virt"]:
+                virt_str = ",".join(hex(x) for x in item["virt"])
+            else:
+                virt_str = "???"
             self.out.append("  page: {:#018x}  offset: {:#010x}  length: {:#010x}  phys: {:18s}  virt: {:s}".format(
                 page, offset, length, phys_str, virt_str,
             ))
-
-            # check if end
-            if page_link & 2: # SG_END:
-                break
-
-            # calc sizeof(scatterlist) then go to next
-            """
-            struct scatterlist {
-                unsigned long page_link;
-                unsigned int offset;
-                unsigned int length;
-                dma_addr_t dma_address;
-            #ifdef CONFIG_NEED_SG_DMA_LENGTH
-                unsigned int dma_length;
-            #endif
-            #ifdef CONFIG_PCI_P2PDMA
-                unsigned int dma_flags;
-            #endif
-            };
-            """
-            sg += runtime.current_arch.ptrsize + 4 * 2 + runtime.current_arch.ptrsize
-            if not is_valid_addr(read_int_from_memory(sg)):
-                sg += runtime.current_arch.ptrsize
-            if not is_valid_addr(read_int_from_memory(sg)):
-                sg += runtime.current_arch.ptrsize
         return
 
     def dump_db_list(self):
         fmt = "{:18s} {:18s} {:16s} {:16s} {:18s} {:18s}"
         legend = ["dma_buf", "size", "exp_name", "name", "file", "priv"]
         self.out.append(GefUtil.make_legend(fmt.format(*legend)))
-
-        seen = [self.db_list]
-        current = read_int_from_memory(self.db_list)
-        while True:
-            if not is_valid_addr(current):
-                break
-            if current in seen:
-                break
-            seen.append(current)
-
-            # calc top
-            dma_buf = current - self.offset_list_node
-
-            # size, file, priv
-            size = read_int_from_memory(dma_buf + self.offset_size)
-            file = read_int_from_memory(dma_buf + self.offset_file)
-            priv = read_int_from_memory(dma_buf + self.offset_priv)
-
-            # exp_name
-            exp_name_p = read_int_from_memory(dma_buf + self.offset_exp_name)
-            exp_name = read_cstring_from_memory(exp_name_p)
-
-            # name
-            name_p = read_int_from_memory(dma_buf + self.offset_name)
-            if is_valid_addr(name_p):
-                name = read_cstring_from_memory(name_p)
-            else:
-                name = "<none>"
-
+        result = self.kdmabuf.get_buffers()
+        for item in result["buffers"]:
             # dump
-            self.out.append("{:#018x} {:#018x} {:16s} {:16s} {:#018x} {:#018x}".format(
-                dma_buf, size, exp_name, name, file, priv,
+            priv = item["priv"]
+            self.out.append("{:#018x} {:#018x} {:16s} {:16s} {:#018x} {:18s}".format(
+                item["address"], item["size"], item["exp_name"], item["name"], item["file"],
+                "{:#018x}".format(priv) if priv is not None else "???",
             ))
 
             # dump sgl
-            sgl = read_int_from_memory(priv + self.offset_sg_table)
-            self.dump_sgl(sgl)
-
-            # go to next
-            current = read_int_from_memory(current)
+            system_heap = item["system_heap"]
+            if system_heap is not None:
+                self.dump_sgl(system_heap[0], system_heap[1])
+        for reason in result["incomplete"]:
+            self.warn_add_out("Incomplete: {:s}".format(reason))
         return
 
     @parse_args
     @only_if_gdb_running
-    @only_if_specific_gdb_mode(mode=("qemu-system", "vmware"))
-    @only_if_specific_arch(arch=("x86_32", "x86_64", "ARM32", "ARM64"))
+    @only_if_specific_gdb_mode(mode=("qemu-system", "vmware", "kgdb"))
+    @only_if_specific_arch(arch=("x86_32", "x86_64", "ARM32", "ARM64", "RISCV32", "RISCV64"))
     @only_if_in_kernel_or_kpti_disabled
     def do_invoke(self, args):
         self.quiet_info("Wait for memory scan")
 
-        kversion = Kernel.kernel_version()
+        kversion = Kernel.version()
         if kversion is None:
             err("Could not find Linux kernel")
             return
-        if kversion < "5.11":
-            err("Unsupported before v5.11")
-            return
-
-        ret = gdb.execute("ksymaddr-remote --quiet --no-pager dma_heap", to_string=True)
+        self.kdmabuf = Kernel.dmabuf()
+        ret = self.kdmabuf.initialize()
+        if args.meta or not ret:
+            for func, line in Kernel.export_meta(self, self.kdmabuf.meta):
+                func(line)
         if not ret:
-            err("This kernel does not support DMA-BUF")
             return
 
-        ret = self.initialize()
-        if ret is False:
+        if args.meta:
             return
 
         self.out = []
@@ -9303,6 +7997,7 @@ class KernelNetDeviceCommand(GenericCommand, BufferingOutput):
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("-hh", "--help-simple", action="store_true", help="show help without ASCII diagram.")
+    parser.add_argument("--meta", action="store_true", help="display offset information.")
     parser.add_argument("-n", "--no-pager", action="store_true", help="do not use the pager.")
     parser.add_argument("-q", "--quiet", action="store_true", help="show result only.")
     _syntax_ = parser.format_help()
@@ -9320,16 +8015,19 @@ class KernelNetDeviceCommand(GenericCommand, BufferingOutput):
     ]
     _note_ = "\n".join(_note_)
 
+    @Cache.cache_this_session(cache_None=False, per_inferior=True, until_new_objfile=True)
     def initialize(self):
-        if hasattr(self, "initialized") and self.initialized:
-            return True
+        self.meta = []
 
         # init_net
         self.init_net = KernelAddressHeuristicFinder.get_init_net()
         if self.init_net is None:
-            self.quiet_err("Could not find init_net")
-            return False
-        self.quiet_info("init_net: {:#x}".format(self.init_net))
+            if KernelAddressHeuristicFinderUtil.has_networking_symbols() is False:
+                self.meta.append((self.quiet_warn, "No core networking symbols found; this kernel may be built with CONFIG_NET=n"))
+            else:
+                self.meta.append((self.quiet_err, "Could not find init_net"))
+            return None
+        self.meta.append((self.quiet_info, "init_net: {:#x}".format(self.init_net)))
 
         """
         struct net {
@@ -9350,68 +8048,89 @@ class KernelNetDeviceCommand(GenericCommand, BufferingOutput):
             ...
         };
         """
-        # net->dev_base_head
-        for i in range(0x100):
-            candidate_offset = runtime.current_arch.ptrsize * i
+        # net->dev_base_head, net_device->dev_list
+        offset_head = GefUtil.offsetof("net", "dev_base_head")
+        offset_name = GefUtil.offsetof("net_device", "name")
+        offset_list = GefUtil.offsetof("net_device", "dev_list")
+        distance = None
+        if offset_name is not None and offset_list is not None and offset_name <= offset_list:
+            distance = offset_list - offset_name
 
+        head_offsets = list(range(0, runtime.current_arch.ptrsize * 0x100, runtime.current_arch.ptrsize))
+        if offset_head is not None:
+            head_offsets.insert(0, offset_head)
+        name_distances = list(range(0, runtime.current_arch.ptrsize * 0x100, runtime.current_arch.ptrsize))
+        if distance is not None:
+            name_distances.insert(0, distance)
+
+        found = False
+        for candidate_offset in dict.fromkeys(head_offsets):
             addr = self.init_net + candidate_offset
-            if not is_double_link_list(addr):
+            if not is_double_link_list(addr, min_len=1):
                 continue
 
-            cand_netdev = read_int_from_memory(addr)
-            if not is_double_link_list(cand_netdev + runtime.current_arch.ptrsize * 2): # napi_list
+            nodes = KernelListHead(addr).parse()
+            if not nodes:
                 continue
-            if not is_double_link_list(cand_netdev + runtime.current_arch.ptrsize * 4): # unreg_list
-                continue
-            if not is_double_link_list(cand_netdev + runtime.current_arch.ptrsize * 6): # close_list
-                continue
-            if not is_double_link_list(cand_netdev + runtime.current_arch.ptrsize * 8): # ptype_all
-                continue
-            break # found
-        else:
-            self.quiet_err("Could not find net->dev_base_head")
-            return False
+            for candidate_distance in dict.fromkeys(name_distances):
+                try:
+                    names = [read_cstring_from_memory(node - candidate_distance, 0x10) for node in nodes]
+                except gdb.MemoryError:
+                    continue
+                if any(
+                    not name
+                    or len(name) >= 0x10
+                    or name in (".", "..")
+                    or any(c.isspace() or c in "/:" for c in name)
+                    for name in names
+                ):
+                    continue
+                if "lo" not in names:
+                    continue
 
-        self.offset_dev_base_head = candidate_offset
-        self.quiet_info("offsetof(net, dev_base_head): {:#x}".format(self.offset_dev_base_head))
-
-        # net_device->dev_list
-        netdev_dev_list = read_int_from_memory(self.init_net + self.offset_dev_base_head)
-        for i in range(0x20):
-            candidate_offset = runtime.current_arch.ptrsize * i
-            if read_cstring_from_memory(netdev_dev_list - candidate_offset) == "lo":
+                self.offset_dev_base_head = candidate_offset
+                self.distance_dev_list_name = candidate_distance
+                if candidate_distance == distance:
+                    self.offset_name = offset_name
+                else:
+                    self.offset_name = None
+                if self.offset_name is not None:
+                    self.offset_dev_list = offset_list
+                else:
+                    self.offset_dev_list = None
+                found = True
+                break
+            if found:
                 break
         else:
-            self.quiet_err("Could not find net_device->dev_list")
-            return False
+            self.meta.append((self.quiet_err, "Could not find net->dev_base_head"))
+            return None
 
-        self.offset_dev_list = candidate_offset
-        self.quiet_info("offsetof(net_device, dev_list): {:#x}".format(self.offset_dev_list))
+        self.meta.append((self.quiet_info, "offsetof(net, dev_base_head): {:#x}".format(self.offset_dev_base_head)))
+        if self.offset_name is not None:
+            self.meta.append((self.quiet_info, "offsetof(net_device, name): {:#x}".format(self.offset_name)))
+            self.meta.append((self.quiet_info, "offsetof(net_device, dev_list): {:#x}".format(self.offset_dev_list)))
+        else:
+            self.meta.append((self.quiet_info, "distance(dev_list, name): {:#x}".format(self.distance_dev_list_name)))
 
         return True
 
     def dump_net(self):
         fmt = "{:18s} {:s}"
-        legend = ["net_device", "name"]
+        legend = ["net_device" if self.offset_name is not None else "&net_device.name", "name"]
         self.out.append(GefUtil.make_legend(fmt.format(*legend)))
 
         # `struct net_device` is a very complex struct, and detecting the offset of its members is very difficult.
         # My best effort is to detect only names and addresses.
 
-        head = current = self.init_net + self.offset_dev_base_head
-        while True:
-            current = read_int_from_memory(current)
-            if current == head:
-                break
-
-            netdev = current - self.offset_dev_list
-            name = read_cstring_from_memory(netdev)
+        head = self.init_net + self.offset_dev_base_head
+        for name_addr in KernelListHead(head, self.distance_dev_list_name).iter_entries():
+            name = read_cstring_from_memory(name_addr, 0x10)
+            if self.offset_name is not None:
+                netdev = name_addr - self.offset_name
+            else:
+                netdev = name_addr
             self.out.append("{:#018x} {:s}".format(netdev, name))
-
-        kversion = Kernel.kernel_version()
-        if "6.8" <= kversion:
-            info("In kernel 6.8 and later, the order of the members of `struct net_device` has changed significantly")
-            info("Please note that the address detected as `net_device` is precisely the address of &net_device.name")
         return
 
     @parse_args
@@ -9423,13 +8142,20 @@ class KernelNetDeviceCommand(GenericCommand, BufferingOutput):
         self.quiet_info("Wait for memory scan")
 
         ret = self.initialize()
-        if ret is False:
+        if args.meta or not ret:
+            for func, line in self.meta:
+                func(line)
+        if not ret:
+            return
+
+        if args.meta:
             return
 
         self.out = []
         self.dump_net()
         self.print_output(check_terminal_size=True)
         return
+
 
 
 class KernelDmesgRing:

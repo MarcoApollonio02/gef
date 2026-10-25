@@ -7312,20 +7312,23 @@ Simplified jemalloc (v3.x/v4.x) structure:
 
 ## mimalloc-heap-dump
 
-mimalloc heap free-list viewer (x64 only).
+mimalloc heap free-list viewer.
 
 
 ### Syntax
 
 ```text
-usage: mimalloc-heap-dump [-h] [-hh] [-m MI_HEAP_MAIN] [-D] [-n]
+usage: mimalloc-heap-dump [-h] [-hh] [-m MI_HEAP_MAIN] [-f] [-D] [--meta] [-n]
 
 options:
   -h, --help            show this help message and exit
   -hh, --help-simple    show help without ASCII diagram.
   -m, --mi-heap-main MI_HEAP_MAIN
-                        the address of _mi_heap_main (v2.x) / heap_main (v3.x).
+                        address of a mi_heap_t (default: resolve the main heap).
+  -f, --force-heuristic
+                        use heuristic detection.
   -D, --dump-chunk      dump each chunks.
+  --meta                display offset information.
   -n, --no-pager        do not use the pager.
 ```
 
@@ -7337,18 +7340,19 @@ Simplified mimalloc structure:
 +-mi_heap_t(_mi_heap_main / heap_main)-+
 | ...                                  |
 | next                                 |----> mi_heap_t --> ...
-| pages_free_direct[130] (v2.x/v3.0.x) |------+
-| theap / theaps (v3.1.x~)             |---+  |
+| pages_free_direct[] (v2.x/v3.0/v3.1) |------+
+| pages[]                              |------+
+| theap / theaps (v3.2.x~)             |---+  |
 +--------------------------------------+   |  |
                                            |  |
   +----------------------------------------+  |
   |                                           |
   v                                           |
-+-mi_theap_t(v3.1.x~)------------------+      |
++-mi_theap_t(v3.2.x~)------------------+      |
 | heap                                 |      |
 | ...                                  |      |
 | tnext / hnext                        |      |
-| pages_free_direct[130]               |------+
+| pages_free_direct[]                  |------+
 | pages[]                              |      |
 +--------------------------------------+      |
                                               |
@@ -7372,10 +7376,12 @@ Simplified mimalloc structure:
 
 * In mimalloc, the member offsets of important structures vary depending on the version.
 * You should be able to check the version with a command like `strings libmimalloc.so | grep git`.
-* If you cannot determine it, please choose an option that can successfully decode it.
 
-* For `_mi_heap_main` (v2.x) or `heap_main` (v3.x), GEF tries to resolve the address from symbol.
+* GEF resolves `_mi_heap_main`, `heap_main`, or `mi_process_heap_main` from symbols when available.
 * If symbols are not available, GEF scans the TLS area for automatic detection.
+* Use -m with stripped binaries when automatic TLS detection is unavailable.
+* All size-class queues, including huge and full pages, are visited once per page owner.
+* --meta reports whether the layout comes from debug information or memory heuristics.
 ```
 
 ## musl-heap-dump
@@ -8604,7 +8610,7 @@ Convert between slab-virtual addresses and page addresses.
 ### Syntax
 
 ```text
-usage: slab-virtual [-h] [-r] [-q] {to_virt,to_page,from_virt,from_page} ADDRESS
+usage: slab-virtual [-h] [--meta] [-r] [-q] [{to_virt,to_page,from_virt,from_page}] [ADDRESS]
 
 positional arguments:
   {to_virt,to_page,from_virt,from_page}
@@ -8613,6 +8619,7 @@ positional arguments:
 
 options:
   -h, --help            show this help message and exit
+  --meta                display offset information.
   -r, --rescan          do not use cache.
   -q, --quiet           quiet execution.
 ```
@@ -8731,13 +8738,31 @@ Load the vmlinux without a load address.
 ### Syntax
 
 ```text
-usage: kload [-h] VMLINUX_PATH
+usage: kload [-h] [-f] VMLINUX_PATH
 
 positional arguments:
   VMLINUX_PATH  path of the vmlinux.
 
 options:
   -h, --help    show this help message and exit
+  -f, --force   load the vmlinux even if it does not match the running kernel.
+```
+
+### Notes
+
+```text
+The KASLR offset is resolved in the following order and applied to all sections.
+  1. The address of `linux_banner` in memory and in the vmlinux (this also checks that they match)
+  2. The address of `_stext` in kallsyms and in the vmlinux
+  3. The exception vector address and its symbol in the vmlinux
+Sections linked below the image (e.g., x86_64 zero-based .data..percpu, ARM32 .vectors) are not relocated.
+
+Then the vmlinux is verified against the running kernel with:
+  - the ELF class, machine and endianness
+  - the GNU build ID in `.notes`, read from the relocated address in memory
+  - the linux_banner
+  - the addresses of sampled global functions in kallsyms
+A clear mismatch is not loaded without `--force`.
 ```
 
 ## kmod-load
@@ -8748,7 +8773,7 @@ Load the kernel module without a load address.
 ### Syntax
 
 ```text
-usage: kmod-load [-h] [-n] [-q] name path
+usage: kmod-load [-h] [--force] [--meta] [-n] [-q] name path
 
 positional arguments:
   name            name of the loaded module to search for by `kmod`.
@@ -8756,6 +8781,8 @@ positional arguments:
 
 options:
   -h, --help      show this help message and exit
+  --force         load even if the file does not match the loaded module.
+  --meta          display offset information.
   -n, --no-pager  do not use the pager.
   -q, --quiet     enable quiet mode.
 ```
@@ -8769,8 +8796,14 @@ kmod-load sample /path/to/sample.ko
 ### Notes
 
 ```text
-This command requires CONFIG_RANDSTRUCT=n.
+This command requires CONFIG_RANDSTRUCT=n, CONFIG_KALLSYMS=y and CONFIG_SYSFS=y (module->sect_attrs).
 It is useful if you have a kernel module with debuginfo at hand.
+
+The file is verified against the loaded module before loading:
+- ELF type, machine, class and endianness
+- The allocated section names
+- The .note.gnu.build-id section in memory, or the symbol addresses of the module kallsyms if it is unavailable
+A clear mismatch is rejected unless --force is specified.
 ```
 
 ## ksymaddr-remote
@@ -9513,13 +9546,15 @@ Dump I/O-port and I/O-memory information.
 ### Syntax
 
 ```text
-usage: kdevio [-h] [-hh] [-n] [-q]
+usage: kdevio [-h] [-hh] [--meta] [--resource RESOURCE] [-n] [-q]
 
 options:
-  -h, --help          show this help message and exit
-  -hh, --help-simple  show help without ASCII diagram.
-  -n, --no-pager      do not use the pager.
-  -q, --quiet         show result only.
+  -h, --help           show this help message and exit
+  -hh, --help-simple   show help without ASCII diagram.
+  --meta               display resource layout information.
+  --resource RESOURCE  walk a resource tree at ADDRESS.
+  -n, --no-pager       do not use the pager.
+  -q, --quiet          show result only.
 ```
 
 ### Notes
@@ -9560,11 +9595,12 @@ Dump DMA-BUF information.
 ### Syntax
 
 ```text
-usage: kdmabuf [-h] [-hh] [-n] [-q]
+usage: kdmabuf [-h] [-hh] [--meta] [-n] [-q]
 
 options:
   -h, --help          show this help message and exit
   -hh, --help-simple  show help without ASCII diagram.
+  --meta              display offset information.
   -n, --no-pager      do not use the pager.
   -q, --quiet         show result only.
 ```
@@ -9842,12 +9878,13 @@ Dump IPCs information (System V semaphore, message queue and shared memory).
 ### Syntax
 
 ```text
-usage: kipcs [-h] [-hh] [-v] [-n] [-q]
+usage: kipcs [-h] [-hh] [-v] [--meta] [-n] [-q]
 
 options:
   -h, --help          show this help message and exit
   -hh, --help-simple  show help without ASCII diagram.
   -v, --verbose       dump the beginning of msg_msg.
+  --meta              display offset information.
   -n, --no-pager      do not use the pager.
   -q, --quiet         show result only.
 ```
@@ -9856,6 +9893,7 @@ options:
 
 ```text
 This command requires CONFIG_RANDSTRUCT=n.
+Until v6.17, the IPC namespaces not used by any task (e.g., held only by a file descriptor) are not shown.
 
 Simplified ipc structure:
 
@@ -10032,7 +10070,7 @@ Display kernel module list.
 ### Syntax
 
 ```text
-usage: kmod [-h] [-hh] [-s | -a] [--symbol-unsort] [-f FILTER] [-n] [-q]
+usage: kmod [-h] [-hh] [-s | -a] [--symbol-unsort] [-f FILTER] [--meta] [-n] [-q]
 
 options:
   -h, --help            show this help message and exit
@@ -10041,6 +10079,7 @@ options:
   -a, --apply-symbol    try to apply symbol in the form 'module_name.symbol'.
   --symbol-unsort       print resolved symbols without sorting by address.
   -f, --filter FILTER   REGEXP filter.
+  --meta                display offset information.
   -n, --no-pager        do not use the pager.
   -q, --quiet           enable quiet mode.
 ```
@@ -10058,34 +10097,38 @@ This command requires CONFIG_RANDSTRUCT=n.
 
 Simplified module structure:
 
-                   +-module------------------+
-+-modules-----+    | ...                     |
-| list_head   |--->| list                    |--->...
-+-------------+    | name[]                  |
-                   | ...                     |
-                   | mem[] (v6.4~)           |
-                   |     base                |
-                   |     size                |
-                   |     ...                 |
-                   | init_layout (v4.5~v6.4) |
-                   |     base                |
-                   |     size                |
-                   |     text_size           |
-                   |     ro_size             |
-                   |     ro_after_init_size  |
-                   |     ...                 |
-                   | module_core    (~v4.4)  |
-                   | init_size      (~v4.4)  |
-                   | core_size      (~v4.4)  |
-                   | init_text_size (~v4.4)  |  +-->+-mod_kallsyms---+
-                   | core_text_size (~v4.4)  |  |   | symtab         |
-                   | ...                     |  |   | num_symtab     |
-                   | kallsyms                |--+   | strtab         |
-                   | ...                     |      | typetab (v5.2~)|
-                   +-------------------------+      +----------------+
+                   +-module-------------------------+
++-modules-----+    | ...                            |
+| list_head   |--->| list                           |--->...
++-------------+    | name[]                         |
+                   | ...                            |
+                   | mem[] (v6.4~)                  |
+                   |     base                       |
+                   |     size                       |
+                   |     ...                        |
+                   | core_layout (v4.5~v6.4)        |
+                   |     base                       |
+                   |     size                       |
+                   |     text_size                  |
+                   |     ro_size                    |
+                   |     ro_after_init_size (v4.8~) |
+                   |     ...                        |
+                   | module_core    (~v4.4)         |
+                   | init_size      (~v4.4)         |
+                   | core_size      (~v4.4)         |
+                   | init_text_size (~v4.4)         |  +-->+-mod_kallsyms---+
+                   | core_text_size (~v4.4)         |  |   | symtab         |
+                   | ...                            |  |   | num_symtab     |
+                   | kallsyms                       |--+   | strtab         |
+                   | ...                            |      | typetab (v5.2~)|
+                   +--------------------------------+      +----------------+
+
+Since v6.4, each type of mem[] (text, data, rodata, ro_after_init, init_*) is allocated separately,
+so each allocated type is displayed on its own line. Before v6.4, the whole core is displayed as `core`.
 
 Notes for -a option:
 - You can check the added symbols with the `symbols` command.
+- Symbols are applied per region of the module memory. Symbols outside them (e.g., per-cpu variables) are skipped.
 - Added symbols are in the format `module_name.symbol` to avoid collisions.
   When used from the command line, they must be enclosed in single quotes.
   e.g., `p 'virtio_net.__this_module'`
@@ -10172,11 +10215,12 @@ Dump net device information.
 ### Syntax
 
 ```text
-usage: knetdev [-h] [-hh] [-n] [-q]
+usage: knetdev [-h] [-hh] [--meta] [-n] [-q]
 
 options:
   -h, --help          show this help message and exit
   -hh, --help-simple  show help without ASCII diagram.
+  --meta              display offset information.
   -n, --no-pager      do not use the pager.
   -q, --quiet         show result only.
 ```
@@ -10410,10 +10454,11 @@ Dump the PCI devices.
 ### Syntax
 
 ```text
-usage: kpcidev [-h] [-n] [-v] [-q]
+usage: kpcidev [-h] [--meta] [-n] [-v] [-q]
 
 options:
   -h, --help      show this help message and exit
+  --meta          display offset information.
   -n, --no-pager  do not use the pager.
   -v, --verbose   enable verbose mode.
   -q, --quiet     enable quiet mode.
@@ -10464,7 +10509,7 @@ Dump pipe information.
 ### Syntax
 
 ```text
-usage: kpipe [-h] [-hh] [-i INODE_FILTER] [-f FILE_FILTER] [-n] [-q]
+usage: kpipe [-h] [-hh] [-i INODE_FILTER] [-f FILE_FILTER] [-r] [--meta] [-n] [-q]
 
 options:
   -h, --help            show this help message and exit
@@ -10473,6 +10518,8 @@ options:
                         filter by specific struct inode.
   -f, --file-filter FILE_FILTER
                         filter by specific struct file.
+  -r, --rescan          do not use cached offset.
+  --meta                display offset information.
   -n, --no-pager        do not use the pager.
   -q, --quiet           show result only.
 ```
@@ -10486,7 +10533,8 @@ kpipe -q
 ### Notes
 
 ```text
-This command requires CONFIG_RANDSTRUCT=n.
+This command requires CONFIG_RANDSTRUCT=n unless vmlinux with debug information is loaded.
+A notification pipe (CONFIG_WATCH_QUEUE) can hold more entries than `max`.
 
 Simplified pipe structure:
 
@@ -11496,16 +11544,16 @@ Resolve the slab cache (kmem_cache) that an object belongs to (for slab/slub/slu
 ### Syntax
 
 ```text
-usage: slab-contains [-h] [-r] [-v] [-q] ADDRESS
+usage: slab-contains [-h] [-r] [--meta] [-q] ADDRESS
 
 positional arguments:
-  ADDRESS        target address.
+  ADDRESS       target address.
 
 options:
-  -h, --help     show this help message and exit
-  -r, --rescan   do not use cache.
-  -v, --verbose  enable verbose mode.
-  -q, --quiet    show result only.
+  -h, --help    show this help message and exit
+  -r, --rescan  do not use cache.
+  --meta        display offset information.
+  -q, --quiet   show result only.
 ```
 
 ### Notes
@@ -11939,7 +11987,7 @@ options:
   -h, --help            show this help message and exit
   -hh, --help-simple    show help without ASCII diagram.
   --only-used           display only used area.
-  --only-freed          display only freed area.
+  --only-freed          display only free area.
   --meta                display offset information.
   --hexdump-used SIZE   hexdump `used chunks` if layout is resolved.
   --telescope-used SIZE
@@ -11959,17 +12007,17 @@ vmalloc-dump -q
 
 ```text
 Simplified vmalloc structure:
-                           +-vmap_area--+
-                           | va_start   |
-(~v6.8)                    | va_end     |
-+---------------------+    | ...        |
-| vmap_area_list      |--->| list       |--->...
-+---------------------+    | ...        |
-                           | vm         |---->+-vm_struct--+
-                           | ...        |     | ...        |
-                           +------------+     | flags      |
-                                              | ...        |
-                                              +------------+
+                                       +-vmap_area--+
+                                       | va_start   |
+                                       | va_end     |
++---------------------------------+    | ...        |
+| vmap_area_list (~v6.8)          |--->| list       |--->...
+| vmap_nodes[i].busy.head (v6.9~) |    | ...        |
++---------------------------------+    | vm         |---->+-vm_struct--+
+                                       | ...        |     | ...        |
+                                       +------------+     | flags      |
+                                                          | ...        |
+                                                          +------------+
                            +-vmap_area--+
                            | va_start   |
 (v5.2~)                    | va_end     |
@@ -11977,6 +12025,12 @@ Simplified vmalloc structure:
 | free_vmap_area_list |--->| list       |--->...
 +---------------------+    | ...        |
                            +------------+
+
+`unpurged` is an area freed lazily but not purged yet. It is still linked to vmap_area_list (~v5.3),
+or linked to vmap_purge_list (v5.4~v5.10), purge_vmap_area_list (v5.11~v6.8) or vmap_nodes[i].lazy.head (v6.9~).
+`pooled` is a purged area kept in vmap_nodes[i].pool[] for reuse (v6.9~).
+`free` is an unallocated range of the vmalloc space, not a history of vfree().
+--hexdump-used and --telescope-used skip VM_IOREMAP areas, since reading device registers may have side effects.
 ```
 
 # 06-i. Qemu-system/KGDB Cooperation - Linux Dynamic Inspection
@@ -13307,13 +13361,16 @@ Dump memory regions for qemu-system.
 ### Syntax
 
 ```text
-usage: qemu-system-memory-region-dump [-h] [-s] [-n] [-q]
+usage: qemu-system-memory-region-dump [-h] [-s] [--meta] [--qemu-version VERSION] [-n] [-q]
 
 options:
-  -h, --help      show this help message and exit
-  -s, --smart     show only entries where read or write is not the default.
-  -n, --no-pager  do not use the pager.
-  -q, --quiet     enable quiet mode.
+  -h, --help            show this help message and exit
+  -s, --smart           show unique ops with read/write callbacks, including attribute-aware callbacks.
+  --meta                display offset information.
+  --qemu-version VERSION
+                        QEMU version when debug information is unavailable.
+  -n, --no-pager        do not use the pager.
+  -q, --quiet           enable quiet mode.
 ```
 
 # 99. GEF Maintenance Command

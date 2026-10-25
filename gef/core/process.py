@@ -46,6 +46,20 @@ def is_remote_debug():
         return "remote" in res
 
 
+@Cache.cache_this_session(cache_None=False, per_inferior=True)
+def is_core_file():
+    """GDB mode determination function for core file."""
+    if not is_alive():
+        return None
+    try:
+        connection = gdb.selected_inferior().connection
+        return connection is not None and connection.type == "core"
+    except AttributeError:
+        # before gdb 11.x: AttributeError: 'gdb.Inferior' object has no attribute 'connection'
+        res = gdb.execute("maintenance print target-stack", to_string=True)
+        return "core" in res
+
+
 # Removed is_remote_same_host.
 # It can detect that gdb connects to a process in the same host.
 # However, it cannot detect that traffic is being redirected to another host.
