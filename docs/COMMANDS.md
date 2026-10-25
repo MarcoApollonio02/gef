@@ -972,6 +972,14 @@ options:
                         the address to exclude from breakpoints.
 ```
 
+### Notes
+
+```text
+Classifies potential data accesses by instruction family for each architecture.
+Implicit stack accesses (e.g., push, pop, call, and ret on x86) are included.
+Address computations (e.g., lea on x86) and register-indirect branches are excluded.
+```
+
 ## exec-until region-change
 
 Execute until different region.
@@ -2408,6 +2416,7 @@ options:
 
 Dump each file under `/proc/PID`.
 
+- Alias: `prd`
 
 ### Syntax
 
@@ -4442,9 +4451,9 @@ usage: patch range-replace [-h] [--phys] START_ADDR END_ADDR HEX_STR_FROM HEX_ST
 
 positional arguments:
   START_ADDR    start address to search.
-  END_ADDR      end address to search.
+  END_ADDR      exclusive end address for searching and writing.
   HEX_STR_FROM  the hex string to search for (source pattern).
-  HEX_STR_TO    the hex string to replace it with (replacement pattern).
+  HEX_STR_TO    the replacement bytes; all writes must fit in the range and must not overlap.
 
 options:
   -h, --help    show this help message and exit
@@ -7864,6 +7873,7 @@ options:
 
 Dump pagetable for ARM64 Cortex-A (ARM v8.7 base).
 
+- Alias: `pagewalk aarch64`
 
 ### Syntax
 
@@ -8323,17 +8333,20 @@ $ks_selftest_failures is nonzero if the test cannot run, otherwise it is the num
 
 ## kversion
 
-Display kernel version string.
+Display or override the kernel version.
 
 
 ### Syntax
 
 ```text
-usage: kversion [-h] [-r] [-q]
+usage: kversion [-h] [-r] [-q] [VERSION]
+
+positional arguments:
+  VERSION       use this kernel version (e.g. 6.18.0).
 
 options:
   -h, --help    show this help message and exit
-  -r, --rescan  do not use cache.
+  -r, --rescan  clear the version override and do not use cache.
   -q, --quiet   enable quiet mode.
 ```
 
@@ -8360,6 +8373,7 @@ options:
 
 Translate from physical address to virtual address.
 
+- Alias: `phys2virt`
 
 ### Syntax
 
@@ -8662,6 +8676,7 @@ CONFIG_SLAB_VIRTUAL=y (mitigated kernel):
 
 Translate from virtual address to physical address.
 
+- Alias: `virt2phys`
 
 ### Syntax
 

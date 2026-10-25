@@ -73,7 +73,7 @@ class KernelConstsBase:
                 vs = [int(vs[0]), int(vs[1]), 0]
             else:
                 vs = [int(vs[0]), int(vs[1]), int(vs[2])]
-            self.kversion = Kernel.KernelVersion(0, "",  *vs)
+            self.kversion = KernelVersion(0, "",  *vs)
         else:
             self.kversion = Kernel.kernel_version()
         return
@@ -2635,92 +2635,12 @@ class Kernel:
         kinfo = Kernel.get_kernel_layout()
         return kinfo.text_base
 
-    class KernelVersion:
-        def __init__(self, address, version_string, major, minor, patch):
-            self.address = address
-            self.version_string = version_string
-            self.major = major
-            self.minor = minor
-            self.patch = patch
-            self.version_tuple = (major, minor, patch)
-            return
-
-        def to_version_tuple(self, _v):
-            v = _v.split(".")
-            if len(v) == 2:
-                return (int(v[0]), int(v[1]), 0)
-            elif len(v) == 3:
-                return (int(v[0]), int(v[1]), int(v[2]))
-            raise
-
-        def __ge__(self, v):
-            return self.to_version_tuple(v) <= self.version_tuple
-
-        def __gt__(self, v):
-            return self.to_version_tuple(v) < self.version_tuple
-
-        def __le__(self, v):
-            return self.to_version_tuple(v) >= self.version_tuple
-
-        def __lt__(self, v):
-            return self.to_version_tuple(v) > self.version_tuple
-
-        def __eq__(self, v):
-            return self.to_version_tuple(v) == self.version_tuple
-
-        def __ne__(self, v):
-            return self.to_version_tuple(v) != self.version_tuple
-
-        def __str__(self):
-            return "{:d}.{:d}.{:d}".format(*self.version_tuple)
 
     @staticmethod
     @Cache.cache_this_session(cache_None=False)
     def kernel_version():
-        # fast path
-        linux_banner = None
-        if is_kdb():
-            linux_banner = Symbol.get_symbol_by_monitor("linux_banner")
-        if linux_banner is None:
-            linux_banner = Symbol.get_ksymaddr("linux_banner")
-        if linux_banner and is_valid_addr(linux_banner):
-            version_string = read_cstring_from_memory(linux_banner, 0x200).rstrip()
-            r = re.search(r"Linux version (\d)\.(\d+)\.(\d+)", version_string)
-            if r:
-                major, minor, patch = int(r.group(1)), int(r.group(2)), int(r.group(3))
-                return Kernel.KernelVersion(linux_banner, version_string, major, minor, patch)
-
-        # slow path
-        kinfo = Kernel.get_kernel_layout()
-        if kinfo.has_none:
-            return None
-        area = []
-        for addr in kinfo.maps: # resolve search range
-            if addr[0] < kinfo.text_base:
-                continue
-            if kinfo.rw_base and addr[0] >= kinfo.rw_base:
-                continue
-            area.append([addr[0], addr[0] + addr[1]])
-        if area == []:
-            return None
-        for start, end in area: # find version string
-            try:
-                data = read_memory(start, end - start)
-            except gdb.MemoryError:
-                continue
-            data = "".join([chr(x) for x in data])
-            r = re.findall(r"(Linux version (?:\d+\.[\d.]*\d)[ -~]+)", data)
-            if not r:
-                continue
-
-            version_string = r[0]
-            address = start + data.find(version_string)
-
-            r = re.search(r"Linux version (\d)\.(\d+)\.(\d+)", version_string)
-            major, minor, patch = int(r.group(1)), int(r.group(2)), int(r.group(3))
-
-            return Kernel.KernelVersion(address, version_string, major, minor, patch)
-        return None
+        """Compatibility alias for `Kernel.version()`, the upstream KernelVersion resolver."""
+        return Kernel.version()
 
     @staticmethod
     @Cache.cache_this_session(cache_None=False)

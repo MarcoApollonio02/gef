@@ -400,6 +400,8 @@ def write_memory(addr, data):
                     return ret
                 except (OSError, gdb.error):
                     return None
+                finally:
+                    MemoryCache.reset() # it may be written partially even on failure
 
         def write_with_check(pid, addr, data, length, offset=0):
             before = read_memory_via_proc_mem(pid, addr + offset, length)
@@ -407,7 +409,7 @@ def write_memory(addr, data):
                 return None
 
             ret = write_memory_via_proc_mem(pid, addr + offset, data, length)
-            after = read_memory(addr, length)
+            after = read_memory(addr, length, safe=True)
 
             if ret:
                 if after == data[:length]:
@@ -484,11 +486,11 @@ def read_memory(addr, length, safe=False):
             # Memory read of Intel Pin is very slow, so speed it up
             try:
                 pid = Pid.get_pid()
-                fd = open("/proc/{:d}/mem".format(pid), "rb")
-                fd.seek(addr)
-                content = fd.read(length)
-                fd.close()
-                return content
+                with open("/proc/{:d}/mem".format(pid), "rb") as fd:
+                    fd.seek(addr)
+                    content = fd.read(length)
+                if len(content) == length:
+                    return content
             except Exception:
                 pass
 

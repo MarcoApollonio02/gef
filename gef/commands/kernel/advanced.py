@@ -36,7 +36,8 @@ from gef.core.config import Config
 from gef.core.instruction import Disasm, get_insn, get_insn_next
 from gef.core.display import ProgressBar
 from gef.core.kernel import (Kernel, KernelListHead, KernelMapleTree, KernelNftables, KernelRBTree,
-                             KernelRadixTree, KernelSlub, KernelTask, KernelXArray, Ksym)
+                             KernelRadixTree, KernelSlub, KernelTask, KernelVersion, KernelXArray,
+                             Ksym)
 from gef.core.memory import (
     hexdump,
     is_ascii_string,
@@ -3414,7 +3415,7 @@ class KernelOperationsCommand(GenericCommand, BufferingOutput):
             else:
                 err("Failed to parse version string")
                 return
-            kversion = Kernel.KernelVersion(None, args.version, major, minor, patch)
+            kversion = KernelVersion(None, args.version, major, minor, patch)
         else:
             self.quiet_info("Wait for memory scan")
             kversion = Kernel.kernel_version()

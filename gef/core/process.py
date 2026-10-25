@@ -1739,4 +1739,3 @@ class LinuxSignal:
         if names:
             return ",".join(names)
         return "-"
-

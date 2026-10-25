@@ -372,7 +372,7 @@ For a comprehensive list and additional details, see [docs/SUPPORTED-MODE.md](do
     - It will try heuristic search if the binary has no symbol.
     - How to test:
         - See [dev/partition-alloc-dump/downloader.py](dev/partition-alloc-dump/downloader.py).
-- `tcmalloc-dump`: dumps TCMalloc (`gperftools-2.16-1` or named `libgoogle-perftools{4,-dev}`) free-list (x64 only).
+- `tcmalloc-heap-dump`: dumps TCMalloc (`gperftools-2.16-1` or named `libgoogle-perftools{4,-dev}`) free-list (x64 only).
     - ![](images/tcmalloc-dump.png)
     - How to test:
         - Run your test program with `LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc.so ./a.out`.
@@ -715,7 +715,7 @@ For a comprehensive list and additional details, see [docs/SUPPORTED-MODE.md](do
     - ![](images/call-syscall.png)
 - `mmap`: allocates a new memory by `call-syscall`.
 - `munmap`: unmaps a memory by `call-syscall`.
-- `killthreads`: kills specific or all threads (for `pthread`).
+- `kill-threads`: kills specific or all threads (for `pthread`).
 - `constgrep`: invokes `grep` under `/usr/include/`.
     - ![](images/constgrep.png)
 - `proc-dump`: dumps each file under `/proc/PID/`.

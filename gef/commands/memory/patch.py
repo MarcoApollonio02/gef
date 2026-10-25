@@ -1325,11 +1325,11 @@ class PatchRangeReplaceCommand(PatchCommand):
     parser.add_argument("range_start", metavar="START_ADDR", type=AddressUtil.parse_address,
                         help="start address to search.")
     parser.add_argument("range_end", metavar="END_ADDR", type=AddressUtil.parse_address,
-                        help="end address to search.")
+                        help="exclusive end address for searching and writing.")
     parser.add_argument("hstr_from", metavar="HEX_STR_FROM", type=lambda x: bytes.fromhex(x),
                         help="the hex string to search for (source pattern).")
     parser.add_argument("hstr_to", metavar="HEX_STR_TO", type=lambda x: bytes.fromhex(x),
-                        help="the hex string to replace it with (replacement pattern).")
+                        help="the replacement bytes; all writes must fit in the range and must not overlap.")
     _syntax_ = parser.format_help()
 
     _example_ = [
@@ -1342,20 +1342,45 @@ class PatchRangeReplaceCommand(PatchCommand):
         return
 
     def patch_range_replace(self):
+        if not self.args.hstr_from:
+            err("Search pattern must not be empty")
+            return
+        if self.args.range_end < self.args.range_start:
+            err("END_ADDR must not precede START_ADDR")
+            return
         try:
-            data = read_memory(self.args.range_start, self.args.range_end - self.args.range_start)
+            if self.args.phys:
+                target_mode = "phys"
+            else:
+                target_mode = "virt"
+            with QemuMonitor.use_mmu_mode(target_mode) as available:
+                if not available:
+                    raise gdb.error("Could not select {:s} memory mode".format(target_mode))
+                data = read_memory(self.args.range_start, self.args.range_end - self.args.range_start)
         except gdb.MemoryError:
             err("Memory read error")
             return
 
-        tag = PatchCommand.PatchInfo.get_unique_tag()
+        positions = []
         pos = 0
         while True:
             found_pos = data.find(self.args.hstr_from, pos)
             if found_pos == -1:
                 break
-            self.PatchInfo(self.args.range_start + found_pos, self.args.hstr_to, tag=tag).patch()
+            if found_pos + len(self.args.hstr_to) > len(data):
+                err("Replacement at {:#x} would exceed END_ADDR; no patches applied".format(
+                    self.args.range_start + found_pos))
+                return
+            if positions and found_pos < positions[-1] + len(self.args.hstr_to):
+                err("Replacement at {:#x} would overlap a previous replacement; no patches applied".format(
+                    self.args.range_start + found_pos))
+                return
+            positions.append(found_pos)
             pos = found_pos + len(self.args.hstr_from)
+
+        tag = PatchCommand.PatchInfo.get_unique_tag()
+        for found_pos in positions:
+            self.PatchInfo(self.args.range_start + found_pos, self.args.hstr_to, phys=self.args.phys, tag=tag).patch()
         return
 
     @parse_args

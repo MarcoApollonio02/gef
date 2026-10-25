@@ -643,6 +643,13 @@ class ExecUntilMemaccessCommand(ExecUntilCommand):
     _syntax_ = parser.format_help()
     _example_ = None
 
+    _note_ = [
+        "Classifies potential data accesses by instruction family for each architecture.",
+        "Implicit stack accesses (e.g., push, pop, call, and ret on x86) are included.",
+        "Address computations (e.g., lea on x86) and register-indirect branches are excluded.",
+    ]
+    _note_ = "\n".join(_note_)
+
     def __init__(self):
         super().__init__(prefix=False)
         return
@@ -721,7 +728,7 @@ class ExecUntilMemaccessCommand(ExecUntilCommand):
         return "[" in operand
 
     def is_target_insn(self, insn):
-        return "[" in str(insn)
+        return self.is_memory_access(insn)
 
     @parse_args
     @only_if_gdb_running
@@ -1344,4 +1351,3 @@ class StringsContinueCommand(GenericCommand):
         elif stopped and is_alive():
             gdb.execute("context")
         return
-

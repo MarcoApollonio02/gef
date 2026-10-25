@@ -114,7 +114,7 @@ class EventHandler:
     def new_objfile_handler(_event):
         """GDB event handler for new object file cases."""
         from gef.core.process import ProcessMap, is_alive, is_kgdb, is_qemu_system, is_vmware, get_arch, set_arch
-        Cache.reset_gef_caches(all=True)
+        Cache.reset_gef_caches(new_objfile=True)
         if runtime.current_arch is None:
             set_arch(get_arch())
 

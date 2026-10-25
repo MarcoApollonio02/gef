@@ -24,7 +24,7 @@ from gef.core import runtime
 from gef.core.address import AddressUtil
 from gef.core.cache import Cache
 from gef.core.color import Color, err, gef_print, info, titlify, warn
-from gef.core.kernel import Kernel, Ksym
+from gef.core.kernel import Kernel, KernelVersion, Ksym
 from gef.core.memory import (
     hexdump,
     is_valid_addr,
@@ -1632,13 +1632,14 @@ class KernelbaseCommand(GenericCommand):
 
 @register_command
 class KernelVersionCommand(GenericCommand):
-    """Display kernel version string."""
+    """Display or override the kernel version."""
 
     _cmdline_ = "kversion"
     _category_ = "06-c. Qemu-system/KGDB Cooperation - Linux Basic"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
-    parser.add_argument("-r", "--rescan", action="store_true", help="do not use cache.")
+    parser.add_argument("version", nargs="?", metavar="VERSION", help="use this kernel version (e.g. 6.18.0).")
+    parser.add_argument("-r", "--rescan", action="store_true", help="clear the version override and do not use cache.")
     parser.add_argument("-q", "--quiet", action="store_true", help="enable quiet mode.")
     _syntax_ = parser.format_help()
 
@@ -1649,16 +1650,43 @@ class KernelVersionCommand(GenericCommand):
     @only_if_in_kernel_or_kpti_disabled
     def do_invoke(self, args):
         if args.rescan:
+            KernelVersion.clear_override()
+            Cache.reset_gef_caches(all=True)
+
+        # override by user specified version
+        if args.version is not None:
+            match = re.fullmatch(r"v?(\d+)\.(\d+)(?:\.(\d+))?", args.version)
+            if match is None:
+                message = "Invalid kernel version: {!r} (expected MAJOR.MINOR[.PATCH])"
+                self.quiet_err(message.format(args.version))
+                return
+
+            detected = Kernel.version()
+            if detected is not None:
+                address = detected.address
+            else:
+                address = 0
+            if detected is not None:
+                version_string = detected.version_string
+            else:
+                version_string = "Linux version {:s} (user specified)".format(args.version)
+            major, minor, patch = (int(value) if value is not None else 0 for value in match.groups())
+            inferior = gdb.selected_inferior()
+            KernelVersion.overrides[inferior, inferior.connection_num] = KernelVersion(
+                address, version_string, major, minor, patch)
             Cache.reset_gef_caches(all=True)
 
         self.quiet_info("Wait for memory scan")
-        kversion = Kernel.kernel_version()
+        kversion = Kernel.version()
         if kversion is None:
             self.quiet_err("Failed to resolve")
             return
 
         self.out = []
-        self.out.append("{:#x}: {:s}".format(kversion.address, kversion.version_string))
+        if kversion.address:
+            self.out.append("{:#x}: {:s}".format(kversion.address, kversion.version_string))
+        if KernelVersion.get_override() is not None:
+            self.out.append("User-specified kernel version: {:s}".format(str(kversion)))
         if self.out:
             gef_print("\n".join(self.out))
         return

@@ -2885,7 +2885,7 @@ class PagewalkArm64Command(PagewalkCommand):
 
     _cmdline_ = "pagewalk arm64"
     _category_ = "06-a. Qemu-system/KGDB Cooperation - Memory Map"
-    _aliases_ = [] # re-overwrite
+    _aliases_ = ["pagewalk aarch64"]
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("target_el", metavar="TARGET_EL", nargs="?", type=int,

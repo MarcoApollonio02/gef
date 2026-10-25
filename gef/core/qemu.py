@@ -931,5 +931,3 @@ class SystemManagementMemory:
         if return_stats:
             return (result, stats)
         return result
-
-
