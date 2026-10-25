@@ -666,7 +666,7 @@ options:
 ```text
 Only for AArch64 + kgdb.
 Temporarily masks IRQ before `stepi`, then restores the original state
-unless the stepped instruction intentionally modified DAIF.I.
+unless the stepped instruction intentionally modified DAIF.I or entered an exception.
 ```
 
 ## stepi-for-qemu-user
@@ -777,7 +777,7 @@ exec-until syscall                              # execute until syscall instruct
 exec-until ret                                  # execute until ret instruction
 exec-until all-branch                           # execute until call/jmp/ret instruction
 exec-until indirect-branch                      # execute until indirect branch instruction (x64/x86 only)
-exec-until memaccess                            # execute until '[' is included by the instruction
+exec-until memaccess                            # execute until memory access instruction
 exec-until keyword "call +r[ab]x"               # execute until specified keyword (regex)
 exec-until cond "$rax==0xdead && $rbx==0xcafe"  # execute until specified condition is filled
 exec-until user-code                            # execute until user code
@@ -2018,7 +2018,7 @@ Hooked syscalls:
   write-like: write, sendto, sendmsg, sendmmsg, pwrite64, pwritev, pwritev2, writev
 
 - Relies on `catch syscall`.
-- Auto-continues; stops on a user breakpoint or Ctrl+C.
+- Auto-continues; stops on a user breakpoint, signal, or Ctrl+C.
 - qemu-user is unsupported: its gdbstub does not update the return-value register
   at syscall-return, so read-like sizes are wrong. Use a native target.
 ```
@@ -2108,6 +2108,7 @@ future-calls --debug                 # show Unicorn fault details
 ```text
 This command is a best-effort concrete preview based on Unicorn emulation.
 Only x86, x86-64, ARM32, and ARM64 are supported.
+A loop is cut only when the registers and written memory repeat; other loops run until --nb-insn.
 ```
 
 ## unicorn-emulate
@@ -2195,7 +2196,7 @@ options:
 ### Examples
 
 ```gdb
-unicorn-emulate-script -g 10               # from $pc to the point where 4 instructions are executed
+unicorn-emulate-script -g 10               # from $pc to the point where 10 gadgets are executed
 unicorn-emulate-script -n 5                # from $pc to 5 later instructions (assume it is no branch)
 unicorn-emulate-script -t 0x805678a4 -s    # from $pc to specified address with saving script
 ```
@@ -2605,6 +2606,13 @@ options:
 
 ```gdb
 tls -vvv  # repeat `-v` to display more lines
+```
+
+### Notes
+
+```text
+Under qemu-user, multi-threaded mips/mipsn32/mips64/m68k targets may produce unreliable TLS/heap results
+because ExecAsm/ExecSyscall can fail after thread switches.
 ```
 
 # 02-c. Process Information - Memory/Section
@@ -3249,7 +3257,7 @@ options:
 
 ## canary
 
-Display the canary value of the current process from auxv information.
+Display the canary value of the current process.
 
 
 ### Syntax
@@ -4771,6 +4779,12 @@ command:
   {memory,file,value}
 ```
 
+### Notes
+
+```text
+For integer bases other than base1, each leading zero symbol represents one zero byte.
+```
+
 ## base-n-decode file
 
 Decode baseN from file.
@@ -4798,6 +4812,12 @@ base-n-decode file /tmp/data.bin
 base-n-decode file /tmp/data.bin 0x10 0x20
 ```
 
+### Notes
+
+```text
+For integer bases other than base1, each leading zero symbol represents one zero byte.
+```
+
 ## base-n-decode memory
 
 Decode baseN from memory values.
@@ -4821,6 +4841,12 @@ options:
 
 ```gdb
 base-n-decode memory $rsp 0x20
+```
+
+### Notes
+
+```text
+For integer bases other than base1, each leading zero symbol represents one zero byte.
 ```
 
 ## base-n-decode value
@@ -4849,6 +4875,12 @@ base-n-decode value "\\x51\\x55\\x46\\x42"
 base-n-decode value --hex "51 55 46 42"
 ```
 
+### Notes
+
+```text
+For integer bases other than base1, each leading zero symbol represents one zero byte.
+```
+
 ## base-n-encode
 
 The base command to encode baseN.
@@ -4864,6 +4896,12 @@ options:
 
 command:
   {memory,file,value}
+```
+
+### Notes
+
+```text
+For integer bases other than base1, each leading zero symbol represents one zero byte.
 ```
 
 ## base-n-encode file
@@ -4893,6 +4931,12 @@ base-n-encode file /tmp/data.bin
 base-n-encode file /tmp/data.bin 0x10 0x20
 ```
 
+### Notes
+
+```text
+For integer bases other than base1, each leading zero symbol represents one zero byte.
+```
+
 ## base-n-encode memory
 
 Encode baseN from memory values.
@@ -4916,6 +4960,12 @@ options:
 
 ```gdb
 base-n-encode memory $rsp 0x20
+```
+
+### Notes
+
+```text
+For integer bases other than base1, each leading zero symbol represents one zero byte.
 ```
 
 ## base-n-encode value
@@ -4942,6 +4992,12 @@ options:
 ```gdb
 base-n-encode value "\\x41\\x42\\x43\\x44"
 base-n-encode value --hex "41 42 43 44"
+```
+
+### Notes
+
+```text
+For integer bases other than base1, each leading zero symbol represents one zero byte.
 ```
 
 ## crc
@@ -5311,6 +5367,12 @@ command:
   {memory,value}
 ```
 
+### Notes
+
+```text
+Uses one space between letters and three spaces between words.
+```
+
 ## morse-decode memory
 
 Decode morse code from memory values.
@@ -5333,6 +5395,12 @@ options:
 
 ```gdb
 morse-decode memory $rsp 0x20
+```
+
+### Notes
+
+```text
+Uses one space between letters and three spaces between words.
 ```
 
 ## morse-decode value
@@ -5358,6 +5426,12 @@ options:
 morse-decode value -- ".- -... -.-. -.."
 ```
 
+### Notes
+
+```text
+Uses one space between letters and three spaces between words.
+```
+
 ## morse-encode
 
 The base command to encode morse code.
@@ -5373,6 +5447,12 @@ options:
 
 command:
   {memory,value}
+```
+
+### Notes
+
+```text
+Uses one space between letters and three spaces between words.
 ```
 
 ## morse-encode memory
@@ -5399,6 +5479,12 @@ options:
 morse-encode memory $rsp 0x20
 ```
 
+### Notes
+
+```text
+Uses one space between letters and three spaces between words.
+```
+
 ## morse-encode value
 
 Encode morse code from specified values.
@@ -5420,6 +5506,12 @@ options:
 
 ```gdb
 morse-encode value AAAA
+```
+
+### Notes
+
+```text
+Uses one space between letters and three spaces between words.
 ```
 
 ## seq-length
@@ -5705,7 +5797,7 @@ freq-analysis $rax 0x1000 -e 00 -e 01   # exclude some characters
 
 ## peek-pageflags
 
-Read the page flags of a page frame (needs root).
+Read the local host's page flags of a page frame (needs root).
 
 - Alias: `ppfl`
 
@@ -5726,6 +5818,15 @@ options:
 
 ```gdb
 peek-pageflags 0x6b2ae3
+```
+
+### Notes
+
+```text
+PFNs always refer to the local host, including during remote debugging.
+Reads /proc/kpagecount and /proc/kpageflags on the machine running GDB.
+The mapping count can be an average for pages in a large allocation, depending on the kernel configuration.
+Bit 23 is BALLOON before Linux 5.1 and OFFLINE since Linux 5.1.
 ```
 
 ## peek-pageframe
@@ -5758,6 +5859,15 @@ options:
 ```gdb
 peek-pageframe 0x555555555060                       # read pagemap of single address
 peek-pageframe -f 0x7ffffffdd000 -t 0x7ffffffff000  # read pagemap of an address range
+```
+
+### Notes
+
+```text
+Reads the local host's /proc/PID/pagemap; qemu-user is not supported.
+Range flags: P=present, S=swapped, F=file/shared-anon, D=soft-dirty, E=exclusive, U=uffd-wp.
+Unknown or unavailable flags are shown as '?' (or 'unknown' for a single address).
+On Linux 3.11-4.1, bits 55-60 are decoded only when the entry identifies the format.
 ```
 
 ## sixel-memory
@@ -6028,6 +6138,7 @@ edit-flags             # show the flag register
 edit-flags zero+       # set ZERO flag
 edit-flags direction-  # unset DIRECTION flag
 edit-flags sign~       # toggle SIGN flag
+edit-flags z+ c-       # a unique prefix of the flag name is also accepted
 edit-flags -v          # verbose output
 ```
 
@@ -6121,6 +6232,9 @@ Supports up to glibc 2.43.
 - 2.42: tcache_perthread_struct.counts changes to num_slots.
 - 2.43: fastbins are removed.
 - 2.43: TCACHE_FILL_COUNT 7->16.
+
+Under qemu-user, multi-threaded mips/mipsn32/mips64/m68k targets may produce unreliable TLS/heap results
+because ExecAsm/ExecSyscall can fail after thread switches.
 ```
 
 ## heap arena
@@ -6935,7 +7049,9 @@ partition-alloc-dump ab            # same above
 ### Notes
 
 ```text
-Chromium mainline is too fast to develop. So if parse is failed, you need fix this gef.py.
+Version numbers do not identify the build layout; the fixed layout is checked against the heap.
+Requires 4 KiB system pages, 2 MiB super pages and 32-byte metadata entries.
+Settings must occupy 0x40, 0x80 or 0xc0 bytes; metadata placement is checked against the extents.
 
 Simplified partition alloc structure:
 
@@ -6980,7 +7096,7 @@ Simplified partition alloc structure:
 
 `extent`, `slot_span` and `slot` are in super_page.
 
-     [~v144.x]                    [v145.x~; PA_CONFIG(MOVE_METADATA_OUT_OF_GIGACAGE)=y]
+     [inline layout]              [PA_CONFIG(MOVE_METADATA_OUT_OF_GIGACAGE)=y]
      +-super_page-(2MB)-----+      +-super_page(for meta)-+ +-super_page(for chunk)+
 4KB  | Guard Page           |      | Guard Page           | | Guard Page           |
      +----------------------+      +----------------------+ +----------------------+
@@ -7113,7 +7229,7 @@ Also, since it uses V8 commands internally, `_v8_internal_Print_Object` must be 
 # 05-c. Heap - Other
 ## go-heap-dump
 
-go language v1.24.4 mheap dumper (x64 only).
+Go mheap dumper.
 
 
 ### Syntax
@@ -7174,7 +7290,10 @@ Simplified Go heap structure:
 
 * `allspans` is used as the entry point for this command.
 * `spanClass >> 1` is used as the size class, and the size class is converted to chunk size.
-* `allocBits` is used to distinguish allocated/free objects in a span.
+* `freeindex` and `allocBits` distinguish allocated/free objects in an in-use span.
+* Large objects use `elemsize`; non-heap spans are shown only with `--verbose`, without object data.
+* Without debug types, the command assumes the Go 1.22.2 layout for the target pointer size.
+* If the runtime.mheap_ symbol is stripped, specify its address with `--mheap`.
 * `arenas`, `central`, and walking from `mspan.next` are currently unsupported.
 ```
 
@@ -7493,7 +7612,7 @@ Simplified musl mallocng structure:
 
 ## scalloc-heap-dump
 
-scalloc heap free-list viewer (x64 only).
+scalloc heap free-list viewer.
 
 
 ### Syntax
@@ -7551,7 +7670,10 @@ Simplified scalloc structure:
 * `size_class_` is converted to object size and capacity by fixed tables.
 * `local_free_list_.list_` points to the local free-list.
 * `local_free_list_.bump_pointer_` points to the next unused object area (top).
-* `remote_free_list_.top_` is a tagged pointer and is decoded before dumping.
+* `remote_free_list_.top_` is a tagged 64-bit value with a 48-bit pointer and a 16-bit tag.
+* Pointers must fit in 48 bits (with bit 47 sign-extended on 64-bit targets).
+* Upstream scalloc targets x86-64; other architectures require a compatible allocator port.
+* Layouts use debug types when available, otherwise the upstream field order and target pointer size.
 ```
 
 ## snmalloc-heap-dump
@@ -7881,7 +8003,7 @@ options:
 
 The base command to dump page tables.
 
-- Alias: `pw`, `ptdump`, `pt`
+- Alias: `ptdump`, `pt`
 
 ### Syntax
 
@@ -7897,7 +8019,7 @@ command:
 
 ## pagewalk arm
 
-Dump pagetable for ARM Cortex-A. PL2 pagewalk is unsupported.
+Dump page tables for ARM32 Cortex-A. PL2 pagewalk is unsupported.
 
 - Alias: `pagewalk arm32`
 
@@ -7928,7 +8050,7 @@ options:
 
 ## pagewalk arm64
 
-Dump pagetable for ARM64 Cortex-A (ARM v8.7 base).
+Dump page tables for ARM64 Cortex-A (ARM v8.7 base).
 
 - Alias: `pagewalk aarch64`
 
@@ -7962,7 +8084,7 @@ options:
 
 ## pagewalk riscv
 
-Dump pagetable for riscv64/32.
+Dump page tables for RISC-V 32/64.
 
 - Alias: `pagewalk riscv32`, `pagewalk riscv64`
 
@@ -8199,6 +8321,7 @@ read-system-register-for-qemu-arm TTBR0
 
 ```text
 Attempting to read a non-existing register raises an undefined exception.
+Context-dependent EL0 timer aliases CNTHPS_*, CNTHV_* and CNTHVS_* are not accepted.
 ```
 
 ## switch-el
@@ -8415,7 +8538,7 @@ options:
 # 06-d. Qemu-system/KGDB Cooperation - Virt/Phys/Page
 ## highmem-dump
 
-Dump HighMem mappings.
+Dump HighMem mappings made by kmap().
 
 
 ### Syntax
@@ -8429,6 +8552,13 @@ options:
   -S, --sort-by-page  sort by page address.
   -n, --no-pager      do not use the pager.
   -q, --quiet         show result only.
+```
+
+### Notes
+
+```text
+This command dumps page_address_htable, which exists only if CONFIG_HIGHMEM=y.
+It has the mappings made by kmap(), but not the ones made by kmap_atomic(), kmap_local_page() and vmap().
 ```
 
 ## p2v
@@ -8479,6 +8609,8 @@ command:
 ### Notes
 
 ```text
+These conversions do not verify RAM presence or the memory hotplug state.
+
 Simplified page structure:
 
 [x86_64 / CONFIG_SPARSEMEM_VMEMMAP]
@@ -8535,7 +8667,7 @@ mem_map--------------->+-struct page[]--------------+
                        +----------------------------+
 
 
-[x86_32 or arm32 / CONFIG_SPARSEMEM]
+[x86_32 / arm32 / arm64 / CONFIG_SPARSEMEM]
 * This pattern uses `mem_section[]`, i.e. multiple section-specific mem_maps.
 * `section_id` can be obtained from `page->flags`.
 * `section_mem_map` is encoded and used to locate the page descriptor array.
@@ -8555,7 +8687,7 @@ mem_map--------------->+-struct page[]--------------+
                                     |  flags                       |
                                     +------------------------------+
 
-* CONFIG_SPARSEMEM_EXTREME is currently unsupported by this command.
+* CONFIG_SPARSEMEM_EXTREME is supported on arm64.
 ```
 
 ## page from_phys
@@ -9315,13 +9447,15 @@ options:
 ### Examples
 
 ```gdb
-ktask -q
+ktask -T 0xffff888012345000  # task address filter
+ktask -f bash                # comm string filter
+ktask --all                  # it means -mritFsSN
 ```
 
 ### Notes
 
 ```text
-This command requires CONFIG_RANDSTRUCT=n.
+This command requires CONFIG_RANDSTRUCT=n unless vmlinux with debug information is loaded.
 
 Simplified task_struct structure:
 
@@ -10423,7 +10557,8 @@ kops -V 6.6.0 file_operations
 ### Notes
 
 ```text
-This command requires CONFIG_RANDSTRUCT=n.
+Reading values requires debug information or a known kernel config for conditional members.
+Without debug information, CONFIG_RANDSTRUCT=n is required.
 
 Currently it supports from 3.0 to 7,0-rc7.
 
@@ -12314,6 +12449,13 @@ options:
   -h, --help  show this help message and exit
 ```
 
+### Notes
+
+```text
+Linux 6.14 removed automatic binfmt module loading for unrecognized executable formats.
+Executing a file containing four 0xff bytes no longer triggers a usermode helper via that path.
+```
+
 # 06-j. Qemu-system/KGDB Cooperation - TrustZone
 ## bsm
 
@@ -13207,6 +13349,7 @@ print-format -f py -b 8 -l 256 $rsp
 ```text
 "hexn" means hex with new-line.
 "hexs" means hex with separator.
+JavaScript uses BigInt for 64-bit values.
 ```
 
 # 07-d. Misc - Show Example
@@ -13754,7 +13897,7 @@ options:
 
 ## gef reset-cache
 
-Reset all caches (both Cache.cache_until_next and Cache.cache_this_session).
+Reset all caches.
 
 - Alias: `reset-cache`
 

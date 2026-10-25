@@ -46,6 +46,7 @@ class EditFlagsCommand(GenericCommand):
         "{0:s} zero+       # set ZERO flag",
         "{0:s} direction-  # unset DIRECTION flag",
         "{0:s} sign~       # toggle SIGN flag",
+        "{0:s} z+ c-       # a unique prefix of the flag name is also accepted",
         "{0:s} -v          # verbose output",
     ]
     _example_ = "\n".join(_example_).format(_cmdline_)
@@ -66,9 +67,9 @@ class EditFlagsCommand(GenericCommand):
 
             if is_x86():
                 dic = {
-                    "id": "identification",
+                    "id": "ident",
                     "ac": "align",
-                    "vm": "virtualx86",
+                    "vm": "vx86",
                     "rf": "resume",
                     "nt": "nested",
                     "of": "overflow",
@@ -85,8 +86,14 @@ class EditFlagsCommand(GenericCommand):
                     name = dic[name]
 
             if name not in runtime.current_arch.flags_table.values():
-                err("Invalid flag name '{:s}'".format(flag[:-1]))
-                continue
+                candidates = sorted({x for x in runtime.current_arch.flags_table.values() if x.startswith(name)})
+                if not candidates:
+                    err("Invalid flag name '{:s}'".format(flag[:-1]))
+                    continue
+                if len(candidates) > 1:
+                    err("Ambiguous flag name '{:s}' ({:s})".format(flag[:-1], ", ".join(candidates)))
+                    continue
+                name = candidates[0]
 
             for off in runtime.current_arch.flags_table:
                 if runtime.current_arch.flags_table[off] != name:
@@ -277,6 +284,10 @@ class EditFlagsCommand(GenericCommand):
             warn("This command is not supported on this architecture")
             return
 
+        if get_register(runtime.current_arch.flag_register) is None:
+            err("Could not read {:s}".format(runtime.current_arch.flag_register))
+            return
+
         self.edit_flags(args.flagname)
 
         gef_print(runtime.current_arch.flag_register_to_human())
@@ -288,6 +299,7 @@ class EditFlagsCommand(GenericCommand):
             elif is_arm64():
                 self.verbose_arm64()
         return
+
 
 
 @register_command

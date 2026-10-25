@@ -702,7 +702,7 @@ class TcmallocHeapDumpCommand(GenericCommand, BufferingOutput):
         return
 @register_command
 class GoHeapDumpCommand(GenericCommand, BufferingOutput):
-    """go language v1.24.4 mheap dumper (x64 only)."""
+    """Go mheap dumper."""
 
     _cmdline_ = "go-heap-dump"
     _category_ = "05-c. Heap - Other"
@@ -759,7 +759,10 @@ class GoHeapDumpCommand(GenericCommand, BufferingOutput):
         "",
         "* `allspans` is used as the entry point for this command.",
         "* `spanClass >> 1` is used as the size class, and the size class is converted to chunk size.",
-        "* `allocBits` is used to distinguish allocated/free objects in a span.",
+        "* `freeindex` and `allocBits` distinguish allocated/free objects in an in-use span.",
+        "* Large objects use `elemsize`; non-heap spans are shown only with `--verbose`, without object data.",
+        "* Without debug types, the command assumes the Go 1.22.2 layout for the target pointer size.",
+        "* If the runtime.mheap_ symbol is stripped, specify its address with `--mheap`.",
         "* `arenas`, `central`, and walking from `mspan.next` are currently unsupported.",
     ]
     _note_ = "\n".join(_note_)
@@ -784,29 +787,11 @@ class GoHeapDumpCommand(GenericCommand, BufferingOutput):
         0x6000, 0x6a80, 0x7000, 0x8000,
     ]
 
-    def get_struct_offset(self, type_name, member_name):
-        tp = GefUtil.cached_lookup_type(type_name)
-        if tp is None:
-            return None
-        if member_name not in tp:
-            return None
-        field = tp[member_name]
-        if not hasattr(field, "bitpos"):
-            return None
-        return field.bitpos // 8
-
-    def get_struct_size(self, type_name):
-        tp = GefUtil.cached_lookup_type(type_name)
-        if tp is None:
-            return None
-        return tp.sizeof
-
+    @Cache.cache_this_session(cache_None=False, per_inferior=True, until_new_objfile=True)
     def initialize(self):
-        if hasattr(self, "initialized") and self.initialized:
-            return True
-
         self.PageShift = 13
         self.PageSize = 1 << self.PageShift
+        ptrsize = runtime.current_arch.ptrsize
 
         # assume 1.22.2 (Ubuntu 24.04)
         """
@@ -822,8 +807,7 @@ class GoHeapDumpCommand(GenericCommand, BufferingOutput):
         } // total: 0x16ab8 bytes
         """
 
-        self.offset_allspans = self.get_struct_offset("runtime.mheap", "allspans") or 0x10148
-        self.sizeof_mheap = self.get_struct_size("runtime.mheap") or 0x16ab8
+        self.offset_allspans = GefUtil.member_offset("runtime.mheap", "allspans") or (0xb4 if ptrsize == 4 else 0x10148)
 
         """
         struct runtime.mspan {
@@ -843,94 +827,117 @@ class GoHeapDumpCommand(GenericCommand, BufferingOutput):
             ...
         } // total: 0xa0 bytes
         """
-        self.offset_next = self.get_struct_offset("runtime.mspan", "next") or 0x0
-        self.offset_prev = self.get_struct_offset("runtime.mspan", "next") or 0x8
-        self.offset_startAddr = self.get_struct_offset("runtime.mspan", "startAddr") or 0x18
-        self.offset_npages = self.get_struct_offset("runtime.mspan", "npages") or 0x20
-        self.offset_nelems = self.get_struct_offset("runtime.mspan", "nelems") or 0x32
-        self.offset_allocBits = self.get_struct_offset("runtime.mspan", "allocBits") or 0x40
-        self.offset_spanclass = self.get_struct_offset("runtime.mspan", "spanClass") or 0x62
+        self.offset_next = GefUtil.member_offset("runtime.mspan", "next") or 0x0
+        self.offset_prev = GefUtil.member_offset("runtime.mspan", "prev") or ptrsize
+        self.offset_startAddr = GefUtil.member_offset("runtime.mspan", "startAddr") or ptrsize * 3
+        self.offset_npages = GefUtil.member_offset("runtime.mspan", "npages") or ptrsize * 4
+        self.offset_freeindex = GefUtil.member_offset("runtime.mspan", "freeindex") or ptrsize * 6
+        self.offset_nelems = GefUtil.member_offset("runtime.mspan", "nelems") or ptrsize * 6 + 2
+        self.offset_allocBits = GefUtil.member_offset("runtime.mspan", "allocBits") or ptrsize * 6 + 0x10
+        self.offset_spanclass = GefUtil.member_offset("runtime.mspan", "spanclass") or ptrsize * 9 + 0x1a
+        self.offset_state = GefUtil.member_offset("runtime.mspan", "state") or ptrsize * 9 + 0x1b
+        self.offset_elemsize = GefUtil.member_offset("runtime.mspan", "elemsize") or ptrsize * 9 + 0x20
 
-        self.initialized = True
         return True
 
     def get_mheap_(self):
-        # use symbol
-        try:
-            return AddressUtil.parse_address("&'runtime.mheap_'")
-        except gdb.error:
-            pass
-
-        # use heuristic search (TODO: Check if it is always correct)
-        elf = Elf.get_elf()
-        if elf is None or not elf.is_valid():
-            return None
-
-        bss = elf.get_shdr(".bss")
-        mheap = bss.sh_addr + bss.sh_size - self.sizeof_mheap
-        if is_valid_addr(mheap):
-            return mheap
-        return None
+        return Symbol.resolve_address("'runtime.mheap_'")
 
     def parse_mheap(self, mheap):
         self.out.append(titlify("runtime.mheap_ @ {:#x}".format(mheap)))
 
-        current = read_int_from_memory(mheap + self.offset_allspans)
+        allspans = mheap + self.offset_allspans
+        current = read_int_from_memory(allspans)
+        length = read_int_from_memory(allspans + runtime.current_arch.ptrsize)
+        capacity = read_int_from_memory(allspans + runtime.current_arch.ptrsize * 2)
+        if length > capacity or (length and not current):
+            self.out.append("Invalid allspans slice")
+            return []
+
         mspans = []
-        while True:
-            try:
-                mspan_addr = read_int_from_memory(current)
-            except gdb.MemoryError:
+        for i in range(length):
+            mspan_addr = read_int_from_memory(current + i * runtime.current_arch.ptrsize, safe=True)
+            if mspan_addr is None:
                 self.out.append("Memory read error")
-                return []
-            if not mspan_addr:
                 break
+            if not mspan_addr:
+                self.out.append("Invalid mspan pointer in allspans[{:d}]".format(i))
+                continue
             mspan = self.parse_mspan(mspan_addr)
             if mspan:
                 mspans.append(mspan)
-            current += runtime.current_arch.ptrsize
 
         mspans = sorted(mspans, key=lambda m: (m.chunk_size, m.address))
         return mspans
 
     def parse_mspan(self, mspan):
         # read member
-        try:
-            start_addr = read_int_from_memory(mspan + self.offset_startAddr)
-        except gdb.MemoryError:
+        start_addr = read_int_from_memory(mspan + self.offset_startAddr, safe=True)
+        if start_addr is None:
             self.out.append("Memory read error")
             return None
         if not self.args.verbose and start_addr == 0:
             return None
 
-        # spanclass = (sizeclass << 1) | (noscan bit)
-        spanclass = read_int8_from_memory(mspan + self.offset_spanclass) >> 1
-        chunk_size = self.class_to_size_dic[spanclass]
-        if not self.args.verbose and chunk_size == 0:
+        state = read_int8_from_memory(mspan + self.offset_state)
+        if not self.args.verbose and state != 1:
             return None
+
+        chunk_size = 0
+        nelems = 0
+        allocBits_array = []
+        if state == 1:
+            # spanclass = (sizeclass << 1) | (noscan bit)
+            spanclass = read_int8_from_memory(mspan + self.offset_spanclass) >> 1
+            if spanclass >= len(self.class_to_size_dic):
+                self.out.append("Invalid spanclass in mspan @ {:#x}".format(mspan))
+                return None
+            chunk_size = self.class_to_size_dic[spanclass]
+            if spanclass == 0:
+                chunk_size = read_int_from_memory(mspan + self.offset_elemsize)
+            nelems = read_int16_from_memory(mspan + self.offset_nelems)
+            freeindex = read_int16_from_memory(mspan + self.offset_freeindex)
+            if freeindex > nelems:
+                self.out.append("Invalid freeindex in mspan @ {:#x}".format(mspan))
+                return None
+            if nelems:
+                allocBits_addr = read_int_from_memory(mspan + self.offset_allocBits)
+                allocBits_data = read_memory(allocBits_addr, (nelems + 7) // 8, safe=True)
+                if allocBits_data is None:
+                    self.out.append("Unreadable allocation bitmap in mspan @ {:#x}".format(mspan))
+                    return None
+                allocBits_array = [int(i < freeindex or (allocBits_data[i // 8] >> (i % 8)) & 1)
+                                   for i in range(nelems)]
 
         next_ = read_int_from_memory(mspan + self.offset_next)
         prev_ = read_int_from_memory(mspan + self.offset_prev)
         npages = read_int_from_memory(mspan + self.offset_npages)
         end_addr = start_addr + npages * self.PageSize
 
-        aligned_nelems = nelems = read_int_from_memory(mspan + self.offset_nelems) & 0xffff
-        while aligned_nelems % 8:
-            aligned_nelems += 1
-        allocBits_addr = read_int_from_memory(mspan + self.offset_allocBits)
-        allocBits_data = read_memory(allocBits_addr, aligned_nelems)
-        allocBits_array = [((b >> i) & 1) for b in allocBits_data for i in range(8)]
-
         Mspan = collections.namedtuple("Mspan", [
-            "address", "next", "prev", "start_addr", "end_addr", "npages", "chunk_size", "nelems", "alloc_bits",
+            "address", "next", "prev", "start_addr", "end_addr", "npages", "chunk_size", "nelems", "alloc_bits", "state",
         ])
-        mspan = Mspan(mspan, next_, prev_, start_addr, end_addr, npages, chunk_size, nelems, allocBits_array[:nelems])
+        mspan = Mspan(mspan, next_, prev_, start_addr, end_addr, npages, chunk_size, nelems, allocBits_array, state)
         return mspan
 
     def dump_mspan_data(self, mspan):
-        chunk_data = read_memory(mspan.start_addr, mspan.end_addr - mspan.start_addr)
-        chunk_hexdump = hexdump(chunk_data, base=mspan.start_addr, color=False, unit=8)
+        if not mspan.chunk_size:
+            # `--verbose` does not filter out the span of chunk_size == 0
+            return
+        section = ProcessMap.process_lookup_address(mspan.start_addr)
+        if section is not None and (not section.permission & Permission.READ or mspan.end_addr > section.page_end):
+            self.out.append("Unreadable mspan data @ {:#x}".format(mspan.start_addr))
+            return
+        chunk_data = read_memory(mspan.start_addr, mspan.end_addr - mspan.start_addr, safe=True)
+        if chunk_data is None:
+            self.out.append("Unreadable mspan data @ {:#x}".format(mspan.start_addr))
+            return
+        ptrsize = runtime.current_arch.ptrsize
+        chunk_hexdump = hexdump(chunk_data, base=mspan.start_addr, color=False, show_symbol=False, unit=ptrsize)
         lines = chunk_hexdump.splitlines()
+        column_start = AddressUtil.get_format_address_width() + 5
+        word_width = ptrsize * 2 + 2
+        words_per_line = 0x10 // ptrsize
 
         color_dic = {
             # (b, idx % 2): color name
@@ -941,39 +948,25 @@ class GoHeapDumpCommand(GenericCommand, BufferingOutput):
         }
 
         # coloring
-        for i in range(len(lines)):
-            line = lines[i]
-
-            offset1 = i * 0x10
-            idx1 = offset1 // mspan.chunk_size
-            if idx1 >= mspan.nelems:
-                color1 = ""
-            else:
-                b1 = mspan.alloc_bits[idx1]
-                color1 = color_dic[b1, idx1 % 2]
-
-            offset2 = i * 0x10 + 8
-            idx2 = offset2 // mspan.chunk_size
-            if idx2 >= mspan.nelems:
-                color2 = ""
-            else:
-                b2 = mspan.alloc_bits[idx2]
-                color2 = color_dic[b2, idx2 % 2]
-
-            lines[i] = "{:s}{:s}{:s}{:s}{:s}".format(
-                line[:19],
-                Color.colorify(line[19:37], color1),
-                line[37:38],
-                Color.colorify(line[38:56], color2),
-                line[56:],
-            )
+        for i, line in enumerate(lines):
+            words = []
+            for j in range(words_per_line):
+                idx = (i * 0x10 + j * ptrsize) // mspan.chunk_size
+                if idx < mspan.nelems:
+                    color = color_dic[mspan.alloc_bits[idx], idx % 2]
+                else:
+                    color = ""
+                start = column_start + j * (word_width + 1)
+                words.append(Color.colorify(line[start:start + word_width], color))
+            end = column_start + words_per_line * (word_width + 1) - 1
+            lines[i] = line[:column_start] + " ".join(words) + line[end:]
 
         self.out.extend(lines)
         return
 
     def dump_mspans(self, mspans):
-        chunk_size_color = Config.get_gef_setting("theme.heap_chunk_size")
-        page_address_color = Config.get_gef_setting("theme.heap_page_address")
+        chunk_size_color = Config.get("theme.heap_chunk_size")
+        page_address_color = Config.get("theme.heap_page_address")
 
         for mspan in mspans:
             # meta data
@@ -982,11 +975,12 @@ class GoHeapDumpCommand(GenericCommand, BufferingOutput):
             range_addr_str += "-"
             range_addr_str += Color.colorify_hex(mspan.end_addr, page_address_color)
             range_size = mspan.end_addr - mspan.start_addr
-            msg = "mspan @ {!s} [{:s} sz={:#x} chunk_size={:s} next={!s}, prev:{!s}]".format(
-                ProcessMap.lookup_address(mspan.address),
+            msg = "mspan @ {!s} [{:s} sz={:#x} chunk_size={:s} next={!s}, prev:{!s} state={:d}]".format(
+                ProcessMap.lookup(mspan.address),
                 range_addr_str, range_size, chunk_size_str,
-                ProcessMap.lookup_address(mspan.next),
-                ProcessMap.lookup_address(mspan.prev),
+                ProcessMap.lookup(mspan.next),
+                ProcessMap.lookup(mspan.prev),
+                mspan.state,
             )
             self.out.append(msg)
             if self.args.dump:
@@ -996,19 +990,28 @@ class GoHeapDumpCommand(GenericCommand, BufferingOutput):
     @parse_args
     @only_if_gdb_running
     @exclude_specific_gdb_mode(mode=("qemu-system", "kgdb", "vmware", "wine"))
-    @only_if_specific_arch(arch=("x86_64",))
+    @only_if_specific_arch(arch=("x86_32", "x86_64", "ARM32", "ARM64", "MIPS32", "MIPS64",
+                                          "PPC64", "RISCV64", "S390X", "LOONGARCH64"))
     def do_invoke(self, args):
+        if args.mheap is not None and not is_valid_addr(args.mheap):
+            err("Cannot read mheap at {:#x}".format(args.mheap))
+            return
         self.out = []
-        self.initialize()
+        if not self.initialize():
+            return
 
         if args.mspan is not None:
             mspans = [self.parse_mspan(args.mspan)]
-        elif args.mheap:
-            mspans = self.parse_mheap(args.mheap)
+        elif args.mheap is not None:
+            try:
+                mspans = self.parse_mheap(args.mheap)
+            except gdb.MemoryError:
+                err("Cannot read mheap at {:#x}".format(args.mheap))
+                return
         else:
             mheap = self.get_mheap_()
             if mheap is None:
-                err("Could not find runtime.mheap_")
+                err("Could not find runtime.mheap_; specify its address with --mheap")
                 return
             mspans = self.parse_mheap(mheap)
 
@@ -1016,6 +1019,7 @@ class GoHeapDumpCommand(GenericCommand, BufferingOutput):
         self.dump_mspans(mspans)
         self.print_output()
         return
+
 
 
 @register_command
@@ -2994,7 +2998,7 @@ class SnmallocHeapDumpCommand(GenericCommand, BufferingOutput):
 
 @register_command
 class ScallocHeapDumpCommand(GenericCommand, BufferingOutput):
-    """scalloc heap free-list viewer (x64 only)."""
+    """scalloc heap free-list viewer."""
 
     _cmdline_ = "scalloc-heap-dump"
     _category_ = "05-c. Heap - Other"
@@ -3010,7 +3014,7 @@ class ScallocHeapDumpCommand(GenericCommand, BufferingOutput):
         "Simplified scalloc structure:",
         "",
         "+-Arena(object_space)-+",
-        "| name_               |--->\"object\"",
+        '| name_               |--->"object"',
         "| start_              |------+",
         "| end_                |------|---->Span[N]",
         "| len_                |      |",
@@ -3046,9 +3050,42 @@ class ScallocHeapDumpCommand(GenericCommand, BufferingOutput):
         "* `size_class_` is converted to object size and capacity by fixed tables.",
         "* `local_free_list_.list_` points to the local free-list.",
         "* `local_free_list_.bump_pointer_` points to the next unused object area (top).",
-        "* `remote_free_list_.top_` is a tagged pointer and is decoded before dumping.",
+        "* `remote_free_list_.top_` is a tagged 64-bit value with a 48-bit pointer and a 16-bit tag.",
+        "* Pointers must fit in 48 bits (with bit 47 sign-extended on 64-bit targets).",
+        "* Upstream scalloc targets x86-64; other architectures require a compatible allocator port.",
+        "* Layouts use debug types when available, otherwise the upstream field order and target pointer size.",
     ]
     _note_ = "\n".join(_note_)
+
+    def initialize(self):
+        ptr = runtime.current_arch.ptrsize
+        self.arena_offsets = {}
+        for member, offset in (("name_", 0), ("start_", ptr), ("end_", ptr * 2),
+                               ("len_", ptr * 3), ("current_", 0x40)):
+            actual = GefUtil.member_offset("scalloc::Arena", member)
+            if actual is None:
+                self.arena_offsets[member] = offset
+            else:
+                self.arena_offsets[member] = actual
+
+        self.span_offsets = {}
+        for member, offset in (("span_link_", 0), ("owner_", ptr * 2), ("epoch_", ptr * 2 + 8),
+                               ("size_class_", ptr * 2 + 12), ("local_free_list_", ptr * 2 + 24),
+                               ("remote_free_list_", ptr * 4 + 32)):
+            actual = GefUtil.member_offset("scalloc::Span", member)
+            if actual is None:
+                self.span_offsets[member] = offset
+            else:
+                self.span_offsets[member] = actual
+
+        self.freelist_offsets = {}
+        for member, offset in (("list_", 0), ("bump_pointer_", ptr), ("len_", ptr * 2), ("increment_", ptr * 2 + 4)):
+            actual = GefUtil.member_offset("scalloc::IncrementalFreeList", member)
+            if actual is None:
+                self.freelist_offsets[member] = offset
+            else:
+                self.freelist_offsets[member] = actual
+        return
 
     def class_to_objects(self, cl):
         # number of objects in each span
@@ -3058,7 +3095,7 @@ class ScallocHeapDumpCommand(GenericCommand, BufferingOutput):
             0x7f, 0x40, 0x40, 0x40, 0x20, 0x20, 0x10, 0x10,
             0x10, 0x8, 0x4, 0x2, 0x1,
         ]
-        assert cl < len(class_to_objects_list)
+        assert 0 <= cl < len(class_to_objects_list)
         return class_to_objects_list[cl]
 
     def class_to_size(self, cl):
@@ -3068,7 +3105,7 @@ class ScallocHeapDumpCommand(GenericCommand, BufferingOutput):
             0x100, 0x200, 0x400, 0x800, 0x1000, 0x2000, 0x4000, 0x8000,
             0x10000, 0x20000, 0x40000, 0x80000, 0x100000,
         ]
-        assert cl < len(class_to_size_list)
+        assert 0 <= cl < len(class_to_size_list)
         return class_to_size_list[cl]
 
     def read_arena(self, addr, arena_name):
@@ -3088,68 +3125,56 @@ class ScallocHeapDumpCommand(GenericCommand, BufferingOutput):
         dic = {}
         dic["addr"] = addr
         dic["name"] = arena_name
-        dic["name_"] = read_cstring_from_memory(read_int_from_memory(addr))
-        dic["start"] = read_int_from_memory(addr + runtime.current_arch.ptrsize * 1)
-        dic["end"] = read_int_from_memory(addr + runtime.current_arch.ptrsize * 2)
-        dic["len"] = read_int_from_memory(addr + runtime.current_arch.ptrsize * 3)
-        dic["current"] = read_int_from_memory(addr + 0x40)
-        Arena = collections.namedtuple("Arena", dic.keys())
-        arena = Arena(*dic.values())
+        dic["name_"] = read_cstring_from_memory(read_int_from_memory(addr + self.arena_offsets["name_"]))
+        dic["start"] = read_int_from_memory(addr + self.arena_offsets["start_"])
+        dic["end"] = read_int_from_memory(addr + self.arena_offsets["end_"])
+        dic["len"] = read_int_from_memory(addr + self.arena_offsets["len_"])
+        dic["current"] = read_int_from_memory(addr + self.arena_offsets["current_"])
+        arena = GefUtil.dict_to_namedtuple("Arena", dic)
         return arena
 
     def get_object_space_heuristic(self):
+        ptr = runtime.current_arch.ptrsize
+        offsets = {name: offset // ptr for name, offset in self.arena_offsets.items()}
         maps = ProcessMap.get_process_maps()
         for m in maps:
-            if m.path != "":
+            if not m.is_readable() or not m.is_writable():
                 continue
             if m.size > 0x100_0000: # heuristic
                 continue
-            for addr in range(m.page_start, m.page_end, runtime.current_arch.ptrsize):
-                v = read_int_from_memory(addr)
-                if v == 0 or not is_valid_addr(v):
+            values = read_memory(m.page_start, m.size, safe=True)
+            if values is None:
+                continue
+            values = slice_unpack(values, ptr)
+            for i in range(len(values) - max(offsets.values())):
+                start = values[i + offsets["start_"]]
+                end = values[i + offsets["end_"]]
+                len_ = values[i + offsets["len_"]]
+                current = values[i + offsets["current_"]]
+                if not start or end <= start or end - start != len_:
                     continue
-                if read_cstring_from_memory(v) != "object":
+                if not start <= current <= end or (current - start) % 0x20_0000:
                     continue
-                start = read_int_from_memory(addr + runtime.current_arch.ptrsize)
-                if not is_valid_addr(start):
+                v = values[i + offsets["name_"]]
+                if not v or not is_valid_addr(v):
                     continue
-                end = read_int_from_memory(addr + runtime.current_arch.ptrsize * 2)
-                if not is_valid_addr(end - 1):
+                if read_cstring_from_memory(v, max_length=7, safe=True) != "object":
                     continue
-                len_ = read_int_from_memory(addr + runtime.current_arch.ptrsize * 3)
-                if end - start != len_:
+                if not is_valid_addr(start) or not is_valid_addr(end - 1):
                     continue
-                pad1 = read_int_from_memory(addr + runtime.current_arch.ptrsize * 4)
-                if pad1 != 0:
-                    continue
-                pad2 = read_int_from_memory(addr + runtime.current_arch.ptrsize * 5)
-                if pad2 != 0:
-                    continue
-                pad3 = read_int_from_memory(addr + runtime.current_arch.ptrsize * 6)
-                if pad3 != 0:
-                    continue
-                pad4 = read_int_from_memory(addr + runtime.current_arch.ptrsize * 7)
-                if pad4 != 0:
-                    continue
-                current = read_int_from_memory(addr + runtime.current_arch.ptrsize * 8)
-                if not is_valid_addr(current):
-                    continue
-                return addr
+                return m.page_start + i * ptr
         return None
 
     def get_object_space(self):
         object_space = None
 
         # use specific address
-        if self.args.object_space:
+        if self.args.object_space is not None:
             object_space = self.args.object_space
 
         ## use symbol
         if object_space is None:
-            try:
-                object_space = AddressUtil.parse_address("&_ZN7scalloc12object_spaceE")
-            except gdb.error:
-                object_space = None
+            object_space = Symbol.resolve_address("_ZN7scalloc12object_spaceE")
 
         # heuristic search
         if object_space is None:
@@ -3160,9 +3185,10 @@ class ScallocHeapDumpCommand(GenericCommand, BufferingOutput):
 
     def decode_top(self, raw):
         kValueBits = 48
-        kValueMask= (1 << kValueBits) - 1
-        kExtendMask = 0xffff_ffff_ffff_ffff
-        return (raw & kValueMask) | (((raw >> (kValueBits - 1)) & 0x1) * kExtendMask)
+        kValueMask = (1 << kValueBits) - 1
+        kPointerMask = (1 << (runtime.current_arch.ptrsize * 8)) - 1
+        kExtendMask = kPointerMask & ~kValueMask
+        return ((raw & kValueMask) | (((raw >> (kValueBits - 1)) & 0x1) * kExtendMask)) & kPointerMask
 
     def read_span(self, addr):
         """
@@ -3187,59 +3213,75 @@ class ScallocHeapDumpCommand(GenericCommand, BufferingOutput):
             } remote_free_list_;
         }
         """
+        link = addr + self.span_offsets["span_link_"]
+        local = addr + self.span_offsets["local_free_list_"]
         dic = {}
         dic["addr"] = addr
-        dic["next"] = read_int_from_memory(addr + runtime.current_arch.ptrsize * 0)
-        dic["prev"] = read_int_from_memory(addr + runtime.current_arch.ptrsize * 1)
-        dic["owner"] = read_int_from_memory(addr + runtime.current_arch.ptrsize * 2)
-        dic["epoch"] = read_int32_from_memory(addr + runtime.current_arch.ptrsize * 3)
-        dic["size_class"] = read_int32_from_memory(addr + runtime.current_arch.ptrsize * 3 + 4)
+        dic["next"] = read_int_from_memory(link)
+        dic["prev"] = read_int_from_memory(link + runtime.current_arch.ptrsize)
+        dic["owner"] = read_int64_from_memory(addr + self.span_offsets["owner_"])
+        dic["epoch"] = read_int32_from_memory(addr + self.span_offsets["epoch_"])
+        dic["size_class"] = read_int32_from_memory(addr + self.span_offsets["size_class_"], signed=True)
         dic["object_num"] = self.class_to_objects(dic["size_class"]) # number of objects in each span
         dic["object_size"] = self.class_to_size(dic["size_class"])
-        dic["freelist"] = read_int_from_memory(addr + runtime.current_arch.ptrsize * 5)
-        dic["freelist_addr"] = addr + runtime.current_arch.ptrsize * 5
-        dic["bump_pointer"] = read_int_from_memory(addr + runtime.current_arch.ptrsize * 6) # top pointer in glibc
-        dic["freelist_len"] = read_int32_from_memory(addr + runtime.current_arch.ptrsize * 7)
-        dic["freelist_increment"] = read_int32_from_memory(addr + runtime.current_arch.ptrsize * 7 + 4) # = object_size
-        dic["top"] = read_int_from_memory(addr + runtime.current_arch.ptrsize * 8) # encoded remote freelist
-        dic["top_addr"] = addr + runtime.current_arch.ptrsize * 8
+        dic["freelist_addr"] = local + self.freelist_offsets["list_"]
+        dic["freelist"] = read_int_from_memory(dic["freelist_addr"])
+        dic["bump_pointer"] = read_int_from_memory(local + self.freelist_offsets["bump_pointer_"])
+        dic["freelist_len"] = read_int32_from_memory(local + self.freelist_offsets["len_"])
+        dic["freelist_increment"] = read_int32_from_memory(local + self.freelist_offsets["increment_"])
+        dic["top_addr"] = addr + self.span_offsets["remote_free_list_"]
+        dic["top"] = read_int64_from_memory(dic["top_addr"])
         dic["top_decoded"] = self.decode_top(dic["top"])
-        Span = collections.namedtuple("Span", dic.keys())
-        span = Span(*dic.values())
+        span = GefUtil.dict_to_namedtuple("Span", dic)
         return span
 
     def dump_freelist(self, head):
-        freed_address_color = Config.get_gef_setting("theme.heap_chunk_address_freed")
+        freed_address_color = Config.get("theme.heap_chunk_address_freed")
+        corrupted_msg_color = Config.get("theme.heap_corrupted_msg")
 
         cur = head
         cnt = 0
+        seen = set()
         while True:
+            if cur in seen:
+                self.out.append(" -> {:s}".format(Color.colorify("loop detected", corrupted_msg_color)))
+                break
+            seen.add(cur)
             if cur == 0 and cnt > 0:
                 self.out.append(" -> {:s} (num: {:#x})".format(Color.colorify_hex(cur, freed_address_color), cnt))
             else:
                 self.out.append(" -> {:s}".format(Color.colorify_hex(cur, freed_address_color)))
             if cur == 0:
                 break
-            cur = read_int_from_memory(cur)
+            try:
+                cur = read_int_from_memory(cur)
+            except gdb.MemoryError:
+                self.out.append(" -> {:s}".format(Color.colorify("corrupted: invalid address", corrupted_msg_color)))
+                break
             cnt += 1
         return cnt
 
     def dump_spans(self, arena):
         self.out.append(titlify("Arena ({:s}) @{:#x}".format(arena.name, arena.addr)))
         current = arena.start
+        span = None
         while current < arena.current:
-            span = self.read_span(current)
+            try:
+                span = self.read_span(current)
+            except (gdb.MemoryError, AssertionError):
+                self.err_add_out("Corrupted span at {:#x}".format(current))
+                break
             if span.object_size != 0:
                 self.out.append(titlify("Span @{:#x} (size: {:#x}, capacity: {:#x}, available: {:#x})".format(
                     span.addr, span.object_size, span.object_num, span.freelist_len,
                 )))
-                self.out.append("freelist @ {!s}:".format(ProcessMap.lookup_address(span.freelist_addr)))
+                self.out.append("freelist @ {!s}:".format(ProcessMap.lookup(span.freelist_addr)))
                 cnt = self.dump_freelist(span.freelist)
                 self.out.append("bump_pointer: {!s} (num: {:#x})".format(
-                    ProcessMap.lookup_address(span.bump_pointer),
+                    ProcessMap.lookup(span.bump_pointer),
                     span.freelist_len - cnt,
                 ))
-                self.out.append("remote freelist @ {!s}:".format(ProcessMap.lookup_address(span.top_addr)))
+                self.out.append("remote freelist @ {!s}:".format(ProcessMap.lookup(span.top_addr)))
                 self.dump_freelist(span.top_decoded)
             current += 0x20_0000 # kVirtualSpanSize
         return span
@@ -3247,9 +3289,19 @@ class ScallocHeapDumpCommand(GenericCommand, BufferingOutput):
     @parse_args
     @only_if_gdb_running
     @exclude_specific_gdb_mode(mode=("qemu-system", "kgdb", "vmware", "wine"))
-    @only_if_specific_arch(arch=("x86_64",))
     def do_invoke(self, args):
-        object_space = self.get_object_space()
+        if args.object_space is not None and not is_valid_addr(args.object_space):
+            err("Cannot read object_space at {:#x}".format(args.object_space))
+            return
+        self.initialize()
+        try:
+            object_space = self.get_object_space()
+        except gdb.MemoryError:
+            if args.object_space is None:
+                err("Cannot read object_space")
+            else:
+                err("Cannot read object_space at {:#x}".format(args.object_space))
+            return
         if object_space is None:
             err("Could not find object_space")
             return
@@ -3258,6 +3310,7 @@ class ScallocHeapDumpCommand(GenericCommand, BufferingOutput):
         self.dump_spans(object_space)
         self.print_output()
         return
+
 
 
 @register_command

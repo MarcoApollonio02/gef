@@ -12,6 +12,7 @@ import re
 import gdb
 
 from gef.commands.base import (
+    ContextManager,
     BufferingOutput,
     GenericCommand,
     exclude_specific_gdb_mode,
@@ -550,6 +551,12 @@ class TlsCommand(GenericCommand, BufferingOutput):
     ]
     _example_ = "\n".join(_example_).format(_cmdline_)
 
+    _note_ = [
+        "Under qemu-user, multi-threaded mips/mipsn32/mips64/m68k targets may produce unreliable TLS/heap results",
+        "because ExecAsm/ExecSyscall can fail after thread switches.",
+    ]
+    _note_ = "\n".join(_note_)
+
     @staticmethod
     def get_direction():
         if is_x86() or is_sparc64() or is_s390x():
@@ -559,8 +566,6 @@ class TlsCommand(GenericCommand, BufferingOutput):
         return direction
 
     def get_specific_tls(self, thread_id):
-        orig_thread = gdb.selected_thread()
-        orig_frame = gdb.selected_frame()
         threads = gdb.selected_inferior().threads()
         threads = [th for th in threads if th.num == thread_id]
 
@@ -568,19 +573,15 @@ class TlsCommand(GenericCommand, BufferingOutput):
             err("Could not find the target thread")
             return
 
-        try:
-            threads[0].switch()
-            tls = runtime.current_arch.get_tls()
-        except Exception:
-            tls = None
-
-        orig_thread.switch() # revert
-        orig_frame.select()
+        with ContextManager.selected_thread():
+            try:
+                threads[0].switch()
+                tls = runtime.current_arch.get_tls()
+            except Exception:
+                tls = None
         return tls
 
     def print_all_tls(self):
-        orig_thread = gdb.selected_thread()
-        orig_frame = gdb.selected_frame()
         threads = gdb.selected_inferior().threads()
         threads = sorted(threads, key=lambda th: th.num)
 
@@ -588,19 +589,24 @@ class TlsCommand(GenericCommand, BufferingOutput):
             err("No thread is detected")
             return
 
-        for thread in threads:
-            msg = "Thread Id:{:d}".format(thread.num)
-            try:
-                thread.switch()
-            except gdb.error:
-                msg += " - Failed to switch to this thread"
-                continue
-            tls = runtime.current_arch.get_tls()
-            msg += " - {:#x}".format(tls)
-            gef_print(msg)
-
-        orig_thread.switch() # revert
-        orig_frame.select()
+        with ContextManager.selected_thread():
+            for thread in threads:
+                msg = "Thread Id:{:d}".format(thread.num)
+                try:
+                    thread.switch()
+                except (gdb.error, RuntimeError):
+                    msg += " - Failed to switch to this thread"
+                    gef_print(msg)
+                    continue
+                try:
+                    tls = runtime.current_arch.get_tls()
+                except Exception:
+                    tls = None
+                if tls is None:
+                    msg += " - Failed to get TLS address"
+                else:
+                    msg += " - {:#x}".format(tls)
+                gef_print(msg)
         return
 
     def get_varnames(self):
@@ -671,6 +677,7 @@ class TlsCommand(GenericCommand, BufferingOutput):
         return
 
 
+
 @register_command
 class FsbaseCommand(GenericCommand):
     """Display fsbase address."""
@@ -718,4 +725,3 @@ class GsbaseCommand(GenericCommand):
         if gsbase is not None:
             gef_print("$gs_base: {:#x}".format(gsbase))
         return
-

@@ -25,7 +25,7 @@ from gef.commands.base import (
     require_arch_set,
 )
 from gef.core import runtime
-from gef.core.address import Address, AddressUtil, Permission
+from gef.core.address import Address, AddressUtil, Endian, Permission
 from gef.core.auxv import Auxv
 from gef.core.bitinfo import BitInfo
 from gef.core.cache import Cache
@@ -42,6 +42,7 @@ from gef.core.process import (
     Pid,
     ProcessMap,
     get_pagesize,
+    is_32bit,
     is_64bit,
     is_alive,
     is_arm32,
@@ -65,7 +66,7 @@ from gef.core.utils import GefUtil, slice_unpack, u2i, align_to_ptrsize, get_lib
 
 @register_command
 class CanaryCommand(GenericCommand):
-    """Display the canary value of the current process from auxv information."""
+    """Display the canary value of the current process."""
 
     _cmdline_ = "canary"
     _category_ = "02-f. Process Information - Security"
@@ -74,23 +75,52 @@ class CanaryCommand(GenericCommand):
     _syntax_ = parser.format_help()
 
     @staticmethod
-    @Cache.cache_this_session
+    @Cache.cache_this_session(cache_None=False, until_new_objfile=True)
     def gef_read_canary():
-        """Read the canary of a running process using Auxiliary Vector.
-        Return a tuple of (canary, location) if found, None otherwise."""
+        """Read the current stack canary and return its value and location."""
         if is_in_kernel():
             return None
 
-        try:
-            auxval = Auxv.get_auxiliary_values()
-            if not auxval:
+        libc_version = get_libc_version(silent=True)
+        if SignalHandlersCommand.get_libc() == "musl" or (libc_version and libc_version >= (2, 44)):
+            # musl uses the TLS guard; from glibc 2.44, AT_RANDOM will be refilled
+            canary_offset = runtime.current_arch.get_canary_offset()
+            if canary_offset is not None:
+                try:
+                    tls = runtime.current_arch.get_tls()
+                    if tls is not None:
+                        canary_location = tls + canary_offset
+                        canary = read_int_from_memory(canary_location)
+                        # The canary address in TLS differs between threads, so only cache its value.
+                        return canary, None
+                except Exception:
+                    return None
+            else:
+                try:
+                    canary_location = Symbol.resolve_address("__stack_chk_guard")
+                    if canary_location is None:
+                        return None
+                    canary = read_int_from_memory(canary_location)
+                    return canary, canary_location
+                except (gdb.error, gdb.MemoryError):
+                    return None
+        else:
+            try:
+                auxval = Auxv.get_auxiliary_values()
+                if not auxval:
+                    return None
+                canary_location = auxval["AT_RANDOM"]
+                canary = read_int_from_memory(canary_location)
+                if Endian.is_big_endian():
+                    if is_64bit():
+                        canary &= 0x00ff_ffff_ffff_ffff
+                    elif is_32bit():
+                        canary &= 0x00ff_ffff
+                else:
+                    canary &= ~0xff
+                return canary, canary_location
+            except (KeyError, gdb.MemoryError):
                 return None
-            canary_location = auxval["AT_RANDOM"]
-            canary = read_int_from_memory(canary_location)
-            canary &= ~0xff
-            return canary, canary_location
-        except (KeyError, gdb.MemoryError):
-            return None
 
     def dump_canary(self):
         res = CanaryCommand.gef_read_canary()
@@ -98,16 +128,17 @@ class CanaryCommand(GenericCommand):
             err("Failed to get the canary")
             return
 
-        canary, location = res
+        canary, canary_location = res
         gef_print(titlify("Canary value"))
-        info("Found AT_RANDOM at {!s}, reading {:d} bytes".format(
-            ProcessMap.lookup_address(location), runtime.current_arch.ptrsize,
-        ))
+        if canary_location is not None:
+            info("Found canary at {!s}, reading {:d} bytes".format(
+                ProcessMap.lookup(canary_location), runtime.current_arch.ptrsize,
+            ))
         info("The canary is {:s}".format(Color.colorify_hex(canary, "bold")))
 
         gef_print(titlify("Found canaries"))
         vmmap = ProcessMap.get_process_maps_exclude_special_regions(allow_vdso=True)
-        unpack = u32 if runtime.current_arch.ptrsize == 4 else u64
+        unpack = GefUtil.get_unpack()
         sp = runtime.current_arch.sp
         printed_flag_sp = False
         for m in vmmap:
@@ -115,9 +146,8 @@ class CanaryCommand(GenericCommand):
                 continue
             if not (m.permission & Permission.WRITE):
                 continue
-            try:
-                data = read_memory(m.page_start, m.page_end - m.page_start)
-            except gdb.MemoryError:
+            data = read_memory(m.page_start, m.page_end - m.page_start, safe=True)
+            if data is None:
                 continue
             prev_addr = -1
             for pos in range(0, m.page_end - m.page_start, runtime.current_arch.ptrsize):
@@ -131,14 +161,14 @@ class CanaryCommand(GenericCommand):
                     path = m.path
                 if prev_addr <= sp <= addr:
                     if printed_flag_sp is False:
-                        info("(Stack pointer is at {!s})".format(ProcessMap.lookup_address(sp)))
+                        info("(Stack pointer is at {!s})".format(ProcessMap.lookup(sp)))
                         printed_flag_sp = True
                 if path == "[stack]":
                     info("Found at {!s} in {!r} (sp{:+#x})".format(
-                        ProcessMap.lookup_address(addr), path, addr - sp,
+                        ProcessMap.lookup(addr), path, addr - sp,
                     ))
                 else:
-                    info("Found at {!s} in {!r}".format(ProcessMap.lookup_address(addr), path))
+                    info("Found at {!s} in {!r}".format(ProcessMap.lookup(addr), path))
                 prev_addr = addr
         return
 
@@ -149,6 +179,7 @@ class CanaryCommand(GenericCommand):
     def do_invoke(self, args):
         self.dump_canary()
         return
+
 
 
 @register_command

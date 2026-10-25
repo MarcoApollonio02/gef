@@ -36,7 +36,7 @@ from gef.core.config import Config
 from gef.core.instruction import Disasm, get_insn, get_insn_next
 from gef.core.display import ProgressBar
 from gef.core.http import http_get
-from gef.core.kernel import (Kernel, KernelDevice, KernelListHead, KernelMapleTree, KernelNftables,
+from gef.core.kernel import (AddrMap, Kernel, KernelDevice, KernelListHead, KernelMapleTree, KernelNftables,
                              KernelRBTree, KernelRadixTree, KernelResourceLayout, KernelSlub,
                              KernelTask, KernelVersion, KernelXArray, Ksym)
 from gef.core.memory import (
@@ -2469,7 +2469,8 @@ class KernelOperationsCommand(GenericCommand, BufferingOutput):
     _example_ = "\n".join(_example_).format(_cmdline_)
 
     _note_ = [
-        "This command requires CONFIG_RANDSTRUCT=n.",
+        "Reading values requires debug information or a known kernel config for conditional members.",
+        "Without debug information, CONFIG_RANDSTRUCT=n is required.",
         "",
         "Currently it supports from 3.0 to 7,0-rc7.",
         "",
@@ -2483,24 +2484,16 @@ class KernelOperationsCommand(GenericCommand, BufferingOutput):
         super().__init__(complete="use_user_complete")
         return
 
-    def complete(self, text, word): # noqa
-        if text.strip() in self.types:
-            # already matched
-            return []
+    def complete(self, text, word):
+        return GefUtil.complete_candidates(self.types, text, word)
 
-        if text == "":
-            # no prefix: example: `kops TAB`
-            return [s for s in self.types if ((word is None) or (s and word in s))]
-
-        # finally, look for possible values for given prefix
-        return [s for s in self.types if s and s.startswith(text.strip())]
-
-    def initialize(self, kversion):
+    @Cache.cache_this_session(cache_None=False)
+    def get_members(self, kversion):
         if kversion.major < 3:
             err("Unsupported before v3.0")
-            return False
+            return None
 
-        self.members = {}
+        members = {}
 
         def adapt_to_kernel_version(ops):
             out = []
@@ -2514,6 +2507,7 @@ class KernelOperationsCommand(GenericCommand, BufferingOutput):
 
                 if minver and kversion < minver:
                     continue
+                # maxver is exclusive: the first version without the member (usually the next mainline)
                 if maxver and maxver <= kversion:
                     continue
                 out.append((typ, name))
@@ -2522,7 +2516,7 @@ class KernelOperationsCommand(GenericCommand, BufferingOutput):
         file_operations = [
             # type       name                                       minver     maxver
             ["ptr",      "owner",                                   None,      None],
-            ["int",      "flags",                                   "6.10.0",  None],
+            ["int",      "fop_flags",                               "6.10.0",  None],
             ["func_ptr", "llseek",                                  None,      None],
             ["func_ptr", "read",                                    None,      None],
             ["func_ptr", "write",                                   None,      None],
@@ -2553,20 +2547,24 @@ class KernelOperationsCommand(GenericCommand, BufferingOutput):
             ["func_ptr", "flock",                                   None,      None],
             ["func_ptr", "splice_write",                            None,      None],
             ["func_ptr", "splice_read",                             None,      None],
+            ["func_ptr", "splice_eof",                              "5.15.196", "5.16.0"],
+            ["func_ptr", "splice_eof",                              "6.1.72",   "6.2.0"],
             ["func_ptr", "splice_eof",                              "6.5.0",   None],
             ["func_ptr", "setlease",                                None,      None],
             ["func_ptr", "fallocate",                               None,      None],
             ["func_ptr", "show_fdinfo",                             "3.8.0",   None],
             ["func_ptr", "copy_file_range",                         "4.5.0",   None],
-            ["func_ptr", "clone_file_range",                        None,      "4.19.289"],
-            ["func_ptr", "dedupe_file_range",                       None,      "4.19.289"],
+            ["func_ptr", "clone_file_range",                        "4.5.0",   "4.20.0"],
+            ["func_ptr", "dedupe_file_range",                       "4.5.0",   "4.20.0"],
             ["func_ptr", "remap_file_range",                        "4.20.0",  None],
             ["func_ptr", "fadvise",                                 "4.19.0",  None],
             ["func_ptr", "uring_cmd",                               "5.19.0",  None],
             ["func_ptr", "uring_cmd_iopoll",                        "6.1.0",   None],
             ["func_ptr", "mmap_prepare",                            "6.16.0",  None],
+            ["bool",     "may_pollfree",                            "5.4.212", "5.5.0"],
+            ["bool",     "may_pollfree",                            "5.10.141", "5.11.0"],
         ]
-        self.members["file_operations"] = adapt_to_kernel_version(file_operations)
+        members["file_operations"] = adapt_to_kernel_version(file_operations)
 
         tty_operations = [
             # type       name                                       minver     maxver
@@ -2592,17 +2590,19 @@ class KernelOperationsCommand(GenericCommand, BufferingOutput):
             ["func_ptr", "hangup",                                  None,      None],
             ["func_ptr", "break_ctl",                               None,      None],
             ["func_ptr", "flush_buffer",                            None,      None],
-            ["func_ptr", "ldisc_ok",                                "6.1.0",   None],
+            ["func_ptr", "ldisc_ok",                                "6.1.96",  "6.2.0"],
+            ["func_ptr", "ldisc_ok",                                "6.6.36",  "6.7.0"],
+            ["func_ptr", "ldisc_ok",                                "6.9.7",   None],
             ["func_ptr", "set_ldisc",                               None,      None],
             ["func_ptr", "wait_until_sent",                         None,      None],
             ["func_ptr", "send_xchar",                              None,      None],
             ["func_ptr", "tiocmget",                                None,      None],
             ["func_ptr", "tiocmset",                                None,      None],
             ["func_ptr", "resize",                                  None,      None],
-            ["func_ptr", "set_termiox",                             None,      "5.10.0"],
+            ["func_ptr", "set_termiox",                             None,      "5.10.37"],
             ["func_ptr", "get_icount",                              None,      None],
-            ["func_ptr", "get_serial",                              "4.19.0",  None],
-            ["func_ptr", "set_serial",                              "4.19.0",  None],
+            ["func_ptr", "get_serial",                              "4.20.0",  None],
+            ["func_ptr", "set_serial",                              "4.20.0",  None],
             ["func_ptr", "show_fdinfo",                             "4.14.0",  None],
             ["func_ptr", "poll_init (CONFIG_CONSOLE_POLL=y)",       None,      None],
             ["func_ptr", "poll_get_char (CONFIG_CONSOLE_POLL=y)",   None,      None],
@@ -2610,19 +2610,20 @@ class KernelOperationsCommand(GenericCommand, BufferingOutput):
             ["func_ptr", "proc_show",                               "4.18.0",  None],
             ["ptr",      "proc_fops",                               None,      "4.18.0"],
         ]
-        self.members["tty_operations"] = adapt_to_kernel_version(tty_operations)
+        members["tty_operations"] = adapt_to_kernel_version(tty_operations)
 
         tty_ldisc_ops = [
             # type       name                                       minver     maxver      additional_flag
             ["int",      "magic",                                   None,      "5.13.0"],
             ["char*",    "name",                                    None,      None],
             ["int",      "num",                                     "5.16.0",  None],
-            ["int",      "num",                                     None,      "5.15.121", is_32bit()],
-            ["int",      "flags",                                   None,      "5.15.121", is_32bit()],
-            ["int, int", "flags, num",                              None,      "5.15.121", is_64bit()],
+            ["int",      "num",                                     None,      "5.16.0", is_32bit()],
+            ["int",      "flags",                                   None,      "5.16.0", is_32bit()],
+            ["int, int", "num, flags",                              None,      "5.16.0", is_64bit()],
             ["func_ptr", "open",                                    None,      None],
             ["func_ptr", "close",                                   None,      None],
             ["func_ptr", "flush_buffer",                            None,      None],
+            ["func_ptr", "chars_in_buffer",                         None,      "4.6.0"],
             ["func_ptr", "read",                                    None,      None],
             ["func_ptr", "write",                                   None,      None],
             ["func_ptr", "ioctl",                                   None,      None],
@@ -2635,11 +2636,11 @@ class KernelOperationsCommand(GenericCommand, BufferingOutput):
             ["func_ptr", "dcd_change",                              None,      None],
             ["func_ptr", "fasync",                                  "3.11.0",  "4.6.0"],
             ["func_ptr", "receive_buf2",                            "3.12.0",  None],
-            ["func_ptr", "lookahead_buf",                           "5.16.0",  None],
+            ["func_ptr", "lookahead_buf",                           "6.0.0",   None],
             ["ptr",      "owner",                                   None,      None],
             ["int",      "refcount",                                None,      "5.14.0"],
         ]
-        self.members["tty_ldisc_ops"] = adapt_to_kernel_version(tty_ldisc_ops)
+        members["tty_ldisc_ops"] = adapt_to_kernel_version(tty_ldisc_ops)
 
         seq_operations = [
             # type       name                                       minver     maxver
@@ -2648,7 +2649,7 @@ class KernelOperationsCommand(GenericCommand, BufferingOutput):
             ["func_ptr", "next",                                    None,      None],
             ["func_ptr", "show",                                    None,      None],
         ]
-        self.members["seq_operations"] = adapt_to_kernel_version(seq_operations)
+        members["seq_operations"] = adapt_to_kernel_version(seq_operations)
 
         inode_operations = [
             # type       name                                       minver     maxver
@@ -2657,7 +2658,7 @@ class KernelOperationsCommand(GenericCommand, BufferingOutput):
             ["func_ptr", "follow_link",                             None,      "4.5.0"],
             ["func_ptr", "permission",                              None,      None],
             ["func_ptr", "get_inode_acl",                           "6.2.0",   None],
-            ["func_ptr", "get_acl",                                 "3.1.0",   "6.1.39"],
+            ["func_ptr", "get_acl",                                 "3.1.0",   "6.2.0"],
             ["func_ptr", "check_acl",                               None,      "3.1.0"],
             ["func_ptr", "readlink",                                None,      None],
             ["func_ptr", "put_link",                                None,      "4.5.0"],
@@ -2677,6 +2678,7 @@ class KernelOperationsCommand(GenericCommand, BufferingOutput):
             ["func_ptr", "getxattr",                                None,      "4.9.0"],
             ["func_ptr", "listxattr",                               None,      None],
             ["func_ptr", "removexattr",                             None,      "4.9.0"],
+            ["func_ptr", "truncate_range",                          None,      "3.5.0"],
             ["func_ptr", "fiemap",                                  None,      None],
             ["func_ptr", "update_time",                             "3.5.0",   None],
             ["func_ptr", "sync_lazytime",                           "7.0.0",   None],
@@ -2684,31 +2686,38 @@ class KernelOperationsCommand(GenericCommand, BufferingOutput):
             ["func_ptr", "tmpfile",                                 "3.11.0",  None],
             ["func_ptr", "get_acl",                                 "6.2.0",   None],
             ["func_ptr", "set_acl",                                 "3.14.0",  None],
-            ["func_ptr", "dentry_open",                             None,      "4.2.0"],
+            ["func_ptr", "dentry_open",                             "3.18.0",  "3.18.23"],
+            ["func_ptr", "dentry_open",                             "3.19.0",  "4.1.11"],
             ["func_ptr", "fileattr_set",                            "5.13.0",  None],
             ["func_ptr", "fileattr_get",                            "5.13.0",  None],
             ["func_ptr", "get_offset_ctx",                          "6.6.0",   None],
         ]
-        self.members["inode_operations"] = adapt_to_kernel_version(inode_operations)
+        members["inode_operations"] = adapt_to_kernel_version(inode_operations)
 
         pernet_operations = [
             # type       name                                       minver     maxver
             ["ptr",      "list.next",                               None,      None],
             ["ptr",      "list.prev",                               None,      None],
             ["func_ptr", "init",                                    None,      None],
+            ["func_ptr", "pre_exit",                                "4.19.322", "4.20.0"],
             ["func_ptr", "pre_exit",                                "5.3.0",   None],
             ["func_ptr", "exit",                                    None,      None],
             ["func_ptr", "exit_batch",                              None,      None],
-            ["func_ptr", "exit_batch_rtnl",                         "6.9.0",   "6.15.9"],
+            ["func_ptr", "exit_batch_rtnl",                         "5.4.290", "5.5.0"],
+            ["func_ptr", "exit_batch_rtnl",                         "5.10.234", "5.11.0"],
+            ["func_ptr", "exit_batch_rtnl",                         "5.15.177", "5.16.0"],
+            ["func_ptr", "exit_batch_rtnl",                         "6.1.127",  "6.2.0"],
+            ["func_ptr", "exit_batch_rtnl",                         "6.6.74",   "6.7.0"],
+            ["func_ptr", "exit_batch_rtnl",                         "6.9.0",   "6.16.0"],
             ["func_ptr", "exit_rtnl",                               "6.16.0",  None],
             ["ptr",      "id",                                      None,      None],
-            ["long",     "size",                                    None,      None],
+            ["ulong",    "size",                                    None,      None],
         ]
-        self.members["pernet_operations"] = adapt_to_kernel_version(pernet_operations)
+        members["pernet_operations"] = adapt_to_kernel_version(pernet_operations)
 
         address_space_operations = [
             # type       name                                       minver     maxver
-            ["func_ptr", "writepage",                               None,      "6.15.9"],
+            ["func_ptr", "writepage",                               None,      "6.16.0"],
             ["func_ptr", "read_folio",                              "5.19.0",  None],
             ["func_ptr", "readpage",                                None,      "5.19.0"],
             ["func_ptr", "writepages",                              None,      None],
@@ -2741,7 +2750,7 @@ class KernelOperationsCommand(GenericCommand, BufferingOutput):
             ["func_ptr", "swap_deactivate",                         "3.6.0",   None],
             ["func_ptr", "swap_rw",                                 "5.19.0",  None],
         ]
-        self.members["address_space_operations"] = adapt_to_kernel_version(address_space_operations)
+        members["address_space_operations"] = adapt_to_kernel_version(address_space_operations)
 
         vm_operations_struct = [
             # type       name                                            minver     maxver
@@ -2749,8 +2758,9 @@ class KernelOperationsCommand(GenericCommand, BufferingOutput):
             ["func_ptr", "close",                                        None,      None],
             ["func_ptr", "mapped",                                       "7.1.0",   None],
             ["func_ptr", "may_split",                                    "5.11.0",  None],
-            ["func_ptr", "split",                                        "4.14.0",  "5.10.187"],
-            ["func_ptr", "mremap",                                       "4.3.9",   None],
+            ["func_ptr", "split",                                        "4.9.67",  "4.10.0"],
+            ["func_ptr", "split",                                        "4.14.4",  "5.11.0"],
+            ["func_ptr", "mremap",                                       "4.3.0",   None],
             ["func_ptr", "mprotect",                                     "5.11.0",  None],
             ["func_ptr", "fault",                                        None,      None],
             ["func_ptr", "huge_fault",                                   "4.11.0",  None],
@@ -2764,13 +2774,13 @@ class KernelOperationsCommand(GenericCommand, BufferingOutput):
             ["func_ptr", "set_policy (CONFIG_NUMA=y)",                   None,      None],
             ["func_ptr", "get_policy (CONFIG_NUMA=y)",                   None,      None],
             ["func_ptr", "migrate (CONFIG_NUMA=y)",                      None,      "3.19.0"],
-            ["func_ptr", "find_special_page",                            "4.0.0",   "6.17.8"],
+            ["func_ptr", "find_special_page",                            "4.0.0",   "6.18.0"],
             ["func_ptr", "find_normal_page (CONFIG_FIND_NORMAL_PAGE=y)", "6.18.0",  None],
             ["func_ptr", "remap_pages",                                  "3.17.0",  "4.0.0"],
             ["func_ptr", "remap_pages",                                  "3.7.0",   "3.16.59"],
             ["ptr",      "uffd_ops (CONFIG_USERFAULTFD=y)",              "7.1.0",   None],
         ]
-        self.members["vm_operations_struct"] = adapt_to_kernel_version(vm_operations_struct)
+        members["vm_operations_struct"] = adapt_to_kernel_version(vm_operations_struct)
 
         super_operations = [
             # type       name                                       minver     maxver
@@ -2805,7 +2815,7 @@ class KernelOperationsCommand(GenericCommand, BufferingOutput):
             ["func_ptr", "shutdown",                                "6.5.0",   None],
             ["func_ptr", "report_error",                            "7.0.0",   None],
         ]
-        self.members["super_operations"] = adapt_to_kernel_version(super_operations)
+        members["super_operations"] = adapt_to_kernel_version(super_operations)
 
         dentry_operations = [
             # type       name                                       minver     maxver
@@ -2821,13 +2831,14 @@ class KernelOperationsCommand(GenericCommand, BufferingOutput):
             ["func_ptr", "d_dname",                                 None,      None],
             ["func_ptr", "d_automount",                             None,      None],
             ["func_ptr", "d_manage",                                None,      None],
-            ["func_ptr", "d_select_inode",                          "4.1.0",   "4.8.0"],
-            ["func_ptr", "d_real",                                  "4.4.0",   None],
+            ["func_ptr", "d_select_inode",                          "4.1.11",  "4.8.0"],
+            ["func_ptr", "d_real",                                  "4.4.8",   "4.5.0"],
+            ["func_ptr", "d_real",                                  "4.5.2",   None],
             ["func_ptr", "d_select_inode",                          "3.18.23", "3.19.0"],
             ["func_ptr", "d_unalias_trylock",                       "6.14.0",  None],
             ["func_ptr", "d_unalias_unlock",                        "6.14.0",  None],
         ]
-        self.members["dentry_operations"] = adapt_to_kernel_version(dentry_operations)
+        members["dentry_operations"] = adapt_to_kernel_version(dentry_operations)
 
         block_device_operations = [
             # type       name                                       minver     maxver
@@ -2835,16 +2846,18 @@ class KernelOperationsCommand(GenericCommand, BufferingOutput):
             ["func_ptr", "poll_bio",                                "5.18.0",  None],
             ["func_ptr", "open",                                    None,      None],
             ["func_ptr", "release",                                 None,      None],
-            ["func_ptr", "rw_page",                                 None,      "6.3.0"],
+            ["func_ptr", "rw_page",                                 "3.16.0",  "6.3.0"],
             ["func_ptr", "ioctl",                                   None,      None],
             ["func_ptr", "compat_ioctl",                            None,      None],
             ["func_ptr", "direct_access",                           None,      "4.12.0"],
             ["func_ptr", "check_events",                            None,      None],
-            ["func_ptr", "media_changed",                           None,      "5.9.0"],
+            ["func_ptr", "media_changed",                           None,      "4.19.311"],
+            ["func_ptr", "media_changed",                           "4.20.0",  "5.9.0"],
             ["func_ptr", "unlock_native_capacity",                  None,      None],
             ["func_ptr", "revalidate_disk",                         None,      "5.13.0"],
             ["func_ptr", "getgeo",                                  None,      None],
-            ["func_ptr", "set_read_only",                           "5.11.0",  None],
+            ["func_ptr", "set_read_only",                           "4.19.311", "4.20.0"],
+            ["func_ptr", "set_read_only",                           "5.10.214", None],
             ["func_ptr", "free_disk",                               "5.18.0",  None],
             ["func_ptr", "swap_slot_free_notify",                   None,      None],
             ["func_ptr", "report_zones",                            "4.20.0",  None],
@@ -2854,7 +2867,7 @@ class KernelOperationsCommand(GenericCommand, BufferingOutput):
             ["ptr",      "pr_ops",                                  "4.4.0",   None],
             ["func_ptr", "alternative_gpt_sector",                  "5.15.0",  None],
         ]
-        self.members["block_device_operations"] = adapt_to_kernel_version(block_device_operations)
+        members["block_device_operations"] = adapt_to_kernel_version(block_device_operations)
 
         pipe_buf_operations = [
             # type       name                                       minver     maxver
@@ -2863,10 +2876,11 @@ class KernelOperationsCommand(GenericCommand, BufferingOutput):
             ["func_ptr", "unmap",                                   None,      "3.15.0"],
             ["func_ptr", "confirm",                                 None,      None],
             ["func_ptr", "release",                                 None,      None],
-            ["func_ptr", "try_steal",                               None,      None],
+            ["func_ptr", "steal",                                   None,      "5.8.0"],
+            ["func_ptr", "try_steal",                               "5.8.0",   None],
             ["func_ptr", "get",                                     None,      None],
         ]
-        self.members["pipe_buf_operations"] = adapt_to_kernel_version(pipe_buf_operations)
+        members["pipe_buf_operations"] = adapt_to_kernel_version(pipe_buf_operations)
 
         smp_operations = [
             # type       name                                       minver     maxver
@@ -2879,20 +2893,20 @@ class KernelOperationsCommand(GenericCommand, BufferingOutput):
             ["func_ptr", "cpu_can_disable (CONFIG_HOTPLUG_CPU=y)",  "4.3.0",   None],
             ["func_ptr", "cpu_disable (CONFIG_HOTPLUG_CPU=y)",      "3.7.0",   None],
         ]
-        self.members["smp_operations"] = adapt_to_kernel_version(smp_operations)
+        members["smp_operations"] = adapt_to_kernel_version(smp_operations)
 
         dma_buf_ops = [
             # type         name                                     minver     maxver
-            ["bool",       "cache_sgt_mapping",                     "5.7.0",   "6.15.9"],
+            ["bool",       "cache_sgt_mapping",                     "5.7.0",   "6.16.0"],
             ["bool, bool", "cache_sgt_mapping, dynamic_mapping",    "5.5.0",   "5.7.0"],
-            ["bool",       "cache_sgt_mapping",                     "5.3.0",   "5.4.265"],
-            ["func_ptr",   "attach",                                "3.2.0",   None],
-            ["func_ptr",   "detach",                                "3.2.0",   None],
+            ["bool",       "cache_sgt_mapping",                     "5.3.0",   "5.5.0"],
+            ["func_ptr",   "attach",                                "3.3.0",   None],
+            ["func_ptr",   "detach",                                "3.3.0",   None],
             ["func_ptr",   "pin",                                   "5.7.0",   None],
             ["func_ptr",   "unpin",                                 "5.7.0",   None],
-            ["func_ptr",   "map_dma_buf",                           "3.2.0",   None],
-            ["func_ptr",   "unmap_dma_buf",                         "3.2.0",   None],
-            ["func_ptr",   "release",                               "3.2.0",   None],
+            ["func_ptr",   "map_dma_buf",                           "3.3.0",   None],
+            ["func_ptr",   "unmap_dma_buf",                         "3.3.0",   None],
+            ["func_ptr",   "release",                               "3.3.0",   None],
             ["func_ptr",   "begin_cpu_access",                      "3.4.0",   None],
             ["func_ptr",   "end_cpu_access",                        "3.4.0",   None],
             ["func_ptr",   "mmap",                                  "5.3.0",   None],
@@ -2908,7 +2922,7 @@ class KernelOperationsCommand(GenericCommand, BufferingOutput):
             ["func_ptr",   "vmap",                                  "3.5.0",   None],
             ["func_ptr",   "vunmap",                                "3.5.0",   None],
         ]
-        self.members["dma_buf_ops"] = adapt_to_kernel_version(dma_buf_ops)
+        members["dma_buf_ops"] = adapt_to_kernel_version(dma_buf_ops)
 
         ata_port_operations = [
             # type       name                                       minver     maxver
@@ -2927,22 +2941,22 @@ class KernelOperationsCommand(GenericCommand, BufferingOutput):
             ["func_ptr", "dev_config",                              None,      None],
             ["func_ptr", "freeze",                                  None,      None],
             ["func_ptr", "thaw",                                    None,      None],
-            ["func_ptr", "prereset",                                None,      "6.16.5"],
-            ["func_ptr", "softreset",                               None,      "6.16.5"],
-            ["func_ptr", "hardreset",                               None,      "6.16.5"],
-            ["func_ptr", "postreset",                               None,      "6.16.5"],
+            ["func_ptr", "prereset",                                None,      "6.17.0"],
+            ["func_ptr", "softreset",                               None,      "6.17.0"],
+            ["func_ptr", "hardreset",                               None,      "6.17.0"],
+            ["func_ptr", "postreset",                               None,      "6.17.0"],
             ["func_ptr", "reset.prereset",                          "6.17.0",  None],
             ["func_ptr", "reset.softreset",                         "6.17.0",  None],
             ["func_ptr", "reset.hardreset",                         "6.17.0",  None],
             ["func_ptr", "reset.postreset",                         "6.17.0",  None],
-            ["func_ptr", "pmp_prereset",                            None,      "6.16.5"],
-            ["func_ptr", "pmp_softreset",                           None,      "6.16.5"],
-            ["func_ptr", "pmp_hardreset",                           None,      "6.16.5"],
-            ["func_ptr", "pmp_postreset",                           None,      "6.16.5"],
-            ["func_ptr", "pmp_reset.pmp_prereset",                  "6.17.0",  None],
-            ["func_ptr", "pmp_reset.pmp_softreset",                 "6.17.0",  None],
-            ["func_ptr", "pmp_reset.pmp_hardreset",                 "6.17.0",  None],
-            ["func_ptr", "pmp_reset.pmp_postreset",                 "6.17.0",  None],
+            ["func_ptr", "pmp_prereset",                            None,      "6.17.0"],
+            ["func_ptr", "pmp_softreset",                           None,      "6.17.0"],
+            ["func_ptr", "pmp_hardreset",                           None,      "6.17.0"],
+            ["func_ptr", "pmp_postreset",                           None,      "6.17.0"],
+            ["func_ptr", "pmp_reset.prereset",                      "6.17.0",  None],
+            ["func_ptr", "pmp_reset.softreset",                     "6.17.0",  None],
+            ["func_ptr", "pmp_reset.hardreset",                     "6.17.0",  None],
+            ["func_ptr", "pmp_reset.postreset",                     "6.17.0",  None],
             ["func_ptr", "error_handler",                           None,      None],
             ["func_ptr", "lost_interrupt",                          None,      None],
             ["func_ptr", "post_internal_cmd",                       None,      None],
@@ -2983,7 +2997,7 @@ class KernelOperationsCommand(GenericCommand, BufferingOutput):
             ["func_ptr", "eng_timeout",                             None,      "6.6.0"],
             ["ptr",      "inherits",                                None,      None],
         ]
-        self.members["ata_port_operations"] = adapt_to_kernel_version(ata_port_operations)
+        members["ata_port_operations"] = adapt_to_kernel_version(ata_port_operations)
 
         media_entity_operations = [
             # type       name                                       minver     maxver
@@ -2992,7 +3006,7 @@ class KernelOperationsCommand(GenericCommand, BufferingOutput):
             ["func_ptr", "link_validate",                           "3.5.0",   None],
             ["func_ptr", "has_pad_interdep",                        "6.1.0",   None],
         ]
-        self.members["media_entity_operations"] = adapt_to_kernel_version(media_entity_operations)
+        members["media_entity_operations"] = adapt_to_kernel_version(media_entity_operations)
 
         configfs_item_operations = [
             # type       name                                       minver     maxver
@@ -3002,19 +3016,19 @@ class KernelOperationsCommand(GenericCommand, BufferingOutput):
             ["func_ptr", "allow_link",                              None,      None],
             ["func_ptr", "drop_link",                               None,      None],
         ]
-        self.members["configfs_item_operations"] = adapt_to_kernel_version(configfs_item_operations)
+        members["configfs_item_operations"] = adapt_to_kernel_version(configfs_item_operations)
 
         configfs_group_operations = [
             # type       name                                       minver     maxver
             ["func_ptr", "make_item",                               None,      None],
             ["func_ptr", "make_group",                              None,      None],
-            ["func_ptr", "commit_item",                             None,      "6.1.113"],
+            ["func_ptr", "commit_item",                             None,      "6.2.0"],
             ["func_ptr", "disconnect_notify",                       None,      None],
             ["func_ptr", "drop_item",                               None,      None],
             ["func_ptr", "is_visible",                              "6.11.0",  None],
             ["func_ptr", "is_bin_visible",                          "6.11.0",  None],
         ]
-        self.members["configfs_group_operations"] = adapt_to_kernel_version(configfs_group_operations)
+        members["configfs_group_operations"] = adapt_to_kernel_version(configfs_group_operations)
 
         fs_context_operations = [
             # type       name                                       minver     maxver
@@ -3025,7 +3039,7 @@ class KernelOperationsCommand(GenericCommand, BufferingOutput):
             ["func_ptr", "get_tree",                                "5.1.0",   None],
             ["func_ptr", "reconfigure",                             "5.1.0",   None],
         ]
-        self.members["fs_context_operations"] = adapt_to_kernel_version(fs_context_operations)
+        members["fs_context_operations"] = adapt_to_kernel_version(fs_context_operations)
 
         export_operations = [
             # type       name                                       minver     maxver
@@ -3035,15 +3049,17 @@ class KernelOperationsCommand(GenericCommand, BufferingOutput):
             ["func_ptr", "get_name",                                None,      None],
             ["func_ptr", "get_parent",                              None,      None],
             ["func_ptr", "commit_metadata",                         None,      None],
-            ["func_ptr", "get_uuid",                                "4.0.0",   None],
-            ["func_ptr", "map_blocks",                              "4.0.0",   None],
-            ["func_ptr", "commit_blocks",                           "4.0.0",   None],
-            ["func_ptr", "fetch_iversion",                          "5.10.0",  "6.3.0"],
+            ["func_ptr", "get_uuid",                                "4.0.0",   "7.2.0"],
+            ["func_ptr", "map_blocks",                              "4.0.0",   "7.2.0"],
+            ["func_ptr", "commit_blocks",                           "4.0.0",   "7.2.0"],
+            ["func_ptr", "fetch_iversion",                          "5.10.220", "5.11.0"],
+            ["func_ptr", "fetch_iversion",                          "5.12.0",  "6.3.0"],
             ["func_ptr", "permission",                              "6.14.0",  None],
             ["func_ptr", "open",                                    "6.14.0",  None],
-            ["long",     "flags",                                   "5.10.0",  None],
+            ["ulong",    "flags",                                   "5.10.220", None],
+            ["ptr",      "block_ops (CONFIG_EXPORTFS_BLOCK_OPS=y)", "7.2.0",    None],
         ]
-        self.members["export_operations"] = adapt_to_kernel_version(export_operations)
+        members["export_operations"] = adapt_to_kernel_version(export_operations)
 
         dev_pm_ops = [
             # type       name                                       minver     maxver
@@ -3071,7 +3087,7 @@ class KernelOperationsCommand(GenericCommand, BufferingOutput):
             ["func_ptr", "runtime_resume",                          None,      None],
             ["func_ptr", "runtime_idle",                            None,      None],
         ]
-        self.members["dev_pm_ops"] = adapt_to_kernel_version(dev_pm_ops)
+        members["dev_pm_ops"] = adapt_to_kernel_version(dev_pm_ops)
 
         clk_ops = [
             # type       name                                       minver     maxver
@@ -3088,7 +3104,7 @@ class KernelOperationsCommand(GenericCommand, BufferingOutput):
             ["func_ptr", "restore_context",                         "4.20.0",  None],
             ["func_ptr", "recalc_rate",                             "3.4.0",   None],
             ["func_ptr", "recalc",                                  None,      "3.4.0"],
-            ["func_ptr", "round_rate",                              "3.4.0",   "7.0.10"],
+            ["func_ptr", "round_rate",                              "3.4.0",   "7.1.0"],
             ["func_ptr", "determine_rate",                          "3.12.0",  None],
             ["func_ptr", "set_parent",                              "3.4.0",   None],
             ["func_ptr", "get_parent",                              "3.4.0",   None],
@@ -3105,7 +3121,7 @@ class KernelOperationsCommand(GenericCommand, BufferingOutput):
             ["func_ptr", "terminate",                               "5.6.0",   None],
             ["func_ptr", "debug_init",                              "3.15.0",  None],
         ]
-        self.members["clk_ops"] = adapt_to_kernel_version(clk_ops)
+        members["clk_ops"] = adapt_to_kernel_version(clk_ops)
 
         parport_operations = [
             # type       name                                       minver     maxver
@@ -3134,13 +3150,13 @@ class KernelOperationsCommand(GenericCommand, BufferingOutput):
             ["func_ptr", "byte_read_data",                          None,      None],
             ["ptr",      "owner",                                   None,      None],
         ]
-        self.members["parport_operations"] = adapt_to_kernel_version(parport_operations)
+        members["parport_operations"] = adapt_to_kernel_version(parport_operations)
 
         proc_ns_operations = [
             # type       name                                       minver     maxver
             ["char*",    "name",                                    None,      None],
             ["char*",    "real_ns_name",                            "4.12.0",  None],
-            ["int",      "type",                                    None,      "6.17.8"],
+            ["int",      "type",                                    None,      "6.18.0"],
             ["func_ptr", "get",                                     None,      None],
             ["func_ptr", "put",                                     None,      None],
             ["func_ptr", "install",                                 None,      None],
@@ -3148,7 +3164,7 @@ class KernelOperationsCommand(GenericCommand, BufferingOutput):
             ["func_ptr", "get_parent",                              "4.9.0",   None],
             ["func_ptr", "inum",                                    "3.8.0",   "3.19.0"],
         ]
-        self.members["proc_ns_operations"] = adapt_to_kernel_version(proc_ns_operations)
+        members["proc_ns_operations"] = adapt_to_kernel_version(proc_ns_operations)
 
         net_device_ops = [
             # type       name                                                   minver     maxver
@@ -3162,6 +3178,7 @@ class KernelOperationsCommand(GenericCommand, BufferingOutput):
             ["func_ptr", "ndo_change_rx_flags",                                 None,      None],
             ["func_ptr", "ndo_set_rx_mode",                                     None,      None],
             ["func_ptr", "ndo_set_rx_mode_async",                               "7.1.0",   None],
+            ["func_ptr", "ndo_work",                                            "7.2.0",   None],
             ["func_ptr", "ndo_set_multicast_list",                              None,      "3.2.0"],
             ["func_ptr", "ndo_set_mac_address",                                 None,      None],
             ["func_ptr", "ndo_validate_addr",                                   None,      None],
@@ -3205,7 +3222,7 @@ class KernelOperationsCommand(GenericCommand, BufferingOutput):
             ["func_ptr", "ndo_fcoe_disable (CONFIG_FCOE=y)",                    None,      None],
             ["func_ptr", "ndo_fcoe_ddp_setup (CONFIG_FCOE=y)",                  None,      None],
             ["func_ptr", "ndo_fcoe_ddp_done (CONFIG_FCOE=y)",                   None,      None],
-            ["func_ptr", "ndo_fcoe_ddp_target CONFIG_FCOE=y)",                  None,      None],
+            ["func_ptr", "ndo_fcoe_ddp_target (CONFIG_FCOE=y)",                 None,      None],
             ["func_ptr", "ndo_fcoe_get_hbainfo (CONFIG_FCOE=y)",                "3.3.0",   None],
             ["func_ptr", "ndo_fcoe_get_wwn (CONFIG_LIBFCOE=y)",                 "3.2.0",   None],
             ["func_ptr", "ndo_fcoe_get_wwn (CONFIG_FCOE=y)",                    None,      "3.2.0"],
@@ -3220,14 +3237,18 @@ class KernelOperationsCommand(GenericCommand, BufferingOutput):
             ["func_ptr", "ndo_neigh_destroy",                                   "3.3.0",   None],
             ["func_ptr", "ndo_fdb_add",                                         "3.5.0",   None],
             ["func_ptr", "ndo_fdb_del",                                         "3.5.0",   None],
+            ["func_ptr", "ndo_fdb_del_bulk",                                    "5.4.301", "5.5.0"],
+            ["func_ptr", "ndo_fdb_del_bulk",                                    "5.10.246", "5.11.0"],
+            ["func_ptr", "ndo_fdb_del_bulk",                                    "5.15.196", "5.16.0"],
             ["func_ptr", "ndo_fdb_del_bulk",                                    "5.19.0",  None],
             ["func_ptr", "ndo_fdb_dump",                                        "3.5.0",   None],
             ["func_ptr", "ndo_fdb_get",                                         "5.0.0",   None],
             ["func_ptr", "ndo_mdb_add",                                         "6.4.0",   None],
             ["func_ptr", "ndo_mdb_del",                                         "6.4.0",   None],
+            ["func_ptr", "ndo_mdb_del_bulk",                                    "6.6.157", "6.7.0"],
             ["func_ptr", "ndo_mdb_del_bulk",                                    "6.8.0",   None],
             ["func_ptr", "ndo_mdb_dump",                                        "6.4.0",   None],
-            ["func_ptr", "ndo_mdb_get",                                         "6.7.0",   None],
+            ["func_ptr", "ndo_mdb_get",                                         "6.6.157", None],
             ["func_ptr", "ndo_bridge_setlink",                                  "3.8.0",   None],
             ["func_ptr", "ndo_bridge_getlink",                                  "3.8.0",   None],
             ["func_ptr", "ndo_bridge_dellink",                                  "3.9.0",   None],
@@ -3261,7 +3282,7 @@ class KernelOperationsCommand(GenericCommand, BufferingOutput):
             ["func_ptr", "ndo_xsk_wakeup",                                      "5.4.0",   None],
             ["func_ptr", "ndo_xsk_async_xmit",                                  "4.18.0",  "5.4.0"],
             ["func_ptr", "ndo_xdp_flush",                                       "4.14.0",  "4.18.0"],
-            ["func_ptr", "ndo_get_devlink_port",                                "5.2.0",   "6.1.115"],
+            ["func_ptr", "ndo_get_devlink_port",                                "5.2.0",   "6.2.0"],
             ["func_ptr", "ndo_get_devlink",                                     "5.1.0",   "5.2.0"],
             ["func_ptr", "ndo_tunnel_ctl",                                      "5.8.0",   None],
             ["func_ptr", "ndo_get_peer_dev",                                    "5.10.0",  None],
@@ -3269,46 +3290,50 @@ class KernelOperationsCommand(GenericCommand, BufferingOutput):
             ["func_ptr", "ndo_get_tstamp",                                      "5.19.0",  None],
             ["func_ptr", "ndo_hwtstamp_get",                                    "6.6.0",   None],
             ["func_ptr", "ndo_hwtstamp_set",                                    "6.6.0",   None],
-            ["ptr",      "net_shaper_ops (CONFIG_NET_SHAPER=y)",                "6.12.0",  None],
+            ["ptr",      "net_shaper_ops (CONFIG_NET_SHAPER=y)",                "6.13.0",  None],
         ]
-        self.members["net_device_ops"] = adapt_to_kernel_version(net_device_ops)
+        members["net_device_ops"] = adapt_to_kernel_version(net_device_ops)
 
         page_ext_operations = [
             # type       name                                       minver     maxver
-            ["long",     "offset",                                  "4.9.0",   None],
-            ["long",     "size",                                    "4.9.0",   None],
+            ["ulong",    "offset",                                  "4.9.0",   None],
+            ["ulong",    "size",                                    "4.9.0",   None],
             ["func_ptr", "need",                                    "3.19.0",  None],
             ["func_ptr", "init",                                    "3.19.0",  None],
             ["bool",     "need_shared_flags",                       "6.3.0",   None],
         ]
-        self.members["page_ext_operations"] = adapt_to_kernel_version(page_ext_operations)
+        members["page_ext_operations"] = adapt_to_kernel_version(page_ext_operations)
 
         ucsi_operations = [
             # type       name                                       minver     maxver
             ["func_ptr", "read_version",                            "6.11.0",  None],
             ["func_ptr", "read_cci",                                "6.11.0",  None],
-            ["func_ptr", "poll_cci",                                "6.14.0",  None],
+            ["func_ptr", "poll_cci",                                "6.12.19", "6.13.0"],
+            ["func_ptr", "poll_cci",                                "6.13.7",  None],
             ["func_ptr", "read_message_in",                         "6.11.0",  None],
+            ["func_ptr", "write_message_out",                       "7.2.0",   None],
             ["func_ptr", "sync_control",                            "6.11.0",  None],
             ["func_ptr", "async_control",                           "6.11.0",  None],
-            ["func_ptr", "read",                                    "5.4.0",   "6.11.0"],
-            ["func_ptr", "sync_write",                              "5.4.0",   "6.11.0"],
-            ["func_ptr", "async_write",                             "5.4.0",   "6.11.0"],
+            ["func_ptr", "read",                                    "5.5.0",   "6.11.0"],
+            ["func_ptr", "sync_write",                              "5.5.0",   "6.11.0"],
+            ["func_ptr", "async_write",                             "5.5.0",   "6.11.0"],
             ["func_ptr", "update_altmodes",                         "5.6.0",   None],
+            ["func_ptr", "update_connector",                        "6.6.70",  "6.7.0"],
             ["func_ptr", "update_connector",                        "6.10.0",  None],
+            ["func_ptr", "connector_status",                        "6.6.70",  "6.7.0"],
             ["func_ptr", "connector_status",                        "6.10.0",  None],
             ["func_ptr", "add_partner_altmodes",                    "7.0.0",   None],
             ["func_ptr", "remove_partner_altmodes",                 "7.0.0",   None],
         ]
-        self.members["ucsi_operations"] = adapt_to_kernel_version(ucsi_operations)
+        members["ucsi_operations"] = adapt_to_kernel_version(ucsi_operations)
 
         movable_operations = [
             # type       name                                       minver     maxver
             ["func_ptr", "isolate_page",                            "6.0.0",   None],
             ["func_ptr", "migrate_page",                            "6.0.0",   None],
-            ["func_ptr", "pushback_page",                           "6.0.0",   None],
+            ["func_ptr", "putback_page",                            "6.0.0",   None],
         ]
-        self.members["movable_operations"] = adapt_to_kernel_version(movable_operations)
+        members["movable_operations"] = adapt_to_kernel_version(movable_operations)
 
         damon_operations = [
             # type       name                                       minver     maxver
@@ -3317,6 +3342,7 @@ class KernelOperationsCommand(GenericCommand, BufferingOutput):
             ["func_ptr", "update",                                  "5.18.0",  None],
             ["func_ptr", "prepare_access_checks",                   "5.18.0",  None],
             ["func_ptr", "check_accesses",                          "5.18.0",  None],
+            ["func_ptr", "apply_probes",                            "7.2.0",   None],
             ["func_ptr", "reset_aggregated",                        "5.18.0",  "6.15.0"],
             ["func_ptr", "get_scheme_score",                        "5.18.0",  None],
             ["func_ptr", "apply_scheme",                            "5.18.0",  None],
@@ -3324,7 +3350,7 @@ class KernelOperationsCommand(GenericCommand, BufferingOutput):
             ["func_ptr", "cleanup_target",                          "6.17.0",  None],
             ["func_ptr", "cleanup",                                 "5.18.0",  "7.0.0"],
         ]
-        self.members["damon_operations"] = adapt_to_kernel_version(damon_operations)
+        members["damon_operations"] = adapt_to_kernel_version(damon_operations)
 
         proc_ops = [
             # type       name                                       minver     maxver
@@ -3341,13 +3367,13 @@ class KernelOperationsCommand(GenericCommand, BufferingOutput):
             ["func_ptr", "proc_mmap",                               "5.6.0",   None],
             ["func_ptr", "proc_get_unmapped_area",                  "5.6.0",   None],
         ]
-        self.members["proc_ops"] = adapt_to_kernel_version(proc_ops)
+        members["proc_ops"] = adapt_to_kernel_version(proc_ops)
 
         regulator_ops = [
             # type       name                                       minver     maxver
             ["func_ptr", "list_voltage",                            None,      None],
             ["func_ptr", "set_voltage",                             None,      None],
-            ["func_ptr", "map_voltage",                             None,      None],
+            ["func_ptr", "map_voltage",                             "3.5.0",   None],
             ["func_ptr", "set_voltage_sel",                         None,      None],
             ["func_ptr", "get_voltage",                             None,      None],
             ["func_ptr", "get_voltage_sel",                         None,      None],
@@ -3383,17 +3409,18 @@ class KernelOperationsCommand(GenericCommand, BufferingOutput):
             ["func_ptr", "resume_early",                            "4.16.0",  "4.19.0"],
             ["func_ptr", "set_pull_down",                           "4.2.0",   None],
         ]
-        self.members["regulator_ops"] = adapt_to_kernel_version(regulator_ops)
+        members["regulator_ops"] = adapt_to_kernel_version(regulator_ops)
 
         tty_port_operations = [
             # type       name                                       minver     maxver
-            ["func_ptr", "carrier_raised",                          "5.15.0",  None],
-            ["func_ptr", "dtr_rts",                                 "5.15.0",  None],
-            ["func_ptr", "shutdown",                                "5.15.0",  None],
-            ["func_ptr", "activate",                                "5.15.0",  None],
-            ["func_ptr", "destruct",                                "5.15.0",  None],
+            ["func_ptr", "carrier_raised",                          None,      None],
+            ["func_ptr", "dtr_rts",                                 None,      None],
+            ["func_ptr", "shutdown",                                None,      None],
+            ["func_ptr", "drop",                                    None,      "3.13.0"],
+            ["func_ptr", "activate",                                None,      None],
+            ["func_ptr", "destruct",                                None,      None],
         ]
-        self.members["tty_port_operations"] = adapt_to_kernel_version(tty_port_operations)
+        members["tty_port_operations"] = adapt_to_kernel_version(tty_port_operations)
 
         kobj_ns_type_operations = [
             # type       name                                       minver     maxver
@@ -3404,7 +3431,7 @@ class KernelOperationsCommand(GenericCommand, BufferingOutput):
             ["func_ptr", "initial_ns",                              None,      None],
             ["func_ptr", "drop_ns",                                 None,      None],
         ]
-        self.members["kobj_ns_type_operations"] = adapt_to_kernel_version(kobj_ns_type_operations)
+        members["kobj_ns_type_operations"] = adapt_to_kernel_version(kobj_ns_type_operations)
 
         btf_kind_operations = [
             # type       name                                       minver     maxver
@@ -3416,10 +3443,56 @@ class KernelOperationsCommand(GenericCommand, BufferingOutput):
             ["func_ptr", "show",                                    "5.10.0",  None],
             ["func_ptr", "seq_show",                                "4.18.0",  "5.10.0"],
         ]
-        self.members["btf_kind_operations"] = adapt_to_kernel_version(btf_kind_operations)
+        members["btf_kind_operations"] = adapt_to_kernel_version(btf_kind_operations)
 
-        assert set(self.members.keys()) == set(self.types)
-        return True
+        assert set(members.keys()) == set(self.types)
+        return members
+
+    def get_layout(self, name, members):
+        struct_type = GefUtil.cached_lookup_type("struct " + name)
+        if struct_type is not None and GefUtil.type_size(struct_type):
+            layout = []
+            for field in struct_type.fields():
+                offset = GefUtil.member_offset(struct_type, field.name)
+                size = GefUtil.type_size(field.type)
+                if offset is None or size not in (1, 2, 4, 8):
+                    err("Unsupported member: {:s}.{:s}".format(name, field.name or "<anonymous>"))
+                    return None
+                typ = field.type.strip_typedefs()
+                type_name = str(typ)
+                if typ.code == gdb.TYPE_CODE_PTR:
+                    target = typ.target().strip_typedefs()
+                    if target.code == gdb.TYPE_CODE_FUNC:
+                        type_name = "func_ptr"
+                    elif target.code == gdb.TYPE_CODE_INT and target.sizeof == 1:
+                        type_name = "char*"
+                    else:
+                        type_name = "ptr"
+                layout.append((type_name, field.name, offset, size))
+            return layout
+
+        configs = runtime.CommandRegistry.instances["kconfig"].get_configs()
+        if configs and any(configs.get(key) == "y" for key in ("CONFIG_RANDSTRUCT", "CONFIG_GCC_PLUGIN_RANDSTRUCT")):
+            err("CONFIG_RANDSTRUCT requires debug information; load matching types with ktypes-load")
+            return None
+
+        layout = []
+        offset = 0
+        for type_names, name in members:
+            condition = re.search(r" \((CONFIG_\w+)=y\)$", name)
+            if condition:
+                if configs is None:
+                    err("Unknown {:s}; load matching types with ktypes-load".format(condition.group(1)))
+                    return None
+                if configs.get(condition.group(1), "n") not in ("y", "m"):
+                    continue
+                name = name[:condition.start()]
+            for type_name, member in zip(type_names.split(", "), name.split(", ")):
+                size = {"int": 4, "bool": 1}.get(type_name, runtime.current_arch.ptrsize)
+                offset = align(offset, min(size, runtime.current_arch.ptrsize))
+                layout.append((type_name, member, offset, size))
+                offset += size
+        return layout
 
     @parse_args
     @only_if_gdb_running
@@ -3438,18 +3511,22 @@ class KernelOperationsCommand(GenericCommand, BufferingOutput):
             kversion = KernelVersion(None, args.version, major, minor, patch)
         else:
             self.quiet_info("Wait for memory scan")
-            kversion = Kernel.kernel_version()
+            kversion = Kernel.version()
             if kversion is None:
                 err("Could not find Linux kernel")
                 return
         self.quiet_info("Kernel version: {:d}.{:d}.{:d}".format(kversion.major, kversion.minor, kversion.patch))
 
-        # initialize
-        if self.initialize(kversion) is False:
-            return
-
         # get member
-        members = self.members[args.name]
+        members_table = self.get_members(kversion)
+        if members_table is None:
+            return
+        members = members_table[args.name]
+        if args.address:
+            layout = self.get_layout(args.name, members)
+            if layout is None:
+                return
+            members = [(type_name, name) for type_name, name, offset, size in layout]
         if not members:
             warn("Not defined in this version")
             return
@@ -3459,22 +3536,23 @@ class KernelOperationsCommand(GenericCommand, BufferingOutput):
         if args.address:
             # show permission
             if not args.quiet:
-                kinfo = Kernel.get_kernel_layout()
-                for vaddr, size, perm in kinfo.maps:
-                    if vaddr <= args.address and args.address < vaddr + size:
-                        perm_str = perm
-                        break
+                klayout = Kernel.layout()
+                entry = AddrMap.find_virtual(args.address, maps=klayout.maps)
+                if entry is not None:
+                    perm_str = str(entry.permission)
                 else:
                     perm_str = "???"
                 self.out.append("Address: {:#x} Permission: {:s}".format(args.address, perm_str))
 
             # get name width
             name_width = max(len(m[1]) for m in members)
-            try:
-                addrs = [read_int_from_memory(args.address + runtime.current_arch.ptrsize * i) for i in range(len(members))]
-            except gdb.MemoryError:
-                self.quiet_err("Memory read error")
-                return
+            addrs = []
+            for _, _, offset, size in layout:
+                data = read_memory(args.address + offset, size, safe=True)
+                if data is None:
+                    self.quiet_err("Memory read error")
+                    return
+                addrs.append(GefUtil.get_unpack(size)(data))
 
             # legend
             if not args.quiet:
@@ -3485,10 +3563,16 @@ class KernelOperationsCommand(GenericCommand, BufferingOutput):
             # each entries
             width = AddressUtil.get_format_address_width()
             for idx, ((type_name, name), address) in enumerate(zip(members, addrs)):
-                if type_name == "char*":
+                if type_name == "char*" and address:
                     sym = " {!r}".format(read_cstring_from_memory(address))
+                elif type_name in ("func_ptr", "ptr"):
+                    sym = Symbol.format(address)
+                    if sym:
+                        sym = " " + sym
+                    else:
+                        sym = ""
                 else:
-                    sym = Symbol.get_symbol_string(address)
+                    sym = ""
                 self.out.append("{:<5d} {:10s} {:{:d}s} {:#0{:d}x}{:s}".format(
                     idx, type_name, name, name_width, address, width, sym,
                 ))

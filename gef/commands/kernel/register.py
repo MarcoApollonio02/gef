@@ -328,6 +328,7 @@ class ReadSystemRegisterForQemuArmCommand(GenericCommand):
 
     _note_ = [
         "Attempting to read a non-existing register raises an undefined exception.",
+        "Context-dependent EL0 timer aliases CNTHPS_*, CNTHV_* and CNTHVS_* are not accepted.",
     ]
     _note_ = "\n".join(_note_)
 
@@ -687,18 +688,11 @@ class ReadSystemRegisterForQemuArmCommand(GenericCommand):
         # Generic timer registers.
         ("p15", "c14", 0, "c0", 0): ("CNTFRQ", "Counter-timer Frequency register"),
         ("p15", "c14", 0, "c1", 0): ("CNTKCTL", "Counter-timer Kernel Control register"),
-        ("p15", "c14", 0, "c2", 0): ("CNTP_TVAL", "Counter-timer Physical Timer TimerValue register",
-                                     "CNTHP_TVAL", "Counter-timer Hyp Physical Timer TimerValue register",
-                                     "CNTHPS_TVAL", "Counter-timer Secure Physical Timer TimerValue Register (EL2)"),
-        ("p15", "c14", 0, "c2", 1): ("CNTP_CTL", "Counter-timer Physical Timer Control register",
-                                     "CNTHP_CTL", "Counter-timer Hyp Physical Timer Control register",
-                                     "CNTHPS_CTL", "Counter-timer Secure Physical Timer Control Register (EL2)"),
-        ("p15", "c14", 0, "c3", 0): ("CNTV_TVAL", "Counter-timer Virtual Timer TimerValue register",
-                                     "CNTHV_TVAL", "Counter-timer Virtual Timer TimerValue register (EL2)",
-                                     "CNTHVS_TVAL", "Counter-timer Secure Virtual Timer TimerValue Register (EL2)"),
-        ("p15", "c14", 0, "c3", 1): ("CNTV_CTL", "Counter-timer Virtual Timer Control register",
-                                     "CNTHV_CTL", "Counter-timer Virtual Timer Control register (EL2)",
-                                     "CNTHVS_CTL", "Counter-timer Secure Virtual Timer Control Register (EL2)"),
+        # EL0 aliases require an AArch64 VHE host; their encoding reads CNTP/CNTV in other contexts.
+        ("p15", "c14", 0, "c2", 0): ("CNTP_TVAL", "Counter-timer Physical Timer TimerValue register"),
+        ("p15", "c14", 0, "c2", 1): ("CNTP_CTL", "Counter-timer Physical Timer Control register"),
+        ("p15", "c14", 0, "c3", 0): ("CNTV_TVAL", "Counter-timer Virtual Timer TimerValue register"),
+        ("p15", "c14", 0, "c3", 1): ("CNTV_CTL", "Counter-timer Virtual Timer Control register"),
         ("p15", "c14", 4, "c1", 0): ("CNTHCTL", "Counter-timer Hyp Control register"),
         ("p15", "c14", 4, "c2", 0): ("CNTHP_TVAL", "Counter-timer Hyp Physical Timer TimerValue register"),
         ("p15", "c14", 4, "c2", 1): ("CNTHP_CTL", "Counter-timer Hyp Physical Timer Control register"),
@@ -965,23 +959,37 @@ class ReadSystemRegisterForQemuArmCommand(GenericCommand):
     }
 
     def get_coproc_info(self, target_reg_name):
-        for k, v in self.AARCH32_COPROC_REGISTERS.items():
-            for reg_name, _desc in slicer(v, 2):
-                if target_reg_name == reg_name:
-                    return k
+        target_reg_name = target_reg_name.upper()
+        # some names are also aliases of other encodings, so the encoding where the name comes first wins
+        for primary_only in [True, False]:
+            for k, v in self.AARCH32_COPROC_REGISTERS.items():
+                for reg_name, _desc in slicer(v[:2] if primary_only else v, 2):
+                    if target_reg_name == reg_name.upper():
+                        return k
         return None
 
-    def get_mrc_code(self, cp_info):
-        code = "mrc {:s}, {:d}, r0, {:s}, {:s}, {:d}".format(cp_info[0], cp_info[2], cp_info[1], cp_info[3], cp_info[4])
+    def get_mrc_code(self, cp_info, wide=False):
+        if wide:
+            code = "mrrc {:s}, {:d}, r0, r1, {:s}".format(cp_info[0], cp_info[4], cp_info[1])
+        else:
+            code = "mrc {:s}, {:d}, r0, {:s}, {:s}, {:d}".format(cp_info[0], cp_info[2], cp_info[1], cp_info[3], cp_info[4])
         arch, mode = UnicornKeystoneCapstone.get_keystone_arch()
         raw_insns = UnicornKeystoneCapstone.keystone_assemble(code, arch, mode, raw=True)
         return raw_insns
 
     def mrc_execute(self, reg_name):
+        reg_name = reg_name.upper()
         cp_info = self.get_coproc_info(reg_name)
         if cp_info is None:
+            err("Unknown register name")
             return None
-        codes = [self.get_mrc_code(cp_info)]
+        wide = False
+        if reg_name in ("TTBR0", "TTBR1"):
+            ttbcr = self.mrc_execute("TTBCR")
+            if ttbcr is None:
+                return None
+            wide = bool(ttbcr & (1 << 31))
+        codes = [self.get_mrc_code(cp_info, wide=wide)]
 
         before_pc = runtime.current_arch.pc
         ret = ExecAsm(codes).exec_code()
@@ -992,7 +1000,10 @@ class ReadSystemRegisterForQemuArmCommand(GenericCommand):
         if abs(after_pc - before_pc) > 0x10:
             err("Undefined register, it probably crashes the kernel")
             return None
-        return ret["reg"][runtime.current_arch.return_register]
+        value = ret["reg"][runtime.current_arch.return_register]
+        if wide:
+            value |= ret["reg"]["$r1"] << 32
+        return value
 
     @parse_args
     @only_if_gdb_running
@@ -1007,10 +1018,16 @@ class ReadSystemRegisterForQemuArmCommand(GenericCommand):
         if reg_name.startswith("$"):
             reg_name = reg_name[1:]
 
+        # DBGDTRTXint is written by MCR; MRC of the same encoding reads DBGDTRRXint instead
+        if reg_name == "DBGDTRTXINT":
+            err("DBGDTRTXint is write-only")
+            return
+
         ret = self.mrc_execute(reg_name)
         if ret is not None:
             gef_print("{:s} = {:#x}".format(reg_name, ret))
         return
+
 
 
 @register_command

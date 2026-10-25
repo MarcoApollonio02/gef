@@ -118,6 +118,9 @@ class GlibcHeapCommand(GenericCommand):
         "- 2.42: tcache_perthread_struct.counts changes to num_slots.",
         "- 2.43: fastbins are removed.",
         "- 2.43: TCACHE_FILL_COUNT 7->16.",
+        "",
+        "Under qemu-user, multi-threaded mips/mipsn32/mips64/m68k targets may produce unreliable TLS/heap results",
+        "because ExecAsm/ExecSyscall can fail after thread switches.",
     ]
     _note_ = "\n".join(_note_)
 
@@ -133,6 +136,7 @@ class GlibcHeapCommand(GenericCommand):
     def do_invoke(self, args):
         self.usage()
         return
+
 
 
 @register_command

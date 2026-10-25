@@ -15,6 +15,7 @@ import functools
 import hashlib
 import itertools
 import json
+import math
 import os
 import re
 import sys
@@ -43,7 +44,7 @@ from gef.core.process import (
 from gef.core.qemu import read_physmem
 from gef.core.strings import String
 from gef.core.symbols import ModuleLoader
-from gef.core.utils import GefUtil, align_to_pagesize, slicer, xor
+from gef.core.utils import GefUtil, align, align_to_pagesize, slicer, xor
 
 
 @register_command
@@ -3011,6 +3012,279 @@ class HashKnownCollisionCommand(HashCommand, BufferingOutput):
 
 
 
+class CrcEngine:
+    """Parameterized CRC calculator. This is a substitute of the `crccheck` package."""
+
+    REFLECT8 = bytes(int("{:08b}".format(i)[::-1], 2) for i in range(256))
+
+    # name, width, poly, initvalue, reflect_input, reflect_output, xor_output[, append_length]
+    PARAMETERS = [
+        ("CrcBase", 0, 0x0, 0x0, False, False, 0x0),
+        ("Crc8Base", 8, 0x7, 0x0, False, False, 0x0),
+        ("Crc16Base", 16, 0x1021, 0x0, False, False, 0x0),
+        ("Crc32Base", 32, 0x4c11db7, 0xffffffff, True, True, 0xffffffff),
+        ("Crc3Gsm", 3, 0x3, 0x0, False, False, 0x7),
+        ("Crc3Rohc", 3, 0x3, 0x7, True, True, 0x0),
+        ("Crc4G704", 4, 0x3, 0x0, True, True, 0x0),
+        ("Crc4Itu", 4, 0x3, 0x0, True, True, 0x0),
+        ("Crc4Interlaken", 4, 0x3, 0xf, False, False, 0xf),
+        ("Crc5EpcC1G2", 5, 0x9, 0x9, False, False, 0x0),
+        ("Crc5Epc", 5, 0x9, 0x9, False, False, 0x0),
+        ("Crc5G704", 5, 0x15, 0x0, True, True, 0x0),
+        ("Crc5Itu", 5, 0x15, 0x0, True, True, 0x0),
+        ("Crc5Usb", 5, 0x5, 0x1f, True, True, 0x1f),
+        ("Crc6Cdma2000A", 6, 0x27, 0x3f, False, False, 0x0),
+        ("Crc6Cdma2000B", 6, 0x7, 0x3f, False, False, 0x0),
+        ("Crc6Darc", 6, 0x19, 0x0, True, True, 0x0),
+        ("Crc6G704", 6, 0x3, 0x0, True, True, 0x0),
+        ("Crc6Itu", 6, 0x3, 0x0, True, True, 0x0),
+        ("Crc6Gsm", 6, 0x2f, 0x0, False, False, 0x3f),
+        ("Crc7Mmc", 7, 0x9, 0x0, False, False, 0x0),
+        ("Crc7", 7, 0x9, 0x0, False, False, 0x0),
+        ("Crc7Rohc", 7, 0x4f, 0x7f, True, True, 0x0),
+        ("Crc7Umts", 7, 0x45, 0x0, False, False, 0x0),
+        ("Crc8Autosar", 8, 0x2f, 0xff, False, False, 0xff),
+        ("Crc8Bluetooth", 8, 0xa7, 0x0, True, True, 0x0),
+        ("Crc8Cdma2000", 8, 0x9b, 0xff, False, False, 0x0),
+        ("Crc8Darc", 8, 0x39, 0x0, True, True, 0x0),
+        ("Crc8DvbS2", 8, 0xd5, 0x0, False, False, 0x0),
+        ("Crc8GsmA", 8, 0x1d, 0x0, False, False, 0x0),
+        ("Crc8GsmB", 8, 0x49, 0x0, False, False, 0xff),
+        ("Crc8Hitag", 8, 0x1d, 0xff, False, False, 0x0),
+        ("Crc8I4321", 8, 0x7, 0x0, False, False, 0x55),
+        ("Crc8Itu", 8, 0x7, 0x0, False, False, 0x55),
+        ("Crc8ICode", 8, 0x1d, 0xfd, False, False, 0x0),
+        ("Crc8Lte", 8, 0x9b, 0x0, False, False, 0x0),
+        ("Crc8MaximDow", 8, 0x31, 0x0, True, True, 0x0),
+        ("Crc8Maxim", 8, 0x31, 0x0, True, True, 0x0),
+        ("CrcDow", 8, 0x31, 0x0, True, True, 0x0),
+        ("Crc8MifareMad", 8, 0x1d, 0xc7, False, False, 0x0),
+        ("Crc8Nrsc5", 8, 0x31, 0xff, False, False, 0x0),
+        ("Crc8Opensafety", 8, 0x2f, 0x0, False, False, 0x0),
+        ("Crc8Rohc", 8, 0x7, 0xff, True, True, 0x0),
+        ("Crc8SaeJ1850", 8, 0x1d, 0xff, False, False, 0xff),
+        ("Crc8Smbus", 8, 0x7, 0x0, False, False, 0x0),
+        ("Crc8", 8, 0x7, 0x0, False, False, 0x0),
+        ("Crc8Tech3250", 8, 0x1d, 0xff, True, True, 0x0),
+        ("Crc8Aes", 8, 0x1d, 0xff, True, True, 0x0),
+        ("Crc8Ebu", 8, 0x1d, 0xff, True, True, 0x0),
+        ("Crc8Wcdma", 8, 0x9b, 0x0, True, True, 0x0),
+        ("Crc10Atm", 10, 0x233, 0x0, False, False, 0x0),
+        ("Crc10", 10, 0x233, 0x0, False, False, 0x0),
+        ("Crc10I610", 10, 0x233, 0x0, False, False, 0x0),
+        ("Crc10Cdma2000", 10, 0x3d9, 0x3ff, False, False, 0x0),
+        ("Crc10Gsm", 10, 0x175, 0x0, False, False, 0x3ff),
+        ("Crc11Flexray", 11, 0x385, 0x1a, False, False, 0x0),
+        ("Crc11", 11, 0x385, 0x1a, False, False, 0x0),
+        ("Crc11Umts", 11, 0x307, 0x0, False, False, 0x0),
+        ("Crc12Cdma2000", 12, 0xf13, 0xfff, False, False, 0x0),
+        ("Crc12Dect", 12, 0x80f, 0x0, False, False, 0x0),
+        ("Crc12X", 12, 0x80f, 0x0, False, False, 0x0),
+        ("Crc12Gsm", 12, 0xd31, 0x0, False, False, 0xfff),
+        ("Crc12Umts", 12, 0x80f, 0x0, False, True, 0x0),
+        ("Crc123Gpp", 12, 0x80f, 0x0, False, True, 0x0),
+        ("Crc13Bbc", 13, 0x1cf5, 0x0, False, False, 0x0),
+        ("Crc14Darc", 14, 0x805, 0x0, True, True, 0x0),
+        ("Crc14Gsm", 14, 0x202d, 0x0, False, False, 0x3fff),
+        ("Crc15Can", 15, 0x4599, 0x0, False, False, 0x0),
+        ("Crc15", 15, 0x4599, 0x0, False, False, 0x0),
+        ("Crc15Mpt1327", 15, 0x6815, 0x0, False, False, 0x1),
+        ("Crc16Arc", 16, 0x8005, 0x0, True, True, 0x0),
+        ("CrcArc", 16, 0x8005, 0x0, True, True, 0x0),
+        ("Crc16Lha", 16, 0x8005, 0x0, True, True, 0x0),
+        ("CrcIbm", 16, 0x8005, 0x0, True, True, 0x0),
+        ("Crc16Cdma2000", 16, 0xc867, 0xffff, False, False, 0x0),
+        ("Crc16Cms", 16, 0x8005, 0xffff, False, False, 0x0),
+        ("Crc16Dds110", 16, 0x8005, 0x800d, False, False, 0x0),
+        ("Crc16DectR", 16, 0x589, 0x0, False, False, 0x1),
+        ("Crc16R", 16, 0x589, 0x0, False, False, 0x1),
+        ("Crc16DectX", 16, 0x589, 0x0, False, False, 0x0),
+        ("Crc16X", 16, 0x589, 0x0, False, False, 0x0),
+        ("Crc16Dnp", 16, 0x3d65, 0x0, True, True, 0xffff),
+        ("Crc16En13757", 16, 0x3d65, 0x0, False, False, 0xffff),
+        ("Crc16Genibus", 16, 0x1021, 0xffff, False, False, 0xffff),
+        ("Crc16Darc", 16, 0x1021, 0xffff, False, False, 0xffff),
+        ("Crc16Epc", 16, 0x1021, 0xffff, False, False, 0xffff),
+        ("Crc16EpcC1G2", 16, 0x1021, 0xffff, False, False, 0xffff),
+        ("Crc16ICode", 16, 0x1021, 0xffff, False, False, 0xffff),
+        ("Crc16Gsm", 16, 0x1021, 0x0, False, False, 0xffff),
+        ("Crc16Ibm3740", 16, 0x1021, 0xffff, False, False, 0x0),
+        ("Crc16Autosar", 16, 0x1021, 0xffff, False, False, 0x0),
+        ("Crc16CcittFalse", 16, 0x1021, 0xffff, False, False, 0x0),
+        ("Crc16IbmSdlc", 16, 0x1021, 0xffff, True, True, 0xffff),
+        ("Crc16IsoHdlc", 16, 0x1021, 0xffff, True, True, 0xffff),
+        ("Crc16IsoIec144433B", 16, 0x1021, 0xffff, True, True, 0xffff),
+        ("Crc16X25", 16, 0x1021, 0xffff, True, True, 0xffff),
+        ("CrcB", 16, 0x1021, 0xffff, True, True, 0xffff),
+        ("CrcX25", 16, 0x1021, 0xffff, True, True, 0xffff),
+        ("Crc16IsoIec144433A", 16, 0x1021, 0xc6c6, True, True, 0x0),
+        ("CrcA", 16, 0x1021, 0xc6c6, True, True, 0x0),
+        ("Crc16Kermit", 16, 0x1021, 0x0, True, True, 0x0),
+        ("Crc16Ccitt", 16, 0x1021, 0x0, True, True, 0x0),
+        ("Crc16CcittTrue", 16, 0x1021, 0x0, True, True, 0x0),
+        ("Crc16V41Lsb", 16, 0x1021, 0x0, True, True, 0x0),
+        ("CrcCcitt", 16, 0x1021, 0x0, True, True, 0x0),
+        ("CrcKermit", 16, 0x1021, 0x0, True, True, 0x0),
+        ("Crc16Lj1200", 16, 0x6f63, 0x0, False, False, 0x0),
+        ("Crc16M17", 16, 0x5935, 0xffff, False, False, 0x0),
+        ("Crc16MaximDow", 16, 0x8005, 0x0, True, True, 0xffff),
+        ("Crc16Maxim", 16, 0x8005, 0x0, True, True, 0xffff),
+        ("Crc16Mcrf4Xx", 16, 0x1021, 0xffff, True, True, 0x0),
+        ("Crc16Mcrf4XX", 16, 0x1021, 0xffff, True, True, 0x0),
+        ("Crcc16Mcrf4xx", 16, 0x1021, 0xffff, True, True, 0x0),
+        ("Crc16Modbus", 16, 0x8005, 0xffff, True, True, 0x0),
+        ("CrcModbus", 16, 0x8005, 0xffff, True, True, 0x0),
+        ("Crc16Nrsc5", 16, 0x80b, 0xffff, True, True, 0x0),
+        ("Crc16OpensafetyA", 16, 0x5935, 0x0, False, False, 0x0),
+        ("Crc16OpensafetyB", 16, 0x755b, 0x0, False, False, 0x0),
+        ("Crc16Profibus", 16, 0x1dcf, 0xffff, False, False, 0xffff),
+        ("Crc16Iec611582", 16, 0x1dcf, 0xffff, False, False, 0xffff),
+        ("Crc16Riello", 16, 0x1021, 0xb2aa, True, True, 0x0),
+        ("Crc16SpiFujitsu", 16, 0x1021, 0x1d0f, False, False, 0x0),
+        ("Crc16AugCcitt", 16, 0x1021, 0x1d0f, False, False, 0x0),
+        ("Crc16T10Dif", 16, 0x8bb7, 0x0, False, False, 0x0),
+        ("Crc16Teledisk", 16, 0xa097, 0x0, False, False, 0x0),
+        ("Crc16Tms37157", 16, 0x1021, 0x89ec, True, True, 0x0),
+        ("Crc16Umts", 16, 0x8005, 0x0, False, False, 0x0),
+        ("Crc16Buypass", 16, 0x8005, 0x0, False, False, 0x0),
+        ("Crc16Verifone", 16, 0x8005, 0x0, False, False, 0x0),
+        ("Crc16Usb", 16, 0x8005, 0xffff, True, True, 0xffff),
+        ("Crc16Xmodem", 16, 0x1021, 0x0, False, False, 0x0),
+        ("Crc16Acorn", 16, 0x1021, 0x0, False, False, 0x0),
+        ("Crc16Lte", 16, 0x1021, 0x0, False, False, 0x0),
+        ("Crc16V41Msb", 16, 0x1021, 0x0, False, False, 0x0),
+        ("CrcXmodem", 16, 0x1021, 0x0, False, False, 0x0),
+        ("CrcZmodem", 16, 0x1021, 0x0, False, False, 0x0),
+        ("Crc16", 16, 0x1021, 0x0, False, False, 0x0),
+        ("Crc17CanFd", 17, 0x1685b, 0x0, False, False, 0x0),
+        ("Crc21CanFd", 21, 0x102899, 0x0, False, False, 0x0),
+        ("Crc24Ble", 24, 0x65b, 0x555555, True, True, 0x0),
+        ("Crc24FlexrayA", 24, 0x5d6dcb, 0xfedcba, False, False, 0x0),
+        ("Crc24FlexrayB", 24, 0x5d6dcb, 0xabcdef, False, False, 0x0),
+        ("Crc24Interlaken", 24, 0x328b63, 0xffffff, False, False, 0xffffff),
+        ("Crc24LteA", 24, 0x864cfb, 0x0, False, False, 0x0),
+        ("Crc24LteB", 24, 0x800063, 0x0, False, False, 0x0),
+        ("Crc24Openpgp", 24, 0x864cfb, 0xb704ce, False, False, 0x0),
+        ("Crc24", 24, 0x864cfb, 0xb704ce, False, False, 0x0),
+        ("Crc24OpenPgp", 24, 0x864cfb, 0xb704ce, False, False, 0x0),
+        ("Crc24Os9", 24, 0x800063, 0xffffff, False, False, 0xffffff),
+        ("Crc30Cdma", 30, 0x2030b9c7, 0x3fffffff, False, False, 0x3fffffff),
+        ("Crc31Philips", 31, 0x4c11db7, 0x7fffffff, False, False, 0x7fffffff),
+        ("Crc32Aixm", 32, 0x814141ab, 0x0, False, False, 0x0),
+        ("Crc32Q", 32, 0x814141ab, 0x0, False, False, 0x0),
+        ("Crc32q", 32, 0x814141ab, 0x0, False, False, 0x0),
+        ("Crc32Autosar", 32, 0xf4acfb13, 0xffffffff, True, True, 0xffffffff),
+        ("Crc32Base91D", 32, 0xa833982b, 0xffffffff, True, True, 0xffffffff),
+        ("Crc32D", 32, 0xa833982b, 0xffffffff, True, True, 0xffffffff),
+        ("Crc32d", 32, 0xa833982b, 0xffffffff, True, True, 0xffffffff),
+        ("Crc32Bzip2", 32, 0x4c11db7, 0xffffffff, False, False, 0xffffffff),
+        ("Crc32Aal5", 32, 0x4c11db7, 0xffffffff, False, False, 0xffffffff),
+        ("Crc32DectB", 32, 0x4c11db7, 0xffffffff, False, False, 0xffffffff),
+        ("Crc32B", 32, 0x4c11db7, 0xffffffff, False, False, 0xffffffff),
+        ("Crc32CdRomEdc", 32, 0x8001801b, 0x0, True, True, 0x0),
+        ("Crc32Cksum", 32, 0x4c11db7, 0x0, False, False, 0xffffffff),
+        ("CrcCksum", 32, 0x4c11db7, 0x0, False, False, 0xffffffff),
+        ("Crc32Posix", 32, 0x4c11db7, 0x0, False, False, 0xffffffff),
+        ("Crc32Iscsi", 32, 0x1edc6f41, 0xffffffff, True, True, 0xffffffff),
+        ("Crc32Base91C", 32, 0x1edc6f41, 0xffffffff, True, True, 0xffffffff),
+        ("Crc32Castagnoli", 32, 0x1edc6f41, 0xffffffff, True, True, 0xffffffff),
+        ("Crc32Interlaken", 32, 0x1edc6f41, 0xffffffff, True, True, 0xffffffff),
+        ("Crc32C", 32, 0x1edc6f41, 0xffffffff, True, True, 0xffffffff),
+        ("Crc32c", 32, 0x1edc6f41, 0xffffffff, True, True, 0xffffffff),
+        ("Crc32IsoHdlc", 32, 0x4c11db7, 0xffffffff, True, True, 0xffffffff),
+        ("Crc32", 32, 0x4c11db7, 0xffffffff, True, True, 0xffffffff),
+        ("Crc32Adccp", 32, 0x4c11db7, 0xffffffff, True, True, 0xffffffff),
+        ("Crc32V42", 32, 0x4c11db7, 0xffffffff, True, True, 0xffffffff),
+        ("Crc32Xz", 32, 0x4c11db7, 0xffffffff, True, True, 0xffffffff),
+        ("CrcPkzip", 32, 0x4c11db7, 0xffffffff, True, True, 0xffffffff),
+        ("Crc32Jamcrc", 32, 0x4c11db7, 0xffffffff, True, True, 0x0),
+        ("CrcJamcrc", 32, 0x4c11db7, 0xffffffff, True, True, 0x0),
+        ("Crc32Mef", 32, 0x741b8cd7, 0xffffffff, True, True, 0x0),
+        ("Crc32Mpeg2", 32, 0x4c11db7, 0xffffffff, False, False, 0x0),
+        ("Crc32Xfer", 32, 0xaf, 0x0, False, False, 0x0),
+        ("CrcXfer", 32, 0xaf, 0x0, False, False, 0x0),
+        ("Crc40Gsm", 40, 0x4820009, 0x0, False, False, 0xffffffffff),
+        ("Crc64Ecma182", 64, 0x42f0e1eba9ea3693, 0x0, False, False, 0x0),
+        ("Crc64", 64, 0x42f0e1eba9ea3693, 0x0, False, False, 0x0),
+        ("Crc64GoIso", 64, 0x1b, 0xffffffffffffffff, True, True, 0xffffffffffffffff),
+        ("Crc64Ms", 64, 0x259c84cba6426349, 0xffffffffffffffff, True, True, 0x0),
+        ("Crc64Nvme", 64, 0xad93d23594c93659, 0xffffffffffffffff, True, True, 0xffffffffffffffff),
+        ("Crc64Redis", 64, 0xad93d23594c935a9, 0x0, True, True, 0x0),
+        ("Crc64We", 64, 0x42f0e1eba9ea3693, 0xffffffffffffffff, False, False, 0xffffffffffffffff),
+        ("Crc64Xz", 64, 0x42f0e1eba9ea3693, 0xffffffffffffffff, True, True, 0xffffffffffffffff),
+        ("Crc64GoEcma", 64, 0x42f0e1eba9ea3693, 0xffffffffffffffff, True, True, 0xffffffffffffffff),
+        ("Crc82Darc", 82, 0x308c0111011401440411, 0x0, True, True, 0x0),
+        # CRC-32K (Koopman), which is not included in the crccheck package
+        ("Crc32K", 32, 0x741b8cd7, 0xffffffff, True, True, 0xffffffff),
+        ("Crc32Koopman", 32, 0x741b8cd7, 0xffffffff, True, True, 0xffffffff),
+        # the output of the POSIX `cksum` command, which feeds the data length to CRC-32/CKSUM after the data
+        ("Cksum", 32, 0x4c11db7, 0x0, False, False, 0xffffffff, True),
+    ]
+
+    def __init__(self, width, poly, initvalue, reflect_input, reflect_output, xor_output, append_length=False):
+        self.params = (width, poly, initvalue, reflect_input, reflect_output, xor_output, append_length)
+        self._width = width
+        self.poly = poly
+        self.initvalue = initvalue
+        self.reflect_input = reflect_input
+        self.reflect_output = reflect_output
+        self.xor_output = xor_output
+        self.append_length = append_length
+        self.value = initvalue
+        self.length = 0
+        return
+
+    def process(self, data):
+        crc = self.value
+        highbit = 1 << (self._width - 1) # ValueError is raised if width is 0
+        mask = (1 << self._width) - 1
+        poly = self.poly
+        shift = self._width - 8
+        if shift < 0:
+            # enlarge temporarily to fit 8-bit
+            diff8 = -shift
+            mask, shift, highbit = 0xff, 0, 0x80
+            crc <<= diff8
+            poly <<= diff8
+        else:
+            diff8 = 0
+        if self.reflect_input:
+            table = self.REFLECT8
+        else:
+            table = None
+        for byte in data:
+            if table:
+                byte = table[byte]
+            crc ^= byte << shift
+            for _ in range(8):
+                if crc & highbit:
+                    crc = (crc << 1) ^ poly
+                else:
+                    crc <<= 1
+            crc &= mask
+        if diff8:
+            crc >>= diff8
+        self.value = crc
+        self.length += len(data)
+        return self
+
+    def final(self):
+        crc = self.value
+        if self.append_length:
+            # in as few bytes as needed, the least significant byte first
+            length = self.length.to_bytes((self.length.bit_length() + 7) // 8, "little")
+            crc = CrcEngine(self._width, self.poly, crc, self.reflect_input, False, 0).process(length).value
+        if self.reflect_output:
+            crc = int("{:0{:d}b}".format(crc, self._width)[::-1], 2)
+        return crc ^ self.xor_output
+
+    def finalhex(self):
+        return self.final().to_bytes((self._width + 7) // 8, "big").hex()
+
+    def calchex(self, data):
+        return CrcEngine(*self.params).process(data).finalhex()
+
+
 @register_command
 class CrcCommand(GenericCommand, BufferingOutput):
     """The base command to calculate crc."""
@@ -3040,65 +3314,10 @@ class CrcCommand(GenericCommand, BufferingOutput):
         return
 
     def get_valid_crc_funcs(self):
-        import crccheck
-        for cname in crccheck.crc.__dict__:
-            if self.args.filter and not any(filt.search(cname) for filt in self.args.filter):
+        for cname, *params in CrcEngine.PARAMETERS:
+            if not GefUtil.matches_regex(cname, self.args.filter):
                 continue
-            if not cname.startswith("Crc"):
-                continue
-            if cname.startswith("Crccheck"):
-                continue
-            try:
-                cfunc = getattr(crccheck.crc, cname)()
-            except TypeError:
-                continue
-            yield (cname, cfunc)
-
-        class Crc32kWrapper:
-            def __init__(self):
-                self.buf = b""
-                return
-
-            def cfunc(self, data):
-                # CRC-32K (Koopman) polynomial:
-                # normal:   0x741B8CD7
-                # reflected 0xEB31D82E  (LSB-first bit processing)
-                poly_reflected = 0xeb31_d82e
-                init = 0xffff_ffff
-                xorout = 0xffff_ffff
-
-                crc = init & 0xffff_ffff
-                for b in data:
-                    crc ^= b
-                    for _ in range(8):
-                        if crc & 1:
-                            crc = (crc >> 1) ^ poly_reflected
-                        else:
-                            crc >>= 1
-                        crc &= 0xffff_ffff
-
-                crc ^= xorout
-                return crc & 0xffff_ffff
-
-            def process(self, value):
-                self.buf += value
-                return
-
-            def calchex(self, value):
-                crc = self.cfunc(value)
-                return "{:08x}".format(crc)
-
-            def finalhex(self):
-                crc = self.cfunc(self.buf)
-                return "{:08x}".format(crc)
-
-            def width(self):
-                return 32
-
-        for cname in ["Crc32K", "Crc32Koopman"]:
-            if self.args.filter and not any(filt.search(cname) for filt in self.args.filter):
-                continue
-            yield (cname, Crc32kWrapper())
+            yield (cname, CrcEngine(*params))
         return None
 
     def make_line(self, cname, cfunc, crc):
@@ -3159,9 +3378,8 @@ class CrcMemoryCommand(CrcCommand):
                 chunk_size = end_address - chunk_addr
             else:
                 chunk_size = step
-            try:
-                mem = read_memory(chunk_addr, chunk_size)
-            except (gdb.MemoryError, MemoryError):
+            mem = read_memory(chunk_addr, chunk_size, safe=True)
+            if mem is None:
                 err("Memory read error")
                 return False
             try:
@@ -3173,8 +3391,10 @@ class CrcMemoryCommand(CrcCommand):
 
     @parse_args
     @only_if_gdb_running
-    @ModuleLoader.load_crccheck
     def do_invoke(self, args):
+        if args.size < 0:
+            err("Invalid size")
+            return
         self.out = []
         self.out.append("Address: {:#x}".format(args.location))
         self.out.append("Size: {:#x}".format(args.size))
@@ -3221,7 +3441,8 @@ class CrcFileCommand(CrcCommand):
 
         step = 0x400 * get_pagesize()
 
-        with open(self.args.filename, "rb") as f:
+        with open(filename, "rb") as f:
+            end_pos = min(end_pos, os.fstat(f.fileno()).st_size)
             f.seek(start_pos)
             for chunk_pos in range(start_pos, end_pos, step):
                 chunk_size = min(end_pos - chunk_pos, step)
@@ -3234,23 +3455,31 @@ class CrcFileCommand(CrcCommand):
         return cfunc.finalhex()
 
     @parse_args
-    @only_if_gdb_running
-    @ModuleLoader.load_crccheck
     def do_invoke(self, args):
+        if args.start < 0 or args.size is not None and args.size < 0:
+            err("Invalid range")
+            return
         self.out = []
         if not os.path.exists(args.filename):
             err("File not found")
+            return
+        if not os.path.isfile(args.filename):
+            err("Not a regular file")
             return
         self.out.append("Path: {:s}".format(args.filename))
         self.out.append("FileSize: {:#x}".format(os.path.getsize(args.filename)))
 
         if args.size is None:
-            end_pos = args.start + os.path.getsize(args.filename)
+            end_pos = os.path.getsize(args.filename)
         else:
             end_pos = args.start + args.size
 
         for cname, cfunc in self.get_valid_crc_funcs():
-            crc = self.calc_crc(cfunc, args.filename, args.start, end_pos)
+            try:
+                crc = self.calc_crc(cfunc, args.filename, args.start, end_pos)
+            except OSError as e:
+                err("Cannot read file {:s}: {:s}".format(args.filename, str(e)))
+                return
             if crc is False:
                 return
             if crc is None:
@@ -3288,16 +3517,15 @@ class CrcValueCommand(CrcCommand):
         return
 
     @parse_args
-    @ModuleLoader.load_crccheck
     def do_invoke(self, args):
         if args.hex: # "41414141" -> b"\x41\x41\x41\x41"
             value = GefUtil.fromhex_ignore_invalid(args.value)
-            if not value:
+            if value is None:
                 return
         else:
             try:
                 value = codecs.escape_decode(args.value)[0]
-            except binascii.Error:
+            except (binascii.Error, ValueError):
                 err('Could not decode "\\xXX" encoded string')
                 return
 
@@ -3312,6 +3540,495 @@ class CrcValueCommand(CrcCommand):
         self.print_output(check_terminal_size=True)
         return
 
+
+
+class BaseNCodec:
+    """The base encodings used by base-n-encode/decode, without an external module."""
+
+    UPPER = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    LOWER = "abcdefghijklmnopqrstuvwxyz"
+    DIGITS = "0123456789"
+    CHARSETS = {
+        "base1": "A",
+        "base3": "123",
+        "base10": DIGITS,
+        "base26": UPPER,
+        "base36": DIGITS + UPPER,
+        "base58-bitcoin": "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz",
+        "base58-flickr": "123456789abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ",
+        "base58-ripple": "rpshnaf39wBUDNEGHJKLM4PQRST7VWXYZ2bcdeCg65jkm8oFqi1tuvAxyz",
+        "base62": DIGITS + UPPER + LOWER,
+        "base63": DIGITS + UPPER + LOWER + "_",
+        "base67": UPPER + LOWER + DIGITS + "-_.!~",
+    }
+    POWER_CHARSETS = {
+        "base2": "01",
+        "base4": "1234",
+        "base8": "abcdefgh",
+        "base16": DIGITS + "ABCDEF",
+        "base32": UPPER + "234567",
+        "base32-crockford": DIGITS + "ABCDEFGHJKMNPQRSTVWXYZ",
+        "base32-geohash": DIGITS + "bcdefghjkmnpqrstuvwxyz",
+        "base32-hex": DIGITS + UPPER[:22],
+        "base32-z": "ybndrfg8ejkmcpqxot1uwisza345h769",
+        "base64": UPPER + LOWER + DIGITS + "+/",
+        "base64-url": UPPER + LOWER + DIGITS + "-_",
+    }
+    BASE45 = DIGITS + UPPER + " $%*+-./:"
+    BASE91 = UPPER + LOWER + DIGITS + "!#$%&()*+,./:;<=>?@[]^_`{|}~\""
+    BASE85_ASCII = "!\"#$%&'()*+,-./" + DIGITS + ":;<=>?@" + UPPER + "[\\]^_`" + LOWER[:21]
+    BASE85 = {
+        "base85": BASE85_ASCII,
+        "base85-adobe": BASE85_ASCII,
+        "base85-xbtoa": BASE85_ASCII,
+        "base85-ipv6": DIGITS + UPPER + LOWER + "!#$%&()*+-;<=>?@^_`{|}~",
+        "base85-xml": DIGITS + UPPER + LOWER[:-1] + "!#$()*+,-./:;=?@^`{|}~z_",
+        "base85-zeromq": DIGITS + LOWER + UPPER + ".-:+=^!/*?&<>()[]{}@%$#",
+    }
+    BAD122 = (0, 10, 13, 34, 38, 92)
+
+    @staticmethod
+    def as_bytes(value):
+        if isinstance(value, bytes):
+            return value
+        try:
+            return value.encode("latin-1")
+        except UnicodeEncodeError:
+            return value.encode("utf-8")
+
+    @staticmethod
+    def as_text(value):
+        if isinstance(value, str):
+            return value
+        try:
+            return value.decode("utf-8")
+        except UnicodeDecodeError:
+            return value.decode("latin-1")
+
+    @staticmethod
+    def int_to_bytes(value):
+        if value < 0:
+            raise ValueError("Negative base value")
+        size = max(1, (value.bit_length() + 7) // 8)
+        return value.to_bytes(size, "big")
+
+    @staticmethod
+    def encode_generic(data, charset):
+        value = int.from_bytes(data, "big")
+        if len(charset) == 1:
+            if value > 1024 * 1024 * 1024:
+                raise ValueError("Input exceeded size limit")
+            return (charset * value).encode("latin-1")
+        if len(charset) == 10:
+            if value:
+                result = str(value)
+            else:
+                result = ""
+        else:
+            result = ""
+            while value:
+                value, digit = divmod(value, len(charset))
+                result = charset[digit] + result
+        result = charset[0] * (len(data) - len(data.lstrip(b"\0"))) + result
+        return result.encode("latin-1")
+
+    @staticmethod
+    def decode_generic(text, charset):
+        if not text:
+            return b""
+        if len(charset) == 1:
+            text = text.replace("\r\n", "").replace("\n", "")
+            invalid = text.replace(charset, "")
+            if invalid:
+                raise ValueError("Invalid base character {!r}".format(invalid[0]))
+            return BaseNCodec.int_to_bytes(len(text))
+        if len(charset) == 10:
+            value = int(text)
+            text = text.strip()
+        else:
+            value = 0
+            text = text.replace("\r\n", "").replace("\n", "")
+            if not text:
+                return b""
+            for char in text:
+                try:
+                    digit = charset.index(char)
+                except ValueError as exc:
+                    raise ValueError("Invalid base character {!r}".format(char)) from exc
+                value = value * len(charset) + digit
+        zeros = len(text) - len(text.lstrip(charset[0]))
+        return b"\0" * zeros + (BaseNCodec.int_to_bytes(value) if value or not zeros else b"")
+
+    @staticmethod
+    def encode_power(data, charset):
+        bits_per_char = int(math.log2(len(charset)))
+        bits = "".join("{:08b}".format(value) for value in data)
+        result = ""
+        for pos in range(0, len(bits), bits_per_char):
+            chunk = bits[pos:pos + bits_per_char]
+            result += charset[int(chunk.ljust(bits_per_char, "0"), 2)]
+        quantum = bits_per_char
+        while quantum % 8:
+            quantum += bits_per_char
+        while len(result) * bits_per_char % quantum:
+            result += "="
+        return result.encode()
+
+    @staticmethod
+    def decode_power(text, charset):
+        text = re.sub(r"\s", "", text)
+        if not text:
+            return b""
+        if len(charset) == 16:
+            text = text.upper()
+        bits_per_char = int(math.log2(len(charset)))
+        padding = len(text) - len(text.rstrip("="))
+        quantum = 8 // math.gcd(bits_per_char, 8)
+        payload = text.rstrip("=")
+        if ("=" in payload or len(text) % quantum or padding >= quantum
+                or len(payload) * bits_per_char % 8 >= bits_per_char):
+            raise ValueError("Incorrect padding")
+        bits = ""
+        for char in text:
+            if char == "=":
+                bits += "0" * bits_per_char
+                continue
+            try:
+                digit = charset.index(char)
+            except ValueError as exc:
+                raise ValueError("Invalid base character {!r}".format(char)) from exc
+            bits += format(digit, "0{:d}b".format(bits_per_char))
+        if len(bits) % 8:
+            raise ValueError("Incorrect padding")
+        result = bytes(int(bits[pos:pos + 8], 2) for pos in range(0, len(bits), 8))
+        trim = math.ceil(padding * bits_per_char / 8)
+        if trim:
+            return result[:-trim]
+        return result
+
+    @staticmethod
+    def encode45(data):
+        result = ""
+        for pos in range(0, len(data), 2):
+            if pos + 1 == len(data):
+                value = data[pos]
+                result += BaseNCodec.BASE45[value % 45] + BaseNCodec.BASE45[value // 45]
+                break
+            value = data[pos] * 256 + data[pos + 1]
+            result += BaseNCodec.BASE45[value % 45]
+            result += BaseNCodec.BASE45[value // 45 % 45]
+            result += BaseNCodec.BASE45[value // (45 * 45)]
+        return result.encode()
+
+    @staticmethod
+    def decode45(text):
+        result = bytearray()
+        for pos in range(0, len(text), 3):
+            block = text[pos:pos + 3]
+            if len(block) == 1:
+                raise ValueError("Incorrect base45 length")
+            try:
+                value = sum(BaseNCodec.BASE45.index(char) * 45 ** i for i, char in enumerate(block))
+            except ValueError as exc:
+                raise ValueError("Invalid base45 character") from exc
+            if len(block) == 2:
+                if value > 255:
+                    raise ValueError("Invalid base45 value")
+                result.append(value)
+            else:
+                if value > 65535:
+                    raise ValueError("Invalid base45 value")
+                result.extend((value >> 8, value & 0xff))
+        return bytes(result)
+
+    @staticmethod
+    def update_xbtoa(values, data):
+        check_xor, check_sum, check_rot = values
+        for value in data:
+            check_xor ^= value
+            check_sum = (check_sum + value + 1) & 0xffffffff
+            check_rot = ((check_rot << 1 | check_rot >> 31) + value) & 0xffffffff
+        return check_xor, check_sum, check_rot
+
+    @staticmethod
+    def encode85(data, name):
+        if not data:
+            return b""
+        if name == "base85-zeromq" and len(data) % 4:
+            raise ValueError("Incorrect Z85 length")
+        charset = BaseNCodec.BASE85[name]
+        xbtoa = name == "base85-xbtoa"
+        checks = (0, 0, 0)
+        result = ""
+        padding = align(len(data), 4) - len(data)
+        for pos in range(0, len(data), 4):
+            block = data[pos:pos + 4]
+            if xbtoa:
+                checks = BaseNCodec.update_xbtoa(checks, block.ljust(4, b"\0"))
+            if len(block) == 4 and block == b"\0\0\0\0" and charset.endswith("stu"):
+                result += "z"
+                continue
+            if len(block) == 4 and block == b"    " and xbtoa:
+                result += "y"
+                continue
+            value = int.from_bytes(block.ljust(4, b"\0"), "big")
+            encoded = ""
+            while len(encoded) < 5:
+                value, digit = divmod(value, 85)
+                encoded = charset[digit] + encoded
+            result += encoded
+        if not xbtoa and padding:
+            result = result[:-padding]
+        if charset.endswith("stu") and result.endswith("!!!!!"):
+            result = result[:-5] + "z"
+        if name == "base85-adobe":
+            result = "<~" + result + "~>"
+        elif xbtoa:
+            check_xor, check_sum, check_rot = checks
+            body = "\n".join(result[pos:pos + 78] for pos in range(0, len(result), 78))
+            result = "xbtoa Begin\n{:s}\nxbtoa End N {:d} {:x} E {:x} S {:x} R {:x}".format(
+                body, len(data), len(data), check_xor, check_sum, check_rot,
+            )
+        return result.encode()
+
+    @staticmethod
+    def decode85(text, name):
+        if name in ("base85", "base85-adobe"):
+            text = re.sub(r"[ \t\n\r\v\f]", "", text)
+        if not text:
+            return b""
+        if name == "base85-zeromq" and len(text) % 5:
+            raise ValueError("Incorrect Z85 length")
+        charset = BaseNCodec.BASE85[name]
+        xbtoa = name == "base85-xbtoa"
+        expected = None
+        if name == "base85-adobe" and text.startswith("<~") and text.endswith("~>"):
+            text = text[2:-2]
+        elif xbtoa:
+            match = re.search(
+                r"\nxbtoa\s+[eE]nd N (\d+) ([0-9a-fA-F]+) E ([0-9a-fA-F]+) S ([0-9a-fA-F]+) R ([0-9a-fA-F]+)\s*$",
+                text,
+            )
+            if not re.match(r"^xbtoa\s+[bB]egin\n", text) or match is None:
+                raise ValueError("Bad or missing xbtoa parameters")
+            expected = match.groups()
+            text = "".join(text[:match.start()].split("\n")[1:]).replace(" ", "")
+        result = bytearray()
+        padding = 0
+        pos = 0
+        while pos < len(text):
+            if text[pos] == "z" and charset.endswith("stu"):
+                result.extend(b"\0\0\0\0")
+                pos += 1
+                continue
+            if text[pos] == "y" and xbtoa:
+                result.extend(b"    ")
+                pos += 1
+                continue
+            block = text[pos:pos + 5]
+            if len(block) < 5:
+                padding = 5 - len(block)
+            else:
+                padding = 0
+            values = []
+            for char in block:
+                try:
+                    values.append(charset.index(char))
+                except ValueError as exc:
+                    raise ValueError("Invalid base85 character {!r}".format(char)) from exc
+            if len(block) == 1 or xbtoa and padding:
+                raise ValueError("Incorrect base85 length")
+            values.extend([84] * padding)
+            value = sum(digit * 85 ** power for power, digit in enumerate(reversed(values)))
+            if value > 0xffffffff:
+                raise ValueError("Base85 value exceeds 32 bits")
+            result.extend(value.to_bytes(4, "big"))
+            pos += 5
+        if padding:
+            del result[-padding:]
+        if xbtoa:
+            data_len = int(expected[0])
+            if len(result) != align(data_len, 4):
+                raise ValueError("Incorrect xbtoa length")
+            checks = BaseNCodec.update_xbtoa((0, 0, 0), result)
+            del result[data_len:]
+            actual = (str(len(result)), format(len(result), "x")) + tuple(format(value, "x") for value in checks)
+            if tuple(value.lower() for value in expected) != actual:
+                raise ValueError("An xbtoa check value does not match")
+        return bytes(result)
+
+    @staticmethod
+    def encode91(data):
+        value = 0
+        bit_count = 0
+        result = ""
+        for byte in data:
+            value |= byte << bit_count
+            bit_count += 8
+            if bit_count > 13:
+                chunk = value & 8191
+                if chunk > 88:
+                    value >>= 13
+                    bit_count -= 13
+                else:
+                    chunk = value & 16383
+                    value >>= 14
+                    bit_count -= 14
+                result += BaseNCodec.BASE91[chunk % 91] + BaseNCodec.BASE91[chunk // 91]
+        if bit_count:
+            result += BaseNCodec.BASE91[value % 91]
+            if bit_count > 7 or value > 90:
+                result += BaseNCodec.BASE91[value // 91]
+        return result.encode()
+
+    @staticmethod
+    def decode91(text):
+        text = text.replace("\r\n", "").replace("\n", "")
+        value = 0
+        bit_count = 0
+        pending = -1
+        result = bytearray()
+        for char in text:
+            try:
+                digit = BaseNCodec.BASE91.index(char)
+            except ValueError as exc:
+                raise ValueError("Invalid base91 character {!r}".format(char)) from exc
+            if pending < 0:
+                pending = digit
+                continue
+            pending += digit * 91
+            value |= pending << bit_count
+            if pending & 8191 > 88:
+                bit_count += 13
+            else:
+                bit_count += 14
+            while bit_count > 7:
+                result.append(value & 255)
+                value >>= 8
+                bit_count -= 8
+            pending = -1
+        if pending >= 0:
+            result.append((value | pending << bit_count) & 255)
+        return bytes(result)
+
+    @staticmethod
+    def encode100(data):
+        result = bytearray()
+        for value in data:
+            result.extend((240, 159, (value + 55) // 64 + 143, (value + 55) % 64 + 128))
+        return bytes(result)
+
+    @staticmethod
+    def decode100(data):
+        data = data.replace(b"\r\n", b"").replace(b"\n", b"")
+        if len(data) % 4:
+            raise ValueError("Bad input (length should be multiple of 4)")
+        result = bytearray()
+        for pos in range(0, len(data), 4):
+            block = data[pos:pos + 4]
+            value = (block[2] - 143) * 64 + block[3] - 128 - 55
+            if block[:2] != b"\xf0\x9f" or not 128 <= block[3] < 192 or not 0 <= value < 256:
+                raise ValueError("Invalid base100 character {!r}".format(block))
+            result.append(value)
+        return bytes(result)
+
+    @staticmethod
+    def get_122_chunk(data, index, bit):
+        if index >= len(data):
+            return index, bit, None
+        available = 8 - bit
+        if available >= 7:
+            value = data[index] >> (available - 7) & 127
+            bit += 7
+        else:
+            value = (data[index] & ((1 << available) - 1)) << (7 - available)
+            index += 1
+            if index < len(data):
+                value |= data[index] >> (8 - (7 - available))
+            else:
+                value |= 0
+            bit = 7 - available
+        if bit >= 8:
+            bit -= 8
+            index += 1
+        return index, bit, value
+
+    @staticmethod
+    def encode122(data):
+        result = bytearray()
+        index = 0
+        bit = 0
+        while index < len(data):
+            index, bit, value = BaseNCodec.get_122_chunk(data, index, bit)
+            if value not in BaseNCodec.BAD122:
+                result.append(value)
+                continue
+            bad_index = BaseNCodec.BAD122.index(value)
+            index, bit, next_value = BaseNCodec.get_122_chunk(data, index, bit)
+            if next_value is None:
+                next_value = value
+                bad_index = 7
+            result.extend((194 | bad_index << 2 | int(bool(next_value & 64)), 128 | next_value & 63))
+        return bytes(result)
+
+    @staticmethod
+    def decode122(data):
+        text = BaseNCodec.as_text(data)
+        chunks = []
+        for char in text:
+            value = ord(char)
+            if value >= 128:
+                bad_index = value >> 8 & 7
+                if bad_index < len(BaseNCodec.BAD122):
+                    chunks.append(BaseNCodec.BAD122[bad_index])
+                chunks.append(value & 127)
+            else:
+                chunks.append(value)
+        bits = "".join(format(value, "07b") for value in chunks)
+        return bytes(int(bits[pos:pos + 8], 2) for pos in range(0, len(bits) - 7, 8))
+
+    @staticmethod
+    def encode(data, name):
+        data = BaseNCodec.as_bytes(data)
+        if not data:
+            return b""
+        if name in BaseNCodec.CHARSETS:
+            return BaseNCodec.encode_generic(data, BaseNCodec.CHARSETS[name])
+        if name in BaseNCodec.POWER_CHARSETS:
+            return BaseNCodec.encode_power(data, BaseNCodec.POWER_CHARSETS[name])
+        if name == "base45":
+            return BaseNCodec.encode45(data)
+        if name in BaseNCodec.BASE85:
+            return BaseNCodec.encode85(data, name)
+        if name == "base91":
+            return BaseNCodec.encode91(data)
+        if name == "base100":
+            return BaseNCodec.encode100(data)
+        if name == "base122":
+            return BaseNCodec.encode122(data)
+        raise ValueError("Unknown base encoding: {:s}".format(name))
+
+    @staticmethod
+    def decode(data, name):
+        data = BaseNCodec.as_bytes(data)
+        if not data:
+            return b""
+        if name == "base100":
+            return BaseNCodec.decode100(data)
+        if name == "base122":
+            return BaseNCodec.decode122(data)
+        text = BaseNCodec.as_text(data)
+        if name in BaseNCodec.CHARSETS:
+            return BaseNCodec.decode_generic(text, BaseNCodec.CHARSETS[name])
+        if name in BaseNCodec.POWER_CHARSETS:
+            return BaseNCodec.decode_power(text, BaseNCodec.POWER_CHARSETS[name])
+        if name == "base45":
+            return BaseNCodec.decode45(text)
+        if name in BaseNCodec.BASE85:
+            return BaseNCodec.decode85(text, name)
+        if name == "base91":
+            return BaseNCodec.decode91(text)
+        raise ValueError("Unknown base encoding: {:s}".format(name))
 
 
 @register_command
@@ -3340,6 +4057,8 @@ class BaseNDecodeCommand(GenericCommand, BufferingOutput):
         "base91", "base100", "base122",
     ]
 
+    _note_ = "For integer bases other than base1, each leading zero symbol represents one zero byte."
+
     def __init__(self, *args, **kwargs):
         prefix = kwargs.get("prefix", True)
         complete = kwargs.get("complete", gdb.COMPLETE_NONE)
@@ -3347,9 +4066,8 @@ class BaseNDecodeCommand(GenericCommand, BufferingOutput):
         return
 
     def get_valid_base_decode_funcs(self):
-        import codext
         for bname in self.baseN:
-            bfunc = lambda x, bname=bname: codext.decode(x, bname)
+            bfunc = lambda x, bname=bname: BaseNCodec.decode(x, bname)
             yield (bname, bfunc)
         return None
 
@@ -3386,15 +4104,13 @@ class BaseNDecodeMemoryCommand(BaseNDecodeCommand):
 
     @parse_args
     @only_if_gdb_running
-    @ModuleLoader.load_codext
     def do_invoke(self, args):
         self.out = []
         self.out.append("Address: {:#x}".format(args.location))
         self.out.append("Size: {:#x}".format(args.size))
 
-        try:
-            mem = read_memory(args.location, args.size)
-        except (gdb.MemoryError, MemoryError):
+        mem = read_memory(args.location, args.size, safe=True)
+        if mem is None:
             err("Memory read error")
             return False
 
@@ -3436,7 +4152,6 @@ class BaseNDecodeFileCommand(BaseNDecodeCommand):
         return
 
     @parse_args
-    @ModuleLoader.load_codext
     def do_invoke(self, args):
         if args.start < 0 or (args.size is not None and args.size < 0):
             err("Invalid range")
@@ -3497,16 +4212,15 @@ class BaseNDecodeValueCommand(BaseNDecodeCommand):
         return
 
     @parse_args
-    @ModuleLoader.load_crccheck
     def do_invoke(self, args):
         if args.hex: # "41414141" -> b"\x41\x41\x41\x41"
             value = GefUtil.fromhex_ignore_invalid(args.value)
-            if not value:
+            if value is None:
                 return
         else:
             try:
                 value = codecs.escape_decode(args.value)[0]
-            except binascii.Error:
+            except (binascii.Error, ValueError):
                 err('Could not decode "\\xXX" encoded string')
                 return
 
@@ -3548,6 +4262,8 @@ class BaseNEncodeCommand(GenericCommand, BufferingOutput):
         "base91", "base100", "base122",
     ]
 
+    _note_ = "For integer bases other than base1, each leading zero symbol represents one zero byte."
+
     def __init__(self, *args, **kwargs):
         prefix = kwargs.get("prefix", True)
         complete = kwargs.get("complete", gdb.COMPLETE_NONE)
@@ -3555,9 +4271,8 @@ class BaseNEncodeCommand(GenericCommand, BufferingOutput):
         return
 
     def get_valid_base_encode_funcs(self):
-        import codext
         for bname in self.baseN:
-            bfunc = lambda x, bname=bname: codext.encode(x, bname)
+            bfunc = lambda x, bname=bname: BaseNCodec.encode(x, bname)
             yield (bname, bfunc)
         return None
 
@@ -3594,15 +4309,13 @@ class BaseNEncodeMemoryCommand(BaseNEncodeCommand):
 
     @parse_args
     @only_if_gdb_running
-    @ModuleLoader.load_codext
     def do_invoke(self, args):
         self.out = []
         self.out.append("Address: {:#x}".format(args.location))
         self.out.append("Size: {:#x}".format(args.size))
 
-        try:
-            mem = read_memory(args.location, args.size)
-        except (gdb.MemoryError, MemoryError):
+        mem = read_memory(args.location, args.size, safe=True)
+        if mem is None:
             err("Memory read error")
             return False
 
@@ -3647,7 +4360,6 @@ class BaseNEncodeFileCommand(BaseNEncodeCommand):
         return
 
     @parse_args
-    @ModuleLoader.load_codext
     def do_invoke(self, args):
         if args.start < 0 or (args.size is not None and args.size < 0):
             err("Invalid range")
@@ -3711,16 +4423,15 @@ class BaseNEncodeValueCommand(BaseNEncodeCommand):
         return
 
     @parse_args
-    @ModuleLoader.load_crccheck
     def do_invoke(self, args):
         if args.hex: # "41414141" -> b"\x41\x41\x41\x41"
             value = GefUtil.fromhex_ignore_invalid(args.value)
-            if not value:
+            if value is None:
                 return
         else:
             try:
                 value = codecs.escape_decode(args.value)[0]
-            except binascii.Error:
+            except (binascii.Error, ValueError):
                 err('Could not decode "\\xXX" encoded string')
                 return
 
@@ -3754,6 +4465,11 @@ class MorseDecodeCommand(GenericCommand):
     subparsers.add_parser("memory")
     subparsers.add_parser("value")
     _syntax_ = parser.format_help()
+
+    _note_ = [
+        "Uses one space between letters and three spaces between words.",
+    ]
+    _note_ = "\n".join(_note_)
 
     def __init__(self, *args, **kwargs):
         prefix = kwargs.get("prefix", True)
@@ -3797,9 +4513,8 @@ class MorseDecodeMemoryCommand(MorseDecodeCommand):
         gef_print("Address: {:#x}".format(args.location))
         gef_print("Size: {:#x}".format(args.size))
 
-        try:
-            mem = read_memory(args.location, args.size)
-        except (gdb.MemoryError, MemoryError):
+        mem = read_memory(args.location, args.size, safe=True)
+        if mem is None:
             err("Memory read error")
             return False
 
@@ -3853,6 +4568,11 @@ class MorseEncodeCommand(GenericCommand):
     subparsers.add_parser("value")
     _syntax_ = parser.format_help()
 
+    _note_ = [
+        "Uses one space between letters and three spaces between words.",
+    ]
+    _note_ = "\n".join(_note_)
+
     def __init__(self, *args, **kwargs):
         prefix = kwargs.get("prefix", True)
         complete = kwargs.get("complete", gdb.COMPLETE_NONE)
@@ -3895,9 +4615,8 @@ class MorseEncodeMemoryCommand(MorseEncodeCommand):
         gef_print("Address: {:#x}".format(args.location))
         gef_print("Size: {:#x}".format(args.size))
 
-        try:
-            mem = read_memory(args.location, args.size)
-        except (gdb.MemoryError, MemoryError):
+        mem = read_memory(args.location, args.size, safe=True)
+        if mem is None:
             err("Memory read error")
             return False
 

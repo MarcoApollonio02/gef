@@ -17,6 +17,7 @@ import collections
 import functools
 import gdb
 import itertools
+import math
 import re
 import sys
 
@@ -30,7 +31,8 @@ from gef.core.memory import (MemoryCache, is_ascii_string, is_valid_addr, is_val
                              read_cstring_from_memory, read_int32_from_memory, read_int64_from_memory,
                              read_int8_from_memory, read_int_from_memory, read_memory, u32)
 from gef.core.process import (get_pagesize, is_32bit, is_64bit, is_arm32, is_arm64, is_in_kernel, is_in_smm,
-                              is_kgdb, is_qemu_system, is_riscv32, is_riscv64, is_vmware, is_x86, is_x86_16,
+                              is_kgdb, is_qemu_system,
+                              is_support_secure_world, is_riscv32, is_riscv64, is_vmware, is_x86, is_x86_16,
                               is_x86_32, is_x86_64)
 from gef.core.registers import get_register
 from gef.core.qemu import QemuMonitor, SystemManagementMemory, read_physmem
@@ -8966,6 +8968,7 @@ class PageTableX64(PageTable):
         return
 
     def pagewalk(self, args):
+        from gef.commands.base import ContextManager
         self.prepare_pagewalk(args)
         # `info tlb` on qemu-monitor returns pagetable without intermediate pagetable information.
         # for printing it, we will pagewalk manually.
@@ -9092,4 +9095,3663 @@ class PageTableX64(PageTable):
         self.flags_strings_cache = None
         self.save_mapping_cache()
         self.make_out(self.mappings)
+        return
+
+
+class PageTableRiscv(PageTable):
+    """Dump pagetable for riscv64/32."""
+
+    mapping_cache_fields = ("mappings",)
+
+    def is_invalid_entry(self, entry, level, addr, va, bit_shift):
+        if (entry & 1) == 0:
+            return True
+        leaf = (entry & 0b1010) != 0
+        if (entry & 0b110) == 0b100:
+            reason = "W=1 with R=0"
+        elif not leaf and (entry & 0xd0):
+            reason = "Reserved U/A/D bits in a non-leaf entry"
+        elif not leaf and level == 1:
+            reason = "Non-leaf entry at the last level"
+        elif leaf and ((entry >> 10) & ((1 << (bit_shift - 12)) - 1)):
+            reason = "Misaligned superpage"
+        else:
+            return False
+        if self.args.print_each_level and not self.is_not_trace_target(va, va + (1 << bit_shift)):
+            line = "{:#018x}: {:#018x} (virt:{:#018x},type:INVALID) {:s}".format(addr, entry, va, reason)
+            if not self.is_not_filter_target(line):
+                self.out.append(line)
+        return True
+
+    def format_flags(self, flag_info):
+        flag_info_key = tuple(flag_info)
+        x = self.flags_strings_cache.get(flag_info_key, None)
+        if x is not None:
+            return x
+
+        flags = []
+
+        perm = ""
+        perm += ["-", "R"]["R" in flag_info or ("X" in flag_info and getattr(self, "sstatus_mxr", 0))]
+        perm += ["-", "W"]["W" in flag_info]
+        perm += ["-", "X"]["X" in flag_info]
+        if perm not in ["R--", "RW-", "--X", "R-X", "RWX"]:
+            perm = "???"
+
+        if "U" in flag_info:
+            flags.append("USER/" + perm)
+            flags.append("KERN/" + (perm[:2] + "-" if self.sstatus_sum else "---"))
+        else:
+            flags.append("KERN/" + perm)
+
+        if not self.args.simple:
+            if "A" in flag_info:
+                flags.append("ACCESSED")
+            if "D" in flag_info:
+                flags.append("DIRTY")
+            if "G" in flag_info:
+                flags.append("GLOBAL")
+
+        flag_string = " ".join(flags)
+        self.flags_strings_cache[flag_info_key] = flag_string
+        return flag_string
+
+    def pagewalk_L5(self):
+        self.quiet_add_out(titlify("Level 5 Entry"))
+        L5E = []
+        PTE = []
+        COUNT = 0
+        bit_shift = sum([
+            self.bits["L4_BITS"],
+            self.bits["L3_BITS"],
+            self.bits["L2_BITS"],
+            self.bits["L1_BITS"],
+            self.bits["OFFSET"],
+        ])
+        for va_base, table_base, parent_flags in self.TABLES:
+            entries = self.read_memory(table_base, 2 ** self.bits["L5_BITS"] * self.bits["ENTRY_SIZE"])
+            entries = slice_unpack(entries, self.bits["ENTRY_SIZE"])
+            COUNT += len(entries)
+            for i, entry in enumerate(entries):
+                # valid flag
+                if (entry & 1) == 0:
+                    continue
+
+                # calc virtual address
+                if (i >> (self.bits["L5_BITS"] - 1)) & 1:
+                    sign_ext = 0xfe00_0000_0000_0000
+                else:
+                    sign_ext = 0
+                new_va = va_base + (sign_ext | (i << bit_shift))
+                new_va_end = new_va + (1 << bit_shift)
+
+                if self.is_invalid_entry(entry, 5, table_base + i * self.bits["ENTRY_SIZE"], new_va, bit_shift):
+                    continue
+
+                # calc ppn
+                ppn = (entry >> 10) & 0xfff_ffff_ffff # 44 bit
+
+                # calc flags
+                flags = parent_flags.copy()
+                if ((entry >> 1) & 1) == 1:
+                    flags.append("R")
+                if ((entry >> 2) & 1) == 1:
+                    flags.append("W")
+                if ((entry >> 3) & 1) == 1:
+                    flags.append("X")
+                if ((entry >> 4) & 1) == 1:
+                    flags.append("U")
+                if ((entry >> 5) & 1) == 1:
+                    flags.append("G")
+                if ((entry >> 6) & 1) == 1:
+                    flags.append("A")
+                if ((entry >> 7) & 1) == 1:
+                    flags.append("D")
+
+                if ((entry >> 1) & 0b111) == 0:
+                    # calc next table
+                    next_level_entry = ppn * get_pagesize()
+                    L5E.append([new_va, next_level_entry, flags])
+                    entry_type = "TABLE"
+                else:
+                    # make entry
+                    virt_addr = new_va
+                    phys_addr = ppn * get_pagesize()
+                    page_size = 256 * 1024 * 1024 * 1024 * 1024
+                    page_count = 1
+                    PTE.append(PageTable.Entry(virt_addr, phys_addr, page_size, page_count, self.format_flags(flags)))
+                    entry_type = "256TB-PAGE"
+
+                # dump
+                if self.args.print_each_level:
+                    if self.is_not_trace_target(new_va, new_va_end):
+                        continue
+                    addr = table_base + i * self.bits["ENTRY_SIZE"]
+                    fmt = "{:#018x}: {:#018x} (virt:{:#018x}-{:#018x},type:{:s}) {:s}"
+                    line = fmt.format(addr, entry, new_va, new_va_end, entry_type, " ".join(flags))
+                    if self.is_not_filter_target(line):
+                        continue
+                    self.out.append(line)
+
+        if self.args.print_each_level:
+            self.out.append(titlify(""))
+
+        self.quiet_info_add_out("Number of entries: {:d}".format(COUNT))
+        self.quiet_info_add_out("L5 Entry (256TB): {:d}".format(len(L5E)))
+        self.quiet_info_add_out("Invalid entries: {:d}".format(COUNT - len(L5E) - len(PTE)))
+        self.TABLES = L5E
+        self.PTE += PTE
+        return
+
+    def pagewalk_L4(self):
+        self.quiet_add_out(titlify("Level 4 Entry"))
+        L4E = []
+        PTE = []
+        COUNT = 0
+        bit_shift = sum([
+            self.bits["L3_BITS"],
+            self.bits["L2_BITS"],
+            self.bits["L1_BITS"],
+            self.bits["OFFSET"],
+        ])
+        for va_base, table_base, parent_flags in self.TABLES:
+            entries = self.read_memory(table_base, 2 ** self.bits["L4_BITS"] * self.bits["ENTRY_SIZE"])
+            entries = slice_unpack(entries, self.bits["ENTRY_SIZE"])
+            COUNT += len(entries)
+            for i, entry in enumerate(entries):
+                # valid flag
+                if (entry & 1) == 0:
+                    continue
+
+                # calc virtual address
+                if "L5_BITS" in self.bits:
+                    new_va = va_base + (i << bit_shift)
+                    new_va_end = new_va + (1 << bit_shift)
+                else:
+                    if (i >> (self.bits["L4_BITS"] - 1)) & 1:
+                        sign_ext = 0xffff_0000_0000_0000
+                    else:
+                        sign_ext = 0
+                    new_va = va_base + (sign_ext | (i << bit_shift))
+                    new_va_end = new_va + (1 << bit_shift)
+
+                if self.is_invalid_entry(entry, 4, table_base + i * self.bits["ENTRY_SIZE"], new_va, bit_shift):
+                    continue
+
+                # calc ppn
+                ppn = (entry >> 10) & 0xfff_ffff_ffff # 44 bit
+
+                # calc flags
+                flags = parent_flags.copy()
+                if ((entry >> 1) & 1) == 1:
+                    flags.append("R")
+                if ((entry >> 2) & 1) == 1:
+                    flags.append("W")
+                if ((entry >> 3) & 1) == 1:
+                    flags.append("X")
+                if ((entry >> 4) & 1) == 1:
+                    flags.append("U")
+                if ((entry >> 5) & 1) == 1:
+                    flags.append("G")
+                if ((entry >> 6) & 1) == 1:
+                    flags.append("A")
+                if ((entry >> 7) & 1) == 1:
+                    flags.append("D")
+
+                if ((entry >> 1) & 0b111) == 0:
+                    # calc next table
+                    next_level_entry = ppn * get_pagesize()
+                    L4E.append([new_va, next_level_entry, flags])
+                    entry_type = "TABLE"
+                else:
+                    # make entry
+                    virt_addr = new_va
+                    phys_addr = ppn * get_pagesize()
+                    page_size = 512 * 1024 * 1024 * 1024
+                    page_count = 1
+                    PTE.append(PageTable.Entry(virt_addr, phys_addr, page_size, page_count, self.format_flags(flags)))
+                    entry_type = "512GB-PAGE"
+
+                # dump
+                if self.args.print_each_level:
+                    if self.is_not_trace_target(new_va, new_va_end):
+                        continue
+                    addr = table_base + i * self.bits["ENTRY_SIZE"]
+                    fmt = "{:#018x}: {:#018x} (virt:{:#018x}-{:#018x},type:{:s}) {:s}"
+                    line = fmt.format(addr, entry, new_va, new_va_end, entry_type, " ".join(flags))
+                    if self.is_not_filter_target(line):
+                        continue
+                    self.out.append(line)
+
+        if self.args.print_each_level:
+            self.out.append(titlify(""))
+
+        self.quiet_info_add_out("Number of entries: {:d}".format(COUNT))
+        self.quiet_info_add_out("L4 Entry (512GB): {:d}".format(len(L4E)))
+        self.quiet_info_add_out("Invalid entries: {:d}".format(COUNT - len(L4E) - len(PTE)))
+        self.TABLES = L4E
+        self.PTE += PTE
+        return
+
+    def pagewalk_L3(self):
+        self.quiet_add_out(titlify("Level 3 Entry"))
+        L3E = []
+        PTE = []
+        COUNT = 0
+        bit_shift = sum([
+            self.bits["L2_BITS"],
+            self.bits["L1_BITS"],
+            self.bits["OFFSET"],
+        ])
+        for va_base, table_base, parent_flags in self.TABLES:
+            entries = self.read_memory(table_base, 2 ** self.bits["L3_BITS"] * self.bits["ENTRY_SIZE"])
+            entries = slice_unpack(entries, self.bits["ENTRY_SIZE"])
+            COUNT += len(entries)
+            for i, entry in enumerate(entries):
+                # valid flag
+                if (entry & 1) == 0:
+                    continue
+
+                # calc virtual address
+                if "L4_BITS" in self.bits:
+                    new_va = va_base + (i << bit_shift)
+                    new_va_end = new_va + (1 << bit_shift)
+                else:
+                    if (i >> (self.bits["L3_BITS"] - 1)) & 1:
+                        sign_ext = 0xffff_ff80_0000_0000
+                    else:
+                        sign_ext = 0
+                    new_va = va_base + (sign_ext | (i << bit_shift))
+                    new_va_end = new_va + (1 << bit_shift)
+
+                if self.is_invalid_entry(entry, 3, table_base + i * self.bits["ENTRY_SIZE"], new_va, bit_shift):
+                    continue
+
+                # calc ppn
+                ppn = (entry >> 10) & 0xfff_ffff_ffff # 44 bit
+
+                # calc flags
+                flags = parent_flags.copy()
+                if ((entry >> 1) & 1) == 1:
+                    flags.append("R")
+                if ((entry >> 2) & 1) == 1:
+                    flags.append("W")
+                if ((entry >> 3) & 1) == 1:
+                    flags.append("X")
+                if ((entry >> 4) & 1) == 1:
+                    flags.append("U")
+                if ((entry >> 5) & 1) == 1:
+                    flags.append("G")
+                if ((entry >> 6) & 1) == 1:
+                    flags.append("A")
+                if ((entry >> 7) & 1) == 1:
+                    flags.append("D")
+
+                if ((entry >> 1) & 0b111) == 0:
+                    # calc next table
+                    next_level_entry = ppn * get_pagesize()
+                    L3E.append([new_va, next_level_entry, flags])
+                    entry_type = "TABLE"
+                else:
+                    # make entry
+                    virt_addr = new_va
+                    phys_addr = ppn * get_pagesize()
+                    page_size = 1 * 1024 * 1024 * 1024
+                    page_count = 1
+                    PTE.append(PageTable.Entry(virt_addr, phys_addr, page_size, page_count, self.format_flags(flags)))
+                    entry_type = "1GB-PAGE"
+
+                # dump
+                if self.args.print_each_level:
+                    if self.is_not_trace_target(new_va, new_va_end):
+                        continue
+                    addr = table_base + i * self.bits["ENTRY_SIZE"]
+                    fmt = "{:#018x}: {:#018x} (virt:{:#018x}-{:#018x},type:{:s}) {:s}"
+                    line = fmt.format(addr, entry, new_va, new_va_end, entry_type, " ".join(flags))
+                    if self.is_not_filter_target(line):
+                        continue
+                    self.out.append(line)
+
+        if self.args.print_each_level:
+            self.out.append(titlify(""))
+
+        self.quiet_info_add_out("Number of entries: {:d}".format(COUNT))
+        self.quiet_info_add_out("L3 Entry (1GB): {:d}".format(len(L3E)))
+        self.quiet_info_add_out("Invalid entries: {:d}".format(COUNT - len(L3E) - len(PTE)))
+        self.TABLES = L3E
+        self.PTE += PTE
+        return
+
+    def pagewalk_L2(self):
+        self.quiet_add_out(titlify("Level 2 Entry"))
+        L2E = []
+        PTE = []
+        COUNT = 0
+        bit_shift = sum([
+            self.bits["L1_BITS"],
+            self.bits["OFFSET"],
+        ])
+        for va_base, table_base, parent_flags in self.TABLES:
+            entries = self.read_memory(table_base, 2 ** self.bits["L2_BITS"] * self.bits["ENTRY_SIZE"])
+            entries = slice_unpack(entries, self.bits["ENTRY_SIZE"])
+            COUNT += len(entries)
+            for i, entry in enumerate(entries):
+                # valid flag
+                if (entry & 1) == 0:
+                    continue
+
+                # calc virtual address
+                new_va = va_base + (i << bit_shift)
+                new_va_end = new_va + (1 << bit_shift)
+
+                if self.is_invalid_entry(entry, 2, table_base + i * self.bits["ENTRY_SIZE"], new_va, bit_shift):
+                    continue
+
+                # calc ppn
+                if is_riscv64():
+                    ppn = (entry >> 10) & 0xfff_ffff_ffff # 44 bit
+                else:
+                    ppn = (entry >> 10) & 0x3f_ffff # 22 bit
+
+                # calc flags
+                flags = parent_flags.copy()
+                if ((entry >> 1) & 1) == 1:
+                    flags.append("R")
+                if ((entry >> 2) & 1) == 1:
+                    flags.append("W")
+                if ((entry >> 3) & 1) == 1:
+                    flags.append("X")
+                if ((entry >> 4) & 1) == 1:
+                    flags.append("U")
+                if ((entry >> 5) & 1) == 1:
+                    flags.append("G")
+                if ((entry >> 6) & 1) == 1:
+                    flags.append("A")
+                if ((entry >> 7) & 1) == 1:
+                    flags.append("D")
+
+                if ((entry >> 1) & 0b111) == 0:
+                    # calc next table
+                    next_level_entry = ppn * get_pagesize()
+                    L2E.append([new_va, next_level_entry, flags])
+                    entry_type = "TABLE"
+                else:
+                    # make entry
+                    virt_addr = new_va
+                    phys_addr = ppn * get_pagesize()
+                    page_size = 1 << bit_shift # 2MB (Sv39/48/57) or 4MB (Sv32)
+                    page_count = 1
+                    PTE.append(PageTable.Entry(virt_addr, phys_addr, page_size, page_count, self.format_flags(flags)))
+                    entry_type = "{:d}MB-PAGE".format(page_size >> 20)
+
+                # dump
+                if self.args.print_each_level:
+                    if self.is_not_trace_target(new_va, new_va_end):
+                        continue
+                    addr = table_base + i * self.bits["ENTRY_SIZE"]
+                    fmt = "{:#018x}: {:#018x} (virt:{:#018x}-{:#018x},type:{:s}) {:s}"
+                    line = fmt.format(addr, entry, new_va, new_va_end, entry_type, " ".join(flags))
+                    if self.is_not_filter_target(line):
+                        continue
+                    self.out.append(line)
+
+        if self.args.print_each_level:
+            self.out.append(titlify(""))
+
+        self.quiet_info_add_out("Number of entries: {:d}".format(COUNT))
+        self.quiet_info_add_out("L2 Entry ({:d}MB): {:d}".format(1 << (bit_shift - 20), len(L2E)))
+        self.quiet_info_add_out("Invalid entries: {:d}".format(COUNT - len(L2E) - len(PTE)))
+        self.TABLES = L2E
+        self.PTE += PTE
+        return
+
+    def pagewalk_L1(self):
+        self.quiet_add_out(titlify("Level 1 Entry"))
+        PTE = []
+        COUNT = 0
+        bit_shift = self.bits["OFFSET"]
+        for va_base, table_base, parent_flags in self.TABLES:
+            entries = self.read_memory(table_base, 2 ** self.bits["L1_BITS"] * self.bits["ENTRY_SIZE"])
+            entries = slice_unpack(entries, self.bits["ENTRY_SIZE"])
+            COUNT += len(entries)
+            for i, entry in enumerate(entries):
+                # valid flag
+                if (entry & 1) == 0:
+                    continue
+
+                # calc virtual address
+                new_va = va_base + (i << bit_shift)
+                new_va_end = new_va + (1 << bit_shift)
+
+                if self.is_invalid_entry(entry, 1, table_base + i * self.bits["ENTRY_SIZE"], new_va, bit_shift):
+                    continue
+
+                # calc ppn
+                if is_riscv64():
+                    ppn = (entry >> 10) & 0xfff_ffff_ffff # 44 bit
+                else:
+                    ppn = (entry >> 10) & 0x3f_ffff # 22 bit
+
+                # calc flags
+                flags = parent_flags.copy()
+                if ((entry >> 1) & 1) == 1:
+                    flags.append("R")
+                if ((entry >> 2) & 1) == 1:
+                    flags.append("W")
+                if ((entry >> 3) & 1) == 1:
+                    flags.append("X")
+                if ((entry >> 4) & 1) == 1:
+                    flags.append("U")
+                if ((entry >> 5) & 1) == 1:
+                    flags.append("G")
+                if ((entry >> 6) & 1) == 1:
+                    flags.append("A")
+                if ((entry >> 7) & 1) == 1:
+                    flags.append("D")
+
+                # make entry
+                virt_addr = new_va
+                phys_addr = ppn * get_pagesize()
+                page_size = 4 * 1024
+                page_count = 1
+                PTE.append(PageTable.Entry(virt_addr, phys_addr, page_size, page_count, self.format_flags(flags)))
+                entry_type = "4KB-PAGE"
+
+                # dump
+                if self.args.print_each_level:
+                    if self.is_not_trace_target(new_va, new_va_end):
+                        continue
+                    addr = table_base + i * self.bits["ENTRY_SIZE"]
+                    line = "{:#018x}: {:#018x} (virt:{:#018x}-{:#018x},type:{:s}) {:s}".format(
+                        addr, entry, new_va, new_va_end, entry_type, " ".join(flags),
+                    )
+                    if self.is_not_filter_target(line):
+                        continue
+                    self.out.append(line)
+
+        if self.args.print_each_level:
+            self.out.append(titlify(""))
+
+        self.quiet_info_add_out("Number of entries: {:d}".format(COUNT))
+        self.quiet_info_add_out("L1 Entry (4KB): {:d}".format(len(PTE)))
+        self.quiet_info_add_out("Invalid entries: {:d}".format(COUNT - len(PTE)))
+        self.PTE += PTE
+
+        self.quiet_add_out(titlify("Total"))
+        self.quiet_info_add_out("PT Entry (Total): {:d}".format(len(self.PTE)))
+        self.mappings = self.PTE
+        return
+
+    def pagewalk(self, args):
+        self.prepare_pagewalk(args)
+        satp = get_register("satp")
+        if satp is None:
+            self.err_add_out("Failed to read $satp")
+            return
+        self.quiet_info_add_out("satp: {:#018x}".format(satp))
+
+        sstatus = get_register("sstatus")
+        if sstatus is None:
+            self.err_add_out("Failed to read $sstatus")
+            return
+        self.quiet_info_add_out("sstatus: {:#018x}".format(sstatus))
+
+        if is_riscv64():
+            mode = (satp >> 60) & 0b1111 # upper 4 bit
+            pagewalk_base = (satp & 0xfff_ffff_ffff) * get_pagesize() # lower 44 bit
+        else:
+            mode = (satp >> 31) & 0b1 # upper 1 bit
+            pagewalk_base = (satp & 0x3f_ffff) * get_pagesize() # lower 22 bit
+        self.sstatus_sum = (sstatus >> 18) & 1
+        self.sstatus_mxr = (sstatus >> 19) & 1
+
+        # virtual address base
+        va_base = 0
+        flags = []
+
+        # do pagewalk
+        self.PTE = []
+        self.TABLES = [(va_base, pagewalk_base, flags)]
+        self.flags_strings_cache = {}
+
+        if is_riscv64():
+            if mode == 0:
+                self.err_add_out("RV64 bare page table is unsupported")
+                return
+            elif mode == 11: # Sv64 is unsuppported
+                self.err_add_out("RV64 Sv64 page table is unsupported")
+                return
+            elif mode == 10: # Sv57
+                self.quiet_info_add_out("RV64 Sv57 page table")
+                self.bits = {
+                    "ENTRY_SIZE": 8,
+                    "L5_BITS": 9, "L4_BITS": 9, "L3_BITS": 9, "L2_BITS": 9, "L1_BITS": 9, "OFFSET": 12,
+                }
+                if not self.use_cached_mapping("mappings", satp=satp, sstatus=sstatus):
+                    self.mappings = None
+                    self.pagewalk_L5()
+                    self.pagewalk_L4()
+                    self.pagewalk_L3()
+                    self.pagewalk_L2()
+                    self.pagewalk_L1()
+                    self.merge_mappings()
+            elif mode == 9: # Sv48
+                self.quiet_info_add_out("RV64 Sv48 page table")
+                self.bits = {
+                    "ENTRY_SIZE": 8,
+                    "L4_BITS": 9, "L3_BITS": 9, "L2_BITS": 9, "L1_BITS": 9, "OFFSET": 12,
+                }
+                if not self.use_cached_mapping("mappings", satp=satp, sstatus=sstatus):
+                    self.mappings = None
+                    self.pagewalk_L4()
+                    self.pagewalk_L3()
+                    self.pagewalk_L2()
+                    self.pagewalk_L1()
+                    self.merge_mappings()
+            elif mode == 8: # Sv39
+                self.quiet_info_add_out("RV64 Sv39 page table")
+                self.bits = {
+                    "ENTRY_SIZE": 8,
+                    "L3_BITS": 9, "L2_BITS": 9, "L1_BITS": 9, "OFFSET": 12,
+                }
+                if not self.use_cached_mapping("mappings", satp=satp, sstatus=sstatus):
+                    self.mappings = None
+                    self.pagewalk_L3()
+                    self.pagewalk_L2()
+                    self.pagewalk_L1()
+                    self.merge_mappings()
+            else:
+                self.err_add_out("RV64 unknown mode")
+                return
+        else:
+            if mode == 0:
+                self.err_add_out("RV32 bare page table is unsupported")
+                return
+            elif mode == 1: # Sv32
+                self.quiet_info_add_out("RV32 Sv32 page table")
+                self.bits = {
+                    "ENTRY_SIZE": 4,
+                    "L2_BITS": 10, "L1_BITS": 10, "OFFSET": 12,
+                }
+                if not self.use_cached_mapping("mappings", satp=satp, sstatus=sstatus):
+                    self.mappings = None
+                    self.pagewalk_L2()
+                    self.pagewalk_L1()
+                    self.merge_mappings()
+
+        self.flags_strings_cache = {}
+        self.save_mapping_cache()
+        self.make_out(self.mappings)
+        return
+
+
+
+class PageTableArm32(PageTable):
+    """Dump pagetable for ARM Cortex-A. PL2 pagewalk is unsupported."""
+
+    mapping_cache_fields = ("ttbr0_mappings", "ttbr1_mappings")
+
+    def get_system_register(self, name):
+        aliases = {"SCTLR": "SCTLR_EL1", "TTBCR": "TCR_EL1", "ID_MMFR0": "ID_MMFR0_EL1"}
+        value = get_register("${}{}".format(name, self.suffix))
+        if value is None and name in aliases:
+            value = get_register("${}{}".format(aliases[name], self.suffix))
+        return value
+
+    def format_flags_short(self, flag_info):
+        return self.__format_flags_short(flag_info, self.PXN)
+
+    def __format_flags_short(self, flag_info, gPXN):
+        flag_info_key = (tuple(flag_info), gPXN)
+        x = self.flags_strings_cache.get(flag_info_key, None)
+        if x is not None:
+            return x
+
+        flags = []
+
+        XN = "XN" in flag_info
+        PXN = ("PXN" in flag_info) & gPXN
+
+        # AP[2:0] access permissions model
+        if "AP=000" in flag_info:
+            if XN is False and PXN is False:
+                flags += ["PL0/---", "PL1/---"] #
+            elif XN is False and PXN is True:
+                flags += ["PL0/---", "PL1/---"] # PXN
+            elif XN is True and PXN is False:
+                flags += ["PL0/---", "PL1/---"] # XN
+            elif XN is True and PXN is True:
+                flags += ["PL0/---", "PL1/---"] # XN, PXN
+        elif "AP=001" in flag_info:
+            if XN is False and PXN is False:
+                flags += ["PL0/---", "PL1/RWX"] #
+            elif XN is False and PXN is True:
+                flags += ["PL0/---", "PL1/RW-"] # PXN
+            elif XN is True and PXN is False:
+                flags += ["PL0/---", "PL1/RW-"] # XN
+            elif XN is True and PXN is True:
+                flags += ["PL0/---", "PL1/RW-"] # XN, PXN
+        elif "AP=010" in flag_info:
+            if XN is False and PXN is False:
+                flags += ["PL0/R-X", "PL1/RWX"] #
+            elif XN is False and PXN is True:
+                flags += ["PL0/R-X", "PL1/RW-"] # PXN
+            elif XN is True and PXN is False:
+                flags += ["PL0/R--", "PL1/RW-"] # XN
+            elif XN is True and PXN is True:
+                flags += ["PL0/R--", "PL1/RW-"] # XN, PXN
+        elif "AP=011" in flag_info:
+            if XN is False and PXN is False:
+                flags += ["PL0/RWX", "PL1/RWX"] #
+            elif XN is False and PXN is True:
+                flags += ["PL0/RWX", "PL1/RW-"] # PXN
+            elif XN is True and PXN is False:
+                flags += ["PL0/RW-", "PL1/RW-"] # XN
+            elif XN is True and PXN is True:
+                flags += ["PL0/RW-", "PL1/RW-"] # XN, PXN
+        elif "AP=100" in flag_info:
+            flags += ["PL0/???", "PL1/???"] # undefined (reserved)
+        elif "AP=101" in flag_info:
+            if XN is False and PXN is False:
+                flags += ["PL0/---", "PL1/R-X"] #
+            elif XN is False and PXN is True:
+                flags += ["PL0/---", "PL1/R--"] # PXN
+            elif XN is True and PXN is False:
+                flags += ["PL0/---", "PL1/R--"] # XN
+            elif XN is True and PXN is True:
+                flags += ["PL0/---", "PL1/R--"] # XN, PXN
+        elif "AP=110" in flag_info: # deprecated
+            if XN is False and PXN is False:
+                flags += ["PL0/R-X", "PL1/R-X"] #
+            elif XN is False and PXN is True:
+                flags += ["PL0/R-X", "PL1/R--"] # PXN
+            elif XN is True and PXN is False:
+                flags += ["PL0/R--", "PL1/R--"] # XN
+            elif XN is True and PXN is True:
+                flags += ["PL0/R--", "PL1/R--"] # XN, PXN
+        elif "AP=111" in flag_info:
+            if XN is False and PXN is False:
+                flags += ["PL0/R-X", "PL1/R-X"] #
+            elif XN is False and PXN is True:
+                flags += ["PL0/R-X", "PL1/R--"] # PXN
+            elif XN is True and PXN is False:
+                flags += ["PL0/R--", "PL1/R--"] # XN
+            elif XN is True and PXN is True:
+                flags += ["PL0/R--", "PL1/R--"] # XN, PXN
+        # AP[2:1] access permissions model
+        elif "AP=00" in flag_info:
+            if XN is False and PXN is False:
+                flags += ["PL0/---", "PL1/RWX"] #
+            elif XN is False and PXN is True:
+                flags += ["PL0/---", "PL1/RW-"] # PXN
+            elif XN is True and PXN is False:
+                flags += ["PL0/---", "PL1/RW-"] # XN
+            elif XN is True and PXN is True:
+                flags += ["PL0/---", "PL1/RW-"] # XN, PXN
+        elif "AP=01" in flag_info:
+            if XN is False and PXN is False:
+                flags += ["PL0/RWX", "PL1/RWX"] #
+            elif XN is False and PXN is True:
+                flags += ["PL0/RWX", "PL1/RW-"] # PXN
+            elif XN is True and PXN is False:
+                flags += ["PL0/RW-", "PL1/RW-"] # XN
+            elif XN is True and PXN is True:
+                flags += ["PL0/RW-", "PL1/RW-"] # XN, PXN
+        elif "AP=10" in flag_info:
+            if XN is False and PXN is False:
+                flags += ["PL0/---", "PL1/R-X"] #
+            elif XN is False and PXN is True:
+                flags += ["PL0/---", "PL1/R--"] # PXN
+            elif XN is True and PXN is False:
+                flags += ["PL0/---", "PL1/R--"] # XN
+            elif XN is True and PXN is True:
+                flags += ["PL0/---", "PL1/R--"] # XN, PXN
+        elif "AP=11" in flag_info:
+            if XN is False and PXN is False:
+                flags += ["PL0/R-X", "PL1/R-X"] #
+            elif XN is False and PXN is True:
+                flags += ["PL0/R-X", "PL1/R--"] # PXN
+            elif XN is True and PXN is False:
+                flags += ["PL0/R--", "PL1/R--"] # XN
+            elif XN is True and PXN is True:
+                flags += ["PL0/R--", "PL1/R--"] # XN, PXN
+
+        if "NS" in flag_info:
+            flags += ["NS"]
+
+        if not self.args.simple:
+            # short description has no `AF` bit
+
+            if "nG" not in flag_info:
+                flags += ["GLOBAL"]
+
+        flag_string = " ".join(flags)
+        self.flags_strings_cache[flag_info_key] = flag_string
+        return flag_string
+
+    def format_flags_long(self, flag_info):
+        return self.__format_flags_long(flag_info, self.PXN)
+
+    def __format_flags_long(self, flag_info, gPXN):
+        flag_info_key = (tuple(flag_info), gPXN)
+        x = self.flags_strings_cache.get(flag_info_key, None)
+        if x is not None:
+            return x
+
+        flags = []
+
+        # AP/APTable parsing
+        if "AP=00" in flag_info:
+            disable_write_access = 0
+            enable_unpriv_access = 0
+        elif "AP=01" in flag_info:
+            disable_write_access = 0
+            enable_unpriv_access = 1
+        elif "AP=10" in flag_info:
+            disable_write_access = 1
+            enable_unpriv_access = 0
+        elif "AP=11" in flag_info:
+            disable_write_access = 1
+            enable_unpriv_access = 1
+        if "APTable2=00" in flag_info:
+            pass
+        elif "APTable2=01" in flag_info:
+            enable_unpriv_access &= 0
+        elif "APTable2=10" in flag_info:
+            disable_write_access |= 1
+        elif "APTable2=11" in flag_info:
+            disable_write_access |= 1
+            enable_unpriv_access &= 0
+        if "APTable1=00" in flag_info:
+            pass
+        elif "APTable1=01" in flag_info:
+            enable_unpriv_access &= 0
+        elif "APTable1=10" in flag_info:
+            disable_write_access |= 1
+        elif "APTable1=11" in flag_info:
+            disable_write_access |= 1
+            enable_unpriv_access &= 0
+        AP = (disable_write_access << 1) | enable_unpriv_access
+
+        # XN/XNTable, PXN/PXNTable, NS/NSTable parsing
+        XN = "XN" in flag_info
+        XN |= "XNTable2" in flag_info
+        XN |= "XNTable1" in flag_info
+        PXN = "PXN" in flag_info
+        PXN |= "PXNTable2" in flag_info
+        PXN |= "PXNTable1" in flag_info
+        PXN &= gPXN
+        NS = "NS" in flag_info
+        NS |= "NSTable2" in flag_info
+        NS |= "NSTable1" in flag_info
+
+        # AP[2:1] access permissions model
+        if AP == 0b00:
+            if XN is False and PXN is False:
+                flags += ["PL0/---", "PL1/RWX"] #
+            elif XN is False and PXN is True:
+                flags += ["PL0/---", "PL1/RW-"] # PXN
+            elif XN is True and PXN is False:
+                flags += ["PL0/---", "PL1/RW-"] # XN
+            elif XN is True and PXN is True:
+                flags += ["PL0/---", "PL1/RW-"] # XN, PXN
+        elif AP == 0b01:
+            if XN is False and PXN is False:
+                flags += ["PL0/RWX", "PL1/RWX"] #
+            elif XN is False and PXN is True:
+                flags += ["PL0/RWX", "PL1/RW-"] # PXN
+            elif XN is True and PXN is False:
+                flags += ["PL0/RW-", "PL1/RW-"] # XN
+            elif XN is True and PXN is True:
+                flags += ["PL0/RW-", "PL1/RW-"] # XN, PXN
+        elif AP == 0b10:
+            if XN is False and PXN is False:
+                flags += ["PL0/---", "PL1/R-X"] #
+            elif XN is False and PXN is True:
+                flags += ["PL0/---", "PL1/R--"] # PXN
+            elif XN is True and PXN is False:
+                flags += ["PL0/---", "PL1/R--"] # XN
+            elif XN is True and PXN is True:
+                flags += ["PL0/---", "PL1/R--"] # XN, PXN
+        elif AP == 0b11:
+            if XN is False and PXN is False:
+                flags += ["PL0/R-X", "PL1/R-X"] #
+            elif XN is False and PXN is True:
+                flags += ["PL0/R-X", "PL1/R--"] # PXN
+            elif XN is True and PXN is False:
+                flags += ["PL0/R--", "PL1/R--"] # XN
+            elif XN is True and PXN is True:
+                flags += ["PL0/R--", "PL1/R--"] # XN, PXN
+
+        if NS:
+            flags += ["NS"]
+
+        if not self.args.simple:
+            if "AF" in flag_info:
+                flags += ["ACCESSED"]
+            if "nG" not in flag_info:
+                flags += ["GLOBAL"]
+
+        flag_string = " ".join(flags)
+        self.flags_strings_cache[flag_info_key] = flag_string
+        return flag_string
+
+    def do_pagewalk_short(self, table_base, range_start=0):
+        self.mappings = []
+
+        def has_next_level(entry):
+            return (entry & 0b11) == 0b01
+
+        def is_section(entry):
+            return (entry & 0b11) in [0b10, 0b11] and ((entry >> 18) & 1) == 0
+
+        def is_super_section(entry):
+            return self.XP and (entry & 0b11) in [0b10, 0b11] and ((entry >> 18) & 1) == 1
+
+        def is_large_page(entry):
+            return (entry & 0b11) == 0b01
+
+        def is_small_page(entry):
+            return (entry & 0b11) in [0b10, 0b11]
+
+        # 1st level parse
+        self.quiet_add_out(titlify("LEVEL 1"))
+        LEVEL1 = []
+        SECTION = []
+        SUPER_SECTION = []
+        COUNT = 0
+        entries = self.read_memory(table_base, 4 * (2 ** (12 - self.N)))
+        entries = slice_unpack(entries, 4)
+        COUNT += len(entries)
+        for i, entry in enumerate(entries):
+            # present flag
+            if (entry & 0b11) == 0b00:
+                continue
+
+            # calc virtual address
+            new_va = i << 20
+            new_va_end = new_va + (1 << 20)
+
+            if new_va_end <= range_start:
+                continue
+
+            # calc flags
+            flags = []
+            if has_next_level(entry):
+                if self.XP and ((entry >> 2) & 1) == 1:
+                    flags.append("PXN")
+                if self.XP and ((entry >> 3) & 1) == 1:
+                    flags.append("NS")
+                flags.append("domain={:#x}".format((entry >> 5) & 0b1111))
+            elif is_section(entry):
+                if ((entry >> 0) & 1) == 1:
+                    flags.append("PXN")
+                if ((entry >> 2) & 1) == 1:
+                    flags.append("B")
+                if ((entry >> 3) & 1) == 1:
+                    flags.append("C")
+                if self.XP and ((entry >> 4) & 1) == 1:
+                    flags.append("XN")
+                flags.append("domain={:#x}".format((entry >> 5) & 0b1111))
+                ap = (((entry >> 15) & 1) << 2) + ((entry >> 10) & 0b11)
+                if self.AFE: # AP[2:1] access permissions model # codespell:ignore
+                    flags.append("AP={:02b}".format(ap >> 1))
+                else: # AP[2:0] access permissions model
+                    flags.append("AP={:03b}".format(ap))
+                flags.append("TEX={:#x}".format((entry >> 12) & 0b111))
+                if self.XP and ((entry >> 16) & 1) == 1:
+                    flags.append("S")
+                if self.XP and ((entry >> 17) & 1) == 1:
+                    flags.append("nG")
+                if self.XP and ((entry >> 19) & 1) == 1:
+                    flags.append("NS")
+            elif is_super_section(entry):
+                if ((entry >> 0) & 1) == 1:
+                    flags.append("PXN")
+                if ((entry >> 2) & 1) == 1:
+                    flags.append("B")
+                if ((entry >> 3) & 1) == 1:
+                    flags.append("C")
+                if ((entry >> 4) & 1) == 1:
+                    flags.append("XN")
+                ap = (((entry >> 15) & 1) << 2) + ((entry >> 10) & 0b11)
+                if self.AFE: # AP[2:1] access permissions model # codespell:ignore
+                    flags.append("AP={:02b}".format(ap >> 1))
+                else: # AP[2:0] access permissions model
+                    flags.append("AP={:03b}".format(ap))
+                flags.append("TEX={:#x}".format((entry >> 12) & 0b111))
+                if ((entry >> 16) & 1) == 1:
+                    flags.append("S")
+                if ((entry >> 17) & 1) == 1:
+                    flags.append("nG")
+                if ((entry >> 19) & 1) == 1:
+                    flags.append("NS")
+            else:
+                raise ValueError("Unsupported descriptor: {:#x}".format(entry))
+
+            # calc next table (drop the flag bits)
+            if has_next_level(entry):
+                next_level_table = entry & 0xffff_fc00
+            elif is_section(entry):
+                next_level_table = entry & 0xfff0_0000
+            elif is_super_section(entry):
+                next_level_table = entry & 0xff00_0000             # PA[31:24]
+                next_level_table += ((entry >> 20) & 0b1111) << 32 # PA[35:32]
+                next_level_table += ((entry >> 5) & 0b1111) << 36  # PA[39:36]
+
+            # make entry
+            if has_next_level(entry):
+                LEVEL1.append([new_va, next_level_table, flags])
+                entry_type = "TABLE"
+            elif is_section(entry):
+                virt_addr = new_va
+                phys_addr = next_level_table
+                page_size = 1 * 1024 * 1024
+                page_count = 1
+                SECTION.append(PageTable.Entry(virt_addr, phys_addr, page_size, page_count, self.format_flags_short(flags)))
+                entry_type = "SECTION"
+            elif is_super_section(entry):
+                virt_addr = new_va
+                phys_addr = next_level_table
+                group_start = i & ~15
+                repeated = all(value == entry for value in entries[group_start:group_start + 16])
+                page_size = (16 if repeated else 1) * 1024 * 1024
+                page_count = 1
+                if repeated:
+                    virt_addr &= ~0xff_ffff
+                else:
+                    phys_addr += virt_addr & 0xff_ffff
+                if not repeated or i == group_start:
+                    SUPER_SECTION.append(PageTable.Entry(
+                        virt_addr, phys_addr, page_size, page_count, self.format_flags_short(flags),
+                    ))
+                entry_type = "SUPER_SECTION"
+
+            if is_super_section(entry):
+                new_va, new_va_end = virt_addr, virt_addr + page_size
+
+            # dump
+            if self.args.print_each_level:
+                if self.is_not_trace_target(new_va, new_va_end):
+                    continue
+                addr = table_base + i * 4
+                line = "{:#018x}: {:#018x} (virt:{:#018x}-{:#018x},type:{:s}) {:s}".format(
+                    addr, entry, new_va, new_va_end, entry_type, " ".join(flags),
+                )
+                if self.is_not_filter_target(line):
+                    continue
+                self.out.append(line)
+
+        if self.args.print_each_level:
+            self.out.append(titlify(""))
+
+        self.quiet_info_add_out("Number of entries: {:d}".format(COUNT))
+        self.quiet_info_add_out("Level 1 Entry: {:d}".format(len(LEVEL1)))
+        self.quiet_info_add_out("PT Entry (supersection; 16MB): {:d}".format(len(SUPER_SECTION)))
+        self.quiet_info_add_out("PT Entry (section; 1MB): {:d}".format(len(SECTION)))
+        self.quiet_info_add_out("Invalid entries: {:d}".format(
+            COUNT - len(LEVEL1) - sum(entry.total_size >> 20 for entry in SUPER_SECTION) - len(SECTION),
+        ))
+        self.mappings += SECTION + SUPER_SECTION
+
+        # 2nd level parse
+        self.quiet_add_out(titlify("LEVEL 2"))
+        LARGE = []
+        SMALL = []
+        COUNT = 0
+
+        for va_base, table_base, parent_flags in ProgressBar(LEVEL1, desc="LEVEL 2", disable=self.args.quiet):
+            entries = self.read_memory(table_base, 4 * (2 ** 8))
+            entries = slice_unpack(entries, 4)
+            COUNT += len(entries)
+            for i, entry in enumerate(entries):
+                # present flag
+                if (entry & 0b11) == 0b00:
+                    continue
+
+                # calc virtual address
+                virt_addr = va_base + (i << 12)
+                virt_addr_end = virt_addr + (1 << 12)
+
+                # calc flags
+                flags = parent_flags.copy()
+                if is_large_page(entry):
+                    if ((entry >> 2) & 1) == 1:
+                        flags.append("B")
+                    if ((entry >> 3) & 1) == 1:
+                        flags.append("C")
+                    ap = (((entry >> 9) & 1) << 2) + ((entry >> 4) & 0b11)
+                    if self.AFE: # AP[2:1] access permissions model # codespell:ignore
+                        flags.append("AP={:02b}".format(ap >> 1))
+                    else: # AP[2:0] access permissions model
+                        flags.append("AP={:03b}".format(ap))
+                    if ((entry >> 10) & 1) == 1:
+                        flags.append("S")
+                    if ((entry >> 11) & 1) == 1:
+                        flags.append("nG")
+                    flags.append("TEX={:#x}".format((entry >> 12) & 0b111))
+                    if ((entry >> 15) & 1) == 1:
+                        flags.append("XN")
+                elif is_small_page(entry):
+                    if ((entry >> 0) & 1) == 1:
+                        flags.append("XN")
+                    if ((entry >> 2) & 1) == 1:
+                        flags.append("B")
+                    if ((entry >> 3) & 1) == 1:
+                        flags.append("C")
+                    ap = (((entry >> 9) & 1) << 2) + ((entry >> 4) & 0b11)
+                    if self.AFE: # AP[2:1] access permissions model # codespell:ignore
+                        flags.append("AP={:02b}".format(ap >> 1))
+                    else: # AP[2:0] access permissions model
+                        flags.append("AP={:03b}".format(ap))
+                    flags.append("TEX={:#x}".format((entry >> 6) & 0b111))
+                    if ((entry >> 10) & 1) == 1:
+                        flags.append("S")
+                    if ((entry >> 11) & 1) == 1:
+                        flags.append("nG")
+
+                # calc physical addr (drop the flag bits)
+                if is_large_page(entry):
+                    phys_addr = entry & 0xffff_0000
+                elif is_small_page(entry):
+                    phys_addr = entry & 0xffff_f000
+
+                # make entry
+                if is_large_page(entry):
+                    group_start = i & ~15
+                    repeated = all(value == entry for value in entries[group_start:group_start + 16])
+                    page_size = (64 if repeated else 4) * 1024
+                    page_count = 1
+                    if repeated:
+                        virt_addr &= ~0xffff
+                    else:
+                        phys_addr += virt_addr & 0xffff
+                    if not repeated or i == group_start:
+                        LARGE.append(PageTable.Entry(
+                            virt_addr, phys_addr, page_size, page_count, self.format_flags_short(flags),
+                        ))
+                    entry_type = "LARGE"
+                elif is_small_page(entry):
+                    page_size = 4 * 1024
+                    page_count = 1
+                    SMALL.append(PageTable.Entry(virt_addr, phys_addr, page_size, page_count, self.format_flags_short(flags)))
+                    entry_type = "SMALL"
+
+                virt_addr_end = virt_addr + page_size
+
+                # dump
+                if self.args.print_each_level:
+                    if self.is_not_trace_target(virt_addr, virt_addr_end):
+                        continue
+                    addr = table_base + i * 4
+                    line = "{:#018x}: {:#018x} (virt:{:#018x}-{:#018x},type:{:s}) {:s}".format(
+                        addr, entry, virt_addr, virt_addr_end, entry_type, " ".join(flags),
+                    )
+                    if self.is_not_filter_target(line):
+                        continue
+                    self.out.append(line)
+
+        if self.args.print_each_level:
+            self.out.append(titlify(""))
+
+        self.quiet_info_add_out("Number of entries: {:d}".format(COUNT))
+        self.quiet_info_add_out("PT Entry (large; 64KB): {:d}".format(len(LARGE)))
+        self.quiet_info_add_out("PT Entry (small; 4KB): {:d}".format(len(SMALL)))
+        self.quiet_info_add_out("Invalid entries: {:d}".format(
+            COUNT - sum(entry.total_size >> 12 for entry in LARGE) - len(SMALL),
+        ))
+        self.mappings += LARGE + SMALL
+
+        self.quiet_add_out(titlify("Total"))
+        self.quiet_info_add_out("PT Entry (Total): {:d}".format(len(self.mappings)))
+        self.mappings = sorted(self.mappings)
+        return
+
+    def do_pagewalk_long(self, table_base, va_base=0):
+        self.mappings = []
+
+        def has_next_level(entry):
+            return (entry & 0b11) == 0b11
+
+        def is_1GB_page(entry):
+            return (entry & 0b11) == 0b01
+
+        def is_2MB_page(entry):
+            return (entry & 0b11) == 0b01
+
+        self.quiet_add_out(titlify("LEVEL 1"))
+        if self.N < 2:
+            # 1st level parse
+            LEVEL1 = []
+            GB = []
+            COUNT = 0
+            l1_count = 1 << max(0, 2 - self.N)
+            entries = self.read_memory(table_base, 8 * l1_count)
+            entries = slice_unpack(entries, 8)
+            COUNT += len(entries)
+            for i, entry in enumerate(entries):
+                # present flag
+                if (entry & 1) == 0:
+                    continue
+
+                # calc virtual address
+                new_va = va_base | (i << 30)
+                new_va_end = new_va + (1 << 30)
+
+                # calc flags
+                flags = []
+                if has_next_level(entry):
+                    if ((entry >> 59) & 1) == 1:
+                        flags.append("PXNTable1")
+                    if ((entry >> 60) & 1) == 1:
+                        flags.append("XNTable1")
+                    flags.append("APTable1={:02b}".format((entry >> 61) & 0b11))
+                    if ((entry >> 63) & 1) == 1:
+                        flags.append("NSTable1")
+                elif is_1GB_page(entry):
+                    flags.append("AttrIndx={:03b}".format((entry >> 2) & 0b111))
+                    if ((entry >> 5) & 1) == 1:
+                        flags.append("NS")
+                    flags.append("AP={:02b}".format((entry >> 6) & 0b11))
+                    flags.append("SH={:02b}".format((entry >> 8) & 0b11))
+                    if ((entry >> 10) & 1) == 1:
+                        flags.append("AF")
+                    if ((entry >> 11) & 1) == 1:
+                        flags.append("nG")
+                    if ((entry >> 52) & 1) == 1:
+                        flags.append("Contiguous")
+                    if ((entry >> 53) & 1) == 1:
+                        flags.append("PXN")
+                    if ((entry >> 54) & 1) == 1:
+                        flags.append("XN")
+
+                # calc next table (drop the flag bits)
+                if has_next_level(entry):
+                    next_level_table = entry & 0x0000_00ff_ffff_f000
+                elif is_1GB_page(entry):
+                    next_level_table = entry & 0x0000_00ff_c000_0000
+
+                # make entry
+                if has_next_level(entry):
+                    LEVEL1.append([new_va, next_level_table, flags])
+                    entry_type = "TABLE"
+                elif is_1GB_page(entry):
+                    virt_addr = new_va
+                    phys_addr = next_level_table
+                    page_size = 1 * 1024 * 1024 * 1024
+                    page_count = 1
+                    GB.append(PageTable.Entry(virt_addr, phys_addr, page_size, page_count, self.format_flags_long(flags)))
+                    entry_type = "1GB-PAGE"
+
+                # dump
+                if self.args.print_each_level:
+                    if self.is_not_trace_target(new_va, new_va_end):
+                        continue
+                    addr = table_base + i * 8
+                    line = "{:#018x}: {:#018x} (virt:{:#018x}-{:#018x},type:{:s}) {:s}".format(
+                        addr, entry, new_va, new_va_end, entry_type, " ".join(flags),
+                    )
+                    if self.is_not_filter_target(line):
+                        continue
+                    self.out.append(line)
+
+            if self.args.print_each_level:
+                self.out.append(titlify(""))
+
+            self.quiet_info_add_out("Number of entries: {:d}".format(COUNT))
+            self.quiet_info_add_out("Level 1 Entry: {:d}".format(len(LEVEL1)))
+            self.quiet_info_add_out("PT Entry (1GB): {:d}".format(len(GB)))
+            self.quiet_info_add_out("Invalid entries: {:d}".format(COUNT - len(LEVEL1) - len(GB)))
+            self.mappings += GB
+        else:
+            self.quiet_info_add_out("LEVEL 1 is skipped")
+            flags = []
+            LEVEL1 = [[va_base, table_base, flags]]
+
+        # 2nd level parse
+        self.quiet_add_out(titlify("LEVEL 2"))
+        LEVEL2 = []
+        MB = []
+        COUNT = 0
+        for va_base, table_base, parent_flags in ProgressBar(LEVEL1, desc="LEVEL 2", disable=self.args.quiet):
+            if self.N >= 2:
+                l2_count = 1 << (11 - self.N)
+            else:
+                l2_count = 512
+            entries = self.read_memory(table_base, 8 * l2_count)
+            entries = slice_unpack(entries, 8)
+            COUNT += len(entries)
+            for i, entry in enumerate(entries):
+                # present flag
+                if (entry & 1) == 0:
+                    continue
+
+                # calc virtual address
+                new_va = va_base | (i << 21)
+                new_va_end = new_va + (1 << 21)
+
+                # calc flags
+                flags = parent_flags.copy()
+                if has_next_level(entry):
+                    if ((entry >> 59) & 1) == 1:
+                        flags.append("PXNTable2")
+                    if ((entry >> 60) & 1) == 1:
+                        flags.append("XNTable2")
+                    flags.append("APTable2={:02b}".format((entry >> 61) & 0b11))
+                    if ((entry >> 63) & 1) == 1:
+                        flags.append("NSTable2")
+                elif is_2MB_page(entry):
+                    flags.append("AttrIndx={:03b}".format((entry >> 2) & 0b111))
+                    if ((entry >> 5) & 1) == 1:
+                        flags.append("NS")
+                    flags.append("AP={:02b}".format((entry >> 6) & 0b11))
+                    flags.append("SH={:02b}".format((entry >> 8) & 0b11))
+                    if ((entry >> 10) & 1) == 1:
+                        flags.append("AF")
+                    if ((entry >> 11) & 1) == 1:
+                        flags.append("nG")
+                    if ((entry >> 52) & 1) == 1:
+                        flags.append("Contiguous")
+                    if ((entry >> 53) & 1) == 1:
+                        flags.append("PXN")
+                    if ((entry >> 54) & 1) == 1:
+                        flags.append("XN")
+
+                # calc next table (drop the flag bits)
+                if has_next_level(entry):
+                    next_level_table = entry & 0x0000_00ff_ffff_f000
+                elif is_2MB_page(entry):
+                    next_level_table = entry & 0x0000_00ff_ffe0_0000
+
+                # make entry
+                if has_next_level(entry):
+                    LEVEL2.append([new_va, next_level_table, flags])
+                    entry_type = "TABLE"
+                elif is_2MB_page(entry):
+                    virt_addr = new_va
+                    phys_addr = next_level_table
+                    page_size = 2 * 1024 * 1024
+                    page_count = 1
+                    MB.append(PageTable.Entry(virt_addr, phys_addr, page_size, page_count, self.format_flags_long(flags)))
+                    entry_type = "2MB-PAGE"
+
+                # dump
+                if self.args.print_each_level:
+                    if self.is_not_trace_target(new_va, new_va_end):
+                        continue
+                    addr = table_base + i * 8
+                    line = "{:#018x}: {:#018x} (virt:{:#018x}-{:#018x},type:{:s}) {:s}".format(
+                        addr, entry, new_va, new_va_end, entry_type, " ".join(flags),
+                    )
+                    if self.is_not_filter_target(line):
+                        continue
+                    self.out.append(line)
+
+        if self.args.print_each_level:
+            self.out.append(titlify(""))
+
+        self.quiet_info_add_out("Number of entries: {:d}".format(COUNT))
+        self.quiet_info_add_out("Level 2 Entry: {:d}".format(len(LEVEL2)))
+        self.quiet_info_add_out("PT Entry (2MB): {:d}".format(len(MB)))
+        self.quiet_info_add_out("Invalid entries: {:d}".format(COUNT - len(LEVEL2) - len(MB)))
+        self.mappings += MB
+
+        # 3rd level parse
+        self.quiet_add_out(titlify("LEVEL 3"))
+        KB = []
+        COUNT = 0
+
+        for va_base, table_base, parent_flags in ProgressBar(LEVEL2, desc="LEVEL 3", disable=self.args.quiet):
+            entries = self.read_memory(table_base, 8 * (2 ** 9))
+            entries = slice_unpack(entries, 8)
+            COUNT += len(entries)
+            for i, entry in enumerate(entries):
+                # present flag
+                if (entry & 0b11) != 0b11:
+                    continue
+
+                # calc virtual address
+                virt_addr = va_base | (i << 12)
+                virt_addr_end = virt_addr + (1 << 12)
+
+                # calc flags
+                flags = parent_flags.copy()
+                flags.append("AttrIndx={:03b}".format((entry >> 2) & 0b111))
+                if ((entry >> 5) & 1) == 1:
+                    flags.append("NS")
+                flags.append("AP={:02b}".format((entry >> 6) & 0b11))
+                flags.append("SH={:02b}".format((entry >> 8) & 0b11))
+                if ((entry >> 10) & 1) == 1:
+                    flags.append("AF")
+                if ((entry >> 11) & 1) == 1:
+                    flags.append("nG")
+                if ((entry >> 52) & 1) == 1:
+                    flags.append("Contiguous")
+                if ((entry >> 53) & 1) == 1:
+                    flags.append("PXN")
+                if ((entry >> 54) & 1) == 1:
+                    flags.append("XN")
+
+                # calc physical addr (drop the flag bits)
+                phys_addr = entry & 0x0000_00ff_ffff_f000
+
+                # make entry
+                page_size = 4 * 1024
+                page_count = 1
+                KB.append(PageTable.Entry(virt_addr, phys_addr, page_size, page_count, self.format_flags_long(flags)))
+                entry_type = "4KB-PAGE"
+
+                # dump
+                if self.args.print_each_level:
+                    if self.is_not_trace_target(virt_addr, virt_addr_end):
+                        continue
+                    addr = table_base + i * 8
+                    line = "{:#018x}: {:#018x} (virt:{:#018x}-{:#018x},type:{:s}) {:s}".format(
+                        addr, entry, virt_addr, virt_addr_end, entry_type, " ".join(flags),
+                    )
+                    if self.is_not_filter_target(line):
+                        continue
+                    self.out.append(line)
+
+        if self.args.print_each_level:
+            self.out.append(titlify(""))
+
+        self.quiet_info_add_out("Number of entries: {:d}".format(COUNT))
+        self.quiet_info_add_out("PT Entry (4KB): {:d}".format(len(KB)))
+        self.quiet_info_add_out("Invalid entries: {:d}".format(COUNT - len(KB)))
+        self.mappings += KB
+
+        self.quiet_add_out(titlify("Total"))
+        self.quiet_info_add_out("PT Entry (Total): {:d}".format(len(self.mappings)))
+        self.mappings = sorted(self.mappings)
+        return
+
+    def pagewalk_short(self):
+        self.out.append(titlify("$TTBR0_EL1{}".format(self.suffix), color="bold", msg_color="bold"))
+
+        TTBR0_EL1 = get_register("$TTBR0_EL1{}".format(self.suffix))
+        if TTBR0_EL1 is None:
+            TTBR0_EL1 = get_register("$TTBR0", use_mbed_exec=True)
+        if TTBR0_EL1 is None:
+            self.err_add_out("Could not find $TTBR0_EL1{}".format(self.suffix))
+            return
+
+        TTBCR = self.get_system_register("TTBCR")
+        if TTBCR is None:
+            TTBCR = get_register("$TTBCR", use_mbed_exec=True)
+        if TTBCR is None:
+            self.err_add_out("Could not find $TTBCR{}".format(self.suffix))
+            return
+
+        # pagewalk TTBR0_EL1
+        self.N = TTBCR & 0b111
+        x = 14 - self.N
+        pl0_base = ((TTBR0_EL1 & 0xffff_ffff) >> x) << x
+        self.quiet_info_add_out("$TTBR0_EL1{}: {:#x}".format(self.suffix, TTBR0_EL1))
+        self.quiet_info_add_out("$TTBCR{}: {:#x}".format(self.suffix, TTBCR))
+        self.quiet_info_add_out("PL0 base: {:#x}".format(pl0_base))
+        if TTBCR & (1 << 4):
+            self.quiet_info_add_out("PD0: 1 (TTBR0 is not used)")
+            self.ttbr0_mappings = []
+        elif not self.use_cached_mapping(
+            "ttbr0_mappings", TTBR0_EL1=TTBR0_EL1, TTBCR=TTBCR, suffix=self.suffix,
+            SCTLR=self.get_system_register("SCTLR"),
+        ):
+            self.flags_strings_cache = {}
+            self.do_pagewalk_short(pl0_base)
+            self.flags_strings_cache = None
+            self.merge_mappings()
+            self.ttbr0_mappings = self.mappings.copy()
+        self.make_out(self.ttbr0_mappings)
+
+        # pagewalk TTBR1_EL1
+        self.out.append(titlify("$TTBR1_EL1{}".format(self.suffix), color="bold", msg_color="bold"))
+
+        TTBR1_EL1 = get_register("$TTBR1_EL1{}".format(self.suffix))
+        if TTBR1_EL1 is None:
+            TTBR1_EL1 = get_register("$TTBR1", use_mbed_exec=True)
+        if TTBR1_EL1 is None:
+            self.err_add_out("Could not find $TTBR1_EL1{}".format(self.suffix))
+            return
+
+        if self.N:
+            pl1_vabase = 1 << (32 - self.N)
+        else:
+            pl1_vabase = None
+        # Whenever TTBCR.N is nonzero, the size of the translation table addressed by TTBR1 is 16KB (N=0).
+        x1 = 14
+        pl1_base = ((TTBR1_EL1 & 0xffff_ffff) >> x1) << x1
+        self.N = 0
+        if pl1_vabase is not None and TTBCR & (1 << 5):
+            self.quiet_info_add_out("PD1: 1 (TTBR1 is not used)")
+            self.ttbr1_mappings = []
+        elif pl1_vabase is not None:
+            self.quiet_info_add_out("$TTBR1_EL1{}: {:#x}".format(self.suffix, TTBR1_EL1))
+            self.quiet_info_add_out("$TTBCR{}: {:#x}".format(self.suffix, TTBCR))
+            self.quiet_info_add_out("PL1 base: {:#x}".format(pl1_base))
+            self.quiet_info_add_out("PL1 va_base: {:#x}".format(pl1_vabase))
+            if not self.use_cached_mapping(
+                "ttbr1_mappings", TTBR1_EL1=TTBR1_EL1, TTBCR=TTBCR, suffix=self.suffix,
+                SCTLR=self.get_system_register("SCTLR"),
+            ):
+                self.flags_strings_cache = {}
+                self.do_pagewalk_short(pl1_base, pl1_vabase)
+                self.flags_strings_cache = None
+                self.merge_mappings()
+                self.ttbr1_mappings = self.mappings.copy()
+            self.make_out(self.ttbr1_mappings)
+        else:
+            self.quiet_info_add_out("$TTBR1_EL1{} is unused".format(self.suffix))
+        return
+
+    def pagewalk_long(self):
+        self.out.append(titlify("$TTBR0_EL1{}".format(self.suffix), color="bold", msg_color="bold"))
+
+        TTBR0_EL1 = get_register("$TTBR0_EL1{}".format(self.suffix))
+        if TTBR0_EL1 is None:
+            TTBR0_EL1 = get_register("$TTBR0", use_mbed_exec=True)
+        if TTBR0_EL1 is None:
+            self.err_add_out("Could not find $TTBR0_EL1{}".format(self.suffix))
+            return
+
+        TTBCR = self.get_system_register("TTBCR")
+        if TTBCR is None:
+            TTBCR = get_register("$TTBCR", use_mbed_exec=True)
+        if TTBCR is None:
+            self.err_add_out("Could not find $TTBCR{}".format(self.suffix))
+            return
+
+        def get_x(TxSZ):
+            if TxSZ > 1:
+                return 14 - TxSZ
+            else:
+                return 5 - TxSZ
+
+        # pagewalk TTBR0_EL1
+        T0SZ = TTBCR & 0b111
+        T1SZ = (TTBCR >> 16) & 0b111
+        self.N = T0SZ
+        x0 = get_x(T0SZ)
+        pl0_base = ((TTBR0_EL1 & 0xff_ffff_ffff) >> x0) << x0
+        self.quiet_info_add_out("$TTBR0_EL1{}: {:#x}".format(self.suffix, TTBR0_EL1))
+        self.quiet_info_add_out("$TTBCR{}: {:#x}".format(self.suffix, TTBCR))
+        self.quiet_info_add_out("T0SZ: {:#x}".format(T0SZ))
+        self.quiet_info_add_out("PL0 base: {:#x}".format(pl0_base))
+        EPD0 = (TTBCR >> 7) & 1
+        self.quiet_info_add_out("EPD0: {:d}".format(EPD0))
+        if not self.use_cached_mapping(
+            "ttbr0_mappings", TTBR0_EL1=TTBR0_EL1, TTBCR=TTBCR, suffix=self.suffix,
+            SCTLR=self.get_system_register("SCTLR"),
+        ):
+            self.flags_strings_cache = {}
+            self.do_pagewalk_long(pl0_base)
+            self.flags_strings_cache = None
+            self.merge_mappings()
+            self.ttbr0_mappings = self.mappings.copy()
+        self.make_out(self.ttbr0_mappings, walk_disabled=bool(EPD0))
+
+        # pagewalk TTBR1_EL1
+        self.out.append(titlify("$TTBR1_EL1{}".format(self.suffix), color="bold", msg_color="bold"))
+
+        TTBR1_EL1 = get_register("$TTBR1_EL1{}".format(self.suffix))
+        if TTBR1_EL1 is None:
+            TTBR1_EL1 = get_register("$TTBR1", use_mbed_exec=True)
+        if TTBR1_EL1 is None:
+            self.err_add_out("Could not find $TTBR1_EL1{}".format(self.suffix))
+            return
+
+        if T0SZ != 0 or T1SZ != 0:
+            self.N = T1SZ
+            x1 = get_x(T1SZ)
+            pl1_base = ((TTBR1_EL1 & 0xff_ffff_ffff) >> x1) << x1
+            if T1SZ == 0:
+                # T0SZ selects the TTBR0/TTBR1 boundary, but the TTBR1 first
+                # level table is still indexed by VA[31:30].
+                pl1_table_vabase = 0
+                pl1_range_start = 2 ** (32 - T0SZ)
+            else:
+                pl1_table_vabase = (2 ** 32) - (2 ** (32 - T1SZ))
+                pl1_range_start = pl1_table_vabase
+            self.quiet_info_add_out("$TTBR1_EL1{}: {:#x}".format(self.suffix, TTBR1_EL1))
+            self.quiet_info_add_out("$TTBCR{}: {:#x}".format(self.suffix, TTBCR))
+            self.quiet_info_add_out("T1SZ: {:#x}".format(T1SZ))
+            self.quiet_info_add_out("PL1 base: {:#x}".format(pl1_base))
+            self.quiet_info_add_out("PL1 table va_base: {:#x}".format(pl1_table_vabase))
+            self.quiet_info_add_out("PL1 range start: {:#x}".format(pl1_range_start))
+            EPD1 = (TTBCR >> 23) & 1
+            self.quiet_info_add_out("EPD1: {:d}".format(EPD1))
+            if not self.use_cached_mapping(
+                "ttbr1_mappings", TTBR1_EL1=TTBR1_EL1, TTBCR=TTBCR, suffix=self.suffix,
+                SCTLR=self.get_system_register("SCTLR"),
+            ):
+                self.flags_strings_cache = {}
+                self.do_pagewalk_long(pl1_base, pl1_table_vabase)
+                self.flags_strings_cache = None
+                self.mappings = [
+                    mapping for mapping in self.mappings
+                    if mapping.vaddr + mapping.page_size * mapping.page_count > pl1_range_start
+                ]
+                self.merge_mappings()
+                self.ttbr1_mappings = self.mappings.copy()
+            self.make_out(self.ttbr1_mappings, walk_disabled=bool(EPD1))
+        else:
+            self.quiet_info_add_out("$TTBR1_EL1{} is unused".format(self.suffix))
+        return
+
+    def pagewalk(self, args):
+        self.prepare_pagewalk(args)
+        # check use the register with`_S` suffix or not, and Seucre mode or not
+        if self.args.force_prefix_s is None:
+            # auto detect
+            SCR_S = get_register("$SCR_S")
+            SCR = get_register("$SCR")
+
+            if (SCR, SCR_S) == (None, None):
+                self.SECURE = False
+                self.suffix = ""
+
+            elif SCR is not None and SCR_S is None:
+                # do not use "_S"
+                self.SECURE = (SCR & 0x1) == 0 # NS bit
+                self.suffix = ""
+
+            elif SCR is None and SCR_S is not None:
+                # use "_S"
+                self.SECURE = (SCR_S & 0x1) == 0 # NS bit
+                self.suffix = "_S"
+
+            elif SCR is not None and SCR_S is not None:
+                if is_support_secure_world():
+                    # do not use "_S"
+                    self.SECURE = (SCR & 0x1) == 0 # NS bit
+                    self.suffix = ""
+                else:
+                    # use "_S"
+                    self.SECURE = (SCR_S & 0x1) == 0 # NS bit
+                    self.suffix = "_S"
+
+        elif self.args.force_prefix_s is True:
+            # use "_S"
+            SCR_S = get_register("$SCR_S")
+            if SCR_S is not None:
+                self.SECURE = (SCR_S & 0x1) == 0 # NS bit
+            else:
+                self.SECURE = False
+            self.suffix = "_S"
+
+        elif self.args.force_prefix_s is False:
+            # do not use "_S"
+            SCR = get_register("$SCR")
+            if SCR is not None:
+                self.SECURE = (SCR & 0x1) == 0 # NS bit
+            else:
+                self.SECURE = False
+            self.suffix = ""
+
+        # check XP, AFE # codespell:ignore
+        SCTLR = self.get_system_register("SCTLR")
+        if SCTLR is not None:
+            self.XP = ((SCTLR >> 23) & 0x1) == 1
+            self.AFE = ((SCTLR >> 29) & 0x1) == 1 # codespell:ignore
+        else:
+            self.XP = False
+            self.AFE = False # codespell:ignore
+
+        if not self.XP:
+            self.quiet_info_add_out("VMSAv6 subpages is enabled")
+            self.SECURE = False
+        else:
+            self.quiet_info_add_out("Secure world: {}".format(self.SECURE))
+
+        # check enabled LPAE
+        TTBCR = self.get_system_register("TTBCR")
+        if TTBCR is not None:
+            self.LPAE = ((TTBCR >> 31) & 0x1) == 1
+        else:
+            self.LPAE = False
+
+        # check PXN supported
+        ID_MMFR0 = self.get_system_register("ID_MMFR0")
+        if ID_MMFR0 is not None:
+            self.PXN = ((ID_MMFR0 >> 2) & 0x1) == 1
+        else:
+            self.PXN = False
+
+        if self.PXN:
+            self.quiet_info_add_out("{:s} is supported".format(Color.boldify("PXN")))
+        else:
+            self.quiet_info_add_out("PXN is unsupported")
+        self.quiet_info_add_out("PAN is unimplemented on all ARMv7")
+
+        # pagewalk
+        if self.LPAE:
+            self.quiet_info_add_out("{:s} is enabled (using long description)".format(Color.boldify("LPAE")))
+            self.pagewalk_long()
+        else:
+            self.quiet_info_add_out("LPAE is disabled (using short description)")
+            self.pagewalk_short()
+        self.save_mapping_cache()
+        return
+
+    def arm32_optee_exact_pagewalk(self, args):
+        self.prepare_pagewalk(args)
+        entries = AddrMap.get_maps(command="pagewalk arm -S --quiet --no-pager --disable-color")
+        if not entries:
+            return
+
+        flags_width = max(20, *[len(e.flags) for e in entries])
+        fmt = "{:37s}  {:37s}  {:10s}  {:%ds}  {:s}" % flags_width
+        legend = ["Virtual address start-end", "Physical address start-end", "Total size", "Flags", "Hint (Maybe)"]
+        gef_print(GefUtil.make_legend(fmt.format(*legend)))
+
+        """
+        gef> pagewalk --optee -n -q
+        Virtual address start-end              Physical address start-end             Total size  Flags                 Hint (Maybe)
+        0x000000000e100000-0x000000000e101000  0x000000000e100000-0x000000000e101000  0x1000      [PL0/--- PL1/R-X]     TEE-OS bootstrap region
+        0x00000000be700000-0x00000000be900000  0x000000007fe00000-0x0000000080000000  0x200000    [PL0/--- PL1/RW- NS]  NS<->S shared memory
+        0x00000000be9ab000-0x00000000bea00000  0x000000000e1ab000-0x000000000e200000  0x55000     [PL0/--- PL1/RW-]
+        0x00000000bea00000-0x00000000bf800000  0x000000000e200000-0x000000000f000000  0xe00000    [PL0/--- PL1/RW-]
+        0x00000000bf900000-0x00000000bfa00000  0x000000000e000000-0x000000000e100000  0x100000    [PL0/--- PL1/RW-]
+        0x00000000bfa00000-0x00000000bfb00000  0x0000000009000000-0x0000000009100000  0x100000    [PL0/--- PL1/RW-]     UART0_BASE
+        0x00000000bfb00000-0x00000000bfc00000  0x0000000008000000-0x0000000008100000  0x100000    [PL0/--- PL1/RW-]     GIC_BASE
+        0x00000000c2879000-0x00000000c2924000  0x000000000e100000-0x000000000e1ab000  0xab000     [PL0/--- PL1/R-X]     TEE-OS .text
+        0x00000000c2924000-0x00000000c295f000  0x000000000e1ab000-0x000000000e1e6000  0x3b000     [PL0/--- PL1/RW-]     TEE-OS .data / stack
+        gef>
+        """
+        text_end = None
+        pl0_count = 0
+        after_ldelf = False
+        after_ta = False
+
+        for e in entries:
+            if "PL0/---" in e.flags:
+                after_ta = False
+
+            # https://github.com/OP-TEE/optee_os/blob/master/core/arch/arm/plat-vexpress/conf.mk
+            if e.pstart == 0x0e10_0000:
+                if e.vstart == 0x0e10_0000 and e.vsize == 0x1000:
+                    hint = "TEE-OS bootstrap region"
+                else:
+                    hint = "TEE-OS .text"
+                    text_end = e.vend
+            elif text_end and e.vstart == text_end:
+                hint = "TEE-OS .data / stack"
+            elif e.pstart == 0x7fe0_0000:
+                hint = "NS<->S shared memory"
+            # https://github.com/OP-TEE/optee_os/blob/master/core/arch/arm/plat-vexpress/platform_config.h
+            elif e.pstart == 0x0800_0000:
+                hint = "GIC_BASE"
+            elif e.pstart == 0x0900_0000:
+                hint = "UART0_BASE"
+            elif e.pstart == 0x0904_0000:
+                hint = "UART1_BASE"
+            elif e.pstart == 0x0910_0000:
+                hint = "PCSC_BASE"
+            # others
+            elif "[PL0/RW-" in e.flags and pl0_count == 0:
+                hint = "ldelf"
+            elif "[PL0/R-X" in e.flags:
+                if pl0_count == 0:
+                    hint = "ldelf"
+                    after_ldelf = True
+                else:
+                    hint = "TA"
+                    after_ta = True
+                pl0_count += 1
+            elif after_ldelf:
+                hint = "ldelf"
+                after_ldelf = False
+            elif after_ta:
+                if "NS" in e.flags and e.vsize == 0x1000:
+                    hint = "TA (param)"
+                else:
+                    hint = "TA .data / stack"
+            else:
+                hint = ""
+            gef_print("{:#018x}-{:#018x}  {:#018x}-{:#018x}  {:<#10x}  {:{:d}s}  {:s}".format(
+                e.vstart, e.vend, e.pstart, e.pend, e.vsize, e.flags, flags_width, hint,
+            ).rstrip())
+        return
+
+
+
+class PageTableArm64(PageTable):
+    """Dump pagetable for ARM64 Cortex-A (ARM v8.7 base)."""
+
+    mapping_cache_fields = (
+        "ttbr0el1_mappings", "ttbr1el1_mappings",
+        "ttbr0el2_mappings", "ttbr1el2_mappings",
+        "vttbrel2_mappings", "ttbr0el3_mappings",
+    )
+
+    # If you want to dump the secure world memory map, you need to break in the secure world.
+    # This is because unlike ARMv7, TTBR0_EL1_S and TTBR1_EL1_S do not exist.
+    # It is difficult to know the correct value of the secure world's system registers while in the normal world,
+    # as the secure monitor saves all system registers to memory when the world changes.
+
+    def read_mem_wrapper(self, addr, size=8):
+        """
+        When pagewalking EL0/EL1 of the guest OS, gdb pagewalks the physical memory according to $TTBR0_ELx.
+        However, even if you try to read the physical memory, access to the address will fail
+        because it is actually an intermediate physical memory.
+        Therefore, in order to perform a pagewalk of EL0/EL1, EL2 mapping information is required.
+        This function is for reading from physical memory with that in mind.
+        """
+
+        if self.EL3_M and self.args.target_el == 3:
+            with QemuMonitor.use_mmu_mode("virt"):
+                return read_memory(addr, size)
+
+        # translate via EL2 mappings
+        if self.EL2_VM and self.args.target_el == 1 and self.el2_mappings is not None:
+
+            def search_pa(addr):
+                for entry_info in self.el2_mappings:
+                    va = entry_info.vaddr
+                    entry = entry_info.paddr
+                    sz = entry_info.total_size
+                    pa = entry
+                    if va <= addr < va + sz:
+                        offset = addr - va
+                        return pa + offset, sz - offset
+                else: # not found
+                    raise gdb.MemoryError("Could not translate {:#x} via the EL2 mappings".format(addr))
+                return
+
+            out = b""
+            while size > 0:
+                paddr, available_sz = search_pa(addr)
+                chunk_size = min(size, available_sz)
+                out += self.read_memory(paddr, chunk_size)
+                addr += chunk_size
+                size -= chunk_size
+            return out
+
+        # direct physmem read
+        return self.read_memory(addr, size)
+
+    def translate_stage2_mappings(self, mappings):
+        stage2 = sorted(self.el2_mappings or [])
+        starts = [entry.vaddr for entry in stage2]
+        translated = []
+        for entry in mappings:
+            end = entry.paddr + entry.total_size
+            index = max(0, bisect.bisect_right(starts, entry.paddr) - 1)
+            while index < len(stage2) and stage2[index].vaddr < end:
+                next_entry = stage2[index]
+                index += 1
+                start = max(entry.paddr, next_entry.vaddr)
+                size = min(end, next_entry.vaddr + next_entry.total_size) - start
+                if size <= 0:
+                    continue
+                flags = entry.flags.split()
+                for el in ("EL0", "EL1"):
+                    prefix = el + "/"
+                    permissions = next((flag[len(prefix):] for flag in next_entry.flags.split()
+                                        if flag.startswith(prefix)), "---")
+                    flags = [prefix + "".join(a if a == b else "-" for a, b in zip(flag[len(prefix):], permissions))
+                             if flag.startswith(prefix) else flag for flag in flags]
+                page_size = min(entry.page_size, next_entry.page_size)
+                translated.append(PageTable.Entry(
+                    entry.vaddr + start - entry.paddr, next_entry.paddr + start - next_entry.vaddr,
+                    page_size, size // page_size, " ".join(flags),
+                ))
+        return translated
+
+    def format_flags_stage2(self, flag_info):
+        flag_info_key = tuple(flag_info)
+        x = self.flags_strings_cache.get(flag_info_key, None)
+        if x is not None:
+            return x
+
+        flags = []
+
+        if "S2AP=00" in flag_info:
+            if "XN=00" in flag_info:
+                flags += ["EL0/---", "EL1/---"]
+            elif "XN=01" in flag_info:
+                flags += ["EL0/---", "EL1/---"]
+            elif "XN=10" in flag_info:
+                flags += ["EL0/---", "EL1/---"]
+            elif "XN=11" in flag_info:
+                flags += ["EL0/---", "EL1/---"]
+        elif "S2AP=01" in flag_info:
+            if "XN=00" in flag_info:
+                flags += ["EL0/R-X", "EL1/R-X"]
+            elif "XN=01" in flag_info:
+                flags += ["EL0/R-X", "EL1/R--"]
+            elif "XN=10" in flag_info:
+                flags += ["EL0/R--", "EL1/R--"]
+            elif "XN=11" in flag_info:
+                flags += ["EL0/R--", "EL1/R-X"]
+        elif "S2AP=10" in flag_info:
+            if "XN=00" in flag_info:
+                flags += ["EL0/-W-", "EL1/-W-"]
+            elif "XN=01" in flag_info:
+                flags += ["EL0/-W-", "EL1/-W-"]
+            elif "XN=10" in flag_info:
+                flags += ["EL0/-W-", "EL1/-W-"]
+            elif "XN=11" in flag_info:
+                flags += ["EL0/-W-", "EL1/-W-"]
+        elif "S2AP=11" in flag_info:
+            if "XN=00" in flag_info:
+                flags += ["EL0/RWX", "EL1/RWX"]
+            elif "XN=01" in flag_info:
+                flags += ["EL0/RWX", "EL1/RW-"]
+            elif "XN=10" in flag_info:
+                flags += ["EL0/RW-", "EL1/RW-"]
+            elif "XN=11" in flag_info:
+                flags += ["EL0/RW-", "EL1/RWX"]
+
+        if not self.args.simple:
+            if "AF" in flag_info:
+                flags += ["ACCESSED"]
+            if "DBM" in flag_info:
+                flags += ["DIRTY"]
+            # stage2 has no `nG` bit
+
+        flag_string = " ".join(flags)
+        self.flags_strings_cache[flag_info_key] = flag_string
+        return flag_string
+
+    def format_flags(self, flag_info):
+        return self.__format_flags(flag_info, self.args.target_el, self.EL1_WXN, self.EL2_WXN, self.EL2_M20, self.EL3_WXN)
+
+    def __format_flags(self, flag_info, TargetEL, EL1_WXN, EL2_WXN, EL2_M20, EL3_WXN):
+        flag_info_key = (tuple(flag_info), TargetEL, EL1_WXN, EL2_WXN, EL2_M20, EL3_WXN)
+        x = self.flags_strings_cache.get(flag_info_key, None)
+        if x is not None:
+            return x
+
+        flags = []
+
+        # AP/APTable parsing
+        if "AP=00" in flag_info:
+            disable_write_access = 0
+            enable_unpriv_access = 0
+        elif "AP=01" in flag_info:
+            disable_write_access = 0
+            enable_unpriv_access = 1
+        elif "AP=10" in flag_info:
+            disable_write_access = 1
+            enable_unpriv_access = 0
+        elif "AP=11" in flag_info:
+            disable_write_access = 1
+            enable_unpriv_access = 1
+        if "APTable2=00" in flag_info:
+            pass
+        elif "APTable2=01" in flag_info:
+            enable_unpriv_access &= 0
+        elif "APTable2=10" in flag_info:
+            disable_write_access |= 1
+        elif "APTable2=11" in flag_info:
+            disable_write_access |= 1
+            enable_unpriv_access &= 0
+        if "APTable1=00" in flag_info:
+            pass
+        elif "APTable1=01" in flag_info:
+            enable_unpriv_access &= 0
+        elif "APTable1=10" in flag_info:
+            disable_write_access |= 1
+        elif "APTable1=11" in flag_info:
+            disable_write_access |= 1
+            enable_unpriv_access &= 0
+        if "APTable0=00" in flag_info:
+            pass
+        elif "APTable0=01" in flag_info:
+            enable_unpriv_access &= 0
+        elif "APTable0=10" in flag_info:
+            disable_write_access |= 1
+        elif "APTable0=11" in flag_info:
+            disable_write_access |= 1
+            enable_unpriv_access &= 0
+        if "APTable-1=00" in flag_info:
+            pass
+        elif "APTable-1=01" in flag_info:
+            enable_unpriv_access &= 0
+        elif "APTable-1=10" in flag_info:
+            disable_write_access |= 1
+        elif "APTable-1=11" in flag_info:
+            disable_write_access |= 1
+            enable_unpriv_access &= 0
+
+        # UXN/UXNTable, XN/XNTable, PXN/PXNTable, NS/NSTable parsing
+        UXN = "UXN" in flag_info
+        UXN |= "UXNTable2" in flag_info
+        UXN |= "UXNTable1" in flag_info
+        UXN |= "UXNTable0" in flag_info
+        UXN |= "UXNTable-1" in flag_info
+        XN = "XN" in flag_info
+        XN |= "XNTable2" in flag_info
+        XN |= "XNTable1" in flag_info
+        XN |= "XNTable0" in flag_info
+        XN |= "XNTable-1" in flag_info
+        PXN = "PXN" in flag_info
+        PXN |= "PXNTable2" in flag_info
+        PXN |= "PXNTable1" in flag_info
+        PXN |= "PXNTable0" in flag_info
+        PXN |= "PXNTable-1" in flag_info
+        NS = "NS" in flag_info
+        NS |= "NSTable2" in flag_info
+        NS |= "NSTable1" in flag_info
+        NS |= "NSTable0" in flag_info
+        NS |= "NSTable-1" in flag_info
+
+        if TargetEL == 1:
+            # always support 2VA ranges
+            if UXN is False and PXN is False:
+                if disable_write_access == 0 and enable_unpriv_access == 0:
+                    if not EL1_WXN:
+                        flags += ["EL0/--X", "EL1/RWX"]
+                    else:
+                        flags += ["EL0/--X", "EL1/RW-"]
+                elif disable_write_access == 0 and enable_unpriv_access == 1:
+                    if not EL1_WXN:
+                        flags += ["EL0/RWX", "EL1/RW-"]
+                    else:
+                        flags += ["EL0/RW-", "EL1/RW-"]
+                elif disable_write_access == 1 and enable_unpriv_access == 0:
+                    flags += ["EL0/--X", "EL1/R-X"]
+                elif disable_write_access == 1 and enable_unpriv_access == 1:
+                    flags += ["EL0/R-X", "EL1/R-X"]
+            elif UXN is False and PXN is True:
+                if disable_write_access == 0 and enable_unpriv_access == 0:
+                    flags += ["EL0/--X", "EL1/RW-"]
+                elif disable_write_access == 0 and enable_unpriv_access == 1:
+                    if not EL1_WXN:
+                        flags += ["EL0/RWX", "EL1/RW-"]
+                    else:
+                        flags += ["EL0/RW-", "EL1/RW-"]
+                elif disable_write_access == 1 and enable_unpriv_access == 0:
+                    flags += ["EL0/--X", "EL1/R--"]
+                elif disable_write_access == 1 and enable_unpriv_access == 1:
+                    flags += ["EL0/R-X", "EL1/R--"]
+            elif UXN is True and PXN is False:
+                if disable_write_access == 0 and enable_unpriv_access == 0:
+                    if not EL1_WXN:
+                        flags += ["EL0/---", "EL1/RWX"]
+                    else:
+                        flags += ["EL0/---", "EL1/RW-"]
+                elif disable_write_access == 0 and enable_unpriv_access == 1:
+                    flags += ["EL0/RW-", "EL1/RW-"]
+                elif disable_write_access == 1 and enable_unpriv_access == 0:
+                    flags += ["EL0/---", "EL1/R-X"]
+                elif disable_write_access == 1 and enable_unpriv_access == 1:
+                    flags += ["EL0/R--", "EL1/R-X"]
+            elif UXN is True and PXN is True:
+                if disable_write_access == 0 and enable_unpriv_access == 0:
+                    flags += ["EL0/---", "EL1/RW-"]
+                elif disable_write_access == 0 and enable_unpriv_access == 1:
+                    flags += ["EL0/RW-", "EL1/RW-"]
+                elif disable_write_access == 1 and enable_unpriv_access == 0:
+                    flags += ["EL0/---", "EL1/R--"]
+                elif disable_write_access == 1 and enable_unpriv_access == 1:
+                    flags += ["EL0/R--", "EL1/R--"]
+        elif TargetEL == 2:
+            if EL2_M20:
+                # support 2VA ranges if HCR_EL2.{TGE,E2H} == {1,1} # codespell:ignore
+                if UXN is False and PXN is False:
+                    if disable_write_access == 0 and enable_unpriv_access == 0:
+                        if not EL2_WXN:
+                            flags += ["EL0/--X", "EL2/RWX"]
+                        else:
+                            flags += ["EL0/--X", "EL2/RW-"]
+                    elif disable_write_access == 0 and enable_unpriv_access == 1:
+                        if not EL2_WXN:
+                            flags += ["EL0/RWX", "EL2/RW-"]
+                        else:
+                            flags += ["EL0/RW-", "EL2/RW-"]
+                    elif disable_write_access == 1 and enable_unpriv_access == 0:
+                        flags += ["EL0/--X", "EL2/R-X"]
+                    elif disable_write_access == 1 and enable_unpriv_access == 1:
+                        flags += ["EL0/R-X", "EL2/R-X"]
+                elif UXN is False and PXN is True:
+                    if disable_write_access == 0 and enable_unpriv_access == 0:
+                        flags += ["EL0/--X", "EL2/RW-"]
+                    elif disable_write_access == 0 and enable_unpriv_access == 1:
+                        if not EL2_WXN:
+                            flags += ["EL0/RWX", "EL2/RW-"]
+                        else:
+                            flags += ["EL0/RW-", "EL2/RW-"]
+                    elif disable_write_access == 1 and enable_unpriv_access == 0:
+                        flags += ["EL0/--X", "EL2/R--"]
+                    elif disable_write_access == 1 and enable_unpriv_access == 1:
+                        flags += ["EL0/R-X", "EL2/R--"]
+                elif UXN is True and PXN is False:
+                    if disable_write_access == 0 and enable_unpriv_access == 0:
+                        if not EL2_WXN:
+                            flags += ["EL0/---", "EL2/RWX"]
+                        else:
+                            flags += ["EL0/---", "EL2/RW-"]
+                    elif disable_write_access == 0 and enable_unpriv_access == 1:
+                        flags += ["EL0/RW-", "EL2/RW-"]
+                    elif disable_write_access == 1 and enable_unpriv_access == 0:
+                        flags += ["EL0/---", "EL2/R-X"]
+                    elif disable_write_access == 1 and enable_unpriv_access == 1:
+                        flags += ["EL0/R--", "EL2/R-X"]
+                elif UXN is True and PXN is True:
+                    if disable_write_access == 0 and enable_unpriv_access == 0:
+                        flags += ["EL0/---", "EL2/RW-"]
+                    elif disable_write_access == 0 and enable_unpriv_access == 1:
+                        flags += ["EL0/RW-", "EL2/RW-"]
+                    elif disable_write_access == 1 and enable_unpriv_access == 0:
+                        flags += ["EL0/---", "EL2/R--"]
+                    elif disable_write_access == 1 and enable_unpriv_access == 1:
+                        flags += ["EL0/R--", "EL2/R--"]
+            else:
+                # not support 2VA ranges if HCR_EL2.{TGE,E2H} != {1,1} # codespell:ignore
+                if XN is False:
+                    if disable_write_access == 0:
+                        if not EL2_WXN:
+                            flags += ["EL2/RWX"]
+                        else:
+                            flags += ["EL2/RW-"]
+                    elif disable_write_access == 1:
+                        flags += ["EL2/R-X"]
+                elif XN is True:
+                    if disable_write_access == 0:
+                        flags += ["EL2/RW-"]
+                    elif disable_write_access == 1:
+                        flags += ["EL2/R--"]
+        elif TargetEL == 3:
+            if XN is False:
+                if disable_write_access == 0:
+                    if not EL3_WXN:
+                        flags += ["EL3/RWX"]
+                    else:
+                        flags += ["EL3/RW-"]
+                elif disable_write_access == 1:
+                    flags += ["EL3/R-X"]
+            elif XN is True:
+                if disable_write_access == 0:
+                    flags += ["EL3/RW-"]
+                elif disable_write_access == 1:
+                    flags += ["EL3/R--"]
+        if NS:
+            flags += ["NS"]
+
+        if not self.args.simple:
+            if "AF" in flag_info:
+                flags += ["ACCESSED"]
+            if "DBM" in flag_info:
+                flags += ["DIRTY"]
+            if "nG" not in flag_info:
+                flags += ["GLOBAL"]
+
+        flag_string = " ".join(flags)
+        self.flags_strings_cache[flag_info_key] = flag_string
+        return flag_string
+
+    """
+    Relation diagram when CPU uses
+
+      Stage1                  |     Stage2
+    -------------------------------------------------------
+    +----------------------+  |   +----------------------+
+    | Guest OS table       | -|-> | Virtualization table |
+    +----------------------+  |   +----------------------+
+      TTBR0_EL1, TTBR1_EL1    |     VTTBR0_EL2
+                              |
+    +----------------------+  |
+    | Hypervisor table     |  |
+    +----------------------+  |
+      TTBR0_EL2, TTBR1_EL2    |
+                              |
+    +----------------------+  |
+    | Secure monitor table |  |
+    +----------------------+  |
+      TTBR0_EL3               |
+                              |
+
+    Since it is an implementation that dumps for each EL, consider as follows.
+
+      TargetEL=1              |    TargetEL=2              |    TargetEL=3
+    ---------------------------------------------------------------------------------
+    +----------------------+  |  +----------------------+  |  +----------------------+
+    | Guest OS table       |  |  | Virtualization table |  |  | Secure monitor table |
+    +----------------------+  |  +----------------------+  |  +----------------------+
+      TTBR0_EL1, TTBR1_EL1    |    VTTBR0_EL2              |    TTBR0_EL3
+                              |                            |
+                              |  +----------------------+  |
+                              |  | Hypervisor table     |  |
+                              |  +----------------------+  |
+                              |    TTBR0_EL2, TTBR1_EL2    |
+                              |                            |
+    """
+
+    def parse_bit_range(self, granule_bits, region_bits):
+        if self.FEAT_LVA:
+            IA_LVA_MAX = 52
+        else:
+            IA_LVA_MAX = 48
+        if granule_bits == 12: # 4KB granule
+            if region_bits > 48: # no block descriptor
+                self.LEVELM1_BIT_RANGE = [48, min(IA_LVA_MAX, region_bits)]
+            else:
+                self.LEVELM1_BIT_RANGE = None
+            if region_bits > 39:          # 512GB
+                self.LEVEL0_BIT_RANGE = [39, min(48, region_bits)]
+            else:
+                self.LEVEL0_BIT_RANGE = None
+            if region_bits > 30:          # 1GB
+                self.LEVEL1_BIT_RANGE = [30, min(39, region_bits)]
+            else:
+                self.LEVEL1_BIT_RANGE = None
+            if region_bits > 21:          # 2MB
+                self.LEVEL2_BIT_RANGE = [21, min(30, region_bits)]
+            else:
+                self.LEVEL2_BIT_RANGE = None
+            if region_bits > 12:          # 4KB
+                self.LEVEL3_BIT_RANGE = [12, min(21, region_bits)]
+            else:
+                self.LEVEL3_BIT_RANGE = None
+            self.OFFSET_BIT_RANGE = [0, 12]
+        elif granule_bits == 14: # 16KB granule
+            self.LEVELM1_BIT_RANGE = None
+            if region_bits > 47:  # no block descriptor
+                self.LEVEL0_BIT_RANGE = [47, min(IA_LVA_MAX, region_bits)]
+            else:
+                self.LEVEL0_BIT_RANGE = None
+            if region_bits > 36:          # 64GB
+                self.LEVEL1_BIT_RANGE = [36, min(47, region_bits)]
+            else:
+                self.LEVEL1_BIT_RANGE = None
+            if region_bits > 25:          # 32MB
+                self.LEVEL2_BIT_RANGE = [25, min(36, region_bits)]
+            else:
+                self.LEVEL2_BIT_RANGE = None
+            if region_bits > 14:          # 16KB
+                self.LEVEL3_BIT_RANGE = [14, min(25, region_bits)]
+            else:
+                self.LEVEL3_BIT_RANGE = None
+            self.OFFSET_BIT_RANGE = [0, 14]
+        elif granule_bits == 16: # 64KB granule
+            self.LEVELM1_BIT_RANGE = None
+            self.LEVEL0_BIT_RANGE = None
+            if region_bits > 42:  # 4TB
+                self.LEVEL1_BIT_RANGE = [42, min(IA_LVA_MAX, region_bits)]
+            else:
+                self.LEVEL1_BIT_RANGE = None
+            if region_bits > 29:          # 512MB
+                self.LEVEL2_BIT_RANGE = [29, min(42, region_bits)]
+            else:
+                self.LEVEL2_BIT_RANGE = None
+            if region_bits > 16:          # 64KB
+                self.LEVEL3_BIT_RANGE = [16, min(29, region_bits)]
+            else:
+                self.LEVEL3_BIT_RANGE = None
+            self.OFFSET_BIT_RANGE = [0, 16]
+        else:
+            if not self.silent:
+                self.err_add_out("Unsupported granule_bits")
+            return
+
+        if not self.silent:
+            self.quiet_info_add_out("granule_bits: {:d}".format(granule_bits))
+            self.quiet_info_add_out("LEVELM1_BIT_RANGE: " + str(self.LEVELM1_BIT_RANGE))
+            self.quiet_info_add_out("LEVEL0_BIT_RANGE: " + str(self.LEVEL0_BIT_RANGE))
+            self.quiet_info_add_out("LEVEL1_BIT_RANGE: " + str(self.LEVEL1_BIT_RANGE))
+            self.quiet_info_add_out("LEVEL2_BIT_RANGE: " + str(self.LEVEL2_BIT_RANGE))
+            self.quiet_info_add_out("LEVEL3_BIT_RANGE: " + str(self.LEVEL3_BIT_RANGE))
+            self.quiet_info_add_out("OFFSET_BIT_RANGE: " + str(self.OFFSET_BIT_RANGE))
+        return
+
+    def get_entries_per_table(self, BIT_RANGE, granule_bits, region_bits, is_first_level):
+        if is_first_level and region_bits > BIT_RANGE[1]:
+            idx_bits = {12: 9, 14: 11, 16: 13}[granule_bits]
+            offset_bits = granule_bits
+            remainder = (region_bits - offset_bits) % idx_bits
+            entries_per_table = 1 << (idx_bits + remainder)
+        else:
+            used_from_ia = BIT_RANGE[1] - BIT_RANGE[0]
+            entries_per_table = 1 << used_from_ia
+
+        if not self.silent:
+            self.quiet_info_add_out("Entries per table: {:d}".format(entries_per_table))
+        return entries_per_table
+
+    def do_pagewalk(self, table_base, granule_bits, region_start, region_bits, start_level, is_stage2=False, is_2VAranges=False):
+        # table_base: The start address of pagewalk.
+        # granule_bits: One of [12, 14, 16]; It specifies how to separate the bits used for address translation.
+        # region_start: The base address of translated address.
+        # start_level: The start level of the pagewalking.
+        # is_stage2: Whether VTTBR0_EL2 or not. Affects entry bitfield interpretation.
+        # is_2VAranges: TTBR0/TTBR1 presence at target EL. Affects entry bitfield interpretation.
+        self.mappings = []
+
+        is_4k_granule = granule_bits == 12
+        is_16k_granule = granule_bits == 14
+        is_64k_granule = granule_bits == 16
+
+        def has_next_level(entry): # for Level0, 1, 2 but not Level3
+            return (entry & 0b11) == 0b11
+
+        flags = []
+        TABLE_BASE = [[region_start, table_base, flags]]
+
+
+        # level -1 parse for 4KB granule
+        if not self.silent:
+            self.quiet_add_out(titlify("LEVEL -1"))
+        if self.LEVELM1_BIT_RANGE is not None and start_level == -1:
+            entries_per_table = self.get_entries_per_table(
+                self.LEVELM1_BIT_RANGE, granule_bits, region_bits, is_first_level=(start_level == -1),
+            )
+            LEVELM1 = []
+            COUNT = 0
+            for va_base, table_base, parent_flags in ProgressBar(TABLE_BASE, desc="LEVEL -1", disable=self.args.quiet):
+                entries = self.read_mem_wrapper(table_base, 8 * entries_per_table)
+                entries = slice_unpack(entries, 8)
+                COUNT += len(entries)
+                for i, entry in enumerate(entries):
+                    # present flag
+                    if entry & 1 == 0:
+                        continue
+
+                    # calc virtual address
+                    new_va = va_base + (i << self.LEVELM1_BIT_RANGE[0])
+                    new_va_end = new_va + (1 << self.LEVELM1_BIT_RANGE[0])
+
+                    # calc flags
+                    flags = parent_flags.copy()
+                    if has_next_level(entry):
+                        if is_stage2:
+                            # VTTBR_EL2 does not have level -1
+                            raise ValueError("VTTBR_EL2 does not have level -1")
+                        elif is_2VAranges:
+                            if ((entry >> 59) & 1) == 1:
+                                flags.append("PXNTable-1")
+                            if ((entry >> 60) & 1) == 1:
+                                flags.append("UXNTable-1")
+                            flags.append("APTable-1={:02b}".format((entry >> 61) & 0b11))
+                            if ((entry >> 63) & 1) == 1:
+                                flags.append("NSTable-1")
+                        else:
+                            if ((entry >> 60) & 1) == 1:
+                                flags.append("XNTable-1") # Use XNTable, not UXNTable # PXNTable is undefined
+                            flags.append("APTable-1={:02b}".format((entry >> 61) & 0b11 & 0b10)) # APTable[0] must be 0
+                            if ((entry >> 63) & 1) == 1:
+                                flags.append("NSTable-1")
+                    else:
+                        # In ARMv8.7, level -1 has no block descriptors
+                        raise ValueError("level -1 has no block descriptors")
+
+                    # calc next table / output phys addr (drop the flag bits)
+                    if has_next_level(entry):
+                        # In aRMv8.7, level -1 must be 4k_granule
+                        if self.TCR_ELx_DS:
+                            next_level_table = (entry & 0x0003_ffff_ffff_f000) | (((entry >> 8) & 0b11) << 50)
+                        else:
+                            next_level_table = entry & 0x0003_ffff_ffff_f000
+                    else:
+                        # In ARMv8.7, level -1 has no block descriptors
+                        raise ValueError("level -1 has no block descriptors")
+
+                    # make entry
+                    if has_next_level(entry):
+                        LEVELM1.append([new_va, next_level_table, flags])
+                        entry_type = "TABLE"
+                    else:
+                        # In ARMv8.7, level -1 has no block descriptors
+                        raise ValueError("level -1 has no block descriptors")
+
+                    # dump
+                    if self.args.print_each_level:
+                        if self.is_not_trace_target(new_va, new_va_end):
+                            continue
+                        addr = table_base + i * 8
+                        line = "{:#018x}: {:#018x} (virt:{:#018x}-{:#018x},type:{:s}) {:s}".format(
+                            addr, entry, new_va, new_va_end, entry_type, " ".join(flags),
+                        )
+                        if self.is_not_filter_target(line):
+                            continue
+                        self.out.append(line)
+
+            if not self.silent:
+                if self.args.print_each_level:
+                    self.out.append(titlify(""))
+                self.quiet_info_add_out("Number of entries: {:d}".format(COUNT))
+                self.quiet_info_add_out("Level -1 Entry: {:d}".format(len(LEVELM1)))
+                self.quiet_info_add_out("Invalid entries: {:d}".format(COUNT - len(LEVELM1)))
+            self.mappings += []
+        else:
+            if not self.silent:
+                self.quiet_info_add_out("LEVEL -1 is skipped")
+            LEVELM1 = TABLE_BASE
+
+        # level 0 parse for 4KB/16KB granule
+        if not self.silent:
+            self.quiet_add_out(titlify("LEVEL 0"))
+        if self.LEVEL0_BIT_RANGE is not None and start_level <= 0:
+            entries_per_table = self.get_entries_per_table(
+                self.LEVEL0_BIT_RANGE, granule_bits, region_bits, is_first_level=(start_level == 0),
+            )
+            LEVEL0 = []
+            GB512 = []
+            COUNT = 0
+            for va_base, table_base, parent_flags in ProgressBar(LEVELM1, desc="LEVEL 0", disable=self.args.quiet):
+                entries = self.read_mem_wrapper(table_base, 8 * entries_per_table)
+                entries = slice_unpack(entries, 8)
+                COUNT += len(entries)
+                for i, entry in enumerate(entries):
+                    # present flag
+                    if entry & 1 == 0:
+                        continue
+
+                    # calc virtual address
+                    new_va = va_base + (i << self.LEVEL0_BIT_RANGE[0])
+                    new_va_end = new_va + (1 << self.LEVEL0_BIT_RANGE[0])
+
+                    # calc flags
+                    flags = parent_flags.copy()
+                    if has_next_level(entry):
+                        if is_stage2:
+                            # There are no flags in the table for VTTBR0_EL2.
+                            pass
+                        elif is_2VAranges:
+                            if ((entry >> 59) & 1) == 1:
+                                flags.append("PXNTable0")
+                            if ((entry >> 60) & 1) == 1:
+                                flags.append("UXNTable0")
+                            flags.append("APTable0={:02b}".format((entry >> 61) & 0b11))
+                            if ((entry >> 63) & 1) == 1:
+                                flags.append("NSTable0")
+                        else:
+                            if ((entry >> 60) & 1) == 1:
+                                flags.append("XNTable0") # Use XNTable, not UXNTable # PXNTable is undefined
+                            flags.append("APTable0={:02b}".format((entry >> 61) & 0b11 & 0b10)) # APTable[0] must be 0
+                            if ((entry >> 63) & 1) == 1:
+                                flags.append("NSTable0")
+                    else:
+                        if is_stage2:
+                            flags.append("MemAttr={:#x}".format((entry >> 2) & 0b1111))
+                            flags.append("S2AP={:02b}".format((entry >> 6) & 0b11))
+                            flags.append("SH={:02b}".format((entry >> 8) & 0b11))
+                            if ((entry >> 10) & 1) == 1:
+                                flags.append("AF")
+                            if ((entry >> 51) & 1) == 1:
+                                flags.append("DBM")
+                            if ((entry >> 52) & 1) == 1:
+                                flags.append("Contiguous")
+                            flags.append("XN={:02b}".format((entry >> 53) & 0b11)) # Use XN, not UXN
+                            flags.append("PBHA={:#x}".format((entry >> 59) & 0b1111))
+                        elif is_2VAranges:
+                            flags.append("AttrIndx={:03b}".format((entry >> 2) & 0b111))
+                            if ((entry >> 5) & 1) == 1:
+                                flags.append("NS")
+                            flags.append("AP={:02b}".format((entry >> 6) & 0b11))
+                            flags.append("SH={:02b}".format((entry >> 8) & 0b11))
+                            if ((entry >> 10) & 1) == 1:
+                                flags.append("AF")
+                            if ((entry >> 11) & 1) == 1:
+                                flags.append("nG")
+                            if ((entry >> 16) & 1) == 1:
+                                flags.append("nT")
+                            if ((entry >> 50) & 1) == 1:
+                                flags.append("GP")
+                            if ((entry >> 51) & 1) == 1:
+                                flags.append("DBM")
+                            if ((entry >> 52) & 1) == 1:
+                                flags.append("Contiguous")
+                            if ((entry >> 53) & 1) == 1:
+                                flags.append("PXN")
+                            if ((entry >> 54) & 1) == 1:
+                                flags.append("UXN")
+                            flags.append("PBHA={:#x}".format((entry >> 59) & 0b1111))
+                        else:
+                            flags.append("AttrIndx={:03b}".format((entry >> 2) & 0b111))
+                            if ((entry >> 5) & 1) == 1:
+                                flags.append("NS")
+                            flags.append("AP={:02b}".format((entry >> 6) & 0b11 & 0b10)) # AP[0] must be 0
+                            flags.append("SH={:02b}".format((entry >> 8) & 0b11))
+                            if ((entry >> 10) & 1) == 1:
+                                flags.append("AF")
+                            if ((entry >> 11) & 1) == 1:
+                                flags.append("nG")
+                            if ((entry >> 16) & 1) == 1:
+                                flags.append("nT")
+                            if ((entry >> 50) & 1) == 1:
+                                flags.append("GP")
+                            if ((entry >> 51) & 1) == 1:
+                                flags.append("DBM")
+                            if ((entry >> 52) & 1) == 1:
+                                flags.append("Contiguous")
+                            if ((entry >> 54) & 1) == 1:
+                                flags.append("XN") # Use XN, not UXN # PXN is undefined
+                            flags.append("PBHA={:#x}".format((entry >> 59) & 0b1111))
+
+                    # calc next table / output phys addr (drop the flag bits)
+                    if has_next_level(entry):
+                        if self.FEAT_LPA:
+                            # In aRMv8.7, level 0 must be 4k_granule or 16k_granule
+                            if self.TCR_ELx_DS:
+                                next_level_table = (entry & 0x0003_ffff_ffff_f000) | (((entry >> 8) & 0b11) << 50)
+                            else:
+                                next_level_table = entry & 0x0003_ffff_ffff_f000
+                        else:
+                            next_level_table = entry & 0x0000_ffff_ffff_f000
+                    else:
+                        if self.FEAT_LPA:
+                            # In aRMv8.7, level 0 must be 4k_granule or 16k_granule
+                            if self.TCR_ELx_DS:
+                                phys_addr = (entry & 0x0003_ffff_fffe_0000) | (((entry >> 8) & 0b11) << 50)
+                            else:
+                                phys_addr = entry & 0x0003_ffff_fffe_0000
+                        else:
+                            # In ARMv8.7, level 0 + no-FEAT_LPA has no block descriptors
+                            raise ValueError("level 0 has no block descriptors without FEAT_LPA")
+
+                    # make entry
+                    if has_next_level(entry):
+                        LEVEL0.append([new_va, next_level_table, flags])
+                        entry_type = "TABLE"
+                    else:
+                        virt_addr = new_va
+                        page_count = 1
+                        if is_stage2:
+                            flag_string = self.format_flags_stage2(flags)
+                        else:
+                            flag_string = self.format_flags(flags)
+                        if is_4k_granule:
+                            page_size = 512 * 1024 * 1024 * 1024
+                            GB512.append(PageTable.Entry(virt_addr, phys_addr, page_size, page_count, flag_string))
+                            entry_type = "512GB-PAGE"
+                        else:
+                            raise ValueError("a 512GB page is available only with the 4KB granule")
+
+                    # dump
+                    if self.args.print_each_level:
+                        if self.is_not_trace_target(new_va, new_va_end):
+                            continue
+                        addr = table_base + i * 8
+                        line = "{:#018x}: {:#018x} (virt:{:#018x}-{:#018x},type:{:s}) {:s}".format(
+                            addr, entry, new_va, new_va_end, entry_type, " ".join(flags),
+                        )
+                        if self.is_not_filter_target(line):
+                            continue
+                        self.out.append(line)
+
+            if not self.silent:
+                if self.args.print_each_level:
+                    self.out.append(titlify(""))
+                self.quiet_info_add_out("Number of entries: {:d}".format(COUNT))
+                self.quiet_info_add_out("Level 0 Entry: {:d}".format(len(LEVEL0)))
+                self.quiet_info_add_out("PT Entry (512GB): {:d}".format(len(GB512)))
+                self.quiet_info_add_out("Invalid entries: {:d}".format(COUNT - len(LEVEL0) - len(GB512)))
+            self.mappings += GB512
+        else:
+            if not self.silent:
+                self.quiet_info_add_out("LEVEL 0 is skipped")
+            LEVEL0 = TABLE_BASE
+
+        # level 1 parse for 4KB/16KB/64KB granule
+        if not self.silent:
+            self.quiet_add_out(titlify("LEVEL 1"))
+        if self.LEVEL1_BIT_RANGE is not None and start_level <= 1:
+            entries_per_table = self.get_entries_per_table(
+                self.LEVEL1_BIT_RANGE, granule_bits, region_bits, is_first_level=(start_level == 1),
+            )
+            LEVEL1 = []
+            GB1 = []
+            TB4 = []
+            GB64 = []
+            COUNT = 0
+            for va_base, table_base, parent_flags in ProgressBar(LEVEL0, desc="LEVEL 1", disable=self.args.quiet):
+                entries = self.read_mem_wrapper(table_base, 8 * entries_per_table)
+                entries = slice_unpack(entries, 8)
+                COUNT += len(entries)
+                for i, entry in enumerate(entries):
+                    # present flag
+                    if entry & 1 == 0:
+                        continue
+
+                    # calc virtual address
+                    new_va = va_base + (i << self.LEVEL1_BIT_RANGE[0])
+                    new_va_end = new_va + (1 << self.LEVEL1_BIT_RANGE[0])
+
+                    # calc flags
+                    flags = parent_flags.copy()
+                    if has_next_level(entry):
+                        if is_stage2:
+                            # There are no flags in the table for VTTBR0_EL2.
+                            pass
+                        elif is_2VAranges:
+                            if ((entry >> 59) & 1) == 1:
+                                flags.append("PXNTable1")
+                            if ((entry >> 60) & 1) == 1:
+                                flags.append("UXNTable1")
+                            flags.append("APTable1={:02b}".format((entry >> 61) & 0b11))
+                            if ((entry >> 63) & 1) == 1:
+                                flags.append("NSTable1")
+                        else:
+                            if ((entry >> 60) & 1) == 1:
+                                flags.append("XNTable1") # Use XNTable, not UXNTable # PXNTable is undefined
+                            flags.append("APTable1={:02b}".format((entry >> 61) & 0b11 & 0b10)) # APTable[0] must be 0
+                            if ((entry >> 63) & 1) == 1:
+                                flags.append("NSTable1")
+                    else:
+                        if is_stage2:
+                            flags.append("MemAttr={:#x}".format((entry >> 2) & 0b1111))
+                            flags.append("S2AP={:02b}".format((entry >> 6) & 0b11))
+                            flags.append("SH={:02b}".format((entry >> 8) & 0b11))
+                            if ((entry >> 10) & 1) == 1:
+                                flags.append("AF")
+                            if ((entry >> 51) & 1) == 1:
+                                flags.append("DBM")
+                            if ((entry >> 52) & 1) == 1:
+                                flags.append("Contiguous")
+                            flags.append("XN={:02b}".format((entry >> 53) & 0b11)) # Use XN, not UXN
+                            flags.append("PBHA={:#x}".format((entry >> 59) & 0b1111))
+                        elif is_2VAranges:
+                            flags.append("AttrIndx={:03b}".format((entry >> 2) & 0b111))
+                            if ((entry >> 5) & 1) == 1:
+                                flags.append("NS")
+                            flags.append("AP={:02b}".format((entry >> 6) & 0b11))
+                            flags.append("SH={:02b}".format((entry >> 8) & 0b11))
+                            if ((entry >> 10) & 1) == 1:
+                                flags.append("AF")
+                            if ((entry >> 11) & 1) == 1:
+                                flags.append("nG")
+                            if ((entry >> 16) & 1) == 1:
+                                flags.append("nT")
+                            if ((entry >> 50) & 1) == 1:
+                                flags.append("GP")
+                            if ((entry >> 51) & 1) == 1:
+                                flags.append("DBM")
+                            if ((entry >> 52) & 1) == 1:
+                                flags.append("Contiguous")
+                            if ((entry >> 53) & 1) == 1:
+                                flags.append("PXN")
+                            if ((entry >> 54) & 1) == 1:
+                                flags.append("UXN")
+                            flags.append("PBHA={:#x}".format((entry >> 59) & 0b1111))
+                        else:
+                            flags.append("AttrIndx={:03b}".format((entry >> 2) & 0b111))
+                            if ((entry >> 5) & 1) == 1:
+                                flags.append("NS")
+                            flags.append("AP={:02b}".format((entry >> 6) & 0b11 & 0b10)) # AP[0] must be 0
+                            flags.append("SH={:02b}".format((entry >> 8) & 0b11))
+                            if ((entry >> 10) & 1) == 1:
+                                flags.append("AF")
+                            if ((entry >> 11) & 1) == 1:
+                                flags.append("nG")
+                            if ((entry >> 16) & 1) == 1:
+                                flags.append("nT")
+                            if ((entry >> 50) & 1) == 1:
+                                flags.append("GP")
+                            if ((entry >> 51) & 1) == 1:
+                                flags.append("DBM")
+                            if ((entry >> 52) & 1) == 1:
+                                flags.append("Contiguous")
+                            if ((entry >> 54) & 1) == 1:
+                                flags.append("XN") # Use XN, not UXN # PXN is undefined
+                            flags.append("PBHA={:#x}".format((entry >> 59) & 0b1111))
+
+                    # calc next table / output phys addr (drop the flag bits)
+                    if has_next_level(entry):
+                        if self.FEAT_LPA:
+                            if is_64k_granule:
+                                next_level_table = (entry & 0x0000_ffff_ffff_0000) | (((entry >> 12) & 0b1111) << 48)
+                            else: # 4k or 16k
+                                if self.TCR_ELx_DS:
+                                    next_level_table = (entry & 0x0003_ffff_ffff_f000) | (((entry >> 8) & 0b11) << 50)
+                                else:
+                                    next_level_table = entry & 0x0003_ffff_ffff_f000
+                        else:
+                            next_level_table = entry & 0x0000_ffff_ffff_f000
+                    else:
+                        if self.FEAT_LPA:
+                            if is_64k_granule:
+                                phys_addr = (entry & 0x0000_ffff_fffe_0000) | (((entry >> 12) & 0b1111) << 48)
+                            else: # 4k or 16k
+                                if self.TCR_ELx_DS:
+                                    phys_addr = (entry & 0x0003_ffff_fffe_0000) | (((entry >> 8) & 0b11) << 50)
+                                else:
+                                    phys_addr = entry & 0x0003_ffff_fffe_0000
+                        else:
+                            phys_addr = entry & 0x0000_ffff_fffe_0000
+
+                    # make entry
+                    if has_next_level(entry):
+                        LEVEL1.append([new_va, next_level_table, flags])
+                        entry_type = "TABLE"
+                    else:
+                        virt_addr = new_va
+                        page_count = 1
+                        if is_stage2:
+                            flag_string = self.format_flags_stage2(flags)
+                        else:
+                            flag_string = self.format_flags(flags)
+                        if is_4k_granule:
+                            page_size = 1 * 1024 * 1024 * 1024
+                            GB1.append(PageTable.Entry(virt_addr, phys_addr, page_size, page_count, flag_string))
+                            entry_type = "1GB-PAGE"
+                        elif is_16k_granule:
+                            page_size = 64 * 1024 * 1024 * 1024
+                            GB64.append(PageTable.Entry(virt_addr, phys_addr, page_size, page_count, flag_string))
+                            entry_type = "64GB-PAGE"
+                        elif is_64k_granule:
+                            page_size = 4 * 1024 * 1024 * 1024 * 1024
+                            TB4.append(PageTable.Entry(virt_addr, phys_addr, page_size, page_count, flag_string))
+                            entry_type = "4TB-PAGE"
+
+                    # dump
+                    if self.args.print_each_level:
+                        if self.is_not_trace_target(new_va, new_va_end):
+                            continue
+                        addr = table_base + i * 8
+                        line = "{:#018x}: {:#018x} (virt:{:#018x}-{:#018x},type:{:s}) {:s}".format(
+                            addr, entry, new_va, new_va_end, entry_type, " ".join(flags),
+                        )
+                        if self.is_not_filter_target(line):
+                            continue
+                        self.out.append(line)
+
+            if not self.silent:
+                if self.args.print_each_level:
+                    self.out.append(titlify(""))
+                self.quiet_info_add_out("Number of entries: {:d}".format(COUNT))
+                self.quiet_info_add_out("Level 1 Entry: {:d}".format(len(LEVEL1)))
+                self.quiet_info_add_out("PT Entry (1GB): {:d}".format(len(GB1)))
+                self.quiet_info_add_out("PT Entry (64GB): {:d}".format(len(GB64)))
+                self.quiet_info_add_out("PT Entry (4TB): {:d}".format(len(TB4)))
+                self.quiet_info_add_out("Invalid entries: {:d}".format(COUNT - len(LEVEL1) - len(GB1) - len(GB64) - len(TB4)))
+            self.mappings += GB1 + GB64 + TB4
+        else:
+            if not self.silent:
+                self.quiet_info_add_out("LEVEL 1 is skipped")
+            LEVEL1 = LEVEL0
+
+        # level 2 parse for 4KB/16KB/64KB granule
+        if not self.silent:
+            self.quiet_add_out(titlify("LEVEL 2"))
+        if self.LEVEL2_BIT_RANGE is not None and start_level <= 2:
+            entries_per_table = self.get_entries_per_table(
+                self.LEVEL2_BIT_RANGE, granule_bits, region_bits, is_first_level=(start_level == 2),
+            )
+            LEVEL2 = []
+            MB2 = []
+            MB32 = []
+            MB512 = []
+            COUNT = 0
+            for va_base, table_base, parent_flags in ProgressBar(LEVEL1, desc="LEVEL 2", disable=self.args.quiet):
+                entries = self.read_mem_wrapper(table_base, 8 * entries_per_table)
+                entries = slice_unpack(entries, 8)
+                COUNT += len(entries)
+                for i, entry in enumerate(entries):
+                    # present flag
+                    if entry & 1 == 0:
+                        continue
+
+                    # calc virtual address
+                    new_va = va_base + (i << self.LEVEL2_BIT_RANGE[0])
+                    new_va_end = new_va + (1 << self.LEVEL2_BIT_RANGE[0])
+
+                    # calc flags
+                    flags = parent_flags.copy()
+                    if has_next_level(entry):
+                        if is_stage2:
+                            # There are no flags in the table for VTTBR0_EL2.
+                            pass
+                        elif is_2VAranges:
+                            if ((entry >> 59) & 1) == 1:
+                                flags.append("PXNTable2")
+                            if ((entry >> 60) & 1) == 1:
+                                flags.append("UXNTable2")
+                            flags.append("APTable2={:02b}".format((entry >> 61) & 0b11))
+                            if ((entry >> 63) & 1) == 1:
+                                flags.append("NSTable2")
+                        else:
+                            if ((entry >> 60) & 1) == 1:
+                                flags.append("XNTable2") # Use XNTable, not UXNTable # PXNTable is undefined
+                            flags.append("APTable2={:02b}".format((entry >> 61) & 0b11 & 0b10)) # APTable[0] must be 0
+                            if ((entry >> 63) & 1) == 1:
+                                flags.append("NSTable2")
+                    else:
+                        if is_stage2:
+                            flags.append("MemAttr={:#x}".format((entry >> 2) & 0b1111))
+                            flags.append("S2AP={:02b}".format((entry >> 6) & 0b11))
+                            flags.append("SH={:02b}".format((entry >> 8) & 0b11))
+                            if ((entry >> 10) & 1) == 1:
+                                flags.append("AF")
+                            if ((entry >> 51) & 1) == 1:
+                                flags.append("DBM")
+                            if ((entry >> 52) & 1) == 1:
+                                flags.append("Contiguous")
+                            flags.append("XN={:02b}".format((entry >> 53) & 0b11)) # Use XN, not UXN
+                            flags.append("PBHA={:#x}".format((entry >> 59) & 0b1111))
+                        elif is_2VAranges:
+                            flags.append("AttrIndx={:03b}".format((entry >> 2) & 0b111))
+                            if ((entry >> 5) & 1) == 1:
+                                flags.append("NS")
+                            flags.append("AP={:02b}".format((entry >> 6) & 0b11))
+                            flags.append("SH={:02b}".format((entry >> 8) & 0b11))
+                            if ((entry >> 10) & 1) == 1:
+                                flags.append("AF")
+                            if ((entry >> 11) & 1) == 1:
+                                flags.append("nG")
+                            if ((entry >> 16) & 1) == 1:
+                                flags.append("nT")
+                            if ((entry >> 50) & 1) == 1:
+                                flags.append("GP")
+                            if ((entry >> 51) & 1) == 1:
+                                flags.append("DBM")
+                            if ((entry >> 52) & 1) == 1:
+                                flags.append("Contiguous")
+                            if ((entry >> 53) & 1) == 1:
+                                flags.append("PXN")
+                            if ((entry >> 54) & 1) == 1:
+                                flags.append("UXN")
+                            flags.append("PBHA={:#x}".format((entry >> 59) & 0b1111))
+                        else:
+                            flags.append("AttrIndx={:03b}".format((entry >> 2) & 0b111))
+                            if ((entry >> 5) & 1) == 1:
+                                flags.append("NS")
+                            flags.append("AP={:02b}".format((entry >> 6) & 0b11 & 0b10)) # AP[0] must be 0
+                            flags.append("SH={:02b}".format((entry >> 8) & 0b11))
+                            if ((entry >> 10) & 1) == 1:
+                                flags.append("AF")
+                            if ((entry >> 11) & 1) == 1:
+                                flags.append("nG")
+                            if ((entry >> 16) & 1) == 1:
+                                flags.append("nT")
+                            if ((entry >> 50) & 1) == 1:
+                                flags.append("GP")
+                            if ((entry >> 51) & 1) == 1:
+                                flags.append("DBM")
+                            if ((entry >> 52) & 1) == 1:
+                                flags.append("Contiguous")
+                            if ((entry >> 54) & 1) == 1:
+                                flags.append("XN") # Use XN, not UXN # PXN is undefined
+                            flags.append("PBHA={:#x}".format((entry >> 59) & 0b1111))
+
+                    # calc next table / output phys addr (drop the flag bits)
+                    if has_next_level(entry):
+                        if self.FEAT_LPA:
+                            if is_64k_granule:
+                                next_level_table = (entry & 0x0000_ffff_ffff_0000) | (((entry >> 12) & 0b1111) << 48)
+                            else: # 4k or 16k
+                                if self.TCR_ELx_DS:
+                                    next_level_table = (entry & 0x0003_ffff_ffff_f000) | (((entry >> 8) & 0b11) << 50)
+                                else:
+                                    next_level_table = entry & 0x0003_ffff_ffff_f000
+                        else:
+                            next_level_table = entry & 0x0000_ffff_ffff_f000
+                    else:
+                        if self.FEAT_LPA:
+                            if is_64k_granule:
+                                phys_addr = (entry & 0x0000_ffff_fffe_0000) | (((entry >> 12) & 0b1111) << 48)
+                            else: # 4k or 16k
+                                if self.TCR_ELx_DS:
+                                    phys_addr = (entry & 0x0003_ffff_fffe_0000) | (((entry >> 8) & 0b11) << 50)
+                                else:
+                                    phys_addr = entry & 0x0003_ffff_fffe_0000
+                        else:
+                            phys_addr = entry & 0x0000_ffff_fffe_0000
+
+                    # make entry
+                    if has_next_level(entry):
+                        LEVEL2.append([new_va, next_level_table, flags])
+                        entry_type = "TABLE"
+                    else:
+                        virt_addr = new_va
+                        page_count = 1
+                        if is_stage2:
+                            flag_string = self.format_flags_stage2(flags)
+                        else:
+                            flag_string = self.format_flags(flags)
+                        if is_4k_granule:
+                            page_size = 2 * 1024 * 1024
+                            MB2.append(PageTable.Entry(virt_addr, phys_addr, page_size, page_count, flag_string))
+                            entry_type = "2MB-PAGE"
+                        elif is_16k_granule:
+                            page_size = 32 * 1024 * 1024
+                            MB32.append(PageTable.Entry(virt_addr, phys_addr, page_size, page_count, flag_string))
+                            entry_type = "32MB-PAGE"
+                        elif is_64k_granule:
+                            page_size = 512 * 1024 * 1024
+                            MB512.append(PageTable.Entry(virt_addr, phys_addr, page_size, page_count, flag_string))
+                            entry_type = "512MB-PAGE"
+
+                    # dump
+                    if self.args.print_each_level:
+                        if self.is_not_trace_target(new_va, new_va_end):
+                            continue
+                        addr = table_base + i * 8
+                        line = "{:#018x}: {:#018x} (virt:{:#018x}-{:#018x},type:{:s}) {:s}".format(
+                            addr, entry, new_va, new_va_end, entry_type, " ".join(flags),
+                        )
+                        if self.is_not_filter_target(line):
+                            continue
+                        self.out.append(line)
+
+            if not self.silent:
+                if self.args.print_each_level:
+                    self.out.append(titlify(""))
+                self.quiet_info_add_out("Number of entries: {:d}".format(COUNT))
+                self.quiet_info_add_out("Level 2 Entry: {:d}".format(len(LEVEL2)))
+                self.quiet_info_add_out("PT Entry (2MB): {:d}".format(len(MB2)))
+                self.quiet_info_add_out("PT Entry (32MB): {:d}".format(len(MB32)))
+                self.quiet_info_add_out("PT Entry (512MB): {:d}".format(len(MB512)))
+                self.quiet_info_add_out("Invalid entries: {:d}".format(COUNT - len(LEVEL2) - len(MB2) - len(MB32) - len(MB512)))
+            self.mappings += MB2 + MB32 + MB512
+        else:
+            if not self.silent:
+                self.quiet_info_add_out("LEVEL 2 is skipped")
+            LEVEL2 = LEVEL1
+
+        # level 3 parse for 4KB/16KB/64KB granule
+        if not self.silent:
+            self.quiet_add_out(titlify("LEVEL 3"))
+        if self.LEVEL3_BIT_RANGE is not None and start_level <= 3:
+            entries_per_table = self.get_entries_per_table(
+                self.LEVEL3_BIT_RANGE, granule_bits, region_bits, is_first_level=False,
+            )
+            KB4 = []
+            KB16 = []
+            KB64 = []
+            COUNT = 0
+            flag_cache = {}
+
+            for va_base, table_base, parent_flags in ProgressBar(LEVEL2, desc="LEVEL 3", disable=self.args.quiet):
+                entries = self.read_mem_wrapper(table_base, 8 * entries_per_table)
+                entries = slice_unpack(entries, 8)
+                COUNT += len(entries)
+                for i, entry in enumerate(entries):
+                    # present flag
+                    if entry & 1 == 0:
+                        continue
+
+                    # calc virtual address
+                    virt_addr = va_base + (i << self.LEVEL3_BIT_RANGE[0])
+                    virt_addr_end = virt_addr + (1 << self.LEVEL3_BIT_RANGE[0])
+
+                    # calc flags
+                    flags = parent_flags.copy()
+                    if (entry & 0b11) == 0b11:
+                        if is_stage2:
+                            flags.append("MemAttr={:#x}".format((entry >> 2) & 0b1111))
+                            flags.append("S2AP={:02b}".format((entry >> 6) & 0b11))
+                            flags.append("SH={:02b}".format((entry >> 8) & 0b11))
+                            if ((entry >> 10) & 1) == 1:
+                                flags.append("AF")
+                            if ((entry >> 51) & 1) == 1:
+                                flags.append("DBM")
+                            if ((entry >> 52) & 1) == 1:
+                                flags.append("Contiguous")
+                            flags.append("XN={:02b}".format((entry >> 53) & 0b11)) # Use XN, not UXN
+                            flags.append("PBHA={:#x}".format((entry >> 59) & 0b1111))
+                        elif is_2VAranges:
+                            # This route passes many times, so make a memo
+                            entry_flags_key = entry & 0x787c_0000_0001_0ffc
+                            x = flag_cache.get(entry_flags_key, None)
+                            if x is not None:
+                                flags.extend(x)
+                            else:
+                                flags_tmp = []
+                                flags_tmp.append("AttrIndx={:03b}".format((entry >> 2) & 0b111))
+                                if ((entry >> 5) & 1) == 1:
+                                    flags_tmp.append("NS")
+                                flags_tmp.append("AP={:02b}".format((entry >> 6) & 0b11))
+                                flags_tmp.append("SH={:02b}".format((entry >> 8) & 0b11))
+                                if ((entry >> 10) & 1) == 1:
+                                    flags_tmp.append("AF")
+                                if ((entry >> 11) & 1) == 1:
+                                    flags_tmp.append("nG")
+                                if ((entry >> 16) & 1) == 1:
+                                    flags_tmp.append("nT")
+                                if ((entry >> 50) & 1) == 1:
+                                    flags_tmp.append("GP")
+                                if ((entry >> 51) & 1) == 1:
+                                    flags_tmp.append("DBM")
+                                if ((entry >> 52) & 1) == 1:
+                                    flags_tmp.append("Contiguous")
+                                if ((entry >> 53) & 1) == 1:
+                                    flags_tmp.append("PXN")
+                                if ((entry >> 54) & 1) == 1:
+                                    flags_tmp.append("UXN")
+                                flags_tmp.append("PBHA={:#x}".format((entry >> 59) & 0b1111))
+                                flag_cache[entry_flags_key] = flags_tmp
+                                flags.extend(flags_tmp)
+                        else:
+                            flags.append("AttrIndx={:03b}".format((entry >> 2) & 0b111))
+                            if ((entry >> 5) & 1) == 1:
+                                flags.append("NS")
+                            flags.append("AP={:02b}".format((entry >> 6) & 0b11 & 0b10)) # AP[0] must be 0
+                            flags.append("SH={:02b}".format((entry >> 8) & 0b11))
+                            if ((entry >> 10) & 1) == 1:
+                                flags.append("AF")
+                            if ((entry >> 11) & 1) == 1:
+                                flags.append("nG")
+                            if ((entry >> 16) & 1) == 1:
+                                flags.append("nT")
+                            if ((entry >> 50) & 1) == 1:
+                                flags.append("GP")
+                            if ((entry >> 51) & 1) == 1:
+                                flags.append("DBM")
+                            if ((entry >> 52) & 1) == 1:
+                                flags.append("Contiguous")
+                            if ((entry >> 54) & 1) == 1:
+                                flags.append("XN") # Use XN, not UXN # PXN is undefined
+                            flags.append("PBHA={:#x}".format((entry >> 59) & 0b1111))
+                    else:
+                        # In ARMv8.7, level 3 has no table descriptors
+                        raise ValueError("level 3 has no table descriptors")
+
+                    # calc next table / output phys addr (drop the flag bits)
+                    if is_4k_granule:
+                        if self.FEAT_LPA:
+                            if self.TCR_ELx_DS:
+                                phys_addr = (entry & 0x0003_ffff_ffff_f000) | (((entry >> 8) & 0b11) << 50)
+                            else:
+                                phys_addr = entry & 0x0003_ffff_ffff_f000
+                        else:
+                            phys_addr = entry & 0x0000_ffff_ffff_f000
+                    elif is_16k_granule:
+                        if self.FEAT_LPA:
+                            if self.TCR_ELx_DS:
+                                phys_addr = (entry & 0x0003_ffff_ffff_c000) | (((entry >> 8) & 0b11) << 50)
+                            else:
+                                phys_addr = entry & 0x0003_ffff_ffff_c000
+                        else:
+                            phys_addr = entry & 0x0000_ffff_ffff_c000
+                    elif is_64k_granule:
+                        if self.FEAT_LPA:
+                            phys_addr = (entry & 0x0000_ffff_ffff_0000) | (((entry >> 12) & 0b1111) << 48)
+                        else:
+                            phys_addr = entry & 0x0000_ffff_ffff_0000
+
+                    # make entry
+                    page_count = 1
+                    if is_stage2:
+                        flag_string = self.format_flags_stage2(flags)
+                    else:
+                        flag_string = self.format_flags(flags)
+                    if is_4k_granule:
+                        page_size = 4 * 1024
+                        KB4.append(PageTable.Entry(virt_addr, phys_addr, page_size, page_count, flag_string))
+                        entry_type = "4KB-PAGE"
+                    elif is_16k_granule:
+                        page_size = 16 * 1024
+                        KB16.append(PageTable.Entry(virt_addr, phys_addr, page_size, page_count, flag_string))
+                        entry_type = "16KB-PAGE"
+                    elif is_64k_granule:
+                        page_size = 64 * 1024
+                        KB64.append(PageTable.Entry(virt_addr, phys_addr, page_size, page_count, flag_string))
+                        entry_type = "64KB-PAGE"
+
+                    # dump
+                    if self.args.print_each_level:
+                        if self.is_not_trace_target(virt_addr, virt_addr_end):
+                            continue
+                        addr = table_base + i * 8
+                        line = "{:#018x}: {:#018x} (virt:{:#018x}-{:#018x},type:{:s}) {:s}".format(
+                            addr, entry, virt_addr, virt_addr_end, entry_type, " ".join(flags),
+                        )
+                        if self.is_not_filter_target(line):
+                            continue
+                        self.out.append(line)
+
+            if not self.silent:
+                if self.args.print_each_level:
+                    self.out.append(titlify(""))
+                self.quiet_info_add_out("Number of entries: {:d}".format(COUNT))
+                self.quiet_info_add_out("PT Entry (4KB): {:d}".format(len(KB4)))
+                self.quiet_info_add_out("PT Entry (16KB): {:d}".format(len(KB16)))
+                self.quiet_info_add_out("PT Entry (64KB): {:d}".format(len(KB64)))
+                self.quiet_info_add_out("Invalid entries: {:d}".format(COUNT - len(KB4) - len(KB16) - len(KB64)))
+            self.mappings += KB4 + KB16 + KB64
+        else:
+            if not self.silent:
+                self.quiet_info_add_out("LEVEL 3 is skipped")
+
+        if not is_stage2 and self.EL2_VM and self.args.target_el == 1:
+            self.mappings = self.translate_stage2_mappings(self.mappings)
+
+        # finalize
+        if not self.silent:
+            self.quiet_add_out(titlify("Total"))
+            self.quiet_info_add_out("PT Entry (Total): {:d}".format(len(self.mappings)))
+        self.mappings = sorted(self.mappings)
+        return
+
+    def get_granule_bits(self, TG, reg_name):
+        if reg_name == "TG0":
+            if TG == 0b00:
+                return 12 # 4KB
+            elif TG == 0b01:
+                return 16 # 64KB
+            elif TG == 0b10:
+                return 14 # 16KB
+        elif reg_name == "TG1":
+            if TG == 0b01:
+                return 14 # 16KB
+            elif TG == 0b10:
+                return 12 # 4KB
+            elif TG == 0b11:
+                return 16 # 64KB
+        self.err_add_out("Unsupported {:s}".format(reg_name))
+        return None
+
+    def get_pa_size_for_ps(self, ps, granule):
+        if ps == 0b110:
+            if granule == 16:
+                return 52
+            if (granule == 14 or granule == 12) and self.TCR_ELx_DS:
+                return 52
+            return 48
+
+        return {
+            0b000: 32,
+            0b001: 36,
+            0b010: 40,
+            0b011: 42,
+            0b100: 44,
+            0b101: 48,
+            0b110: 52,
+            0b111: 56, # unsupported for TCR_EL2
+        }[ps]
+
+    def get_start_level(self, TnSZ, granule_bits):
+        if self.FEAT_LPA2:
+            if self.TCR_ELx_DS:
+                if granule_bits == 12:
+                    if TnSZ < 0x10:
+                        return -1
+        return 0
+
+    def get_translation_base_addr(self, PS, TTBR, granule_bits):
+        if PS == 0b110 and self.get_pa_size_for_ps(PS, granule_bits) > 48:
+            if (granule_bits == 16 and self.FEAT_LPA) or (granule_bits in (12, 14) and self.FEAT_LPA2):
+                high = TTBR & 0xffff_ffff_ffc0
+                low = (TTBR >> 2) & 0b1111
+                return high | (low << 48)
+            else:
+                self.err_add_out("Unsupported FEAT_LPA and IPS pair")
+                return None
+        return TTBR & 0xffff_ffff_fffe
+
+    def pagewalk_TTBR0_EL1(self):
+        self.out.append(titlify("$TTBR0_EL1", color="bold", msg_color="bold"))
+
+        TTBR0_EL1 = get_register("$TTBR0_EL1", use_mbed_exec=True)
+        TCR_EL1 = get_register("$TCR_EL1", use_mbed_exec=True)
+        if TTBR0_EL1 == 0:
+            self.warn_add_out("Maybe unused TTBR0_EL1")
+            return
+
+        self.TCR_ELx_DS = ((TCR_EL1 >> 59) & 1) == 1
+        IPS = (TCR_EL1 >> 32) & 0b111
+        TG0 = (TCR_EL1 >> 14) & 0b11
+        T0SZ = TCR_EL1 & 0b111111
+
+        granule_bits = self.get_granule_bits(TG0, "TG0")
+        if granule_bits is None:
+            return
+
+        region_start = 0
+        region_end = region_start + (2 ** (64 - T0SZ))
+        region_bits = int(math.log2(region_end - region_start))
+        page_size = 2 ** (granule_bits - 10)
+        intermediate_pa_size = self.get_pa_size_for_ps(IPS, granule_bits)
+        start_level = self.get_start_level(T0SZ, granule_bits)
+
+        translation_base_addr = self.get_translation_base_addr(IPS, TTBR0_EL1, granule_bits)
+        if translation_base_addr is None:
+            return
+
+        self.quiet_info_add_out("$TTBR0_EL1: {:#x}".format(TTBR0_EL1))
+        self.quiet_info_add_out("$TCR_EL1: {:#x}".format(TCR_EL1))
+        self.quiet_info_add_out("Intermediate Physical Address Size: {:d} bits".format(intermediate_pa_size))
+        self.quiet_info_add_out("EL1 User Region: {:#018x} - {:#018x} ({:d} bits)".format(region_start, region_end - 1, region_bits))
+        self.quiet_info_add_out("EL1 User Page Size: {:d}KB (per page)".format(page_size))
+        EPD0 = (TCR_EL1 >> 7) & 1
+        self.quiet_info_add_out("EPD0: {:d}".format(EPD0))
+
+        self.parse_bit_range(granule_bits, region_bits)
+        if not self.use_cached_mapping(
+            "ttbr0el1_mappings", TTBR0_EL1=TTBR0_EL1, TCR_EL1=TCR_EL1,
+            SCTLR=get_register("$SCTLR_EL1"), HCR_EL2=get_register("$HCR_EL2"),
+            VTTBR_EL2=get_register("$VTTBR_EL2"), VTCR_EL2=get_register("$VTCR_EL2"),
+        ):
+            self.flags_strings_cache = {}
+            self.do_pagewalk(translation_base_addr, granule_bits, region_start, region_bits, start_level, is_2VAranges=True)
+            self.flags_strings_cache = None
+            self.merge_mappings()
+            self.ttbr0el1_mappings = self.mappings.copy()
+        self.make_out(self.ttbr0el1_mappings, walk_disabled=bool(EPD0))
+        return
+
+    def pagewalk_TTBR1_EL1(self):
+        self.out.append(titlify("$TTBR1_EL1", color="bold", msg_color="bold"))
+
+        TTBR1_EL1 = get_register("$TTBR1_EL1", use_mbed_exec=True)
+        TCR_EL1 = get_register("$TCR_EL1", use_mbed_exec=True)
+        if TTBR1_EL1 == 0:
+            self.warn_add_out("Maybe unused TTBR1_EL1")
+            return
+
+        self.TCR_ELx_DS = ((TCR_EL1 >> 59) & 1) == 1
+        IPS = (TCR_EL1 >> 32) & 0b111
+        TG1 = (TCR_EL1 >> 30) & 0b11
+        T1SZ = (TCR_EL1 >> 16) & 0b111111
+
+        granule_bits = self.get_granule_bits(TG1, "TG1")
+        if granule_bits is None:
+            return
+
+        region_end = 2 ** 64
+        region_start = region_end - (2 ** (64 - T1SZ))
+        region_bits = int(math.log2(region_end - region_start))
+        page_size = 2 ** (granule_bits - 10)
+        intermediate_pa_size = self.get_pa_size_for_ps(IPS, granule_bits)
+        start_level = self.get_start_level(T1SZ, granule_bits)
+
+        translation_base_addr = self.get_translation_base_addr(IPS, TTBR1_EL1, granule_bits)
+        if translation_base_addr is None:
+            return
+
+        self.quiet_info_add_out("$TTBR1_EL1: {:#x}".format(TTBR1_EL1))
+        self.quiet_info_add_out("$TCR_EL1: {:#x}".format(TCR_EL1))
+        self.quiet_info_add_out("Intermediate Physical Address Size: {:d} bits".format(intermediate_pa_size))
+        self.quiet_info_add_out("EL1 Kernel Region: {:#018x} - {:#018x} ({:d} bits)".format(region_start, region_end - 1, region_bits))
+        self.quiet_info_add_out("EL1 Kernel Page Size: {:d}KB (per page)".format(page_size))
+        EPD1 = (TCR_EL1 >> 23) & 1
+        self.quiet_info_add_out("EPD1: {:d}".format(EPD1))
+
+        self.parse_bit_range(granule_bits, region_bits)
+        if not self.use_cached_mapping(
+            "ttbr1el1_mappings", TTBR1_EL1=TTBR1_EL1, TCR_EL1=TCR_EL1,
+            SCTLR=get_register("$SCTLR_EL1"), HCR_EL2=get_register("$HCR_EL2"),
+            VTTBR_EL2=get_register("$VTTBR_EL2"), VTCR_EL2=get_register("$VTCR_EL2"),
+        ):
+            self.flags_strings_cache = {}
+            self.do_pagewalk(translation_base_addr, granule_bits, region_start, region_bits, start_level, is_2VAranges=True)
+            self.flags_strings_cache = None
+            self.merge_mappings()
+            self.ttbr1el1_mappings = self.mappings.copy()
+        self.make_out(self.ttbr1el1_mappings, walk_disabled=bool(EPD1))
+        return
+
+    def pagewalk_VTTBR_EL2(self):
+        if not self.silent:
+            self.out.append(titlify("$VTTBR_EL2", color="bold", msg_color="bold"))
+
+        VTTBR_EL2 = get_register("$VTTBR_EL2")
+        VTCR_EL2 = get_register("$VTCR_EL2")
+        if VTTBR_EL2 == 0:
+            if not self.silent:
+                self.warn_add_out("Maybe unused VTTBR_EL2")
+            return
+
+        self.TCR_ELx_DS = ((VTCR_EL2 >> 32) & 1) == 1
+        SL2 = (VTCR_EL2 >> 33) & 0b1
+        PS = (VTCR_EL2 >> 16) & 0b111
+        TG0 = (VTCR_EL2 >> 14) & 0b11
+        SL0 = (VTCR_EL2 >> 6) & 0b11
+        T0SZ = VTCR_EL2 & 0b111111
+
+        granule_bits = self.get_granule_bits(TG0, "TG0")
+        if granule_bits is None:
+            return
+
+        region_start = 0
+        region_end = region_start + (2 ** (64 - T0SZ))
+        region_bits = int(math.log2(region_end - region_start))
+        page_size = 2 ** (granule_bits - 10)
+        pa_size = self.get_pa_size_for_ps(PS, granule_bits)
+
+        if self.FEAT_TTST:
+            if SL0 == 0b00:
+                if TG0 == 0b00:
+                    if self.FEAT_LPA2 and SL2 == 1:
+                        stage2_start_level = -1
+                    else:
+                        stage2_start_level = 2
+                else:
+                    stage2_start_level = 3
+            elif SL0 == 0b01:
+                if TG0 == 0b00:
+                    if self.FEAT_LPA2 and SL2 == 1:
+                        if not self.silent:
+                            self.err_add_out("Unsupported stage2 start level")
+                        return
+                    else:
+                        stage2_start_level = 1
+                else:
+                    stage2_start_level = 2
+            elif SL0 == 0b10:
+                if TG0 == 0b00:
+                    if self.FEAT_LPA2 and SL2 == 1:
+                        if not self.silent:
+                            self.err_add_out("Unsupported stage2 start level")
+                        return
+                    else:
+                        stage2_start_level = 0
+                else:
+                    stage2_start_level = 1
+            elif SL0 == 0b11:
+                if TG0 == 0b00:
+                    if self.FEAT_LPA2 and SL2 == 1:
+                        if not self.silent:
+                            self.err_add_out("Unsupported stage2 start level")
+                        return
+                    else:
+                        stage2_start_level = 3
+                else:
+                    stage2_start_level = 0
+        else:
+            if SL0 == 0b00:
+                if TG0 == 0b00:
+                    stage2_start_level = 2
+                else:
+                    stage2_start_level = 3
+            elif SL0 == 0b01:
+                if TG0 == 0b00:
+                    stage2_start_level = 1
+                else:
+                    stage2_start_level = 2
+            elif SL0 == 0b10:
+                if TG0 == 0b00:
+                    stage2_start_level = 0
+                else:
+                    stage2_start_level = 1
+            else:
+                if not self.silent:
+                    self.err_add_out("Unsupported stage2 start level")
+                return
+
+        translation_base_addr = self.get_translation_base_addr(PS, VTTBR_EL2, granule_bits)
+        if translation_base_addr is None:
+            return
+
+        if not self.silent:
+            self.quiet_info_add_out("$VTTBR_EL2: {:#x}".format(VTTBR_EL2))
+            self.quiet_info_add_out("$VTCR_EL2: {:#x}".format(VTCR_EL2))
+            self.quiet_info_add_out("Physical Address Size: {:d} bits".format(pa_size))
+            self.quiet_info_add_out("EL2 Starting Level: {:d}".format(SL0))
+            self.quiet_info_add_out("EL2 Region: {:#018x} - {:#018x} ({:d} bits)".format(region_start, region_end - 1, region_bits))
+            self.quiet_info_add_out("EL2 Page Size: {:d}KB (per page)".format(page_size))
+
+        self.parse_bit_range(granule_bits, region_bits)
+        if self.silent or not self.use_cached_mapping(
+            "vttbrel2_mappings", VTTBR_EL2=VTTBR_EL2, VTCR_EL2=VTCR_EL2,
+            SCTLR=get_register("$SCTLR_EL2"), HCR_EL2=get_register("$HCR_EL2"),
+        ):
+            self.flags_strings_cache = {}
+            self.do_pagewalk(translation_base_addr, granule_bits, region_start, region_bits, stage2_start_level, is_stage2=True)
+            self.flags_strings_cache = None
+            if not self.silent:
+                self.merge_mappings()
+                self.vttbrel2_mappings = self.mappings.copy()
+        else:
+            # the caller reads self.mappings to build el2_mappings, so restore it from the cache
+            self.mappings = self.vttbrel2_mappings.copy()
+
+        if not self.silent:
+            self.make_out(self.vttbrel2_mappings)
+        return
+
+    def pagewalk_TTBR0_EL2(self):
+        self.out.append(titlify("$TTBR0_EL2", color="bold", msg_color="bold"))
+
+        TTBR0_EL2 = get_register("$TTBR0_EL2")
+        TCR_EL2 = get_register("$TCR_EL2")
+        if TTBR0_EL2 == 0:
+            self.warn_add_out("Maybe unused TTBR0_EL2")
+            return
+
+        self.TCR_ELx_DS = ((TCR_EL2 >> (59 if self.EL2_E2H else 32)) & 1) == 1
+        PS = (TCR_EL2 >> (32 if self.EL2_E2H else 16)) & 0b111
+        TG0 = (TCR_EL2 >> 14) & 0b11
+        T0SZ = TCR_EL2 & 0b111111
+
+        granule_bits = self.get_granule_bits(TG0, "TG0")
+        if granule_bits is None:
+            return
+
+        region_start = 0
+        region_end = region_start + (2 ** (64 - T0SZ))
+        region_bits = int(math.log2(region_end - region_start))
+        page_size = 2 ** (granule_bits - 10)
+        pa_size = self.get_pa_size_for_ps(PS, granule_bits)
+        start_level = self.get_start_level(T0SZ, granule_bits)
+
+        translation_base_addr = self.get_translation_base_addr(PS, TTBR0_EL2, granule_bits)
+        if translation_base_addr is None:
+            return
+
+        self.quiet_info_add_out("$TTBR0_EL2: {:#x}".format(TTBR0_EL2))
+        self.quiet_info_add_out("$TCR_EL2: {:#x}".format(TCR_EL2))
+        if self.EL2_E2H:
+            self.quiet_info_add_out("Intermediate Physical Address Size: {:d} bits".format(pa_size))
+        else:
+            self.quiet_info_add_out("Physical Address Size: {:d} bits".format(pa_size))
+        if self.EL2_M20:
+            self.quiet_info_add_out("EL2 User Region: {:#018x} - {:#018x} ({:d} bits)".format(region_start, region_end - 1, region_bits))
+            self.quiet_info_add_out("EL2 USer Page Size: {:d}KB (per page)".format(page_size))
+        else:
+            self.quiet_info_add_out("EL2 Region: {:#018x} - {:#018x} ({:d} bits)".format(region_start, region_end - 1, region_bits))
+            self.quiet_info_add_out("EL2 Page Size: {:d}KB (per page)".format(page_size))
+
+        self.parse_bit_range(granule_bits, region_bits)
+        if not self.use_cached_mapping(
+            "ttbr0el2_mappings", TTBR0_EL2=TTBR0_EL2, TCR_EL2=TCR_EL2,
+            SCTLR=get_register("$SCTLR_EL2"), HCR_EL2=get_register("$HCR_EL2"),
+            VTTBR_EL2=get_register("$VTTBR_EL2"), VTCR_EL2=get_register("$VTCR_EL2"),
+        ):
+            self.flags_strings_cache = {}
+            self.do_pagewalk(translation_base_addr, granule_bits, region_start, region_bits, start_level, is_2VAranges=self.EL2_M20)
+            self.flags_strings_cache = None
+            self.merge_mappings()
+            self.ttbr0el2_mappings = self.mappings.copy()
+        self.make_out(self.ttbr0el2_mappings)
+        return
+
+    def pagewalk_TTBR1_EL2(self):
+        self.out.append(titlify("$TTBR1_EL2", color="bold", msg_color="bold"))
+
+        TTBR1_EL2 = get_register("$TTBR1_EL2")
+        TCR_EL2 = get_register("$TCR_EL2")
+        if TTBR1_EL2 == 0:
+            self.warn_add_out("Maybe unused TTBR1_EL2")
+            return
+
+        self.TCR_ELx_DS = ((TCR_EL2 >> (59 if self.EL2_E2H else 32)) & 1) == 1
+        IPS = (TCR_EL2 >> 32) & 0b111
+        TG1 = (TCR_EL2 >> 30) & 0b11
+        T1SZ = (TCR_EL2 >> 16) & 0b111111
+
+        granule_bits = self.get_granule_bits(TG1, "TG1")
+        if granule_bits is None:
+            return
+
+        region_end = 2 ** 64
+        region_start = region_end - (2 ** (64 - T1SZ))
+        region_bits = int(math.log2(region_end - region_start))
+        page_size = 2 ** (granule_bits - 10)
+        intermediate_pa_size = self.get_pa_size_for_ps(IPS, granule_bits)
+        start_level = self.get_start_level(T1SZ, granule_bits)
+
+        translation_base_addr = self.get_translation_base_addr(IPS, TTBR1_EL2, granule_bits)
+        if translation_base_addr is None:
+            return
+
+        self.quiet_info_add_out("$TTBR1_EL2: {:#x}".format(TTBR1_EL2))
+        self.quiet_info_add_out("$TCR_EL2: {:#x}".format(TCR_EL2))
+        self.quiet_info_add_out("Intermediate Physical Address Size: {:d} bits".format(intermediate_pa_size))
+        self.quiet_info_add_out("EL2 Kernel Region: {:#018x} - {:#018x} ({:d} bits)".format(region_start, region_end - 1, region_bits))
+        self.quiet_info_add_out("EL2 Kernel Page Size: {:d}KB (per page)".format(page_size))
+
+        self.parse_bit_range(granule_bits, region_bits)
+        if not self.use_cached_mapping(
+            "ttbr1el2_mappings", TTBR1_EL2=TTBR1_EL2, TCR_EL2=TCR_EL2,
+            SCTLR=get_register("$SCTLR_EL2"), HCR_EL2=get_register("$HCR_EL2"),
+            VTTBR_EL2=get_register("$VTTBR_EL2"), VTCR_EL2=get_register("$VTCR_EL2"),
+        ):
+            self.flags_strings_cache = {}
+            self.do_pagewalk(translation_base_addr, granule_bits, region_start, region_bits, start_level, is_2VAranges=self.EL2_M20)
+            self.flags_strings_cache = None
+            self.merge_mappings()
+            self.ttbr1el2_mappings = self.mappings.copy()
+        self.make_out(self.ttbr1el2_mappings)
+        return
+
+    def pagewalk_TTBR0_EL3(self):
+        self.out.append(titlify("$TTBR0_EL3", color="bold", msg_color="bold"))
+
+        TTBR0_EL3 = get_register("$TTBR0_EL3")
+        TCR_EL3 = get_register("$TCR_EL3")
+        if TTBR0_EL3 == 0:
+            self.warn_add_out("Maybe unused TTBR0_EL3")
+            return
+
+        self.TCR_ELx_DS = ((TCR_EL3 >> 32) & 1) == 1
+        PS = (TCR_EL3 >> 16) & 0b111
+        TG0 = (TCR_EL3 >> 14) & 0b11
+        T0SZ = TCR_EL3 & 0b111111
+
+        granule_bits = self.get_granule_bits(TG0, "TG0")
+        if granule_bits is None:
+            return
+
+        region_start = 0
+        region_end = region_start + (2 ** (64 - T0SZ))
+        region_bits = int(math.log2(region_end - region_start))
+        page_size = 2 ** (granule_bits - 10)
+        pa_size = self.get_pa_size_for_ps(PS, granule_bits)
+        start_level = self.get_start_level(T0SZ, granule_bits)
+
+        translation_base_addr = self.get_translation_base_addr(PS, TTBR0_EL3, granule_bits)
+        if translation_base_addr is None:
+            return
+
+        self.quiet_info_add_out("$TTBR0_EL3: {:#x}".format(TTBR0_EL3))
+        self.quiet_info_add_out("$TCR_EL3: {:#x}".format(TCR_EL3))
+        self.quiet_info_add_out("Physical Address Size: {:d} bits".format(pa_size))
+        self.quiet_info_add_out("EL3 Region: {:#018x} - {:#018x} ({:d} bits)".format(region_start, region_end - 1, region_bits))
+        self.quiet_info_add_out("EL3 Page Size: {:d}KB (per page)".format(page_size))
+
+        self.parse_bit_range(granule_bits, region_bits)
+        if not self.use_cached_mapping(
+            "ttbr0el3_mappings", TTBR0_EL3=TTBR0_EL3, TCR_EL3=TCR_EL3,
+            SCTLR=get_register("$SCTLR_EL3"), HCR_EL2=get_register("$HCR_EL2"),
+            VTTBR_EL2=get_register("$VTTBR_EL2"), VTCR_EL2=get_register("$VTCR_EL2"),
+        ):
+            self.flags_strings_cache = {}
+            self.do_pagewalk(translation_base_addr, granule_bits, region_start, region_bits, start_level)
+            self.flags_strings_cache = None
+            self.merge_mappings()
+            self.ttbr0el3_mappings = self.mappings.copy()
+        self.make_out(self.ttbr0el3_mappings)
+        return
+
+    def pagewalk_init(self):
+        res = get_register("$TTBR0_EL1", use_mbed_exec=True)
+        if res is None:
+            self.err_add_out("Could not find system registers")
+            return False
+
+        SCTLR_EL1 = get_register("$SCTLR_EL1", use_mbed_exec=True)
+        if SCTLR_EL1 is None:
+            SCTLR_EL1 = get_register("$SCTLR")
+        if SCTLR_EL1 is not None:
+            self.EL1_M = (SCTLR_EL1 & 1) == 1
+            self.EL1_WXN = ((SCTLR_EL1 >> 19) & 1) == 1
+        else:
+            self.EL1_M = False
+            self.EL1_WXN = False
+
+        HCR_EL2 = get_register("$HCR_EL2")
+        if HCR_EL2 is not None:
+            self.EL2_TGE = ((HCR_EL2 >> 27) & 1) == 1
+            self.EL2_E2H = ((HCR_EL2 >> 34) & 1) == 1
+            self.EL2_M20 = self.EL2_TGE and self.EL2_E2H
+            self.EL2_VM = (HCR_EL2 & 1) == 1
+        else:
+            self.EL2_TGE = False
+            self.EL2_E2H = False
+            self.EL2_M20 = False
+            self.EL2_VM = False
+
+        SCTLR_EL2 = get_register("$SCTLR_EL2")
+        if SCTLR_EL2 is not None:
+            self.EL2_M = (SCTLR_EL2 & 1) == 1
+            self.EL2_WXN = ((SCTLR_EL2 >> 19) & 1) == 1
+        else:
+            self.EL2_M = False
+            self.EL2_WXN = False
+
+        SCTLR_EL3 = get_register("$SCTLR_EL3")
+        if SCTLR_EL3 is not None:
+            self.EL3_M = (SCTLR_EL3 & 1) == 1
+            self.EL3_WXN = ((SCTLR_EL3 >> 19) & 1) == 1
+        else:
+            self.EL3_M = False
+            self.EL3_WXN = False
+
+        ID_AA64MMFR0_EL1 = get_register("$ID_AA64MMFR0_EL1", use_mbed_exec=True)
+        if ID_AA64MMFR0_EL1 is not None:
+            TGran4_2 = (ID_AA64MMFR0_EL1 >> 40) & 0b1111
+            TGran16_2 = (ID_AA64MMFR0_EL1 >> 32) & 0b1111
+            TGran4 = (ID_AA64MMFR0_EL1 >> 28) & 0b1111
+            TGran16 = (ID_AA64MMFR0_EL1 >> 20) & 0b1111
+            self.FEAT_LPA2 = (TGran4_2 == 0b0011) or (TGran16_2 == 0b0011) or (TGran4 == 0b0001) or (TGran16 == 0b0010)
+            self.FEAT_LPA = (ID_AA64MMFR0_EL1 & 0b1111) == 0b0110
+        else:
+            self.FEAT_LPA2 = False
+            self.FEAT_LPA = False
+
+        ID_AA64MMFR1_EL1 = get_register("$ID_AA64MMFR1_EL1", use_mbed_exec=True)
+        if ID_AA64MMFR1_EL1 is not None:
+            self.FEAT_PAN = ((ID_AA64MMFR1_EL1 >> 20) & 0b1111) != 0b0000
+        else:
+            self.FEAT_PAN = False
+        self.quiet_info_add_out("{:s} is supported on all ARMv8".format(Color.boldify("PXN")))
+        if self.FEAT_PAN:
+            self.quiet_info_add_out("{:s} is supported".format(Color.boldify("PAN")))
+        else:
+            self.quiet_info_add_out("PAN is unsupported")
+
+        ID_AA64MMFR2_EL1 = get_register("$ID_AA64MMFR2_EL1", use_mbed_exec=True)
+        if ID_AA64MMFR2_EL1 is not None:
+            self.FEAT_TTST = ((ID_AA64MMFR2_EL1 >> 28) & 0b1111) == 0b0001
+            self.FEAT_LVA = ((ID_AA64MMFR2_EL1 >> 16) & 0b1111) == 0b0001
+        else:
+            self.FEAT_TTST = False
+            self.FEAT_LVA = False
+        return True
+
+    def pagewalk(self, args):
+        from gef.commands.base import ContextManager
+        self.prepare_pagewalk(args)
+        if self.args.target_el is None:
+            cpsr = get_register("$cpsr")
+            self.args.target_el = (cpsr >> 2) & 0b11
+            if self.args.target_el == 0:
+                # EL0 cannot inspect its translation tables directly. Use EL1,
+                # which owns TTBR0_EL1 and TTBR1_EL1.
+                self.args.target_el = 1
+
+        if is_kgdb() and self.args.target_el != 1:
+            self.err_add_out("Unsupported target EL")
+            return
+
+        # parse system registers
+        if not self.pagewalk_init():
+            return
+
+        self.silent = False
+        self.mappings = None
+        self.el2_mappings = None
+
+        # TODO: implementation for VSTTBR_EL2, VSTCR_EL2 pattern
+
+        # do pagewalk
+        if self.args.target_el < 1 or 3 < self.args.target_el:
+            self.warn_add_out("No paging in EL{:d}".format(self.args.target_el))
+            return
+        if self.args.target_el == 1 and self.EL1_M:
+            if self.EL2_VM:
+                # el2_mapping is needed because read_mem() uses PA, but not IPA
+                self.silent = True
+                self.pagewalk_VTTBR_EL2()
+                self.silent = False
+                if not self.mappings:
+                    self.err_add_out("Could not resolve the stage2 mappings")
+                    return
+                self.el2_mappings = self.mappings.copy()
+                self.mappings = None
+            if self.args.only_TTBR0_EL1:
+                self.pagewalk_TTBR0_EL1()
+            elif self.args.only_TTBR1_EL1:
+                self.pagewalk_TTBR1_EL1()
+            else:
+                self.pagewalk_TTBR0_EL1()
+                self.pagewalk_TTBR1_EL1()
+        if self.args.target_el == 1 and not self.EL1_M:
+            self.quiet_info_add_out("EL1/0 translation is unused")
+        if self.args.target_el == 2 and self.EL2_VM:
+            self.pagewalk_VTTBR_EL2()
+        if self.args.target_el == 2 and not self.EL2_VM:
+            self.quiet_info_add_out("EL2(as stage2) translation is unused")
+        if self.args.target_el == 2 and self.EL2_M:
+            self.pagewalk_TTBR0_EL2()
+            if self.EL2_M20:
+                self.pagewalk_TTBR1_EL2()
+        if self.args.target_el == 2 and self.EL2_VM:
+            self.quiet_info_add_out("EL2(as stage1) translation is unused")
+        if self.args.target_el == 3 and self.EL3_M:
+            with ContextManager.exception_level(3, info=self.quiet_info_add_out, error=self.err_add_out) as switched:
+                if not switched:
+                    return
+                self.pagewalk_TTBR0_EL3()
+        if self.args.target_el == 3 and not self.EL3_M:
+            self.quiet_info_add_out("EL3 translation is unused")
+        self.save_mapping_cache()
+        return
+
+    def aarch64_optee_pseudo_pagewalk(self, args):
+        self.prepare_pagewalk(args)
+        Cache.reset_gef_caches()
+        maps = AddrMap.get_maps(force_secure=True, verbose=not self.args.quiet)
+        if not maps:
+            return
+        fmt = "{:37s}  {:37s}  {:10s}  {:s}"
+        legend = ["Virtual address start-end", "Physical address start-end", "Total size", "Hint (Maybe)"]
+        gef_print(GefUtil.make_legend(fmt.format(*legend)))
+
+        """
+        [Newer version]
+        gef> pagewalk --optee -n -q
+        Virtual address start-end              Physical address start-end             Total size  Hint (Maybe)
+        0x000000000e100000-0x000000000e102000  0x000000000e100000-0x000000000e102000  0x2000      TEE-OS bootstrap region
+        0x000000009e400000-0x000000009e600000  0x0000000042000000-0x0000000042200000  0x200000    NS<->S shared memory
+        0x000000009e600000-0x000000009e800000  0x0000000009000000-0x0000000009200000  0x200000    UART0_BASE
+        0x000000009e800000-0x000000009f800000  0x0000000008000000-0x0000000009000000  0x1000000   GIC_BASE
+        0x000000009fa00000-0x00000000a0400000  0x0000000000000000-0x0000000000a00000  0xa00000
+        0x00000000a0600000-0x00000000a2600000  0x0000000000000000-0x0000000002000000  0x2000000
+        0x00000000a2900000-0x00000000a3600000  0x000000000e300000-0x000000000f000000  0xd00000
+        0x00000000a362a000-0x00000000a36ae000  0x000000000e100000-0x000000000e184000  0x84000     TEE-OS .text
+        0x00000000a36ae000-0x00000000a382a000  0x000000000e184000-0x000000000e300000  0x17c000    TEE-OS .data / stack
+        gef>
+
+        [Older version]
+        gef> pagewalk --optee -n -q
+        Virtual address start-end              Physical address start-end             Total size  Hint (Maybe)
+        0x000000000e100000-0x000000000e15d000  0x000000000e100000-0x000000000e15d000  0x5d000     TEE-OS .text
+        0x000000000e15d000-0x000000000e300000  0x000000000e15d000-0x000000000e300000  0x1a3000    TEE-OS .data / stack
+        0x000000000e300000-0x000000000f000000  0x000000000e300000-0x000000000f000000  0xd00000
+        0x000000000f200000-0x000000000fa00000  0x0000000000000000-0x0000000000800000  0x800000
+        0x000000000fa00000-0x0000000011a00000  0x0000000000000000-0x0000000002000000  0x2000000
+        0x0000000011a00000-0x0000000011c00000  0x0000000009000000-0x0000000009200000  0x200000    UART0_BASE
+        0x0000000011c00000-0x0000000011e00000  0x0000000042000000-0x0000000042200000  0x200000    NS<->S shared memory
+        0x000000000f000000-0x000000000f200000  0x0000000040000000-0x0000000040200000  0x200000
+        gef>
+        """
+        text_end = None
+        for entry in maps:
+            # https://github.com/OP-TEE/optee_os/blob/master/core/arch/arm/plat-vexpress/conf.mk
+            if entry.pstart == 0x0e10_0000:
+                if entry.vstart == 0x0e10_0000 and entry.vsize == 0x2000:
+                    hint = "TEE-OS bootstrap region"
+                else:
+                    hint = "TEE-OS .text"
+                    text_end = entry.vend
+            elif text_end and entry.vstart == text_end:
+                hint = "TEE-OS .data / stack"
+            elif entry.pstart == 0x4200_0000:
+                hint = "NS<->S shared memory"
+            # https://github.com/OP-TEE/optee_os/blob/master/core/arch/arm/plat-vexpress/platform_config.h
+            elif entry.pstart == 0x0800_0000:
+                hint = "GIC_BASE"
+            elif entry.pstart == 0x0900_0000:
+                hint = "UART0_BASE"
+            elif entry.pstart == 0x0904_0000:
+                hint = "UART1_BASE"
+            else:
+                hint = ""
+            gef_print("{:#018x}-{:#018x}  {:#018x}-{:#018x}  {:<#10x}  {:s}".format(
+                entry.vstart, entry.vend, entry.pstart, entry.pend, entry.vsize, hint,
+            ).rstrip())
         return

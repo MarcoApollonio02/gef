@@ -169,7 +169,7 @@ class ExecUntilCommand(GenericCommand):
         "{0:s} ret                                  # execute until ret instruction",
         "{0:s} all-branch                           # execute until call/jmp/ret instruction",
         "{0:s} indirect-branch                      # execute until indirect branch instruction (x64/x86 only)",
-        "{0:s} memaccess                            # execute until '[' is included by the instruction",
+        "{0:s} memaccess                            # execute until memory access instruction",
         '{0:s} keyword "call +r[ab]x"               # execute until specified keyword (regex)',
         '{0:s} cond "$rax==0xdead && $rbx==0xcafe"  # execute until specified condition is filled',
         "{0:s} user-code                            # execute until user code",
@@ -182,31 +182,6 @@ class ExecUntilCommand(GenericCommand):
     def __init__(self, *args, **kwargs):
         prefix = kwargs.get("prefix", True)
         super().__init__(prefix=prefix)
-        return
-
-    def close_stdout_stderr(self):
-        self.stdout = 1
-        self.stdout_bak = os.dup(self.stdout)
-        f = open("/dev/null")
-        os.dup2(f.fileno(), self.stdout)
-        f.close()
-
-        self.stderr = 2
-        self.stderr_bak = os.dup(self.stderr)
-        f = open("/dev/null")
-        os.dup2(f.fileno(), self.stderr)
-        f.close()
-        return
-
-    def revert_stdout_stderr(self):
-        os.dup2(self.stdout_bak, self.stdout)
-        os.close(self.stdout_bak)
-        os.dup2(self.stderr_bak, self.stderr)
-        os.close(self.stderr_bak)
-        return
-
-    def force_write_stdout(self, msg):
-        open("/proc/self/fd/0", "wb").write(msg)
         return
 
     def check_jump_taken(self, insn):
@@ -226,10 +201,15 @@ class ExecUntilCommand(GenericCommand):
         if (self.args.only_taken, self.args.only_not_taken) == (False, True):
             if runtime.current_arch.is_conditional_branch(insn):
                 taken, _reason = runtime.current_arch.is_branch_taken(insn)
-                return not taken
+                return taken is False
             else:
                 return False # non-conditional, so always jump
-        raise
+        raise ValueError("check_jump_taken: unexpected filter combination")
+
+    def remember_stop(self, event):
+        self.stop_event = event
+        Cache.reset_gef_caches()
+        return
 
     @staticmethod
     def is_caught_syscall():
@@ -263,9 +243,7 @@ class ExecUntilCommand(GenericCommand):
 
     @staticmethod
     def is_user_stop(event):
-        # Late import: gef.commands.debugging.other consumes this module's family.
         from gef.commands.debugging.other import SecondBreakpoint, SimpleInternalTemporaryBreakpoint
-
         if isinstance(event, gdb.SignalEvent):
             return True
         reason = getattr(event, "details", {}).get("reason")
@@ -279,103 +257,75 @@ class ExecUntilCommand(GenericCommand):
         stop = GefUtil.get_stop_reason()
         return stop is None or not stop["stepped"]
 
-    def get_breakpoint_list(self):
-        lines = gdb.execute("info breakpoints", to_string=True).splitlines()
-        if lines[0] == "No breakpoints or watchpoints.":
-            return []
-        if lines[0] == "No breakpoints, watchpoints, tracepoints, or catchpoints.": # gdb 15.x ~
-            return []
-
-        enable_idx = lines[0].index("Enb")
-        addr_idx = lines[0].index("Address")
-
-        bp_list = []
-        for line in lines[1:]:
-            try:
-                if line[0] == "\t":
-                    continue
-                enable = line[enable_idx]
-                addr = int(line[addr_idx:].split()[0], 16)
-                if enable == "y":
-                    bp_list.append(addr)
-            except Exception:
-                pass
-        # breakpoint with condition is unsupported
-        return bp_list
+    def exec_step(self, command, insn=None):
+        if insn and command in ("si", "ni") and self.requires_continue(insn):
+            command = "xuntil"
+        self.stop_event = None
+        gdb.execute(command)
+        return not is_alive() or ExecUntilCommand.is_user_stop(self.stop_event)
 
     def exec_next(self):
-        bp_list = self.get_breakpoint_list()
-        EventHooking.gef_on_stop_unhook(EventHandler.hook_stop_handler)
-        self.close_stdout_stderr()
         self.err = None
 
         prev_addr = -1
-        try:
-            count = 0
-            while True:
-                # progress
-                if not self.args.print_insn and count % 100 == 0:
-                    self.force_write_stdout([b"\r|", b"\r/", b"\r-", b"\r\\"][count // 100 % 4])
+        with ContextManager.redirect_output() as write_stdout, ContextManager.suspend_stop_handler():
+            try:
+                with EventHooking.temporary("stop", self.remember_stop):
+                    count = 0
+                    while True:
+                        # progress
+                        if not self.args.print_insn and count % 100 == 0:
+                            write_stdout([b"\r|", b"\r/", b"\r-", b"\r\\"][count // 100 % 4])
 
-                # backup
-                prev_prev_addr = prev_addr
-                prev_addr = runtime.current_arch.pc
+                        # backup
+                        prev_prev_addr = prev_addr
+                        prev_addr = runtime.current_arch.pc
 
-                # execute 1 instruction
-                insn = get_insn()
-                if self.args.use_ni or (self.args.skip_lib and "@plt>" in str(insn)):
-                    gdb.execute("ni") # use ni wrapper
-                else:
-                    gdb.execute("si") # use si wrapper
+                        # execute 1 instruction
+                        insn = get_insn()
+                        if self.args.use_ni or (self.args.skip_lib and "@plt>" in str(insn)):
+                            stopped = self.exec_step("ni", insn) # use ni wrapper
+                        else:
+                            stopped = self.exec_step("si", insn) # use si wrapper
 
-                # check breakpoint
-                insn = get_insn()
-                if runtime.current_arch.pc in bp_list:
-                    break
+                        if stopped:
+                            break
+                        insn = get_insn()
 
-                # $pc is not changed
-                if prev_prev_addr == prev_addr == runtime.current_arch.pc: # for faster, repeat insn is skip
-                    # infinity self loop
-                    if runtime.current_arch.is_call(insn) or runtime.current_arch.is_jump(insn) or runtime.current_arch.is_ret(insn):
-                        self.err = "Detected infinity loop prev_addr ({:#x})".format(prev_addr)
-                        break
-                    # maybe rep prefix
-                    gdb.execute("xuntil")
-                    # recheck
-                    if prev_prev_addr == prev_addr == runtime.current_arch.pc:
-                        self.err = "Detected infinity loop prev_addr ({:#x})".format(prev_addr)
-                        break
-                    insn = get_insn()
+                        # $pc is not changed
+                        if (prev_prev_addr == prev_addr == runtime.current_arch.pc and runtime.current_arch.is_jump(insn)
+                                and not runtime.current_arch.is_conditional_branch(insn)):
+                            self.err = "Detected infinity loop prev_addr ({:#x})".format(prev_addr)
+                            break
 
-                if self.args.print_insn:
-                    self.force_write_stdout((str(insn) + "\n").encode())
+                        if self.args.print_insn:
+                            write_stdout((str(insn) + "\n").encode())
 
-                # found and break
-                if self.is_target_insn(insn) and runtime.current_arch.pc not in self.args.exclude:
-                    if not self.args.print_insn:
-                        self.force_write_stdout(b"\r \r")
-                    break
+                        # found and break
+                        if self.is_target_insn(insn) and (self.err or runtime.current_arch.pc not in self.args.exclude):
+                            if not self.args.print_insn:
+                                write_stdout(b"\r \r")
+                            break
 
-                count += 1
+                        count += 1
 
-        except KeyboardInterrupt:
-            pass
-
-        except Exception:
-            if is_alive():
-                exc_type, exc_value, exc_traceback = sys.exc_info()
-                self.err = exc_value
-            else:
+            except KeyboardInterrupt:
                 pass
 
-        finally:
-            self.revert_stdout_stderr() # anytime needed
-            EventHooking.gef_on_stop_hook(EventHandler.hook_stop_handler) # anytime needed
-            Cache.reset_gef_caches()
-            if self.err:
-                err(self.err)
-            else:
-                gdb.execute("context")
+            except Exception:
+                if is_alive():
+                    exc_type, exc_value, exc_traceback = sys.exc_info()
+                    self.err = exc_value
+                else:
+                    pass
+
+        Cache.reset_gef_caches()
+        if self.err:
+            err(self.err)
+        elif is_alive():
+            gdb.execute("context")
+        else:
+            info("Inferior exited")
         return
 
     @parse_args
@@ -384,6 +334,7 @@ class ExecUntilCommand(GenericCommand):
     def do_invoke(self, args):
         self.usage()
         return
+
 
 
 @register_command

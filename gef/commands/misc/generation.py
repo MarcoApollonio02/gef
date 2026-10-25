@@ -24,7 +24,7 @@ from gef.commands.base import (
     register_command,
 )
 from gef.core import runtime
-from gef.core.address import AddressUtil
+from gef.core.address import AddressUtil, Endian
 from gef.core.color import err, gef_print, info, ok, titlify
 from gef.core.config import Config
 from gef.core.memory import p32, p64, read_int_from_memory, read_memory
@@ -64,6 +64,7 @@ class PrintFormatCommand(GenericCommand):
     _note_ = [
         '"hexn" means hex with new-line.',
         '"hexs" means hex with separator.',
+        "JavaScript uses BigInt for 64-bit values.",
     ]
     _note_ = "\n".join(_note_)
 
@@ -78,12 +79,19 @@ class PrintFormatCommand(GenericCommand):
         else:
             end_addr = self.args.location + self.args.length * unit_size
 
-        bit_format = {8: "<B", 16: "<H", 32: "<I", 64: "<Q"}[self.args.bitlen]
+        size = end_addr - self.args.location
+        if size < 0:
+            err("Invalid range")
+            return None
+        if size % unit_size:
+            err("Range size must be a multiple of {:d}".format(unit_size))
+            return None
+
+        bit_format = Endian.endian_str() + {8: "B", 16: "H", 32: "I", 64: "Q"}[self.args.bitlen]
         data = []
         for address in range(self.args.location, end_addr, unit_size):
-            try:
-                mem = read_memory(address, unit_size)
-            except gdb.MemoryError:
+            mem = read_memory(address, unit_size, safe=True)
+            if mem is None:
                 err("Memory read error")
                 return None
             value = struct.unpack(bit_format, mem)[0]
@@ -106,10 +114,14 @@ class PrintFormatCommand(GenericCommand):
             for x in data:
                 sdata += "{:02x}{:s}".format(x, separator)
         else:
+            if self.args.format == "js" and self.args.bitlen == 64:
+                suffix = "n"
+            else:
+                suffix = ""
             for i, x in enumerate(data):
                 if (i % 8) == 0:
                     sdata += "    "
-                sdata += "{:#0{}x}, ".format(x, self.args.bitlen // 4 + 2)
+                sdata += "{:#0{}x}{:s}, ".format(x, self.args.bitlen // 4 + 2, suffix)
                 if (i % 8) == 7:
                     sdata += "\n"
         sdata = sdata.rstrip()
@@ -125,7 +137,11 @@ class PrintFormatCommand(GenericCommand):
             out = "var buf = [\n{:s}\n];".format(sdata)
         elif self.args.format == "asm":
             asm_type = {8: "db", 16: "dw", 32: "dd", 64: "dq"}
-            out = "buf {:s}\n{:s}".format(asm_type[self.args.bitlen], sdata)
+            sdata = "\n".join(
+                "    {:s} {:s}".format(asm_type[self.args.bitlen], line.strip().rstrip(","))
+                for line in sdata.splitlines()
+            )
+            out = "buf:\n{:s}".format(sdata)
         elif self.args.format in ["hex", "hexn", "hexs", "hexsn"]:
             out = sdata
         return out
@@ -144,6 +160,7 @@ class PrintFormatCommand(GenericCommand):
         out = self.make_format(sdata)
         gef_print(out)
         return
+
 
 
 @register_command

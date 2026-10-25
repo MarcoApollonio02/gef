@@ -748,7 +748,7 @@ class GefReloadCommand(GenericCommand):
 
 @register_command
 class GefResetCacheCommand(GenericCommand):
-    """Reset all caches (both Cache.cache_until_next and Cache.cache_this_session)."""
+    """Reset all caches."""
 
     _cmdline_ = "gef reset-cache"
     _category_ = "99. GEF Maintenance Command"
@@ -765,6 +765,7 @@ class GefResetCacheCommand(GenericCommand):
         if args.hard:
             GefUtil.rmdir(GEF_TEMP_DIR, verbose=True, keep_root=True)
         return
+
 
 
 @register_command
@@ -1941,5 +1942,3 @@ class GefTmuxSetupCommand(GenericCommand):
 
         warn("Not in a tmux session")
         return
-
-

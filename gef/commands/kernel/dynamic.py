@@ -91,6 +91,12 @@ class UsermodehelperTracerCommand(GenericCommand):
     parser = argparse.ArgumentParser(prog=_cmdline_)
     _syntax_ = parser.format_help()
 
+    _note_ = [
+        "Linux 6.14 removed automatic binfmt module loading for unrecognized executable formats.",
+        "Executing a file containing four 0xff bytes no longer triggers a usermode helper via that path.",
+    ]
+    _note_ = "\n".join(_note_)
+
     @parse_args
     @only_if_gdb_running
     @only_if_specific_gdb_mode(mode=("qemu-system", "vmware"))
@@ -98,13 +104,19 @@ class UsermodehelperTracerCommand(GenericCommand):
     @only_if_in_kernel
     def do_invoke(self, args):
         info("Resolving the function addresses")
-        addr = Symbol.get_ksymaddr("call_usermodehelper_setup")
+        addr = Ksym.get_addr("call_usermodehelper_setup")
         if addr is None:
             err("Could not find call_usermodehelper_setup")
             return
-        CallUsermodehelperSetupBreakpoint(addr)
-        info("Setup is complete. Try `continue`")
+        try:
+            CallUsermodehelperSetupBreakpoint(addr, self)
+            info("Setup is complete. continuing...")
+            gdb.execute("continue")
+            info("usermodehelper-tracer is complete, cleaning up...")
+        finally:
+            GefUtil.delete_breakpoints(self)
         return
+
 
 
 class ThunkBreakpoint(gdb.Breakpoint):

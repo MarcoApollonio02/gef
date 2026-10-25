@@ -32,7 +32,7 @@ from gef.core.color import Color, err, gef_print, info, titlify, warn
 from gef.core.config import Config
 from gef.core.display import ProgressBar
 from gef.core.instruction import Disasm
-from gef.core.kernel import AddrMap, Kernel, Ksym
+from gef.core.kernel import AddrMap, Kernel, KernelListHead, Ksym
 from gef.core.memory import (
     hexdump,
     is_double_link_list,
@@ -51,7 +51,7 @@ from gef.core.process import (
 )
 from gef.core.qemu import read_physmem
 from gef.core.symbols import Symbol
-from gef.core.utils import GefUtil
+from gef.core.utils import GefUtil, u2i
 
 
 @register_command
@@ -304,6 +304,8 @@ class PageCommand(GenericCommand):
     _syntax_ = parser.format_help()
 
     _note_ = [
+        "These conversions do not verify RAM presence or the memory hotplug state.",
+        "",
         "Simplified page structure:",
         "",
         "[x86_64 / CONFIG_SPARSEMEM_VMEMMAP]",
@@ -360,7 +362,7 @@ class PageCommand(GenericCommand):
         "                       +----------------------------+",
         "",
         "",
-        "[x86_32 or arm32 / CONFIG_SPARSEMEM]",
+        "[x86_32 / arm32 / arm64 / CONFIG_SPARSEMEM]",
         "* This pattern uses `mem_section[]`, i.e. multiple section-specific mem_maps.",
         "* `section_id` can be obtained from `page->flags`.",
         "* `section_mem_map` is encoded and used to locate the page descriptor array.",
@@ -380,7 +382,7 @@ class PageCommand(GenericCommand):
         "                                    |  flags                       |",
         "                                    +------------------------------+",
         "",
-        "* CONFIG_SPARSEMEM_EXTREME is currently unsupported by this command.",
+        "* CONFIG_SPARSEMEM_EXTREME is supported on arm64.",
     ]
     _note_ = "\n".join(_note_)
 
@@ -390,24 +392,42 @@ class PageCommand(GenericCommand):
         super().__init__(prefix=prefix, complete=complete)
         return
 
-    def initialize(self):
-        if hasattr(PageCommand, "initialized") and PageCommand.initialized:
-            return True
-
+    @staticmethod
+    @Cache.cache_this_session(cache_None=False)
+    def initialize():
         info("Wait for memory scan")
 
+        if KernelAddressHeuristicFinder.consts() is None:
+            err("Failed to resolve kernel version")
+            return None
+
         PageCommand.PAGE_SHIFT = KernelAddressHeuristicFinder.consts().PAGE_SHIFT
+        PageCommand.mode = "VMEMMAP"
+        PageCommand.sections_per_root = 1
+        PageCommand.NR_MEM_SECTIONS = None
+
+        if is_arm64():
+            configs = runtime.CommandRegistry.instances["kconfig"].get_configs()
+            if not configs or configs.get("CONFIG_SPARSEMEM_VMEMMAP") != "y":
+                layout = KernelAddressHeuristicFinder.get_arm64_sparsemem()
+                if layout:
+                    for name, value in layout.items():
+                        setattr(PageCommand, name, value)
+                    return True
+                if configs and configs.get("CONFIG_SPARSEMEM") == "y":
+                    err("Could not resolve the sparse memory page arrays")
+                    return None
 
         if is_x86_64():
             PageCommand.VMEMMAP_START = KernelAddressHeuristicFinder.get_VMEMMAP_START()
-            if self.VMEMMAP_START is None:
+            if PageCommand.VMEMMAP_START is None:
                 err("Could not find VMEMMAP_START")
-                return False
+                return None
 
             PageCommand.sizeof_struct_page = KernelAddressHeuristicFinder.consts().sizeof_struct_page
-            if self.sizeof_struct_page is None:
+            if PageCommand.sizeof_struct_page is None:
                 err("Could not find sizeof(struct page)")
-                return False
+                return None
 
         elif is_x86_32():
             if KernelAddressHeuristicFinder.consts().CONFIG_FLATMEM:
@@ -415,7 +435,7 @@ class PageCommand(GenericCommand):
                 PageCommand.mem_map = KernelAddressHeuristicFinder.consts().mem_map
                 sizeof_struct_page = KernelAddressHeuristicFinder.consts().sizeof_struct_page
                 if sizeof_struct_page is None:
-                    return False
+                    return None
                 PageCommand.sizeof_struct_page = sizeof_struct_page
 
             elif KernelAddressHeuristicFinder.consts().CONFIG_SPARSEMEM:
@@ -423,7 +443,7 @@ class PageCommand(GenericCommand):
                 PageCommand.mem_section = KernelAddressHeuristicFinder.consts().mem_section
                 sizeof_struct_page = KernelAddressHeuristicFinder.consts().sizeof_struct_page
                 if sizeof_struct_page is None:
-                    return False
+                    return None
                 PageCommand.sizeof_struct_page = sizeof_struct_page
                 PageCommand.SECTION_HAS_MEM_MAP = KernelAddressHeuristicFinder.consts().SECTION_HAS_MEM_MAP
                 PageCommand.sizeof_mem_section = KernelAddressHeuristicFinder.consts().sizeof_mem_section
@@ -434,27 +454,24 @@ class PageCommand(GenericCommand):
 
             else:
                 err("Could not find mem_map and mem_section")
-                return False
+                return None
 
         elif is_arm64():
             PageCommand.VMEMMAP_START = KernelAddressHeuristicFinder.get_VMEMMAP_START()
-            if self.VMEMMAP_START is None:
+            if PageCommand.VMEMMAP_START is None:
                 err("Could not find VMEMMAP_START")
-                return False
+                return None
 
             PageCommand.sizeof_struct_page = KernelAddressHeuristicFinder.consts().sizeof_struct_page
-            if self.sizeof_struct_page is None:
+            if PageCommand.sizeof_struct_page is None:
                 err("Could not find sizeof(struct page)")
-                return False
+                return None
 
             memstart_addr = KernelAddressHeuristicFinder.consts().memstart_addr
             if memstart_addr is None:
                 err("Could not find memstart_addr")
-                return False
+                return None
 
-            pQ = lambda a: struct.pack("<Q", a & 0xffff_ffff_ffff_ffff)
-            uq = lambda a: struct.unpack("<q", a)[0]
-            u2i = lambda a: uq(pQ(a))
             PageCommand.memstart_addr = u2i(memstart_addr)
 
         elif is_arm32():
@@ -464,7 +481,7 @@ class PageCommand(GenericCommand):
                 sizeof_struct_page = KernelAddressHeuristicFinder.consts().sizeof_struct_page
                 if sizeof_struct_page is None:
                     err("Could not find sizeof(struct page)")
-                    return False
+                    return None
                 PageCommand.sizeof_struct_page = sizeof_struct_page
                 PageCommand.PHYS_PFN_OFFSET = KernelAddressHeuristicFinder.consts().PHYS_PFN_OFFSET
 
@@ -474,7 +491,7 @@ class PageCommand(GenericCommand):
                 sizeof_struct_page = KernelAddressHeuristicFinder.consts().sizeof_struct_page
                 if sizeof_struct_page is None:
                     err("Could not find sizeof(struct page)")
-                    return False
+                    return None
                 PageCommand.sizeof_struct_page = sizeof_struct_page
                 PageCommand.sizeof_mem_section = KernelAddressHeuristicFinder.consts().sizeof_mem_section
                 PageCommand.SECTION_HAS_MEM_MAP = KernelAddressHeuristicFinder.consts().SECTION_HAS_MEM_MAP
@@ -486,10 +503,29 @@ class PageCommand(GenericCommand):
 
             else:
                 err("Could not find mem_map and mem_section")
-                return False
+                return None
 
-        PageCommand.initialized = True
         return True
+
+    def get_section_mem_map(self, section_id):
+        limit = self.NR_MEM_SECTIONS
+        if limit is None:
+            limit = KernelAddressHeuristicFinder.consts().NR_MEM_SECTIONS
+        if section_id < 0 or limit is None or section_id >= limit:
+            return None
+        if self.sections_per_root > 1:
+            root = read_int_from_memory(
+                self.mem_section + section_id // self.sections_per_root * runtime.current_arch.ptrsize, safe=True,
+            )
+            if not root:
+                return None
+            section = root + section_id % self.sections_per_root * self.sizeof_mem_section
+        else:
+            section = self.mem_section + section_id * self.sizeof_mem_section
+        encoded = read_int_from_memory(section, safe=True)
+        if encoded is None or not encoded & self.SECTION_HAS_MEM_MAP:
+            return None
+        return encoded & self.SECTION_MAP_MASK
 
     def page2phys(self, page):
         if not is_valid_addr(page):
@@ -514,28 +550,13 @@ class PageCommand(GenericCommand):
                 pfn = (delta // self.sizeof_struct_page)
 
             elif self.mode == "SPARSEMEM":
-                flags = read_int_from_memory(page)
-                section_id = (flags >> self.SECTIONS_PGSHIFT) & self.SECTIONS_MASK
-
-                mem_section_i = self.mem_section + self.sizeof_mem_section * section_id
-                if not is_valid_addr(mem_section_i):
-                    return None
-
-                section_mem_map_i = read_int_from_memory(mem_section_i)
-                if (section_mem_map_i & self.SECTION_HAS_MEM_MAP) == 0:
-                    return None
-
-                biased_map = section_mem_map_i & self.SECTION_MAP_MASK
-                delta = page - biased_map
-                if delta < 0:
-                    return None
-                if delta % self.sizeof_struct_page != 0:
-                    return None
-                pfn = delta // self.sizeof_struct_page
+                return self.sparse_page2phys(page)
             else:
                 return None
 
         elif is_arm64():
+            if self.mode == "SPARSEMEM":
+                return self.sparse_page2phys(page)
             delta = page - self.VMEMMAP_START
             if delta < 0:
                 return None
@@ -554,24 +575,7 @@ class PageCommand(GenericCommand):
                 pfn = (delta // self.sizeof_struct_page) + self.PHYS_PFN_OFFSET
 
             elif self.mode == "SPARSEMEM":
-                flags = read_int_from_memory(page)
-                section_id = (flags >> self.SECTIONS_PGSHIFT) & self.SECTIONS_MASK
-
-                mem_section_i = self.mem_section + self.sizeof_mem_section * section_id
-                if not is_valid_addr(mem_section_i):
-                    return None
-
-                section_mem_map_i = read_int_from_memory(mem_section_i)
-                if (section_mem_map_i & self.SECTION_HAS_MEM_MAP) == 0:
-                    return None
-
-                biased_map = section_mem_map_i & self.SECTION_MAP_MASK
-                delta = page - biased_map
-                if delta < 0:
-                    return None
-                if delta % self.sizeof_struct_page != 0:
-                    return None
-                pfn = delta // self.sizeof_struct_page
+                return self.sparse_page2phys(page)
             else:
                 return None
 
@@ -579,6 +583,20 @@ class PageCommand(GenericCommand):
             return None
 
         if pfn < 0:
+            return None
+        return pfn << self.PAGE_SHIFT
+
+    def sparse_page2phys(self, page):
+        flags = read_int_from_memory(page, safe=True)
+        if flags is None:
+            return None
+        section_id = (flags >> self.SECTIONS_PGSHIFT) & self.SECTIONS_MASK
+        biased_map = self.get_section_mem_map(section_id)
+        if biased_map is None:
+            return None
+        delta = AddressUtil.normalize_address(page - biased_map)
+        pfn, remainder = divmod(delta, self.sizeof_struct_page)
+        if remainder or pfn >> self.PFN_SECTION_SHIFT != section_id:
             return None
         return pfn << self.PAGE_SHIFT
 
@@ -600,25 +618,24 @@ class PageCommand(GenericCommand):
                 page = self.mem_map + (pfn * self.sizeof_struct_page)
 
             elif self.mode == "SPARSEMEM":
-                section_id = pfn >> self.PFN_SECTION_SHIFT
-                mem_section_i = self.mem_section + self.sizeof_mem_section * section_id
-                if not is_valid_addr(mem_section_i):
+                biased_map = self.get_section_mem_map(pfn >> self.PFN_SECTION_SHIFT)
+                if biased_map is None:
                     return None
-
-                section_mem_map_i = read_int_from_memory(mem_section_i)
-                if (section_mem_map_i & self.SECTION_HAS_MEM_MAP) == 0:
-                    return None
-
-                biased_map = section_mem_map_i & self.SECTION_MAP_MASK
-                page = biased_map + (pfn * self.sizeof_struct_page)
+                page = AddressUtil.normalize_address(biased_map + pfn * self.sizeof_struct_page)
             else:
                 return None
 
         elif is_arm64():
-            memstart_pfn = self.memstart_addr >> self.PAGE_SHIFT
-            if pfn < memstart_pfn:
-                return None
-            page = self.VMEMMAP_START + ((pfn - memstart_pfn) * self.sizeof_struct_page)
+            if self.mode == "SPARSEMEM":
+                biased_map = self.get_section_mem_map(pfn >> self.PFN_SECTION_SHIFT)
+                if biased_map is None:
+                    return None
+                page = AddressUtil.normalize_address(biased_map + pfn * self.sizeof_struct_page)
+            else:
+                memstart_pfn = self.memstart_addr >> self.PAGE_SHIFT
+                if pfn < memstart_pfn:
+                    return None
+                page = self.VMEMMAP_START + ((pfn - memstart_pfn) * self.sizeof_struct_page)
 
         elif is_arm32():
             if self.mode == "FLATMEM":
@@ -627,17 +644,10 @@ class PageCommand(GenericCommand):
                 page = self.mem_map + ((pfn - self.PHYS_PFN_OFFSET) * self.sizeof_struct_page)
 
             elif self.mode == "SPARSEMEM":
-                section_id = pfn >> self.PFN_SECTION_SHIFT
-                mem_section_i = self.mem_section + self.sizeof_mem_section * section_id
-                if not is_valid_addr(mem_section_i):
+                biased_map = self.get_section_mem_map(pfn >> self.PFN_SECTION_SHIFT)
+                if biased_map is None:
                     return None
-
-                section_mem_map_i = read_int_from_memory(mem_section_i)
-                if (section_mem_map_i & self.SECTION_HAS_MEM_MAP) == 0:
-                    return None
-
-                biased_map = section_mem_map_i & self.SECTION_MAP_MASK
-                page = biased_map + (pfn * self.sizeof_struct_page)
+                page = AddressUtil.normalize_address(biased_map + pfn * self.sizeof_struct_page)
             else:
                 return None
 
@@ -657,6 +667,7 @@ class PageCommand(GenericCommand):
     def do_invoke(self, args):
         self.usage(simple=True)
         return
+
 
 
 @register_command
@@ -1757,7 +1768,7 @@ class PageInfoCommand(GenericCommand):
 
 @register_command
 class HighMemDumpCommand(GenericCommand, BufferingOutput):
-    """Dump HighMem mappings."""
+    """Dump HighMem mappings made by kmap()."""
 
     _cmdline_ = "highmem-dump"
     _category_ = "06-d. Qemu-system/KGDB Cooperation - Virt/Phys/Page"
@@ -1770,43 +1781,69 @@ class HighMemDumpCommand(GenericCommand, BufferingOutput):
     parser.add_argument("-q", "--quiet", action="store_true", help="show result only.")
     _syntax_ = parser.format_help()
 
+    _note_ = [
+        "This command dumps page_address_htable, which exists only if CONFIG_HIGHMEM=y.",
+        "It has the mappings made by kmap(), but not the ones made by kmap_atomic(), kmap_local_page() and vmap().",
+    ]
+    _note_ = "\n".join(_note_)
+
+    PA_HASH_ORDER = 7
+
     def dump_entry(self, page, virt):
-        heap_page_address_color = Config.get_gef_setting("theme.heap_page_address")
+        heap_page_address_color = Config.get("theme.heap_page_address")
         virt_str = Color.colorify_hex(virt, heap_page_address_color)
         self.out.append("page:{:#010x}  virt:{:s}".format(page, virt_str))
         return
 
-    def dump_slot(self, page_slot):
-        seen = [page_slot]
-        current = read_int_from_memory(page_slot)
-        while current not in seen:
-            seen.append(current)
-            if not is_valid_addr(current):
-                break
-            try:
-                page = read_int_from_memory(current - runtime.current_arch.ptrsize * 2)
-                virt = read_int_from_memory(current - runtime.current_arch.ptrsize * 1)
-            except gdb.MemoryError:
-                self.err_add_out("Corrupted? ({:#x})".format(current))
-                break
-            self.dump_entry(page, virt)
-            current = read_int_from_memory(current)
-        return
+    def parse_slot(self, index, page_slot):
+        # struct page_address_map {
+        #     struct page *page;
+        #     void *virtual;
+        #     struct list_head list;
+        # };
+        entries = []
+        if read_int_from_memory(page_slot, safe=True) is None:
+            return entries, "slot[{:d}] @ {:#x} is unreadable".format(index, page_slot)
+        lh = KernelListHead(page_slot, runtime.current_arch.ptrsize * 2)
+        for current in lh.iter_entries():
+            page = read_int_from_memory(current, safe=True)
+            virt = read_int_from_memory(current + runtime.current_arch.ptrsize, safe=True)
+            if page is None or virt is None:
+                return entries, "slot[{:d}]: page_address_map {:#x} is unreadable".format(index, current)
+            entries.append((page, virt))
+        if lh.broken:
+            return entries, "slot[{:d}]: the list is broken at {:#x} ({:s})".format(index, lh.broken_at, lh.broken_reason)
+        return entries, None
 
-    def dump_table(self, page_address_htable):
-        PA_HASH_ORDER = 7
-        sizeof_cache_align = 0x40
-        found = False
-        for i in range(2 ** PA_HASH_ORDER):
-            page_slot = page_address_htable + sizeof_cache_align * i
-            if not is_double_link_list(page_slot, min_len=1):
-                continue
-            self.quiet_add_out(titlify("slot[{:d}] @ {:#x}".format(i, page_slot)))
-            self.dump_slot(page_slot)
-            found = True
+    def dump_table(self, page_address_htable, sizeof_page_address_slot):
+        slots = []
+        for i in range(2 ** self.PA_HASH_ORDER):
+            page_slot = page_address_htable + sizeof_page_address_slot * i
+            entries, error = self.parse_slot(i, page_slot)
+            if entries or error:
+                slots.append((i, page_slot, entries, error))
 
-        if not found:
-            self.info_add_out("No highmem entries were found.")
+        if self.args.sort_by_page or self.args.sort_by_virt:
+            entries = [entry for _i, _page_slot, slot_entries, _error in slots for entry in slot_entries]
+            if self.args.sort_by_virt:
+                entries = sorted(entries, key=lambda x: x[1])
+            else:
+                entries = sorted(entries)
+            for page, virt in entries:
+                self.dump_entry(page, virt)
+            for _i, _page_slot, _entries, error in slots:
+                if error:
+                    self.warn_add_out("Incomplete: {:s}".format(error))
+        else:
+            for i, page_slot, entries, error in slots:
+                self.quiet_add_out(titlify("slot[{:d}] @ {:#x}".format(i, page_slot)))
+                for page, virt in entries:
+                    self.dump_entry(page, virt)
+                if error:
+                    self.warn_add_out("Incomplete: {:s}".format(error))
+
+        if not slots:
+            self.info_add_out("No kmap() mappings were found (kmap_atomic() and kmap_local_page() ones are not in this table)")
         return
 
     @parse_args
@@ -1819,16 +1856,26 @@ class HighMemDumpCommand(GenericCommand, BufferingOutput):
 
         page_address_htable = KernelAddressHeuristicFinder.get_page_address_htable()
         if page_address_htable is None:
-            err("Could not find page_address_htable")
+            consts = KernelAddressHeuristicFinder.consts()
+            if consts and Ksym.get_kallsyms() and not consts.CONFIG_HIGHMEM:
+                info("CONFIG_HIGHMEM is not set, so there is no page_address_htable")
+            else:
+                err("Could not find page_address_htable")
             return
+        self.quiet_info("page_address_htable: {:#x}".format(page_address_htable))
+
+        # it depends on CONFIG_SMP, the L1 cache line size and the lock debugging
+        sizeof_page_address_slot = GefUtil.sizeof("page_address_slot")
+        if sizeof_page_address_slot is None:
+            sizeof_page_address_slot = KernelAddressHeuristicFinderUtil.get_list_head_array_stride(
+                page_address_htable, 2 ** self.PA_HASH_ORDER,
+            )
+            if sizeof_page_address_slot is None:
+                err("Could not determine sizeof(page_address_slot)")
+                return
+        self.quiet_info("sizeof(page_address_slot): {:#x}".format(sizeof_page_address_slot))
 
         self.out = []
-        self.dump_table(page_address_htable)
-
-        if self.args.sort_by_page:
-            self.out = sorted(x for x in self.out if x.startswith("page:"))
-        elif self.args.sort_by_virt:
-            self.out = sorted([x for x in self.out if x.startswith("page:")], key=lambda x:x.split()[1])
-
+        self.dump_table(page_address_htable, sizeof_page_address_slot)
         self.print_output(check_terminal_size=True)
         return
