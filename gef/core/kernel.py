@@ -26161,3 +26161,146 @@ class KernelNftablesSet:
             "source": source,
         })
         return indices
+
+
+class KernelDevice:
+    """Resolve `struct device` in devices_kset, which every registered device joins.
+
+    struct kset {
+        struct list_head list;
+        spinlock_t list_lock;
+        struct kobject kobj;
+        const struct kset_uevent_ops *uevent_ops;
+    };
+    static struct kset *devices_kset;
+
+    struct device {
+        struct kobject kobj; // v5.2~
+        struct device *parent;
+        struct device_private *p;
+        struct kobject kobj; // ~v5.1
+        ...
+        dev_t devt;
+        ...
+        struct class *class;
+        ...
+    };
+    """
+
+    def __init__(self):
+        self.meta = []
+        self.devices = []
+        return
+
+    def initialize(self):
+        """Collect [[device, name, devt, class_name], ...] of the devices which have devt."""
+        self.meta = []
+        self.devices = []
+
+        devices_kset = KernelAddressHeuristicFinder.get_devices_kset()
+        if devices_kset is None:
+            self.meta.append(("err", "Could not find devices_kset"))
+            return None
+        self.meta.append(("info", "devices_kset: {:#x}".format(devices_kset)))
+        kset = read_int_from_memory(devices_kset)
+
+        offsetof = GefUtil.offsetof
+        offset_list = offsetof("kset", "list")
+        offset_entry = offsetof("kobject", "entry")
+        offset_kobj = offsetof("device", "kobj")
+        offset_devt = offsetof("device", "devt")
+        offset_class = offsetof("device", "class")
+        offset_class_name = offsetof("class", "name")
+        dwarf = None not in (offset_list, offset_entry, offset_kobj, offset_devt, offset_class, offset_class_name)
+        if dwarf:
+            offset_devt -= offset_kobj
+            offset_class -= offset_kobj
+        else:
+            offset_list, offset_entry, offset_class_name = 0, runtime.current_arch.ptrsize, 0
+            if Kernel.version() >= "5.2":
+                offset_kobj = 0
+            else:
+                offset_kobj = runtime.current_arch.ptrsize * 2
+
+        # kobjects in devices_kset->list
+        kobjs = []
+        head = kset + offset_list
+        seen = set()
+        current = read_int_from_memory(head)
+        while current != head:
+            if current in seen or not is_valid_addr(current):
+                self.meta.append(("warn", "Stopped at broken devices_kset list: {:#x}".format(current)))
+                break
+            seen.add(current)
+            kobj = current - offset_entry
+            name_ptr = read_int_from_memory(kobj, safe=True)
+            if name_ptr:
+                name = read_cstring_from_memory(name_ptr, safe=True)
+            else:
+                name = None
+            kobjs.append((kobj, name or "<None>"))
+            current = read_int_from_memory(current)
+
+        if not dwarf:
+            offset_devt, offset_class = self.get_offset_devt(kobjs)
+            if offset_devt is None:
+                self.meta.append(("err", "Could not find offsetof(device, devt)"))
+                return None
+            self.meta.append(("info", "offsetof(device, devt) - offsetof(device, kobj): {:#x}".format(offset_devt)))
+            if offset_class is None:
+                self.meta.append(("warn", "Could not find offsetof(device, class)"))
+            else:
+                self.meta.append(("info", "offsetof(device, class) - offsetof(device, kobj): {:#x}".format(offset_class)))
+
+        for kobj, name in kobjs:
+            devt = read_int32_from_memory(kobj + offset_devt, safe=True)
+            if not devt:
+                continue
+            class_name = "???"
+            if offset_class is not None:
+                class_ = read_int_from_memory(kobj + offset_class, safe=True)
+                if class_ == 0:
+                    class_name = "<None>"
+                elif is_valid_addr(class_):
+                    class_name = read_cstring_from_memory(read_int_from_memory(class_ + offset_class_name), safe=True) or "???"
+            self.devices.append([kobj - offset_kobj, name, devt, class_name])
+        return True
+
+    def get_offset_devt(self, kobjs):
+        """Return the offsets of devt and class from the kobject embedded in struct device.
+        They depend on many CONFIGs, so they are searched with the devices which drivers/char/mem.c always creates."""
+        anchors = {"null": 1 << 20 | 3, "zero": 1 << 20 | 5}
+        samples = {}
+        scan_size = 0x800
+        for kobj, name in kobjs:
+            if name in anchors and name not in samples:
+                data = read_memory(kobj, scan_size, safe=True)
+                if data is None:
+                    continue
+                samples[name] = data
+        if len(samples) != len(anchors):
+            return None, None
+
+        offset_devt = None
+        for offset in range(0, scan_size - 4, 4):
+            if all(u32(samples[name][offset:offset + 4]) == devt for name, devt in anchors.items()):
+                offset_devt = offset
+                break
+        if offset_devt is None:
+            return None, None
+
+        # both are in the "mem" class
+        ptrsize = runtime.current_arch.ptrsize
+        unpack = GefUtil.get_unpack(ptrsize)
+        start = (offset_devt + 4 + ptrsize - 1) & ~(ptrsize - 1)
+        for offset in range(start, min(offset_devt + 0x100, scan_size - ptrsize), ptrsize):
+            classes = {unpack(sample[offset:offset + ptrsize]) for sample in samples.values()}
+            if len(classes) != 1:
+                continue
+            class_ = classes.pop()
+            if not is_valid_addr(class_):
+                continue
+            name = read_int_from_memory(class_)
+            if is_valid_addr(name) and read_cstring_from_memory(name) == "mem":
+                return offset_devt, offset
+        return offset_devt, None
