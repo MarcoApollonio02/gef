@@ -478,6 +478,7 @@ class GenericCommand(gdb.Command):
 
     def invoke(self, args, from_tty): # noqa
         try:
+            self.command_args = args
             argv = gdb.string_to_argv(args)
             if self._repeat_:
                 self.set_repeat_count(argv, from_tty)
@@ -700,6 +701,7 @@ class GefAlias(gdb.Command):
 
         # add or overwrite
         runtime.alias_instances[alias] = self
+        runtime.registered_aliases.add(alias)
         return
 
     def invoke(self, args, from_tty): # noqa

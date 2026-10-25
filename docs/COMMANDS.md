@@ -3757,7 +3757,7 @@ positional arguments:
   {byte,word,dword,qword}
                         dump mode. It also works if you specify the first character. (default: byte)
   LOCATION              the memory address to dump.
-  COUNT                 the count of displayed units. (default: 256)
+  COUNT                 the number of bytes to dump, regardless of the display unit. (default: 256)
 
 options:
   -h, --help            show this help message and exit
@@ -3848,20 +3848,23 @@ Pretty print JSON from memory values.
 ### Syntax
 
 ```text
-usage: json memory [-h] [-n] LOCATION
+usage: json memory [-h] [-r MAX_READ] [-n] LOCATION
 
 positional arguments:
-  LOCATION        start address for json.
+  LOCATION              start address for json.
 
 options:
-  -h, --help      show this help message and exit
-  -n, --no-pager  do not use the pager.
+  -h, --help            show this help message and exit
+  -r, --max-read MAX_READ
+                        maximum bytes to inspect, including the NUL terminator. (default: 1048576)
+  -n, --no-pager        do not use the pager.
 ```
 
 ### Examples
 
 ```gdb
 json memory $rdi
+json memory $rdi --max-read 0x20_0000
 ```
 
 ## json value
@@ -3896,13 +3899,14 @@ Display stack values for sigreturn syscall.
 ### Syntax
 
 ```text
-usage: sigreturn [-h] [-n] [LOCATION]
+usage: sigreturn [-h] [-r] [-n] [LOCATION]
 
 positional arguments:
-  LOCATION        the address interpreted as the beginning of a sigframe. (default: current_arch.sp)
+  LOCATION        the address interpreted as the beginning of a sigframe, or the ucontext_t on architectures other than x86/arm. (default: current_arch.sp)
 
 options:
   -h, --help      show this help message and exit
+  -r, --rt        interpret the frame as a realtime (SA_SIGINFO) frame on i386/ARM32.
   -n, --no-pager  do not use the pager.
 ```
 
@@ -3964,7 +3968,7 @@ Dump string like x/s command, but with hex-string style.
 ### Syntax
 
 ```text
-usage: xs [-h] [-l MAX_LENGTH] [-H] [-n] [-q] [COUNT] ADDRESS
+usage: xs [-h] [-l MAX_LENGTH] [-r MAX_READ] [-H] [-n] [-q] [COUNT] ADDRESS
 
 positional arguments:
   COUNT                 repeat count for displaying.
@@ -3974,6 +3978,8 @@ options:
   -h, --help            show this help message and exit
   -l, --max-length MAX_LENGTH
                         maximum number of characters to display. 0 means unlimited.
+  -r, --max-read MAX_READ
+                        maximum bytes to inspect per string. 0 means unlimited. (default: 0)
   -H, --hex             show in hex style.
   -n, --no-pager        do not use the pager.
   -q, --quiet           quiet mode.
@@ -5046,7 +5052,7 @@ The salt for BLAKE2s and BLAKE2b is blank.
 The key for KMAC128 and KMAC256 is blank.
 The key for SipHash is "\0" * 16.
 The key for HalfSipHash is "\0" * 8.
-To calculate FSB hash, you need the `gmpy2` package (uv pip install gmpy2).
+To calculate FSB hash, install `gmpy2` into the Python environment used by GEF.
 ```
 
 ## hash file
@@ -5082,7 +5088,7 @@ The salt for BLAKE2s and BLAKE2b is blank.
 The key for KMAC128 and KMAC256 is blank.
 The key for SipHash is "\0" * 16.
 The key for HalfSipHash is "\0" * 8.
-To calculate FSB hash, you need the `gmpy2` package (uv pip install gmpy2).
+To calculate FSB hash, install `gmpy2` into the Python environment used by GEF.
 ```
 
 ## hash known-collision
@@ -5108,7 +5114,7 @@ The salt for BLAKE2s and BLAKE2b is blank.
 The key for KMAC128 and KMAC256 is blank.
 The key for SipHash is "\0" * 16.
 The key for HalfSipHash is "\0" * 8.
-To calculate FSB hash, you need the `gmpy2` package (uv pip install gmpy2).
+To calculate FSB hash, install `gmpy2` into the Python environment used by GEF.
 ```
 
 ## hash list
@@ -5168,7 +5174,7 @@ The salt for BLAKE2s and BLAKE2b is blank.
 The key for KMAC128 and KMAC256 is blank.
 The key for SipHash is "\0" * 16.
 The key for HalfSipHash is "\0" * 8.
-To calculate FSB hash, you need the `gmpy2` package (uv pip install gmpy2).
+To calculate FSB hash, install `gmpy2` into the Python environment used by GEF.
 ```
 
 ## hash test
@@ -5179,7 +5185,7 @@ Calculate and check hash from constant inputs.
 ### Syntax
 
 ```text
-usage: hash test [-h] [-f REGEX] [-l LENGTH_FILTER] [-s] [-t | -T] [--size SIZE] [--no-cffi] [-n]
+usage: hash test [-h] [-f REGEX] [-l LENGTH_FILTER] [-s] [--extended | -t | -T] [--size SIZE] [--no-cffi] [-n]
 
 options:
   -h, --help            show this help message and exit
@@ -5187,6 +5193,7 @@ options:
   -l, --length-filter LENGTH_FILTER
                         filter by hash byte length.
   -s, --smart           show only failed.
+  --extended            also check split input, repeated digests and independent instances.
   -t, --time            measure the time taken to compute the hash using large bytes of data.
   -T, --time-with-sort  measure and sort the time taken to compute the hash using large bytes of data.
   --size SIZE           the data size of 'AAAA...' to measure the time taken to compute the hash.
@@ -5233,7 +5240,7 @@ The salt for BLAKE2s and BLAKE2b is blank.
 The key for KMAC128 and KMAC256 is blank.
 The key for SipHash is "\0" * 16.
 The key for HalfSipHash is "\0" * 8.
-To calculate FSB hash, you need the `gmpy2` package (uv pip install gmpy2).
+To calculate FSB hash, install `gmpy2` into the Python environment used by GEF.
 ```
 
 ## is-mem-zero
@@ -12738,19 +12745,21 @@ The preview uses the physical instruction address in SMRAM, or the detected SMRA
 # 07-a. Misc - Conversion
 ## addressify
 
-Convert reverse-order hex values to address.
+Convert hex bytes to an address using the specified byte order.
 
 
 ### Syntax
 
 ```text
-usage: addressify [-h] VALUE [VALUE ...]
+usage: addressify [-h] [-b {little,big}] VALUE [VALUE ...]
 
 positional arguments:
-  VALUE       the string to convert.
+  VALUE                 the string to convert.
 
 options:
-  -h, --help  show this help message and exit
+  -h, --help            show this help message and exit
+  -b, --byte-order {little,big}
+                        the input byte order (default: little, independent of the target).
 ```
 
 ### Examples
@@ -12758,6 +12767,7 @@ options:
 ```gdb
 addressify "00 30 e0 f7 ff 7f"
 addressify 00 30 e0 f7 ff 7f
+addressify --byte-order big 7f ff f7 e0 30 00
 ```
 
 ## convert
@@ -12904,7 +12914,7 @@ Lambdas, unnamed types and expressions in template arguments are unsupported.
 
 ## u2d
 
-Convert type (unsigned long <-> double/float).
+Compare bit reinterpretation and numeric conversion for double/float and unsigned integers.
 
 
 ### Syntax
@@ -12913,7 +12923,7 @@ Convert type (unsigned long <-> double/float).
 usage: u2d [-h] VALUE
 
 positional arguments:
-  VALUE       the hex value or double value.
+  VALUE       an integer (decimal/hex) or floating-point value.
 
 options:
   -h, --help  show this help message and exit
@@ -12930,7 +12940,9 @@ u2d 1.2345e-1
 ### Notes
 
 ```text
-Only ~64bit supported (Unsupported 80bit, 128bit)
+Supports 32-bit float/uint and 64-bit double/ull (not 80-bit or 128-bit).
+Integer inputs use their low 64/32 bits; use a decimal point or exponent for floating-point input.
+Integer round trips outside the unsigned range are marked <out of range>.
 ```
 
 ## unsigned
@@ -12959,25 +12971,27 @@ unsigned -- -0xa0
 # 07-b. Misc - Search
 ## constgrep
 
-Grep for lines with #define in files under /usr/include.
+Grep for lines with #define in header files (default: host /usr/include).
 
 
 ### Syntax
 
 ```text
-usage: constgrep [-h] GREP_PATTERN
+usage: constgrep [-h] [-r DIRECTORY] GREP_PATTERN
 
 positional arguments:
-  GREP_PATTERN  filter by regex.
+  GREP_PATTERN          filter by regex.
 
 options:
-  -h, --help    show this help message and exit
+  -h, --help            show this help message and exit
+  -r, --root DIRECTORY  header search directory (e.g. SYSROOT/usr/include; default: host /usr/include).
 ```
 
 ### Examples
 
 ```gdb
 constgrep '__NR_*'
+constgrep -r /path/to/sysroot/usr/include '__NR_*'
 ```
 
 # 07-c. Misc - Generation
@@ -13049,7 +13063,7 @@ Search for the cyclic de Bruijn pattern generated by the `pattern create`.
 ### Syntax
 
 ```text
-usage: pattern search [-h] [-c CHARSET] PATTERN [SIZE]
+usage: pattern search [-h] [-c CHARSET] [-w {1,2,4,8}] PATTERN [SIZE]
 
 positional arguments:
   PATTERN               the pattern to offset search.
@@ -13059,6 +13073,8 @@ options:
   -h, --help            show this help message and exit
   -c, --charset CHARSET
                         the charset of pattern. (default: abc..z)
+  -w, --width {1,2,4,8}
+                        the integer search width in bytes. (default: target pointer size)
 ```
 
 ### Examples
@@ -13128,14 +13144,16 @@ Hint for sigreturn oriented programming.
 ### Syntax
 
 ```text
-usage: srop-hint [-h] [{x86,x64,arm,aarch64}]
+usage: srop-hint [-h] [--abi {linux,linux-compat,qemu-user}] [{x86,x64,arm,aarch64,riscv32,riscv64,mips,mipsn32,mips64,ppc64,s390x,loongarch64,sparc64,sh4,m68k,alpha,hppa}]
 
 positional arguments:
-  {x86,x64,arm,aarch64}
+  {x86,x64,arm,aarch64,riscv32,riscv64,mips,mipsn32,mips64,ppc64,s390x,loongarch64,sparc64,sh4,m68k,alpha,hppa}
                         the target architecture.
 
 options:
   -h, --help            show this help message and exit
+  --abi {linux,linux-compat,qemu-user}
+                        the signal frame ABI for SPARC64, m68k or PA-RISC32. (default: detect QEMU-user, else Linux)
 ```
 
 # 07-e. Misc - Calculation
@@ -13399,7 +13417,7 @@ Add the command alias.
 ### Syntax
 
 ```text
-usage: aliases add [-h] [-r] ALIAS COMMAND [COMMAND ...]
+usage: aliases add [-h] [-r] ALIAS ...
 
 positional arguments:
   ALIAS         the name of new alias.
@@ -13407,7 +13425,7 @@ positional arguments:
 
 options:
   -h, --help    show this help message and exit
-  -r, --repeat  enforce repeat feature.
+  -r, --repeat  enforce repeat feature (before ALIAS).
 ```
 
 ### Examples

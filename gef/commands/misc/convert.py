@@ -42,13 +42,13 @@ from gef.core.utils import GefUtil, byteswap, slicer
 
 @register_command
 class U2dCommand(GenericCommand):
-    """Convert type (unsigned long <-> double/float)."""
+    """Compare bit reinterpretation and numeric conversion for double/float and unsigned integers."""
 
     _cmdline_ = "u2d"
     _category_ = "07-a. Misc - Conversion"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
-    parser.add_argument("value", metavar="VALUE", help="the hex value or double value.")
+    parser.add_argument("value", metavar="VALUE", help="an integer (decimal/hex) or floating-point value.")
     _syntax_ = parser.format_help()
 
     _example_ = [
@@ -59,77 +59,75 @@ class U2dCommand(GenericCommand):
     _example_ = "\n".join(_example_).format(_cmdline_)
 
     _note_ = [
-        "Only ~64bit supported (Unsupported 80bit, 128bit)",
+        "Supports 32-bit float/uint and 64-bit double/ull (not 80-bit or 128-bit).",
+        "Integer inputs use their low 64/32 bits; use a decimal point or exponent for floating-point input.",
+        "Integer round trips outside the unsigned range are marked <out of range>.",
     ]
     _note_ = "\n".join(_note_)
-
-    def f2u(self, x):
-        u = lambda a: struct.unpack("<I", a)[0]
-        pf = lambda a: struct.pack("<f", a)
-        return u(pf(x))
-
-    def u2f(self, x):
-        p = lambda a: struct.pack("<I", a & 0xffff_ffff)
-        uf = lambda a: struct.unpack("<f", a)[0]
-        return uf(p(x))
-
-    def d2u(self, x):
-        uQ = lambda a: struct.unpack("<Q", a)[0]
-        pd = lambda a: struct.pack("<d", a)
-        return uQ(pd(x))
-
-    def u2d(self, x):
-        pQ = lambda a: struct.pack("<Q", a & 0xffff_ffff_ffff_ffff)
-        ud = lambda a: struct.unpack("<d", a)[0]
-        return ud(pQ(x))
 
     def convert_from_float(self, n):
         gef_print(titlify("double -> unsigned long long"))
         gef_print(Color.cyanify("double -> ull (reinterpret_cast)"))
-        gef_print("  {:.20e} ---> {:#018x}".format(n, self.d2u(n)))
-        gef_print(titlify("float -> float"))
+        gef_print("  {:.20e} ---> {:#018x}".format(n, GefUtil.d2u(n)))
+        gef_print(titlify("float -> unsigned int"))
         gef_print(Color.cyanify("float -> uint (reinterpret_cast)"))
-        gef_print("  {:.20e} ---> {:#010x}".format(n, self.f2u(n)))
+        try:
+            bits = GefUtil.f2u(n)
+        except OverflowError:
+            gef_print("  {:.20e} ---> <overflow>".format(n))
+            return
+        f = GefUtil.u2f(bits)
+        gef_print("  {:.20e} ---> {:#010x}".format(f, bits))
         return
 
     def convert_from_int(self, n):
         n &= 0xffff_ffff_ffff_ffff
         gef_print(titlify("unsigned long long <-> double"))
         gef_print(Color.cyanify("ull -> double (reinterpret_cast)"))
-        gef_print("  {:#018x} ---> {:.20e}".format(n, self.u2d(n)))
+        gef_print("  {:#018x} ---> {:.20e}".format(n, GefUtil.u2d(n)))
         gef_print(Color.cyanify("ull -> double -> ull (static_cast)"))
-        gef_print("  {:#018x} ---> {:#018x} ---> {:#018x}".format(n, self.d2u(float(n)), int(self.u2d(self.d2u(float(n))))))
+        d = float(n)
+        restored = int(d)
+        if restored <= 0xffff_ffff_ffff_ffff:
+            result = "{:#018x}".format(restored)
+        else:
+            result = "<out of range>"
+        gef_print("  {:#018x} ---> {:.20e} ---> {}".format(n, d, result))
         gef_print(Color.cyanify("double -> ull (reinterpret_cast)"))
-        try:
-            gef_print("  {:#018x} ---> {:#018x}".format(n, int(self.u2d(n))))
-        except ValueError:
-            gef_print("  {:18s} ---> ???".format("nan"))
+        gef_print("  {:.20e} ---> {:#018x}".format(d, GefUtil.d2u(d)))
 
         n &= 0xffff_ffff
         gef_print(titlify("unsigned int <-> float"))
         gef_print(Color.cyanify("uint -> float (reinterpret_cast)"))
-        gef_print("  {:#010x} ---> {:.20e}".format(n, self.u2f(n)))
+        gef_print("  {:#010x} ---> {:.20e}".format(n, GefUtil.u2f(n)))
         gef_print(Color.cyanify("uint -> float -> uint (static_cast)"))
-        gef_print("  {:#010x} ---> {:#010x} ---> {:#010x}".format(n, self.f2u(float(n)), int(self.u2f(self.f2u(float(n))))))
+        bits = GefUtil.f2u(n)
+        f = GefUtil.u2f(bits)
+        restored = int(f)
+        if restored <= 0xffff_ffff:
+            result = "{:#010x}".format(restored)
+        else:
+            result = "<out of range>"
+        gef_print("  {:#010x} ---> {:.20e} ---> {}".format(n, f, result))
         gef_print(Color.cyanify("float -> uint (reinterpret_cast)"))
-        try:
-            gef_print("  {:#010x} ---> {:#010x}".format(n, int(self.u2f(n))))
-        except ValueError:
-            gef_print("  {:10s} ---> ???".format("nan"))
+        gef_print("  {:.20e} ---> {:#010x}".format(f, bits))
         return
 
     @parse_args
     def do_invoke(self, args):
         try:
-            if "." in args.value:
+            n = int(args.value, 0)
+        except ValueError:
+            try:
                 n = float(args.value)
-                self.convert_from_float(n)
-            else:
-                n = int(args.value, 0)
-                self.convert_from_int(n)
-        except Exception:
-            self.usage()
+            except ValueError:
+                self.usage()
+                return
+            self.convert_from_float(n)
+        else:
+            self.convert_from_int(n)
         return
+
 
 
 @register_command
@@ -178,18 +176,21 @@ class UnsignedCommand(GenericCommand):
 
 @register_command
 class AddressifyCommand(GenericCommand):
-    """Convert reverse-order hex values to address."""
+    """Convert hex bytes to an address using the specified byte order."""
 
     _cmdline_ = "addressify"
     _category_ = "07-a. Misc - Conversion"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
+    parser.add_argument("-b", "--byte-order", choices=("little", "big"), default="little",
+                        help="the input byte order (default: little, independent of the target).")
     parser.add_argument("value", metavar="VALUE", nargs="+", help="the string to convert.")
     _syntax_ = parser.format_help()
 
     _example_ = [
         '{0:s} "00 30 e0 f7 ff 7f"',
         "{0:s} 00 30 e0 f7 ff 7f",
+        "{0:s} --byte-order big 7f ff f7 e0 30 00",
     ]
     _example_ = "\n".join(_example_).format(_cmdline_)
 
@@ -197,7 +198,7 @@ class AddressifyCommand(GenericCommand):
     def do_invoke(self, args):
         hex_value = ""
         for value in args.value:
-            for c in value.lower():
+            for c in value.lower().replace("0x", ""):
                 if c in "0123456789abcdef":
                     hex_value += c
         if hex_value == "":
@@ -207,12 +208,15 @@ class AddressifyCommand(GenericCommand):
             err("Hex value length is odd")
             return
 
-        hex_values = slicer(hex_value, 2)[::-1]
+        hex_values = slicer(hex_value, 2)
+        if args.byte_order == "little":
+            hex_values.reverse()
         hex_values = "".join(hex_values)
 
         address = int(hex_values, 16)
-        address = ProcessMap.lookup_address(address)
+        address = ProcessMap.lookup(address)
 
+        gef_print("Byte order: {:s}".format(args.byte_order))
         if address.valid and address.section.path:
             gef_print("{!s} @ {:s}".format(address, address.section.path))
         elif is_valid_addr(address.value):
@@ -220,6 +224,7 @@ class AddressifyCommand(GenericCommand):
         else:
             gef_print("{!s} (invalid)".format(address))
         return
+
 
 
 @register_command

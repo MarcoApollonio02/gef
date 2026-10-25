@@ -99,6 +99,7 @@ missing_modules: dict = {}
 # which holds *module-import* failures keyed by dotted module name).
 missing_commands: dict = {}
 alias_instances: dict = {}
+registered_aliases: set = set()
 
 
 def get_current_arch():

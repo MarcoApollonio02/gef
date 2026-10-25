@@ -23,6 +23,7 @@ from gef.commands.base import (
     parse_args,
     register_command,
 )
+from gef.core import runtime
 from gef.core.address import AddressUtil
 from gef.core.color import err, gef_print, info, ok, titlify
 from gef.core.config import Config
@@ -172,6 +173,7 @@ class PatternCommand(GenericCommand):
         return
 
 
+
 @register_command
 class PatternCreateCommand(GenericCommand):
     """Generate a de Bruijn cyclic pattern."""
@@ -246,6 +248,8 @@ class PatternSearchCommand(GenericCommand):
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("-c", "--charset", help="the charset of pattern. (default: abc..z)")
+    parser.add_argument("-w", "--width", type=int, choices=(1, 2, 4, 8),
+                        help="the integer search width in bytes. (default: target pointer size)")
     parser.add_argument("pattern", metavar="PATTERN", help="the pattern to offset search.")
     parser.add_argument("size", metavar="SIZE", type=AddressUtil.parse_address, nargs="?",
                         help="the size of pattern. (default: 0x10000)")
@@ -293,17 +297,25 @@ class PatternSearchCommand(GenericCommand):
     @only_if_gdb_running
     def do_invoke(self, args):
         if args.size is None:
-            size = Config.get_gef_setting("pattern.length") * 64
+            size = Config.get("pattern.length") * 64
         else:
             size = args.size
 
-        cyclic_pattern = PatternCreateCommand.generate_cyclic_pattern(size, args.charset)
-        pack = p32 if is_32bit() else p64
+        try:
+            cyclic_pattern = PatternCreateCommand.generate_cyclic_pattern(size, args.charset)
+        except ValueError as e:
+            err(e)
+            return
+        width = args.width or runtime.current_arch.ptrsize
+        mask = (1 << (width * 8)) - 1
+
+        def pack(value):
+            return (value & mask).to_bytes(width, "little")
 
         # 1. check if it's a symbol (like "$sp")
         try:
             address = AddressUtil.parse_address(args.pattern)
-            value = read_int_from_memory(address)
+            value = int.from_bytes(read_memory(address, width), "little")
             self.search("As symbol (with dereference)", cyclic_pattern, pack(value))
         except gdb.error:
             pass
@@ -320,6 +332,7 @@ class PatternSearchCommand(GenericCommand):
         if set(pattern) - set(cyclic_pattern) == set():
             self.search("As string", cyclic_pattern, pattern)
         return
+
 
 
 @register_command

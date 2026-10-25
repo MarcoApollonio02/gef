@@ -29,7 +29,7 @@ from gef.core.elf import Elf
 from gef.core.arch_base import Architecture
 from gef.core.utils import GefUtil
 from gef.core.config import Config
-from gef.core.memory import hexdump, is_valid_addr, read_int_from_memory, read_memory
+from gef.core.memory import hexdump, is_valid_addr, read_int64_from_memory, read_int_from_memory, read_memory, u32
 from gef.core.process import (
     LinuxSignal,
     is_alpha,
@@ -84,7 +84,7 @@ class HexdumpCommand(GenericCommand, BufferingOutput):
     parser.add_argument("location", metavar="LOCATION", type=AddressUtil.parse_address,
                         help="the memory address to dump.")
     parser.add_argument("count", metavar="COUNT", nargs="?", type=AddressUtil.parse_address, default=0x100,
-                        help="the count of displayed units. (default: %(default)s)")
+                        help="the number of bytes to dump, regardless of the display unit. (default: %(default)s)")
     parser.add_argument("--phys", action="store_true",
                         help="treat LOCATION as a physical address (qemu-system only).")
     parser.add_argument("-r", "--reverse", action="store_true", help="display in reverse order line by line.")
@@ -97,17 +97,8 @@ class HexdumpCommand(GenericCommand, BufferingOutput):
         super().__init__(complete="use_user_complete")
         return
 
-    def complete(self, text, word): # noqa
-        if text.strip() in self.modes:
-            # already matched
-            return []
-
-        if text == "":
-            # no prefix
-            return [s for s in self.modes if ((word is None) or (s and word in s))]
-
-        # finally, look for possible values for given prefix
-        return [s for s in self.modes if s and s.startswith(text.strip())]
+    def complete(self, text, word):
+        return GefUtil.complete_candidates(self.modes, text, word)
 
     @staticmethod
     def merge_lines(lines_unmerged, nb_skip_merge=1):
@@ -173,13 +164,30 @@ class HexdumpCommand(GenericCommand, BufferingOutput):
             read_end -= get_pagesize()
         return None
 
+    def do_invoke(self, argv):
+        options_done = False
+        for index, arg in enumerate(argv):
+            if not options_done and arg == "--":
+                options_done = True
+                continue
+            if not options_done and arg.startswith("-") and not re.match(r"-\d", arg):
+                continue
+            if arg not in self.modes:
+                argv = argv[:index] + ["byte"] + argv[index:]
+            break
+        self.hexdump(argv)
+        return
+
     @parse_args
     @only_if_gdb_running
-    def do_invoke(self, args):
+    def hexdump(self, args):
         if args.phys:
             if not is_qemu_system() and not is_vmware() and not is_kgdb():
                 err("Unsupported in this gdb mode.")
                 return
+        if args.count > 0x0100_0000:
+            err("Maximum read size is 16 MiB; split the range")
+            return
 
         from_idx = args.count * self.repeat_count
         to_idx = args.count * (self.repeat_count + 1)
@@ -209,8 +217,11 @@ class HexdumpCommand(GenericCommand, BufferingOutput):
             lines.reverse()
 
         self.out = lines
+        if len(mem) < args.count:
+            self.warn_add_out("Partial memory read: {:d}/{:d} bytes".format(len(mem), args.count))
         self.print_output(check_terminal_size=True)
         return
+
 
 
 @register_command
@@ -394,197 +405,300 @@ class SigreturnCommand(GenericCommand):
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("location", metavar="LOCATION", nargs="?", type=AddressUtil.parse_address,
-                        help="the address interpreted as the beginning of a sigframe. (default: current_arch.sp)")
+                        help="the address interpreted as the beginning of a sigframe, or the ucontext_t on "
+                             "architectures other than x86/arm. (default: current_arch.sp)")
+    parser.add_argument("-r", "--rt", action="store_true",
+                        help="interpret the frame as a realtime (SA_SIGINFO) frame on i386/ARM32.")
     parser.add_argument("-n", "--no-pager", action="store_true", help="do not use the pager.")
     _syntax_ = parser.format_help()
+
+    # register fields of struct sigcontext (i386) and struct sigcontext (ARM), relative to that struct
+    I386_SC = ("gs", "fs", "es", "ds", "edi", "esi", "ebp", "esp", "ebx", "edx", "ecx", "eax",
+               "trapno", "err", "eip", "cs", "eflags", "esp_at_signal", "ss", "fpstate", "oldmask", "cr2")
+    ARM_MC = ("trapno", "error_code", "oldmask",
+              "arm_r0", "arm_r1", "arm_r2", "arm_r3", "arm_r4", "arm_r5", "arm_r6", "arm_r7",
+              "arm_r8", "arm_r9", "arm_r10", "arm_fp", "arm_ip", "arm_sp", "arm_lr", "arm_pc",
+              "arm_cpsr", "fault_address")
+
+    # known magic values of the AArch64 uc_mcontext.__reserved extension records
+    AARCH64_EXT_MAGIC = {
+        0x46508001: "FPSIMD_MAGIC", 0x45535201: "ESR_MAGIC", 0x53564501: "SVE_MAGIC",
+        0x54504902: "TPIDR2_MAGIC", 0x54366345: "ZA_MAGIC", 0x5a544801: "ZT_MAGIC",
+        0x46504d52: "FPMR_MAGIC", 0x504f4501: "POE_MAGIC", 0x47435300: "GCS_MAGIC",
+        0x45585401: "EXTRA_MAGIC",
+    }
 
     @parse_args
     @only_if_gdb_running
     @exclude_specific_gdb_mode(mode=("wine",))
-    @only_if_specific_arch(arch=("x86_32", "x86_64", "ARM32", "ARM64"))
+    @only_if_specific_arch(arch=(
+        "x86_32", "x86_64", "ARM32", "ARM64", "RISCV32", "RISCV64", "MIPS32", "MIPSN32", "MIPS64", "PPC64",
+        "S390X", "LOONGARCH64", "SPARC64", "SH4", "M68K", "ALPHA", "HPPA32",
+    ))
     def do_invoke(self, args):
         from gef.commands.debugging.context import DereferenceCommand
-        if args.location is None:
-            base = runtime.current_arch.sp
-        else:
+        explicit = args.location is not None
+        if explicit:
             base = args.location
+        else:
+            base = runtime.current_arch.sp
 
+        if not (is_x86_64() or is_x86_32() or is_arm32() or is_arm64()):
+            # LOCATION is the ucontext_t; the default sp points at the frame start,
+            # whose ucontext begins after an architecture-specific header.
+            if not explicit:
+                base += self.frame_to_ucontext()
+            self.print_ucontext_frame(base, args)
+            return
+
+        entries = self.frame_entries(args.rt)
         if is_x86_64():
-            sigreturn_defines = [
-                "rt_sigframe.pretcode",
-                "rt_sigframe.uc.uc_flags",
-                "rt_sigframe.uc.uc_link",
-                "rt_sigframe.uc.uc_stack.ss_sp",
-                "rt_sigframe.uc.uc_stack.ss_flags|ss_size",
-                "rt_sigframe.uc.uc_mcontext.r8",
-                "rt_sigframe.uc.uc_mcontext.r9",
-                "rt_sigframe.uc.uc_mcontext.r10",
-                "rt_sigframe.uc.uc_mcontext.r11",
-                "rt_sigframe.uc.uc_mcontext.r12",
-                "rt_sigframe.uc.uc_mcontext.r13",
-                "rt_sigframe.uc.uc_mcontext.r14",
-                "rt_sigframe.uc.uc_mcontext.r15",
-                "rt_sigframe.uc.uc_mcontext.rdi",
-                "rt_sigframe.uc.uc_mcontext.rsi",
-                "rt_sigframe.uc.uc_mcontext.rbp",
-                "rt_sigframe.uc.uc_mcontext.rbx",
-                "rt_sigframe.uc.uc_mcontext.rdx",
-                "rt_sigframe.uc.uc_mcontext.rax",
-                "rt_sigframe.uc.uc_mcontext.rcx",
-                "rt_sigframe.uc.uc_mcontext.rsp",
-                "rt_sigframe.uc.uc_mcontext.rip",
-                "rt_sigframe.uc.uc_mcontext.rflags",
-                "rt_sigframe.uc.uc_mcontext.cs|gs|fs|__pad0",
-                "rt_sigframe.uc.uc_mcontext.err",
-                "rt_sigframe.uc.uc_mcontext.trapno",
-                "rt_sigframe.uc.uc_mcontext.oldmask",
-                "rt_sigframe.uc.uc_mcontext.cr2",
-                "rt_sigframe.uc.uc_mcontext.fpstate",
-                "rt_sigframe.uc.uc_mcontext.reserved[8]",
-                "rt_sigframe.uc.uc_sigmask",
-                "rt_sigframe.info",
-            ]
-        elif is_x86_32():
-            sigreturn_defines = [
-                "sigframe.sc.gs",
-                "sigframe.sc.fs",
-                "sigframe.sc.es",
-                "sigframe.sc.ds",
-                "sigframe.sc.edi",
-                "sigframe.sc.esi",
-                "sigframe.sc.ebp",
-                "sigframe.sc.esp",
-                "sigframe.sc.ebx",
-                "sigframe.sc.edx",
-                "sigframe.sc.ecx",
-                "sigframe.sc.eax",
-                "sigframe.sc.trapno",
-                "sigframe.sc.err",
-                "sigframe.sc.eip",
-                "sigframe.sc.cs",
-                "sigframe.sc.eflags",
-                "sigframe.sc.esp_at_signal",
-                "sigframe.sc.ss",
-                "sigframe.sc.fpstate",
-                "sigframe.sc.oldmask",
-                "sigframe.sc.cr2",
-            ]
-        elif is_arm32():
-            sigreturn_defines = [
-                "sigframe.uc.uc_flags",
-                "sigframe.uc.uc_link",
-                "sigframe.uc.uc_stack.ss_sp",
-                "sigframe.uc.uc_stack.ss_flags",
-                "sigframe.uc.uc_stack.ss_size",
-                "sigframe.uc.uc_mcontext.trapno",
-                "sigframe.uc.uc_mcontext.error_code",
-                "sigframe.uc.uc_mcontext.oldmask",
-                "sigframe.uc.uc_mcontext.arm_r0",
-                "sigframe.uc.uc_mcontext.arm_r1",
-                "sigframe.uc.uc_mcontext.arm_r2",
-                "sigframe.uc.uc_mcontext.arm_r3",
-                "sigframe.uc.uc_mcontext.arm_r4",
-                "sigframe.uc.uc_mcontext.arm_r5",
-                "sigframe.uc.uc_mcontext.arm_r6",
-                "sigframe.uc.uc_mcontext.arm_r7",
-                "sigframe.uc.uc_mcontext.arm_r8",
-                "sigframe.uc.uc_mcontext.arm_r9",
-                "sigframe.uc.uc_mcontext.arm_r10",
-                "sigframe.uc.uc_mcontext.arm_fp",
-                "sigframe.uc.uc_mcontext.arm_ip",
-                "sigframe.uc.uc_mcontext.arm_sp",
-                "sigframe.uc.uc_mcontext.arm_lr",
-                "sigframe.uc.uc_mcontext.arm_pc",
-                "sigframe.uc.uc_mcontext.arm_cpsr",
-                "sigframe.uc.uc_mcontext.fault_address",
-                "sigframe.uc.uc_sigmask",
-            ]
-        elif is_arm64():
-            sigreturn_defines = [
-                "rt_sigframe.info+0x00",
-                "rt_sigframe.info+0x08",
-                "rt_sigframe.info+0x10",
-                "rt_sigframe.info+0x18",
-                "rt_sigframe.info+0x20",
-                "rt_sigframe.info+0x28",
-                "rt_sigframe.info+0x30",
-                "rt_sigframe.info+0x38",
-                "rt_sigframe.info+0x40",
-                "rt_sigframe.info+0x48",
-                "rt_sigframe.info+0x50",
-                "rt_sigframe.info+0x58",
-                "rt_sigframe.info+0x60",
-                "rt_sigframe.info+0x68",
-                "rt_sigframe.info+0x70",
-                "rt_sigframe.info+0x78",
-                "rt_sigframe.uc.uc_flags",
-                "rt_sigframe.uc.uc_link",
-                "rt_sigframe.uc.uc_stack.ss_sp",
-                "rt_sigframe.uc.uc_stack.ss_flags",
-                "rt_sigframe.uc.uc_stack.ss_size",
-                "rt_sigframe.uc.uc_stack.__unused",
-                "rt_sigframe.uc.uc_sigmask",
-                "rt_sigframe.uc.__unused[120]+0x00",
-                "rt_sigframe.uc.__unused[120]+0x08",
-                "rt_sigframe.uc.__unused[120]+0x10",
-                "rt_sigframe.uc.__unused[120]+0x18",
-                "rt_sigframe.uc.__unused[120]+0x20",
-                "rt_sigframe.uc.__unused[120]+0x28",
-                "rt_sigframe.uc.__unused[120]+0x30",
-                "rt_sigframe.uc.__unused[120]+0x38",
-                "rt_sigframe.uc.__unused[120]+0x40",
-                "rt_sigframe.uc.__unused[120]+0x48",
-                "rt_sigframe.uc.__unused[120]+0x50",
-                "rt_sigframe.uc.__unused[120]+0x58",
-                "rt_sigframe.uc.__unused[120]+0x60",
-                "rt_sigframe.uc.__unused[120]+0x68",
-                "rt_sigframe.uc.__unused[120]+0x70",
-                "rt_sigframe.uc.uc_mcontext.fault_address",
-                "rt_sigframe.uc.uc_mcontext.regs[31].x0",
-                "rt_sigframe.uc.uc_mcontext.regs[31].x1",
-                "rt_sigframe.uc.uc_mcontext.regs[31].x2",
-                "rt_sigframe.uc.uc_mcontext.regs[31].x3",
-                "rt_sigframe.uc.uc_mcontext.regs[31].x4",
-                "rt_sigframe.uc.uc_mcontext.regs[31].x5",
-                "rt_sigframe.uc.uc_mcontext.regs[31].x6",
-                "rt_sigframe.uc.uc_mcontext.regs[31].x7",
-                "rt_sigframe.uc.uc_mcontext.regs[31].x8",
-                "rt_sigframe.uc.uc_mcontext.regs[31].x9",
-                "rt_sigframe.uc.uc_mcontext.regs[31].x10",
-                "rt_sigframe.uc.uc_mcontext.regs[31].x11",
-                "rt_sigframe.uc.uc_mcontext.regs[31].x12",
-                "rt_sigframe.uc.uc_mcontext.regs[31].x13",
-                "rt_sigframe.uc.uc_mcontext.regs[31].x14",
-                "rt_sigframe.uc.uc_mcontext.regs[31].x15",
-                "rt_sigframe.uc.uc_mcontext.regs[31].x16",
-                "rt_sigframe.uc.uc_mcontext.regs[31].x17",
-                "rt_sigframe.uc.uc_mcontext.regs[31].x18",
-                "rt_sigframe.uc.uc_mcontext.regs[31].x19",
-                "rt_sigframe.uc.uc_mcontext.regs[31].x20",
-                "rt_sigframe.uc.uc_mcontext.regs[31].x21",
-                "rt_sigframe.uc.uc_mcontext.regs[31].x22",
-                "rt_sigframe.uc.uc_mcontext.regs[31].x23",
-                "rt_sigframe.uc.uc_mcontext.regs[31].x24",
-                "rt_sigframe.uc.uc_mcontext.regs[31].x25",
-                "rt_sigframe.uc.uc_mcontext.regs[31].x26",
-                "rt_sigframe.uc.uc_mcontext.regs[31].x27",
-                "rt_sigframe.uc.uc_mcontext.regs[31].x28",
-                "rt_sigframe.uc.uc_mcontext.regs[31].x29",
-                "rt_sigframe.uc.uc_mcontext.regs[31].x30",
-                "rt_sigframe.uc.uc_mcontext.sp",
-                "rt_sigframe.uc.uc_mcontext.pc",
-                "rt_sigframe.uc.uc_mcontext.pstate",
-            ]
+            entries = self.apply_x86_64_ss_label(base, entries)
 
-        max_name_width = max(len(x) for x in sigreturn_defines)
+        labels = [e if isinstance(e, str) else e[2] for e in entries]
+        width = max(len(x) for x in labels)
+        ptrsize = runtime.current_arch.ptrsize
+        base_address_color = Config.get("theme.dereference_base_address")
 
         out = []
-        for i, tag in enumerate(sigreturn_defines):
-            line = DereferenceCommand.pprint_dereferenced(base, i, tag.ljust(max_name_width))
-            out.append(line)
+        idx = 0
+        for entry in entries:
+            if isinstance(entry, str):
+                try:
+                    out.append(DereferenceCommand.pprint_dereferenced(base, idx, entry.ljust(width)))
+                except gdb.MemoryError:
+                    out.append("Cannot access memory at address {:#x}".format(base + idx * ptrsize))
+                    break
+                idx += 1
+            else:
+                _, nwords, label = entry
+                addr = base + idx * ptrsize
+                addr_colored = Color.colorify(AddressUtil.format_address(addr), base_address_color)
+                out.append("{:s}|{:+#07x}|{:+04d}: {:s}: ({:d} bytes)".format(
+                    addr_colored, idx * ptrsize, idx, label.ljust(width), nwords * ptrsize))
+                idx += nwords
+
+        if is_arm64():
+            self.append_aarch64_ext(out, base + idx * ptrsize)
 
         gef_print("\n".join(out), less=not args.no_pager)
         return
+
+    def frame_entries(self, rt):
+        if is_x86_64():
+            return self.x86_64_entries()
+        if is_arm64():
+            return self.arm64_entries()
+        if is_x86_32():
+            if rt:
+                entries = ["rt_sigframe.pretcode", "rt_sigframe.sig", "rt_sigframe.pinfo", "rt_sigframe.puc",
+                           ("skip", 32, "rt_sigframe.info")]
+                entries += ["rt_sigframe.uc.uc_flags", "rt_sigframe.uc.uc_link",
+                            "rt_sigframe.uc.uc_stack.ss_sp", "rt_sigframe.uc.uc_stack.ss_flags",
+                            "rt_sigframe.uc.uc_stack.ss_size"]
+                entries += ["rt_sigframe.uc.uc_mcontext." + name for name in self.I386_SC]
+                entries += ["rt_sigframe.uc.uc_sigmask"]
+                return entries
+            return ["sigframe.pretcode", "sigframe.sig"] + ["sigframe.sc." + name for name in self.I386_SC]
+
+        uc = ["uc.uc_flags", "uc.uc_link", "uc.uc_stack.ss_sp", "uc.uc_stack.ss_flags", "uc.uc_stack.ss_size"]
+        uc += ["uc.uc_mcontext." + name for name in self.ARM_MC]
+        uc += ["uc.uc_sigmask"]
+        if rt:
+            return [("skip", 32, "rt_sigframe.info")] + ["rt_sigframe.sig." + name for name in uc]
+        return ["sigframe." + name for name in uc]
+
+    def x86_64_entries(self):
+        return [
+            "rt_sigframe.pretcode",
+            "rt_sigframe.uc.uc_flags",
+            "rt_sigframe.uc.uc_link",
+            "rt_sigframe.uc.uc_stack.ss_sp",
+            "rt_sigframe.uc.uc_stack.ss_flags",
+            "rt_sigframe.uc.uc_stack.ss_size",
+            "rt_sigframe.uc.uc_mcontext.r8",
+            "rt_sigframe.uc.uc_mcontext.r9",
+            "rt_sigframe.uc.uc_mcontext.r10",
+            "rt_sigframe.uc.uc_mcontext.r11",
+            "rt_sigframe.uc.uc_mcontext.r12",
+            "rt_sigframe.uc.uc_mcontext.r13",
+            "rt_sigframe.uc.uc_mcontext.r14",
+            "rt_sigframe.uc.uc_mcontext.r15",
+            "rt_sigframe.uc.uc_mcontext.rdi",
+            "rt_sigframe.uc.uc_mcontext.rsi",
+            "rt_sigframe.uc.uc_mcontext.rbp",
+            "rt_sigframe.uc.uc_mcontext.rbx",
+            "rt_sigframe.uc.uc_mcontext.rdx",
+            "rt_sigframe.uc.uc_mcontext.rax",
+            "rt_sigframe.uc.uc_mcontext.rcx",
+            "rt_sigframe.uc.uc_mcontext.rsp",
+            "rt_sigframe.uc.uc_mcontext.rip",
+            "rt_sigframe.uc.uc_mcontext.rflags",
+            "rt_sigframe.uc.uc_mcontext.cs|gs|fs|__pad0",
+            "rt_sigframe.uc.uc_mcontext.err",
+            "rt_sigframe.uc.uc_mcontext.trapno",
+            "rt_sigframe.uc.uc_mcontext.oldmask",
+            "rt_sigframe.uc.uc_mcontext.cr2",
+            "rt_sigframe.uc.uc_mcontext.fpstate",
+            "rt_sigframe.uc.uc_mcontext.reserved[0]",
+            "rt_sigframe.uc.uc_mcontext.reserved[1]",
+            "rt_sigframe.uc.uc_mcontext.reserved[2]",
+            "rt_sigframe.uc.uc_mcontext.reserved[3]",
+            "rt_sigframe.uc.uc_mcontext.reserved[4]",
+            "rt_sigframe.uc.uc_mcontext.reserved[5]",
+            "rt_sigframe.uc.uc_mcontext.reserved[6]",
+            "rt_sigframe.uc.uc_mcontext.reserved[7]",
+            "rt_sigframe.uc.uc_sigmask",
+            "rt_sigframe.info",
+        ]
+
+    def arm64_entries(self):
+        return [
+            "rt_sigframe.info+0x00",
+            "rt_sigframe.info+0x08",
+            "rt_sigframe.info+0x10",
+            "rt_sigframe.info+0x18",
+            "rt_sigframe.info+0x20",
+            "rt_sigframe.info+0x28",
+            "rt_sigframe.info+0x30",
+            "rt_sigframe.info+0x38",
+            "rt_sigframe.info+0x40",
+            "rt_sigframe.info+0x48",
+            "rt_sigframe.info+0x50",
+            "rt_sigframe.info+0x58",
+            "rt_sigframe.info+0x60",
+            "rt_sigframe.info+0x68",
+            "rt_sigframe.info+0x70",
+            "rt_sigframe.info+0x78",
+            "rt_sigframe.uc.uc_flags",
+            "rt_sigframe.uc.uc_link",
+            "rt_sigframe.uc.uc_stack.ss_sp",
+            "rt_sigframe.uc.uc_stack.ss_flags",
+            "rt_sigframe.uc.uc_stack.ss_size",
+            "rt_sigframe.uc.uc_sigmask",
+            "rt_sigframe.uc.__unused[120]+0x00",
+            "rt_sigframe.uc.__unused[120]+0x08",
+            "rt_sigframe.uc.__unused[120]+0x10",
+            "rt_sigframe.uc.__unused[120]+0x18",
+            "rt_sigframe.uc.__unused[120]+0x20",
+            "rt_sigframe.uc.__unused[120]+0x28",
+            "rt_sigframe.uc.__unused[120]+0x30",
+            "rt_sigframe.uc.__unused[120]+0x38",
+            "rt_sigframe.uc.__unused[120]+0x40",
+            "rt_sigframe.uc.__unused[120]+0x48",
+            "rt_sigframe.uc.__unused[120]+0x50",
+            "rt_sigframe.uc.__unused[120]+0x58",
+            "rt_sigframe.uc.__unused[120]+0x60",
+            "rt_sigframe.uc.__unused[120]+0x68",
+            "rt_sigframe.uc.__unused[120]+0x70",
+            "rt_sigframe.uc.(padding)",
+            "rt_sigframe.uc.uc_mcontext.fault_address",
+            "rt_sigframe.uc.uc_mcontext.regs[31].x0",
+            "rt_sigframe.uc.uc_mcontext.regs[31].x1",
+            "rt_sigframe.uc.uc_mcontext.regs[31].x2",
+            "rt_sigframe.uc.uc_mcontext.regs[31].x3",
+            "rt_sigframe.uc.uc_mcontext.regs[31].x4",
+            "rt_sigframe.uc.uc_mcontext.regs[31].x5",
+            "rt_sigframe.uc.uc_mcontext.regs[31].x6",
+            "rt_sigframe.uc.uc_mcontext.regs[31].x7",
+            "rt_sigframe.uc.uc_mcontext.regs[31].x8",
+            "rt_sigframe.uc.uc_mcontext.regs[31].x9",
+            "rt_sigframe.uc.uc_mcontext.regs[31].x10",
+            "rt_sigframe.uc.uc_mcontext.regs[31].x11",
+            "rt_sigframe.uc.uc_mcontext.regs[31].x12",
+            "rt_sigframe.uc.uc_mcontext.regs[31].x13",
+            "rt_sigframe.uc.uc_mcontext.regs[31].x14",
+            "rt_sigframe.uc.uc_mcontext.regs[31].x15",
+            "rt_sigframe.uc.uc_mcontext.regs[31].x16",
+            "rt_sigframe.uc.uc_mcontext.regs[31].x17",
+            "rt_sigframe.uc.uc_mcontext.regs[31].x18",
+            "rt_sigframe.uc.uc_mcontext.regs[31].x19",
+            "rt_sigframe.uc.uc_mcontext.regs[31].x20",
+            "rt_sigframe.uc.uc_mcontext.regs[31].x21",
+            "rt_sigframe.uc.uc_mcontext.regs[31].x22",
+            "rt_sigframe.uc.uc_mcontext.regs[31].x23",
+            "rt_sigframe.uc.uc_mcontext.regs[31].x24",
+            "rt_sigframe.uc.uc_mcontext.regs[31].x25",
+            "rt_sigframe.uc.uc_mcontext.regs[31].x26",
+            "rt_sigframe.uc.uc_mcontext.regs[31].x27",
+            "rt_sigframe.uc.uc_mcontext.regs[31].x28",
+            "rt_sigframe.uc.uc_mcontext.regs[31].x29",
+            "rt_sigframe.uc.uc_mcontext.regs[31].x30",
+            "rt_sigframe.uc.uc_mcontext.sp",
+            "rt_sigframe.uc.uc_mcontext.pc",
+            "rt_sigframe.uc.uc_mcontext.pstate",
+        ]
+
+    def frame_to_ucontext(self):
+        # bytes from the frame start (= default sp) to the embedded ucontext_t
+        if is_riscv32() or is_riscv64() or is_loongarch64():
+            return 128
+        if is_mips32() or is_mipsn32() or is_mips64():
+            return 152
+        if is_s390x():
+            return 296
+        return 0
+
+    def apply_x86_64_ss_label(self, base, entries):
+        # uc_flags bit UC_SIGCONTEXT_SS (0x2) turns the trailing __pad0 into the saved ss
+        uc_flags = read_int64_from_memory(base + runtime.current_arch.ptrsize, safe=True)
+        if uc_flags is None:
+            return entries
+        if not (uc_flags & 0x2):
+            return entries
+        return [e.replace("cs|gs|fs|__pad0", "cs|gs|fs|ss") if isinstance(e, str) else e for e in entries]
+
+    def append_aarch64_ext(self, out, addr):
+        addr = (addr + 15) & ~15  # extension records are 16-byte aligned
+        out.append(titlify("uc_mcontext.__reserved @ {:#x}".format(addr)))
+        for _ in range(16):
+            header = read_memory(addr, 8, safe=True)
+            if header is None:
+                out.append("(unreadable; FP/SIMD, SVE/SME, etc. may be present but are not shown)")
+                break
+            magic, size = u32(header[0:4]), u32(header[4:8])
+            if magic == 0 and size == 0:
+                out.append("{:#x}: (end)".format(addr))
+                break
+            name = self.AARCH64_EXT_MAGIC.get(magic, "unknown magic {:#x}".format(magic))
+            out.append("{:#x}: {:s} size={:#x}".format(addr, name, size))
+            if magic == 0x45585401 or size < 0x10:
+                out.append("(further records are not followed; general registers above are complete)")
+                break
+            addr += (size + 15) & ~15
+        return
+
+    def print_ucontext_frame(self, base, args):
+        layout = UcontextCommand.get_layout()
+        fields = UcontextCommand.frame_fields(layout)
+        data = read_memory(base, max(offset + size for offset, size, _, _ in fields), safe=True)
+        if data is None:
+            err("Failed to read memory")
+            return
+
+        labels = ["rt_sigframe." + label for _, _, label, _ in fields]
+        width = max(len(x) for x in labels)
+        out = [titlify("rt_sigframe.uc @ {:#x} ({:s})".format(base, layout["name"]))]
+        for (offset, size, _, kind), label in zip(fields, labels):
+            if kind != "sigmask":
+                value = UcontextCommand.unpack(data, offset, size)
+            if kind == "sigmask":
+                value_s = UcontextCommand.format_sigmask(
+                    data, offset, layout["generic_signo"], layout["sigmask_size"], layout["sigmask_word"],
+                )
+            elif kind == "ss_flags":
+                value_s = UcontextCommand.format_ss_flags(value)
+            elif kind == "ptr":
+                value_s = AddressUtil.recursive_dereference_to_string(value)
+            elif kind == "int":
+                value_s = "{:#x}".format(value)
+            else:
+                value_s = UcontextCommand.format_value(value, size, kind)
+            out.append("{:#x}|{:+#07x} {:{:d}s}: {:s}".format(base + offset, offset, label, width, value_s))
+
+        gef_print("\n".join(out), less=not args.no_pager)
+        return
+
 
 
 @register_command
@@ -1375,6 +1489,7 @@ class JsonCommand(GenericCommand, BufferingOutput):
         return
 
 
+
 @register_command
 class JsonMemoryCommand(JsonCommand):
     """Pretty print JSON from memory values."""
@@ -1385,11 +1500,14 @@ class JsonMemoryCommand(JsonCommand):
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("location", metavar="LOCATION", type=AddressUtil.parse_address,
                         help="start address for json.")
+    parser.add_argument("-r", "--max-read", type=AddressUtil.parse_address, default=0x10_0000,
+                        help="maximum bytes to inspect, including the NUL terminator. (default: %(default)s)")
     parser.add_argument("-n", "--no-pager", action="store_true", help="do not use the pager.")
     _syntax_ = parser.format_help()
 
     _example_ = [
         "{0:s} $rdi",
+        "{0:s} $rdi --max-read 0x20_0000",
     ]
     _example_ = "\n".join(_example_).format(_cmdline_)
 
@@ -1397,32 +1515,43 @@ class JsonMemoryCommand(JsonCommand):
         super().__init__(prefix=False, complete=gdb.COMPLETE_LOCATION)
         return
 
-    def read_json(self, loc):
-        pos = 0
-        s = b""
-        while True:
-            try:
-                blob = read_memory(loc + pos, 1)
-            except gdb.MemoryError:
-                err("Memory read error")
-                break
-            if blob == b"\x00":
-                break
+    def read_json(self, loc, max_read):
+        page_size = get_pagesize()
+        s = bytearray()
+        while len(s) < max_read:
+            current = loc + len(s)
+            size = min(page_size - current % page_size, max_read - len(s))
+            blob = read_memory(current, size, safe=True)
+            if blob is None:
+                err("Memory read error at {:#x}".format(current))
+                return None
+            pos = blob.find(b"\0")
+            if pos != -1:
+                return bytes(s + blob[:pos])
+            if len(blob) < size:
+                err("Memory read error at {:#x}".format(current + len(blob)))
+                return None
             s += blob
-            pos += 1
-        return s
+        err("JSON read limit reached ({:#x} bytes); increase --max-read".format(max_read))
+        return None
 
     @parse_args
     @only_if_gdb_running
     def do_invoke(self, args):
-        j = self.read_json(args.location)
+        if args.max_read <= 0:
+            err("--max-read must be > 0")
+            return
+
+        j = self.read_json(args.location, args.max_read)
+        if j is None:
+            return
         if not j:
             err("Could not find JSON")
             return
 
         try:
-            jstr = json.dumps(json.loads(j), indent=2)
-        except (json.JSONDecodeError, UnicodeDecodeError):
+            jstr = json.dumps(json.loads(j), indent=2, allow_nan=False)
+        except (ValueError, UnicodeDecodeError):
             err("Invalid JSON")
             return
 
@@ -1430,6 +1559,7 @@ class JsonMemoryCommand(JsonCommand):
         self.out.append(jstr)
         self.print_output(check_terminal_size=True)
         return
+
 
 
 @register_command
@@ -1479,12 +1609,14 @@ class XStringCommand(GenericCommand, BufferingOutput):
     parser.add_argument("address", metavar="ADDRESS", type=AddressUtil.parse_address, help="dump target address.")
     parser.add_argument("-l", "--max-length", type=AddressUtil.parse_address,
                         help="maximum number of characters to display. 0 means unlimited.")
+    parser.add_argument("-r", "--max-read", type=AddressUtil.parse_address, default=0,
+                        help="maximum bytes to inspect per string. 0 means unlimited. (default: %(default)s)")
     parser.add_argument("-H", "--hex", action="store_true", help="show in hex style.")
     parser.add_argument("-n", "--no-pager", action="store_true", help="do not use the pager.")
     parser.add_argument("-q", "--quiet", action="store_true", help="quiet mode.")
     _syntax_ = parser.format_help()
 
-    def dump_string(self, address, count, max_length, tohex, quiet):
+    def dump_string(self, address, count, max_length, tohex, quiet, max_read=0):
         for _ in range(count):
             if not is_valid_addr(address):
                 err("Memory read error at {:#x}".format(address))
@@ -1493,17 +1625,31 @@ class XStringCommand(GenericCommand, BufferingOutput):
             # read string
             current = address
             size = get_pagesize() - (address & get_pagesize_mask_low())
-            s = b""
+            s = bytearray()
+            pos = -1
+            read_limit_reached = False
             while True:
+                if max_read and len(s) >= max_read:
+                    read_limit_reached = True
+                    break
+
                 # check accessibility
                 if not is_valid_addr(current):
                     break
 
                 # read string
-                s += read_memory(current, size)
-                pos = s.find(b"\0")
+                if max_read:
+                    size = min(size, max_read - len(s))
+                start = len(s)
+                data = read_memory(current, size, safe=True)
+                if data is None:
+                    break
+                s += data
+                pos = s.find(b"\0", start)
                 if pos != -1:
                     s = s[:pos]
+                    break
+                if len(data) < size:
                     break
 
                 # not found 0x0, read more
@@ -1511,28 +1657,36 @@ class XStringCommand(GenericCommand, BufferingOutput):
                 size = get_pagesize()
 
             # cut off
-            if max_length and len(s) >= max_length:
-                cs = s[:max_length] + b"..."
+            s = bytes(s)
+            if max_length:
+                cs = s[:max_length]
             else:
                 cs = s
+            if len(cs) < len(s) or pos == -1:
+                cs += b"..."
 
             if tohex:
                 cs = cs.hex()
             else:
                 cs = repr(cs)
 
+            suffix = ""
+            if read_limit_reached:
+                suffix = " [read limit reached]"
+            elif pos == -1:
+                suffix = " [unterminated]"
+
             if quiet:
-                self.out.append("{:s}".format(cs))
+                self.out.append("{:s}{:s}".format(cs, suffix))
             else:
-                self.out.append("{!s}: {:s} ({:#x} bytes)".format(
-                    ProcessMap.lookup_address(address), cs, len(s),
+                self.out.append("{!s}: {:s} ({:#x}{:s} bytes){:s}".format(
+                    ProcessMap.lookup(address), cs, len(s), "+" if pos == -1 else "", suffix,
                 ))
 
             # go to next address
             if pos == -1:
-                address += 1
-            else:
-                address += pos + 1
+                break
+            address += pos + 1
         return
 
     @parse_args
@@ -1552,15 +1706,27 @@ class XStringCommand(GenericCommand, BufferingOutput):
                 err("Failed to parse: {}".format(args.count))
                 return
 
+        if count < 0:
+            err("Count must be >= 0")
+            return
+
         if args.max_length is not None:
             max_length = args.max_length
         else:
-            max_length = Config.get_gef_setting("context.nb_max_string_length")
+            max_length = Config.get("context.nb_max_string_length")
+
+        if max_length < 0:
+            err("--max-length must be >= 0")
+            return
+        if args.max_read < 0:
+            err("--max-read must be >= 0")
+            return
 
         self.out = []
-        self.dump_string(args.address, count, max_length, args.hex, args.quiet)
+        self.dump_string(args.address, count, max_length, args.hex, args.quiet, args.max_read)
         self.print_output(check_terminal_size=True)
         return
+
 
 
 @register_command
