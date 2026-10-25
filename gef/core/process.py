@@ -629,12 +629,65 @@ def get_arch():
     return arch_str
 
 
+def get_arch_context():
+    """Return the selected inferior and its GDB architecture name.
+    `current_arch` must be resolved again when this value changes (e.g., `inferior N`, or reconnecting to another target)."""
+    try:
+        inferior = gdb.selected_inferior()
+    except Exception:
+        return None
+    if not hasattr(inferior, "architecture"): # ~gdb 10.1
+        return inferior.num, None
+    try:
+        return inferior.num, inferior.architecture().name()
+    except gdb.error:
+        return inferior.num, None
+
+
+@Cache.cache_until_next(per_cpu=True)
+def is_in_kpti_transition():
+    """Return whether arm64 is stopped while switching TTBR1 for KPTI."""
+    from gef.core.kernel import Ksym
+    from gef.core.utils import slice_unpack
+    if not is_arm64() or not is_in_kernel():
+        return False
+
+    pc = runtime.current_arch.pc
+    sp = runtime.current_arch.sp
+    instruction_length = runtime.current_arch.instruction_length
+    if pc is None or sp is None:
+        return False
+
+    # `msr ttbr1_el1, x0` is encoded as 0xd518_2020. The source register xN is
+    # encoded in the low 5 bits, so mask them out when matching the instruction.
+    code = read_memory(pc - 8 * instruction_length, 17 * instruction_length, safe=True)
+    if code is None:
+        return False
+    if not any(insn & 0xffff_ffe0 == 0xd518_2020 for insn in slice_unpack(code, 4)):
+        return False
+
+    if not is_valid_addr(sp):
+        return True
+
+    # If kallsyms was already resolved, also check a known regular kernel mapping.
+    ret = Ksym.peek()
+    if ret is None:
+        return False
+    kallsyms, kallsyms_map = ret
+    known_addresses = kallsyms_map.get("_stext", [])
+    if not known_addresses:
+        return False
+    return not is_valid_addr(known_addresses[0])
+
+
 def set_arch(arch_str=None):
     """Set the current architecture.
     If an arch is explicitly specified, use that one, otherwise try to parse it out of the current target.
     If that fails, and default is specified, select and set that arch.
     Return the selected arch, or raise an OSError."""
     from gef.arch.mips import MIPS64
+
+    runtime.current_arch_context = get_arch_context()
 
     # Determined from the specified arch string
     if arch_str:

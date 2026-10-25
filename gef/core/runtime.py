@@ -94,6 +94,7 @@ class ArchRegistry:
 
 
 current_arch = None
+current_arch_context = None
 missing_modules: dict = {}
 # command *instantiation* failures keyed by `_cmdline_` (vs `missing_modules`,
 # which holds *module-import* failures keyed by dotted module name).

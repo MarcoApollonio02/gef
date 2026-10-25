@@ -12,6 +12,8 @@ import os
 import gdb
 
 from gef.core import runtime
+from gef.core.exec import ExecAsm
+from gef.core.process import get_arch_context, set_arch
 from gef.core.cache import Cache
 from gef.core.color import Color, gef_print, ok, err, warn, info
 from gef.core.config import Config
@@ -480,6 +482,9 @@ class GenericCommand(gdb.Command):
 
     def invoke(self, args, from_tty): # noqa
         try:
+            # Another inferior or target may be selected since the architecture was resolved.
+            if runtime.current_arch_context is not None and runtime.current_arch_context != get_arch_context():
+                set_arch()
             self.command_args = args
             argv = gdb.string_to_argv(args)
             if self._repeat_:
@@ -487,6 +492,8 @@ class GenericCommand(gdb.Command):
             else:
                 self.dont_repeat()
             self.do_invoke(argv)
+        except ExecAsm.ExecutionExitedError as e:
+            err(str(e))
         except Exception:
             # Since we are intercepting cleaning exceptions here, commands preferably should avoid
             # catching generic Exception, but rather specific ones. This is allows a much cleaner use.

@@ -19,6 +19,9 @@ import gdb
 from gef.core import runtime
 from gef.core.cache import Cache
 from gef.core.color import err, warn
+from gef.core.process import (get_arch_context, is_arm32_cortex_m, is_cris, is_in_kpti_transition,
+                              is_kgdb, is_or1k, is_over_serial, is_pin, is_qemu_system, is_qemu_user,
+                              is_vmware, set_arch)
 
 
 def only_if_events_supported(event_type):
@@ -40,8 +43,16 @@ class EventHandler:
     """A collection of handler functions that are called when the specified events occur."""
 
     @staticmethod
-    def continue_handler(_event):
+    def continue_handler(event):
         """GDB event handler for new object continue cases."""
+        from gef.core.exec import ExecAsm
+        ExecAsm.clear_queued_signal(event)
+        thread = getattr(event, "inferior_thread", None) or gdb.selected_thread()
+        if gdb.parameter("non-stop"):
+            context = thread
+        else:
+            context = gdb.selected_inferior()
+        ExecAsm.stop_reasons.pop(context, None)
         return
 
     __gef_check_once__ = True # the flag to process only once at startup
@@ -53,8 +64,15 @@ class EventHandler:
     @staticmethod
     def hook_stop_handler(event):
         """GDB event handler for stop cases."""
-        from gef.core.process import is_arm32_cortex_m, is_cris, is_kgdb, is_or1k, is_over_serial, is_pin, is_qemu_system, is_qemu_user, is_vmware, get_arch, set_arch
+        from gef.core.exec import ExecAsm
+        from gef.core.utils import GefUtil
         Cache.reset_gef_caches()
+        thread = getattr(event, "inferior_thread", None) or gdb.selected_thread()
+        if isinstance(event, gdb.SignalEvent):
+            ExecAsm.queued_signals[thread] = event.stop_signal
+        else:
+            ExecAsm.queued_signals.pop(thread, None)
+        EventHandler.track_qemu_pipe()
 
         # There appears to be a bug on some architectures (e.g., i386) where temporary breakpoints
         # are not deleted even after being hit. The conditions under which this occurs are unknown,
@@ -69,7 +87,7 @@ class EventHandler:
         # when kgdb, assume x86-64 if /dev/ttyS
         if EventHandler.__gef_check_once__:
             if is_over_serial():
-                dev = gdb.selected_inferior().connection.details
+                dev = GefUtil.get_serial_device()
                 if dev.startswith("/dev/ttyS"):
                     gdb.execute("set architecture i386:x86-64:intel", to_string=True)
                 else:
@@ -78,26 +96,44 @@ class EventHandler:
                     pass
                 Cache.reset_gef_caches()
 
-        # GEF will resolve the architecture if it is unknown.
-        if runtime.current_arch is None:
-            set_arch(get_arch())
+        # GEF will resolve the architecture if it is unknown or the target has changed.
+        if runtime.current_arch is None or runtime.current_arch_context != get_arch_context():
+            set_arch()
+
+        kpti_transition = is_in_kpti_transition()
+        if kpti_transition and not EventHandler.kpti_transition_active:
+            warn("Stopped during a KPTI page-table transition; continue briefly and retry.")
+        EventHandler.kpti_transition_active = kpti_transition
 
         # set `c`, `ni` and `si` command hooks for qemu-user and pin
         if EventHandler.__gef_check_once__:
             if is_qemu_user() or is_pin():
-                gdb.execute("define c\ncontinue-for-qemu-user\nend")
+                gdb.execute("define c\n"
+                            "if $argc == 0\n"
+                            "continue-for-qemu-user\n"
+                            "else\n"
+                            "if $argc == 1\n"
+                            "continue-for-qemu-user $arg0\n"
+                            "else\n"
+                            "continue-for-qemu-user $arg0 $arg1\n"
+                            "end\n"
+                            "end\n"
+                            "end")
                 if is_or1k() or is_cris():
-                    gdb.execute("define si\nstepi-for-qemu-user\nend")
-                    gdb.execute("define ni\nnexti-for-qemu-user\nend")
+                    gdb.execute("define si\nif $argc == 0\n"
+                                "stepi-for-qemu-user\nelse\n"
+                                "stepi-for-qemu-user $arg0\nend\nend")
+                    gdb.execute("define ni\nif $argc == 0\n"
+                                "nexti-for-qemu-user\nelse\n"
+                                "nexti-for-qemu-user $arg0\nend\nend")
 
-        # disable for cortex-m
-        if EventHandler.__gef_check_once__:
+            # disable for cortex-m
             if is_arm32_cortex_m():
                 gdb.execute("gef config context.disable_vmmap True")
                 gdb.execute("gef config context.disable_auxv True")
 
         # If the silent command is specified for a breakpoint, skip `context` command.
-        context_flag = True
+        context_flag = not kpti_transition
         if isinstance(event, gdb.BreakpointEvent):
             if event.breakpoint.is_valid() and event.breakpoint.enabled:
                 if event.breakpoint.commands:
@@ -118,29 +154,34 @@ class EventHandler:
     @staticmethod
     def new_objfile_handler(_event):
         """GDB event handler for new object file cases."""
-        from gef.core.process import ProcessMap, is_alive, is_kgdb, is_qemu_system, is_vmware, get_arch, set_arch
+        from gef.commands.memory.patch import PatchCommand
+        from gef.core.utils import GefUtil
+        objfile = getattr(_event, "new_objfile", None)
+        if objfile is not None and objfile.filename == objfile.progspace.filename:
+            PatchCommand.invalidate_history(progspace=objfile.progspace)
+            GefUtil.clear_user_bases(progspace=objfile.progspace)
         Cache.reset_gef_caches(new_objfile=True)
         if runtime.current_arch is None:
-            set_arch(get_arch())
+            set_arch()
 
-        # delayed breakpoint for brva
-        try:
-            from gef.commands.debugging.breakpoint import BreakRelativeVirtualAddressCommand
-        except ModuleNotFoundError:
-            BreakRelativeVirtualAddressCommand = None
-        if BreakRelativeVirtualAddressCommand and BreakRelativeVirtualAddressCommand.delayed_bp_set is False and is_alive():
-            if not (is_qemu_system() or is_kgdb() or is_vmware()):
-                codebase = ProcessMap.get_codebase()
-                if codebase:
-                    for offset in BreakRelativeVirtualAddressCommand.delayed_breakpoints:
-                        gdb.execute("b *{:#x}".format(codebase + offset))
-                    BreakRelativeVirtualAddressCommand.delayed_bp_set = True
         return
 
     @staticmethod
     def exit_handler(_event):
         """GDB event handler for exit cases."""
+        from gef.commands.memory.patch import PatchCommand
+        from gef.core.exec import ExecAsm
+        from gef.core.kernel import KernelVersion
+        from gef.core.utils import GefUtil
         Cache.reset_gef_caches(all=True)
+        PatchCommand.invalidate_history(getattr(_event, "inferior", None))
+        KernelVersion.clear_override(inferior=getattr(_event, "inferior", None))
+        GefUtil.clear_user_bases(inferior=getattr(_event, "inferior", None))
+        EventHandler.kpti_transition_active = False
+        ExecAsm.queued_signals = {thread: sig for thread, sig in ExecAsm.queued_signals.items() if thread.is_valid()}
+        for context in list(ExecAsm.stop_reasons):
+            if not context.is_valid() or context == _event.inferior or getattr(context, "inferior", None) == _event.inferior:
+                ExecAsm.stop_reasons.pop(context, None)
         return
 
     @staticmethod

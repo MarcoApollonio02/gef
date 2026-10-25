@@ -40,7 +40,6 @@ from gef.core.color import Color, err, info, warn
 from gef.core.color import gef_print  # noqa: F401  (re-export for GefUtil.show_last_exception users)
 from gef.core.config import Config
 from gef.core.errors import show_last_exception  # noqa: F401  (re-export)
-from gef.core.exec import ExecAsm
 from gef.core.memory import (is_double_link_list, is_single_link_list, is_valid_addr, p16, p32, p64, p8,
                               read_int32_from_memory, read_int_from_memory, read_memory, u128, u16, u32, u64,
                               u8)
@@ -596,6 +595,7 @@ class GefUtil:
 
     @staticmethod
     def get_stop_reason(use_saved=True):
+        from gef.core.exec import ExecAsm
         """Parse saved or current `info program`, which describes the last stop in all-stop mode, or return None on error.
         "reason" names the stop of the selected thread (e.g. "BREAKPOINT"). "breakpoints" has None for a deleted breakpoint.
         Set use_saved=False to read GDB's current stop.
@@ -651,6 +651,7 @@ class GefUtil:
     @staticmethod
     def get_siginfo():
         """Return the signal information from before injected instructions, if saved."""
+        from gef.core.exec import ExecAsm
         thread = gdb.selected_thread()
         if gdb.parameter("non-stop"):
             context = thread
