@@ -694,12 +694,21 @@ def set_arch(arch_str=None):
         key = arch_str.upper()
 
     else:
-        # Determined from loaded ELF
-        elf = Elf.get_elf()
+        # Determined from loaded ELF. With no path in the progspace (e.g. a
+        # bare-metal `target remote`) there is no ELF to ask, and asking would
+        # only report a path error that cannot be acted on.
+        elf = Elf.get_elf() if Path.get_filepath() else None
         if elf is None or not elf.is_valid():
-            raise OSError("Could not determine architecture.")
+            # No ELF is loaded (e.g. a bare-metal qemu-system target such as OVMF):
+            # fall back to the architecture GDB reports for the target. Raising here
+            # would abort the stop handler before `context` runs and leave GEF without
+            # an architecture, so nothing would work on such a target.
+            try:
+                key = get_arch().upper()
+            except (gdb.error, RuntimeError):
+                raise OSError("Could not determine architecture.")
 
-        if elf.e_machine not in [Elf.EM_MIPS, Elf.EM_RISCV, Elf.EM_PARISC]:
+        elif elf.e_machine not in [Elf.EM_MIPS, Elf.EM_RISCV, Elf.EM_PARISC]:
             key = elf.e_machine
 
         else:
